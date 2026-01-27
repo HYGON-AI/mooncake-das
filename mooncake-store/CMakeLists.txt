@@ -5,11 +5,11 @@ set(MOONCAKE_STORE_INCLUDE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/include")
 # Extract version components for C++ usage
 set(MOONCAKE_STORE_VERSION ${PROJECT_VERSION})
 
-# Read display version from mooncake-wheel/pyproject.toml
+# Read the shared dynamic-package base version from mooncake-wheel/pyproject.toml
 set(PYPROJECT_TOML_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/pyproject.toml")
 if(EXISTS "${PYPROJECT_TOML_PATH}")
     file(READ "${PYPROJECT_TOML_PATH}" PYPROJECT_CONTENT)
-    string(REGEX MATCH "version = \"([^\"]+)\"" _ "${PYPROJECT_CONTENT}")
+    string(REGEX MATCH "base-version = \"([^\"]+)\"" _ "${PYPROJECT_CONTENT}")
     set(MOONCAKE_DISPLAY_VERSION_BASE "${CMAKE_MATCH_1}")
 endif()
 if(NOT MOONCAKE_DISPLAY_VERSION_BASE)

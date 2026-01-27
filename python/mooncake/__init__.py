@@ -6,6 +6,11 @@ from pkgutil import extend_path
 
 __path__ = extend_path(__path__, __name__)
 
+try:
+    from mooncake.version import __hcu_version__, __version__, __version_tuple__
+except ImportError:
+    pass
+
 _BUFFER_POOL_EXPORTS = {"BufferPool", "RegisteredBufferPool"}
 __all__ = sorted(_BUFFER_POOL_EXPORTS)
 
