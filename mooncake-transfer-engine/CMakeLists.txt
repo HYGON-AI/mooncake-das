@@ -61,7 +61,7 @@ if (WITH_RUST_EXAMPLE)
 endif()
 
 # Non-peermem requires cuMem allocated memory pointers
-if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
+if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM OR USE_HIP)
   add_subdirectory(nvlink-allocator)
 endif()
 

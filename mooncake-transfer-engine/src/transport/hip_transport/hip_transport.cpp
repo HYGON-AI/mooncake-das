@@ -29,6 +29,9 @@
 #include "config.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#include "hip/hip_hsa_ext.h"
+#include <fstream>
+#include <mutex>
 
 namespace mooncake {
 
@@ -38,31 +41,7 @@ namespace mooncake {
 // - MC_HIP_NUM_EVENTS: number of HIP events per device
 constexpr int kDefaultNumStreams = 64;
 constexpr int kDefaultNumEvents = 64;
-
-// HIP-specific type aliases
-constexpr auto HIPX_MEM_HANDLE_TYPE_FABRIC =
-    hipMemHandleTypePosixFileDescriptor;
-
-struct hipxFabricHandle {
-    int fd;
-    int pid;
-};
-
-// RAII wrapper for file descriptor management
-struct FdGuard {
-    int fd = -1;
-    explicit FdGuard(int fd_val) : fd(fd_val) {}
-    ~FdGuard() {
-        if (fd != -1) {
-            close(fd);
-        }
-    }
-    // Disable copy/move
-    FdGuard(const FdGuard&) = delete;
-    FdGuard& operator=(const FdGuard&) = delete;
-    FdGuard(FdGuard&&) = delete;
-    FdGuard& operator=(FdGuard&&) = delete;
-};
+constexpr int kAlignment = 2ULL * 1024 * 1024;  // 2MB
 
 static bool checkHip(hipError_t result, const char* message) {
     if (result != hipSuccess) {
@@ -71,57 +50,6 @@ static bool checkHip(hipError_t result, const char* message) {
         return false;
     }
     return true;
-}
-
-// Wrapper around hipMemImportFromShareableHandle to handle ROCm version
-// differences. In ROCm 7.1+, the signature was changed:
-// the second argument is (void*)(uintptr_t)fd instead of a pointer to the fd
-static hipError_t importFromShareableHandle(
-    hipMemGenericAllocationHandle_t* handle, hipxFabricHandle* export_handle) {
-    static const int runtime_version = []() {
-        int version = 0;
-        if (!checkHip(hipRuntimeGetVersion(&version),
-                      "HipTransport: hipRuntimeGetVersion failed")) {
-            return -1;
-        }
-        return version;
-    }();
-
-    if (runtime_version < 0) {
-        return hipErrorInvalidValue;
-    }
-
-    if (runtime_version >= 70100000) {
-        return hipMemImportFromShareableHandle(
-            handle, (void*)(uintptr_t)export_handle->fd,
-            HIPX_MEM_HANDLE_TYPE_FABRIC);
-    } else {
-        return hipMemImportFromShareableHandle(handle, export_handle,
-                                               HIPX_MEM_HANDLE_TYPE_FABRIC);
-    }
-}
-
-static int open_fd(const hipxFabricHandle& export_handle) {
-    int fd = export_handle.fd;
-    int pid = export_handle.pid;
-
-    int pid_fd = (int)syscall(__NR_pidfd_open, pid, 0);
-    if (pid_fd == -1) {
-        LOG(ERROR) << "HIPTransport: pidfd_open error: " << strerror(errno)
-                   << " ( " << pid << " " << fd << ")";
-        return -1;
-    }
-
-    int open_fd = (int)syscall(__NR_pidfd_getfd, pid_fd, fd, 0);
-    if (open_fd == -1) {
-        LOG(ERROR) << "HIPTransport: pidfd_getfd error: " << strerror(errno)
-                   << " ( " << pid << " " << fd << ")";
-        close(pid_fd);
-        return -1;
-    }
-
-    close(pid_fd);
-    return open_fd;
 }
 
 static int openIPCHandle(const std::vector<unsigned char>& buffer,
@@ -136,59 +64,48 @@ static int openIPCHandle(const std::vector<unsigned char>& buffer,
     return 0;
 }
 
+static std::string ShareableHandleToHex(const hipFabricHandle_t& handle) {
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&handle);
+    std::ostringstream oss;
+    for (size_t i = 0; i < sizeof(hipFabricHandle_t); ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(bytes[i]);
+    }
+    return oss.str();
+}
+
 static int openShareableHandle(const std::vector<unsigned char>& buffer,
                                size_t length, void** shm_addr) {
-    hipxFabricHandle export_handle;
-    memcpy(&export_handle, buffer.data(), sizeof(export_handle));
+    /**
+     * 1. Collect ALL local GPU devices.
+     * 2. Perform a single batch attachment of the remote fabric handle.
+     * This registers the remote physical memory into the current process's page tables
+     * and authorizes access for all selected hardware agents.
+     * 
+     * Benefit: Returns a single Virtual Address (shm_addr) consistent across all local GPUs.
+     */
+    hipFabricHandle_t handle;
+    memcpy(&handle, buffer.data(), sizeof(handle));
 
-    // Use RAII guard for automatic fd cleanup
-    FdGuard fd_guard(-1);
-
-    if (HIPX_MEM_HANDLE_TYPE_FABRIC == hipMemHandleTypePosixFileDescriptor) {
-        int opened_fd = open_fd(export_handle);
-        if (opened_fd == -1) {
-            LOG(ERROR) << "HIPTransport: failed to open fd";
-            return -1;
-        }
-        fd_guard.fd = opened_fd;
-        export_handle.fd = opened_fd;
-    }
-
-    hipMemGenericAllocationHandle_t handle;
-    if (!checkHip(importFromShareableHandle(&handle, &export_handle),
-                  "HipTransport: importFromShareableHandle failed")) {
+    int num_devices = 0;
+    if (!checkHip(hipGetDeviceCount(&num_devices),
+                  "HipTransport: hipGetDeviceCount failed")) {
         return -1;
     }
 
-    if (!checkHip(hipMemAddressReserve((hipDeviceptr_t*)shm_addr, length, 0,
-                                       nullptr, 0),
-                  "HipTransport: hipMemAddressReserve failed")) {
+    std::vector<int> devices(num_devices);
+    for (int i = 0; i < num_devices; ++i) {
+        devices[i] = i;
+    }
+
+    if (!checkHip(hipHsaExtRpcMemoryAttachDevice(&handle, devices.size(), devices.data(), shm_addr),
+                  "HipTransport: hipHsaExtRpcMemoryAttachDevice failed")) {
         return -1;
     }
 
-    if (!checkHip(hipMemMap((hipDeviceptr_t)*shm_addr, length, 0, handle, 0),
-                  "HipTransport: hipMemMap failed")) {
-        (void)hipMemAddressFree((hipDeviceptr_t)*shm_addr, length);
-        return -1;
+    if (globalConfig().trace) {
+        LOG(INFO) << "HipTransport: Attaching fabric handle: " << ShareableHandleToHex(handle);
+        LOG(INFO) << "HipTransport: " << num_devices  << " device(s)" << " attached shared memory at address " << *shm_addr;
     }
-
-    int device_count = 0;
-    (void)hipGetDeviceCount(&device_count);
-    std::vector<hipMemAccessDesc> accessDesc(device_count);
-    for (int device_id = 0; device_id < device_count; ++device_id) {
-        accessDesc[device_id].location.type = hipMemLocationTypeDevice;
-        accessDesc[device_id].location.id = device_id;
-        accessDesc[device_id].flags = hipMemAccessFlagsProtReadWrite;
-    }
-
-    if (!checkHip(hipMemSetAccess((hipDeviceptr_t)*shm_addr, length,
-                                  accessDesc.data(), device_count),
-                  "HipTransport: hipMemSetAccess failed")) {
-        (void)hipMemUnmap((hipDeviceptr_t)*shm_addr, length);
-        (void)hipMemAddressFree((hipDeviceptr_t)*shm_addr, length);
-        return -1;
-    }
-
     return 0;
 }
 
@@ -388,6 +305,85 @@ static bool supportFabricMem() {
     return true;
 }
 
+static std::string getCopyKernelPath() {
+    static std::string cached_path;
+    static std::once_flag flag;
+
+    std::call_once(flag, []() {
+        const char* env_path = getenv("MC_COPY_KERNEL_PATH");
+        if (env_path && strlen(env_path) > 0) {
+            cached_path = std::string(env_path) + "/mc_copy_kernel.co";
+            std::ifstream f(cached_path);
+            if (f.good()) {
+                LOG(INFO) << "Found mc_copy_kernel.co via environment: " << cached_path;
+                return;
+            }
+        }
+
+        std::string default_path = "/usr/local/lib/python3.10/dist-packages/mooncake/mc_copy_kernel.co";
+        std::ifstream f(default_path);
+        if (f.good()) {
+            cached_path = default_path;
+            LOG(INFO) << "HipTransport: Found mc_copy_kernel.co in default path: " << cached_path;
+            return;
+        }
+
+        LOG(ERROR) << "HipTransport: mc_copy_kernel.co not found. "
+                   << "Please set MC_COPY_KERNEL_PATH environment variable "
+                   << "or ensure the file exists at /usr/local/lib/python3.10/dist-packages/mooncake/";
+    });
+
+    return cached_path;
+}
+
+void HipTransport::loadCopyModule() {
+    if (module_loaded_) return;
+
+    int num_devices = 0;
+    if (!checkHip(hipGetDeviceCount(&num_devices), "HipTransport: hipGetDeviceCount failed")) {
+        return;
+    }
+
+    std::string kernel_path = getCopyKernelPath();
+    if (kernel_path.empty()) {
+        return;
+    }
+
+    int original_device = 0;
+    if (!checkHip(hipGetDevice(&original_device), "HipTransport: hipGetDevice failed")) {
+        return;
+    }
+
+    for (int device_id = 0; device_id < num_devices; ++device_id) {
+        if (!checkHip(hipSetDevice(device_id), "HipTransport: hipSetDevice failed")) {
+            return;
+        }
+
+        hipModule_t copy_module;
+        hipFunction_t copy_func;
+        hipError_t err = hipModuleLoad(&copy_module, kernel_path.c_str());
+        if (err != hipSuccess) {
+            LOG(ERROR) << "HipTransport: Failed to load copy_kernel.co: " << hipGetErrorString(err);
+            return;
+        }
+
+        err = hipModuleGetFunction(&copy_func, copy_module, "MCCopyKernel");
+        if (err != hipSuccess) {
+            LOG(ERROR) << "HipTransport: Failed to get MCCopyKernel function: " << hipGetErrorString(err);
+            checkHip(hipModuleUnload(copy_module), "HipTransport: Failed to unload copy module");
+            return;
+        }
+
+        device_copy_modules_[device_id] = copy_module;
+        device_copy_funcs_[device_id] = copy_func;
+    }
+
+    module_loaded_ = true;
+    LOG(INFO) << "HipTransport: Custom MCCopyKernel.co loaded on " << device_copy_funcs_.size() << " devices.";
+    checkHip(hipSetDevice(original_device), "HipTransport: hipSetDevice failed to restore original device");
+    return;
+}
+
 HipTransport::HipTransport()
     : use_fabric_mem_(supportFabricMem()),
       stream_pool_(getNumStreams()),
@@ -401,13 +397,18 @@ HipTransport::HipTransport()
         }
 
         setupP2PAccess(num_devices);
+        LOG(INFO) << "HipTransport: Using IPC for transfers";
+    } else {
+        LOG(INFO) << "HipTransport: Using hylink fabric memory for transfers";
+        loadCopyModule();
     }
 }
 
 HipTransport::~HipTransport() {
     if (use_fabric_mem_) {
         for (auto& entry : remap_entries_) {
-            freePinnedLocalMemory(entry.second.shm_addr);
+            checkHip(hipHsaExtRpcMemoryDetach(entry.second.shm_addr),
+                          "HipTransport: hipHsaExtRpcMemoryDetach failed");
         }
     } else {
         for (auto& entry : remap_entries_) {
@@ -415,6 +416,11 @@ HipTransport::~HipTransport() {
         }
     }
     remap_entries_.clear();
+    if (module_loaded_) {
+        for (auto &entry : device_copy_modules_) {
+            checkHip(hipModuleUnload(entry.second), "HipTransport: Failed to unload copy module");
+        }
+    }
 }
 
 int HipTransport::install(std::string& local_server_name,
@@ -481,12 +487,79 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
     }
 
     // Perform async memory copy
-    if (slice->opcode == TransferRequest::READ) {
-        err = hipMemcpyAsync(slice->source_addr, (void*)slice->local.dest_addr,
-                             slice->length, hipMemcpyDefault, stream);
+    if (!supportFabricMem()) {
+        if (slice->opcode == TransferRequest::READ) {
+            err = hipMemcpyAsync(slice->source_addr, (void*)slice->local.dest_addr,
+                                 slice->length, hipMemcpyDefault, stream);
+        } else {
+            err = hipMemcpyAsync((void*)slice->local.dest_addr, slice->source_addr,
+                                 slice->length, hipMemcpyDefault, stream);
+        }
     } else {
-        err = hipMemcpyAsync((void*)slice->local.dest_addr, slice->source_addr,
-                             slice->length, hipMemcpyDefault, stream);
+        // HSA ptr not support in hip API now, use kernel copy
+        uint64_t d_addr, s_addr, length;
+
+        if (slice->opcode == TransferRequest::READ) {
+            d_addr = (uint64_t)slice->source_addr;
+            s_addr = (uint64_t)slice->local.dest_addr;
+        } else {
+            d_addr = (uint64_t)slice->local.dest_addr;
+            s_addr = (uint64_t)slice->source_addr;
+        }
+        length = (uint64_t)slice->length;
+
+        if (globalConfig().trace) {
+            // check 16 bytes alignment for better performance
+            if ((d_addr % 16 != 0) || (s_addr % 16 != 0)) {
+                LOG(WARNING) << "HipTransport: 16-bytes Unaligned copy detected (d_addr: " << std::hex << d_addr
+                             << ", s_addr: " << std::hex << s_addr << "). Performance may be degraded." << std::dec;
+            }
+        }
+
+        void* args[] = { &d_addr, &s_addr, &length };
+        /**
+        * Grid Size Calculation Logic:
+        * Background Mode (Default): Limits the kernel to 20 blocks. Use MC_HIP_COPY_BLOCKS to adjust.
+        * Full Mode (MC_HIP_COPY_PERF=1): Scales grid size to data length for maximum.
+        */
+        int threads_per_block = 1024;
+        uint32_t blocks_per_grid = (length + threads_per_block - 1) / threads_per_block;
+        const char* env_perf = getenv("MC_HIP_COPY_PERF");
+        if (env_perf && strcmp(env_perf, "1") == 0) {
+            if (blocks_per_grid > 4194302LL) {
+                blocks_per_grid = 4194302LL;
+            }
+        } else {
+            const char* env_blocks = getenv("MC_HIP_COPY_BLOCKS");
+            if (blocks_per_grid > 8) {
+                blocks_per_grid = 8;
+            }
+            if (env_blocks) {
+                try {
+                    int value = std::stoi(env_blocks);
+                    if (value > 0) {
+                        blocks_per_grid = value;
+                    } else {
+                        LOG(WARNING) << "HipTransport: MC_HIP_COPY_BLOCKS value " << value
+                                    << " must be positive, using default "
+                                    << blocks_per_grid;
+                    }
+                } catch (...) {
+                    LOG(WARNING) << "HipTransport: Invalid MC_HIP_COPY_BLOCKS value, using default "
+                                << blocks_per_grid;
+                }
+            }
+        }
+
+        auto copy_func_it = device_copy_funcs_.find(device_id);
+        if (copy_func_it == device_copy_funcs_.end()) {
+            LOG(ERROR) << "HipTransport: No copy function found for device " << device_id;
+            slice->markFailed();
+            event_pool_.putEvent(event, device_id);
+            return Status::Memory("No copy function available for device");
+        }
+        err = hipModuleLaunchKernel(copy_func_it->second, blocks_per_grid, 1, 1,
+                                    threads_per_block, 1, 1, 0, stream, args, nullptr);
     }
 
     if (!checkHip(err, "HipTransport: hipMemcpyAsync failed")) {
@@ -675,46 +748,55 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 
     // Fabric memory registration
     else {
-        // Retain allocation handle
-        hipMemGenericAllocationHandle_t handle;
-        hipError_t result = hipMemRetainAllocationHandle(&handle, addr);
-        if (result != hipSuccess) {
-            LOG(WARNING) << "Memory region " << addr
-                         << " is not allocated by hipMemCreate, "
-                         << "but it can be used as local buffer";
-            return 0;
-        }
-
-        // Find whole physical page for memory registration
-        void* real_addr;
-        size_t real_size;
-        result = hipMemGetAddressRange((hipDeviceptr_t*)&real_addr, &real_size,
-                                       (hipDeviceptr_t)addr);
-        if (result != hipSuccess) {
-            LOG(WARNING) << "HipTransport: hipMemGetAddressRange failed: "
-                         << result;
-            const uint64_t granularity = 2ULL * 1024 * 1024;
-            real_addr = addr;
-            real_size = (length + granularity - 1) & ~(granularity - 1);
-        }
-
-        // Export shareable handle
-        hipxFabricHandle export_handle_raw = {};
-        if (!checkHip(
-                hipMemExportToShareableHandle(&export_handle_raw, handle,
-                                              HIPX_MEM_HANDLE_TYPE_FABRIC, 0),
-                "HipTransport: hipMemExportToShareableHandle failed")) {
+        // Validate memory type
+        hipPointerAttribute_t attr;
+        if (!checkHip(hipPointerGetAttributes(&attr, addr),
+                      "HipTransport: hipPointerGetAttributes failed")) {
             return -1;
         }
-        export_handle_raw.pid = getpid();
+
+        if (attr.type != hipMemoryTypeDevice) {
+            LOG(ERROR) << "Unsupported memory type, " << addr << " "
+                       << attr.type;
+            return -1;
+        }
+
+        void* real_addr;
+        size_t real_size;
+        if (!checkHip(hipMemGetAddressRange((hipDeviceptr_t*)&real_addr, &real_size, (hipDeviceptr_t)addr),
+                      "HipTransport: hipMemGetAddressRange failed")) {
+            real_addr = addr;
+            real_size = length;
+        }
+        if (globalConfig().trace) {
+            LOG(INFO) << "HipTransport: Register memory at real address " << real_addr
+                      << " with real size " << real_size;
+        }
+        auto local_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+        for (auto &entry : local_desc->buffers) {
+            if (entry.addr == (uint64_t)real_addr) {
+                if (globalConfig().trace) {
+                    LOG(INFO) << "HipTransport: Memory region " << real_addr << " already registered, skipping.";
+                }
+                return 0;
+            }
+        }
+        hipFabricHandle_t handle;
+        real_size = (real_size + kAlignment - 1) & ~(kAlignment - 1);
+        if (!checkHip(hipHsaExtRpcMemoryCreate(real_addr, real_size, &handle),
+                      "HipTransport: hipHsaExtRpcMemoryCreate failed")) {
+            return -1;
+        }
+        if (globalConfig().trace) {
+            LOG(INFO) << "HipTransport: Created fabric handle: " << ShareableHandleToHex(handle);
+        }
 
         (void)remote_accessible;
         BufferDesc desc;
         desc.addr = (uint64_t)real_addr;
         desc.length = real_size;
         desc.name = location;
-        desc.shm_name = serializeBinaryData((const void*)&export_handle_raw,
-                                            sizeof(hipxFabricHandle));
+        desc.shm_name = serializeBinaryData((const void*)&handle, sizeof(hipFabricHandle_t));
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 }
@@ -755,7 +837,7 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                 if (output_buffer.size() == sizeof(hipIpcMemHandle_t) &&
                     !use_fabric_mem_) {
                     rc = openIPCHandle(output_buffer, &shm_addr);
-                } else if (output_buffer.size() == sizeof(hipxFabricHandle) &&
+                } else if (output_buffer.size() == sizeof(hipFabricHandle_t) &&
                            use_fabric_mem_) {
                     rc = openShareableHandle(output_buffer, entry.length,
                                              &shm_addr);
@@ -808,117 +890,19 @@ int HipTransport::unregisterLocalMemoryBatch(
 }
 
 void* HipTransport::allocatePinnedLocalMemory(size_t size) {
-    if (!supportFabricMem()) {
-        void* ptr = nullptr;
-        if (!checkHip(hipMalloc(&ptr, size),
-                      "HipTransport: hipMalloc failed")) {
-            return nullptr;
-        }
-        return ptr;
-    }
-
-    size_t granularity = 0;
-    hipDevice_t currentDev;
-    hipMemAllocationProp prop = {};
-    hipMemGenericAllocationHandle_t handle;
     void* ptr = nullptr;
-    int hipDev;
-    int flag = 0;
-
-    if (!checkHip(hipGetDevice(&hipDev), "HipTransport: hipGetDevice failed")) {
+    if (supportFabricMem()) {
+        size = (size + kAlignment - 1) & ~(kAlignment - 1);
+    }
+    if (!checkHip(hipMalloc(&ptr, size),
+                  "HipTransport: hipMalloc failed")) {
         return nullptr;
     }
-
-    if (!checkHip(hipDeviceGet(&currentDev, hipDev),
-                  "HipTransport: hipDeviceGet failed")) {
-        return nullptr;
-    }
-
-    prop.type = hipMemAllocationTypePinned;
-    prop.location.type = hipMemLocationTypeDevice;
-    prop.requestedHandleType = HIPX_MEM_HANDLE_TYPE_FABRIC;
-    prop.location.id = currentDev;
-
-    hipError_t result = hipDeviceGetAttribute(
-        &flag, hipDeviceAttributeVirtualMemoryManagementSupported, currentDev);
-    if (!checkHip(result, "HipTransport: hipDeviceGetAttribute failed")) {
-        return nullptr;
-    }
-
-    if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
-
-    result = hipMemGetAllocationGranularity(&granularity, &prop,
-                                            hipMemAllocationGranularityMinimum);
-    if (!checkHip(result,
-                  "HipTransport: hipMemGetAllocationGranularity failed")) {
-        return nullptr;
-    }
-
-    size = (size + granularity - 1) & ~(granularity - 1);
-    if (size == 0) size = granularity;
-
-    result = hipMemCreate(&handle, size, &prop, 0);
-    if (!checkHip(result, "HipTransport: hipMemCreate failed")) {
-        return nullptr;
-    }
-
-    result = hipMemAddressReserve((hipDeviceptr_t*)&ptr, size, granularity,
-                                  nullptr, 0);
-    if (!checkHip(result, "HipTransport: hipMemAddressReserve failed")) {
-        (void)hipMemRelease(handle);
-        return nullptr;
-    }
-
-    result = hipMemMap((hipDeviceptr_t)ptr, size, 0, handle, 0);
-    if (!checkHip(result, "HipTransport: hipMemMap failed")) {
-        (void)hipMemAddressFree((hipDeviceptr_t)ptr, size);
-        (void)hipMemRelease(handle);
-        return nullptr;
-    }
-
-    int device_count = 0;
-    (void)hipGetDeviceCount(&device_count);
-    std::vector<hipMemAccessDesc> accessDesc(device_count);
-    for (int idx = 0; idx < device_count; ++idx) {
-        accessDesc[idx].location.type = hipMemLocationTypeDevice;
-        accessDesc[idx].location.id = idx;
-        accessDesc[idx].flags = hipMemAccessFlagsProtReadWrite;
-    }
-
-    result = hipMemSetAccess((hipDeviceptr_t)ptr, size, accessDesc.data(),
-                             device_count);
-    if (!checkHip(result, "HipTransport: hipMemSetAccess failed")) {
-        (void)hipMemUnmap((hipDeviceptr_t)ptr, size);
-        (void)hipMemAddressFree((hipDeviceptr_t)ptr, size);
-        (void)hipMemRelease(handle);
-        return nullptr;
-    }
-
     return ptr;
 }
 
 void HipTransport::freePinnedLocalMemory(void* ptr) {
-    if (!supportFabricMem()) {
-        (void)hipFree(ptr);
-        return;
-    }
-
-    hipMemGenericAllocationHandle_t handle;
-    size_t size = 0;
-
-    if (!checkHip(hipMemRetainAllocationHandle(&handle, ptr),
-                  "HipTransport: hipMemRetainAllocationHandle failed")) {
-        return;
-    }
-
-    hipDeviceptr_t base = nullptr;
-    hipError_t result =
-        hipMemGetAddressRange(&base, &size, (hipDeviceptr_t)ptr);
-    if (checkHip(result, "HipTransport: hipMemGetAddressRange")) {
-        (void)hipMemUnmap((hipDeviceptr_t)ptr, size);
-        (void)hipMemAddressFree((hipDeviceptr_t)ptr, size);
-    }
-
-    (void)hipMemRelease(handle);
+    (void)hipFree(ptr);
+    return;
 }
 }  // namespace mooncake

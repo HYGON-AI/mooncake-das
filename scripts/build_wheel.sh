@@ -22,11 +22,18 @@ echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
+rm -f mooncake-wheel/mooncake/*.co
 
 echo "Creating directory structure..."
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
+
+# Copy mc_copy_kernel.co to mooncake directory
+if [ -f build/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co ]; then
+    echo "Copying mc_copy_kernel..."
+    cp build/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co mooncake-wheel/mooncake/mc_copy_kernel.co
+fi
 
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp build/mooncake-asio/libasio.so mooncake-wheel/mooncake/libasio.so
@@ -288,6 +295,7 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libamdhip64.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \
+    --exclude libgalaxyhip.so* \
     --exclude libc10.so* \
     --exclude libc10_cuda.so* \
     --exclude libtorch.so* \

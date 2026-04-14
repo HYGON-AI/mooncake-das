@@ -42,4 +42,4 @@ where = ["."]
 include = ["mooncake*"]
 
 [tool.setuptools.package-data]
-mooncake = ["*.so", "mooncake_master", "mooncake_client", "transfer_engine_bench"]
+mooncake = ["*.so", "*.co", "mooncake_master", "mooncake_client", "transfer_engine_bench"]

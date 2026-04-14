@@ -292,7 +292,35 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
         }
-
+#elif defined(USE_HIP)
+        const char* force_hip = getenv("MC_FORCE_HIP");
+        const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
+        if (force_hip || force_mnnvl) {
+            Transport* hip_transport =
+                multi_transports_->installTransport("hip", nullptr);
+            if (!hip_transport) {
+                LOG(ERROR) << "Failed to install HIP transport";
+                return -1;
+            }
+            LOG(INFO) << "Using HIP transport"
+                         "(MC_FORCE_HIP or MC_FORCE_MNNVL set)";
+        } else if (local_topology_->getHcaList().size() > 0 &&
+                   !getenv("MC_FORCE_TCP")) {
+            Transport* t =
+                multi_transports_->installTransport("rdma", local_topology_);
+            if (!t) {
+                LOG(ERROR) << "Failed to install RDMA transport";
+                return -1;
+            }
+            LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
+        } else {
+            Transport* tcp_transport =
+                multi_transports_->installTransport("tcp", nullptr);
+            if (!tcp_transport) {
+                LOG(ERROR) << "Failed to install TCP transport";
+                return -1;
+            }
+        }
 #else
         if (local_topology_->getHcaList().size() > 0 &&
                 !getenv("MC_FORCE_TCP") ||
@@ -333,16 +361,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #ifdef USE_HIP
         // HIP transport handles intra-node GPU P2P via XGMI/IPC and can
         // coexist with the cross-node transport (RDMA/TCP) selected above.
-        {
-            Transport* hip_transport =
-                multi_transports_->installTransport("hip", nullptr);
-            if (!hip_transport) {
-                LOG(WARNING) << "Failed to install HIP transport "
-                                "(intra-node GPU P2P unavailable)";
-            } else {
-                LOG(INFO) << "HIP transport installed for intra-node GPU P2P";
-            }
-        }
+        // {
+        //     Transport* hip_transport =
+        //         multi_transports_->installTransport("hip", nullptr);
+        //     if (!hip_transport) {
+        //         LOG(WARNING) << "Failed to install HIP transport "
+        //                         "(intra-node GPU P2P unavailable)";
+        //     } else {
+        //         LOG(INFO) << "HIP transport installed for intra-node GPU P2P";
+        //     }
+        // }
 #endif
     }
 #endif
