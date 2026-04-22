@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #ifndef RDMA_CTRL_CHANNEL_H_
 #define RDMA_CTRL_CHANNEL_H_
 
@@ -95,7 +99,7 @@ class CtrlChannel {
     void destroyResources();
     int postRecv(size_t idx);
     int repostAllRecvs();
-    int connectQp(const std::string &peer_gid, uint16_t peer_lid,
+    int connectQp(const std::string &peer_gid, uint32_t peer_lid,
                   uint32_t peer_qp_num);
     void dispatchRecvPayload(const uint8_t *data, size_t byte_len);
     void handleSendComplete();

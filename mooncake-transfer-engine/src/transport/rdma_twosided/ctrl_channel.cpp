@@ -12,9 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #include "transport/rdma_twosided/ctrl_channel.h"
 
 #include <glog/logging.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -234,7 +241,7 @@ void CtrlChannel::fillLocalDesc(HandShakeDesc &local_desc) const {
     local_desc.notify_rq_depth = notifyRqDepth();
 }
 
-int CtrlChannel::connectQp(const std::string &peer_gid, uint16_t peer_lid,
+int CtrlChannel::connectQp(const std::string &peer_gid, uint32_t peer_lid,
                            uint32_t peer_qp_num) {
     if (!qp_ || peer_qp_num == 0) return ERR_INVALID_ARGUMENT;
 
@@ -291,7 +298,11 @@ int CtrlChannel::connectQp(const std::string &peer_gid, uint16_t peer_lid,
         attr.ah_attr.grh.traffic_class =
             static_cast<uint8_t>(globalConfig().ib_traffic_class);
     }
-    attr.ah_attr.dlid = peer_lid;
+#ifdef USE_SHCA
+    attr.ah_attr.dlid = u32_to_17(peer_lid);
+#else
+    attr.ah_attr.dlid = static_cast<uint16_t>(peer_lid);
+#endif
     attr.ah_attr.sl = 0;
     if (globalConfig().ib_service_level >= 0) {
         attr.ah_attr.sl = static_cast<uint8_t>(globalConfig().ib_service_level);
