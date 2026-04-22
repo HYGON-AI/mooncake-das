@@ -44,7 +44,7 @@ struct DeviceDesc {
     std::unordered_map<TransportType, std::string> transport_attrs;
 
     // backward compatilble
-    uint16_t lid;
+    uint32_t lid;
     std::string gid;
 
    public:

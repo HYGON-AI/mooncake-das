@@ -15,6 +15,9 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 
 #include <glog/logging.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <cassert>
 #include <cstddef>
@@ -543,7 +546,7 @@ std::vector<uint32_t> RdmaEndPoint::qpNum() const {
 }
 
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
-                                    uint16_t peer_lid,
+                                    uint32_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
                                     std::string *reply_msg) {
     if (qp_list_.size() != peer_qp_num_list.size()) {
@@ -567,7 +570,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
 }
 
 int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
-                                    uint16_t peer_lid, uint32_t peer_qp_num,
+                                    uint32_t peer_lid, uint32_t peer_qp_num,
                                     std::string *reply_msg) {
     if (qp_index < 0 || qp_index > (int)qp_list_.size())
         return ERR_INVALID_ARGUMENT;
@@ -626,7 +629,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
         attr.ah_attr.grh.traffic_class =
             static_cast<uint8_t>(globalConfig().ib_traffic_class);
     }
-    attr.ah_attr.dlid = peer_lid;
+#ifdef USE_SHCA
+    attr.ah_attr.dlid = u32_to_17(peer_lid);
+#else
+    attr.ah_attr.dlid = static_cast<uint16_t>(peer_lid);
+#endif
     attr.ah_attr.sl = 0;
     attr.ah_attr.src_path_bits = 0;
     attr.ah_attr.static_rate = 0;

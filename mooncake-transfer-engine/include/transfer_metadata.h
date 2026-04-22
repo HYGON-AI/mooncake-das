@@ -44,7 +44,7 @@ class TransferMetadata {
    public:
     struct DeviceDesc {
         std::string name;
-        uint16_t lid;
+        uint32_t lid;
         std::string gid;
         std::string eid;  // for ub
     };

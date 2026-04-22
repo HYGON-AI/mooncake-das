@@ -175,7 +175,7 @@ In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy
 Mooncake is designed and optimized for high-speed RDMA networks. Though Mooncake supports TCP-only data transfer, we **strongly** recommend users to evaluate the functionality and performance of Mooncake with RDMA network support.
 
 The following need to be installed before running any component of Mooncake:
-- RDMA Driver & SDK, such as Mellanox OFED.
+- RDMA Driver & SDK, such as Mellanox OFED, or `shca-tools` on TianLong SHCA systems (build with `-DUSE_SHCA=ON`).
 - Python 3.10, virtual environment is recommended.
 - CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA` (disabled by default). *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
 - Cambricon Neuware, if the package is built with `-DUSE_MLU`. By default Mooncake looks for Neuware under `NEUWARE_HOME` or `/usr/local/neuware`.
@@ -232,6 +232,7 @@ The following are additional dependencies for building Mooncake:
 - Go 1.20+, if you want to build with `-DWITH_P2P_STORE`, `-DUSE_ETCD` (enabled by default to use etcd as metadata servers), or `-DSTORE_USE_ETCD` (use etcd for the failover of the store master).
 - CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA`. *This is NOT included in the `dependencies.sh` script. You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
 - Cambricon Neuware, if you want to build with `-DUSE_MLU`. *This is NOT included in the `dependencies.sh` script.* Mooncake resolves it from `NEUWARE_HOME` or `/usr/local/neuware` by default, and also supports overriding `MLU_INCLUDE_DIR` / `MLU_LIB_DIR` during CMake configure.
+- shca-tools, if you want to build with `-DUSE_SHCA=ON` on TianLong SHCA systems. *Install separately before `dependencies.sh`.*
 - [Optional] Rust Toolchain, if you want to build with `-DWITH_RUST_EXAMPLE`. *This is NOT included in the `dependencies.sh` script.*
 - [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers.
 - [Optional] `curl`, if you want to build with `-DUSE_HTTP` to use HTTP instead of etcd as metadata servers.

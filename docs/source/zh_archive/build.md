@@ -180,6 +180,7 @@
 - `-DNEUWARE_ROOT=/path/to/neuware`: 在 `-DUSE_MLU=ON` 时覆盖默认 Neuware SDK 根路径；未设置时使用 `NEUWARE_HOME` 或 `/usr/local/neuware`。
 - `-DMLU_INCLUDE_DIR=/path/to/include` / `-DMLU_LIB_DIR=/path/to/lib64`: 在 `-DUSE_MLU=ON` 时覆盖 Neuware 头文件与库目录。
 - `-DUSE_HIP=[ON|OFF]`: 通过 HIP/ROCm 启用对 AMD GPU 的支持
+- `-DUSE_SHCA=[ON|OFF]`: 启用 TianLong SHCA InfiniBand 支持。默认 OFF；SHCA 构建下不支持 `MC_RPC_PROTOCOL=rdma`。
 - `-DUSE_CXL=[ON|OFF]`: 启用 CXL 支持
 - `-DWITH_STORE=[ON|OFF]`: 编译 Mooncake Store 组件
 - `-DWITH_P2P_STORE=[ON|OFF]`: 启用 Golang 支持并编译 P2P Store 组件，需要 go 1.23+
