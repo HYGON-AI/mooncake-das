@@ -288,6 +288,7 @@ TransferOpcode.WRITE  # 写操作
 - `MC_LEGACY_RPC_PORT_BINDING`: 启用传统RPC端口绑定行为
 - `MC_TCP_BIND_ADDRESS`: 指定TCP绑定地址
 - `MC_CUSTOM_TOPO_JSON`: 自定义拓扑JSON文件路径
+- `MC_TE_FILTERS`: 可选，逗号分隔的 IB 设备名白名单（如 `mlx5_0,mlx5_2`），用于 Legacy Transfer Engine 拓扑自动发现；未设置时不限制。
 - `MC_TE_METRIC`: 启用指标报告（设置为"1"、"true"、"yes"或"on"）
 - `MC_TE_METRIC_INTERVAL_SECONDS`: 设置指标报告间隔（秒）
 
