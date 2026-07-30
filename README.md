@@ -205,6 +205,30 @@ pip install mooncake-transfer-engine-non-cuda
 > - MLU support is currently available through source builds with `-DUSE_MLU=ON`; there is no dedicated prebuilt MLU wheel yet.
 > - If users encounter problems such as missing `lib*.so`, they should uninstall the package they installed and build the binaries manually.
 
+### Build wheel variants for Hygon DCU
+For Hygon DCU packaging (standard NIC / HyLink RPC / TianLong SHCA), build wheels with `scripts/variant_build.sh`:
+
+```bash
+# Standard NIC, without HyLink
+bash scripts/variant_build.sh standard
+
+# Standard NIC, with HyLink (HIP RPC)
+bash scripts/variant_build.sh rpc
+
+# TianLong SHCA NIC, without HyLink
+bash scripts/variant_build.sh shca
+```
+
+Common options:
+
+```bash
+# Skip dependency installation
+bash scripts/variant_build.sh --skip-deps standard
+
+# Override parallel build jobs
+bash scripts/variant_build.sh --jobs 32 rpc
+```
+
 ### Use Docker image
 Mooncake supports Docker-based deployment, see [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html) in detail.
 
