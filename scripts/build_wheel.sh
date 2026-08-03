@@ -1,4 +1,8 @@
 #!/bin/bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Script to build the mooncake wheel package
 # Usage: ./scripts/build_wheel.sh [python_version] [output_dir]
 # Example: ./scripts/build_wheel.sh 3.10 dist-3.10
@@ -453,6 +457,7 @@ fi
 # libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
 # (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
 # corruption risk the EP/PG extensions are kept away from below.
+set +x
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
@@ -548,6 +553,8 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude liburma.so* \
     --exclude libmpcomm.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
+set -x
+echo "auditwheel repair finished"
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
 # can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
