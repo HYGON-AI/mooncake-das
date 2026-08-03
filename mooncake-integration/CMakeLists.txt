@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 file(GLOB SOURCES "*.cpp")
 include(${CMAKE_CURRENT_LIST_DIR}/../mooncake-common/SetupPython.cmake)
 execute_process(

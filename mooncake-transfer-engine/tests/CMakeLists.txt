@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 if (USE_HIP)

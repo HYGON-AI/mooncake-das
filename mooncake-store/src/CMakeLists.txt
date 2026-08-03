@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Find Python package
 add_subdirectory(cachelib_memory_allocator)
 

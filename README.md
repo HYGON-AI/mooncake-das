@@ -29,6 +29,21 @@ Mooncake is the serving platform for  <a href="https://kimi.ai/"><img src="image
 Now both the Transfer Engine and Mooncake Store are open-sourced!
 This repository also hosts its technical report and the open-sourced traces.
 
+<h2 id="attribution">🏷️ Attribution</h2>
+
+This project is based on upstream [Mooncake](https://github.com/kvcache-ai/Mooncake).
+
+- Upstream repository: https://github.com/kvcache-ai/Mooncake
+- Upstream branch: `main`
+- Upstream Commit: `62651b325b29e8214d3af4fe1864d5037e098b40`
+- Upstream license: Apache-2.0
+
+Modified by Hygon Information Technology Co., Ltd.
+
+Third-party source code vendored in this repository is documented in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+
 <h2 id="updates">🔄 Updates</h2>
 
 - **Mar 19, 2026**: [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale) is [open sourced](https://github.com/torchspec-project/TorchSpec), using Mooncake to decouple inference and training via efficient hidden states management.
