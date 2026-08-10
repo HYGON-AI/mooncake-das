@@ -34,8 +34,8 @@ class EventOverlap:
         """
         The current stream `torch.cuda.current_stream()` waits for the event to be finished.
         """
-        assert self.event is not None
-        self.event.current_stream_wait()
+        if self.event is not None:
+            self.event.current_stream_wait()
 
     def __enter__(self) -> Any:
         """
@@ -91,21 +91,14 @@ class Buffer:
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
 
-            raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
-            raddrs = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(raddrs, raddr, self.group)
-            raddrs = torch.cat(raddrs).tolist()
-
-            rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
-            rkeys = [
-                torch.empty(1, dtype=torch.int32, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(rkeys, rkey, self.group)
-            rkeys = torch.cat(rkeys).tolist()
+            mr_info = torch.tensor([raddr, rkey], dtype=torch.int64, device="cuda")
+            mr_infos_tensor = torch.empty(
+                self.group_size * 2, dtype=torch.int64, device="cuda"
+            )
+            dist.all_gather_into_tensor(mr_infos_tensor, mr_info, self.group)
+            mr_infos = mr_infos_tensor.view(self.group_size, 2).cpu()
+            raddrs = mr_infos[:, 0].tolist()
+            rkeys = [int(v) for v in mr_infos[:, 1].tolist()]
 
             all_to_all_size = ep.MAX_QP_COUNT // self.group_size
 
@@ -130,25 +123,16 @@ class Buffer:
             if self.runtime.is_roce():
                 (subnet_prefix, interface_id) = self.runtime.get_gid()
 
-                subnet_prefix = torch.tensor(
-                    [subnet_prefix], dtype=torch.int64, device="cuda"
+                gid = torch.tensor(
+                    [subnet_prefix, interface_id], dtype=torch.int64, device="cuda"
                 )
-                subnet_prefixes = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(subnet_prefixes, subnet_prefix, self.group)
-                subnet_prefixes = torch.cat(subnet_prefixes).tolist()
-
-                interface_id = torch.tensor(
-                    [interface_id], dtype=torch.int64, device="cuda"
+                gids_tensor = torch.empty(
+                    self.group_size * 2, dtype=torch.int64, device="cuda"
                 )
-                interface_ids = [
-                    torch.empty(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(interface_ids, interface_id, self.group)
-                interface_ids = torch.cat(interface_ids).tolist()
+                dist.all_gather_into_tensor(gids_tensor, gid, self.group)
+                gids = gids_tensor.view(self.group_size, 2).cpu()
+                subnet_prefixes = gids[:, 0].tolist()
+                interface_ids = gids[:, 1].tolist()
 
                 from mooncake.ep import get_active_ranks
                 active_ranks_mask = get_active_ranks(self.backend).tolist()
@@ -183,12 +167,15 @@ class Buffer:
             local_handle_tensor = torch.tensor(
                 local_handle_ints, dtype=torch.int32, device="cuda"
             )
-            handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(handles, local_handle_tensor, self.group)
-            remote_handles = [h.tolist() for h in handles]
+            handles_tensor = torch.empty(
+                self.group_size * len(local_handle_ints),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            dist.all_gather_into_tensor(
+                handles_tensor, local_handle_tensor, self.group
+            )
+            remote_handles = handles_tensor.view(self.group_size, -1).tolist()
             from mooncake.ep import get_active_ranks
             active_ranks_mask = get_active_ranks(self.backend).tolist()
             self.runtime.sync_nvlink_ipc_handles(remote_handles,

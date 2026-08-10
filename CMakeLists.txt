@@ -85,8 +85,27 @@ if (WITH_EP)
     include_directories(mooncake-pg/include)
   else ()
     message(STATUS "WITH_EP enabled: building Mooncake EP and PG Python extensions")
-    find_package(CUDAToolkit REQUIRED)
-    message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+    if(USE_HIP)
+      find_package(HIP REQUIRED)
+      set(EP_GPU_BACKEND "hip")
+      set(EP_TOOLKIT_MAJOR "0")
+      set(EP_TOOLKIT_MINOR "0")
+      if(NOT PYTORCH_ROCM_ARCH)
+        set(PYTORCH_ROCM_ARCH "$ENV{PYTORCH_ROCM_ARCH}")
+      endif()
+      if(NOT PYTORCH_ROCM_ARCH)
+        set(PYTORCH_ROCM_ARCH "gfx936")
+      endif()
+      set(PYTORCH_ROCM_ARCH "${PYTORCH_ROCM_ARCH}" CACHE STRING
+          "ROCm arch list for EP/PG extension builds")
+      message(STATUS "Building Mooncake EP/PG for HIP architectures: ${PYTORCH_ROCM_ARCH}")
+    else()
+      find_package(CUDAToolkit REQUIRED)
+      set(EP_GPU_BACKEND "cuda")
+      set(EP_TOOLKIT_MAJOR "${CUDAToolkit_VERSION_MAJOR}")
+      set(EP_TOOLKIT_MINOR "${CUDAToolkit_VERSION_MINOR}")
+      message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+    endif()
 
     # EP_TORCH_VERSIONS: semicolon-separated list of PyTorch versions to build for.
     # Can be set via -DEP_TORCH_VERSIONS="2.9.1;2.8.0" or the EP_TORCH_VERSIONS env var.
@@ -116,15 +135,18 @@ if (WITH_EP)
     # CMake's COMMAND list-splitting (semicolons are CMake list separators).
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
+    string(REPLACE ";" "|" _pytorch_rocm_arch_pipe "${PYTORCH_ROCM_ARCH}")
 
     add_custom_target(mooncake_ep_ext ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
       COMMAND ${CMAKE_COMMAND}
         "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep"
-        "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
-        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
+        "-DEP_GPU_BACKEND=${EP_GPU_BACKEND}"
+        "-DEP_CUDA_MAJOR=${EP_TOOLKIT_MAJOR}"
+        "-DEP_CUDA_MINOR=${EP_TOOLKIT_MINOR}"
         "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
+        "-DPYTORCH_ROCM_ARCH=${_pytorch_rocm_arch_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
@@ -137,10 +159,12 @@ if (WITH_EP)
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
       COMMAND ${CMAKE_COMMAND}
         "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg"
-        "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
-        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
+        "-DEP_GPU_BACKEND=${EP_GPU_BACKEND}"
+        "-DEP_CUDA_MAJOR=${EP_TOOLKIT_MAJOR}"
+        "-DEP_CUDA_MINOR=${EP_TOOLKIT_MINOR}"
         "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
+        "-DPYTORCH_ROCM_ARCH=${_pytorch_rocm_arch_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"

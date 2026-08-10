@@ -524,6 +524,11 @@ int initiator() {
 
     auto addr = allocateBuffers();
     for (int i = 0; i < buffer_num; ++i) {
+        if (addr[i] == nullptr) {
+            LOG(ERROR) << "Failed to allocate buffer " << i;
+            freeBuffers(addr);
+            return 1;
+        }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_UBSHMEM)
         if (FLAGS_use_vram) {
@@ -650,6 +655,11 @@ int target() {
 
     auto addr = allocateBuffers();
     for (int i = 0; i < buffer_num; ++i) {
+        if (addr[i] == nullptr) {
+            LOG(ERROR) << "Failed to allocate buffer " << i;
+            freeBuffers(addr);
+            return 1;
+        }
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
     defined(USE_UBSHMEM)
         if (FLAGS_use_vram) {

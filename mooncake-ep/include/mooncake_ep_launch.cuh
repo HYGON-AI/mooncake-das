@@ -1,22 +1,61 @@
 #pragma once
 
 #include <mooncake_ep_configs.cuh>
+#include <cstdio>
+#include <memory>
+#include <utility>
 
-#ifndef SETUP_LAUNCH_CONFIG
+namespace mooncake::hip_launch {
+struct LaunchConfig {
+    dim3 grid;
+    dim3 block;
+    unsigned int shared_mem;
+    hipStream_t stream;
+};
+
+template <typename T>
+inline void fill_args(void** args, size_t index, T&& arg) {
+    args[index] = static_cast<void*>(std::addressof(arg));
+    return;
+}
+
+template <typename Head, typename... Tail>
+inline void fill_args(void** args, size_t index, Head&& head, Tail&&... tail) {
+    args[index] = static_cast<void*>(std::addressof(head));
+    fill_args(args, index + 1, std::forward<Tail>(tail)...);
+    return;
+}
+
+template <typename Kernel, typename... Args>
+inline void launch(const LaunchConfig& config, Kernel kernel, Args&&... args) {
+    void* kernel_args[sizeof...(args)];
+    fill_args(kernel_args, 0, std::forward<Args>(args)...);
+    const auto result = hipLaunchCooperativeKernel(
+        reinterpret_cast<const void*>(kernel), config.grid, config.block,
+        kernel_args, config.shared_mem, config.stream);
+    if (result != hipSuccess) {
+        hipFuncAttributes attr{};
+        int device = 0;
+        int cooperative = 0;
+        hipGetDevice(&device);
+        hipDeviceGetAttribute(&cooperative, hipDeviceAttributeCooperativeLaunch,
+                              device);
+        hipFuncGetAttributes(&attr, reinterpret_cast<const void*>(kernel));
+        std::fprintf(stderr,
+                     "[EP] HIP cooperative launch failed: grid=%u block=%u "
+                     "max_threads=%d regs=%d static_smem=%zu cooperative=%d\n",
+                     config.grid.x, config.block.x, attr.maxThreadsPerBlock,
+                     attr.numRegs, attr.sharedSizeBytes, cooperative);
+    }
+    HIP_CHECK(result);
+}
+}  // namespace mooncake::hip_launch
+
 #define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \
-    cudaLaunchConfig_t cfg = {                            \
-        (num_sms), (num_threads), 0, stream, nullptr, 0}; \
-    cudaLaunchAttribute attr[1];                          \
-    attr[0].id = cudaLaunchAttributeCooperative;          \
-    attr[0].val.cooperative = 1;                          \
-    cfg.attrs = attr;                                     \
-    cfg.numAttrs = 1
-#endif
-
-#ifndef LAUNCH_KERNEL
+    mooncake::hip_launch::LaunchConfig cfg = {            \
+        dim3(num_sms), dim3(num_threads), 0, stream}
 #define LAUNCH_KERNEL(config, kernel, ...) \
-    CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
-#endif
+    mooncake::hip_launch::launch(*(config), kernel, ##__VA_ARGS__)
 
 #define SWITCH_RANKS(case_macro)                           \
     switch (num_ranks) {                                   \
@@ -67,9 +106,9 @@
 
 #define SWITCH_TYPES(case_macro)                         \
     switch (type) {                                      \
-        case CUDA_R_16BF:                                \
-            case_macro(nv_bfloat16);                     \
-        case CUDA_R_32F:                                 \
+        case HIP_R_16BF:                                 \
+            case_macro(hip_bfloat16);                    \
+        case HIP_R_32F:                                  \
             case_macro(float);                           \
         default:                                         \
             EP_HOST_ASSERT(false && "Unsupported type"); \

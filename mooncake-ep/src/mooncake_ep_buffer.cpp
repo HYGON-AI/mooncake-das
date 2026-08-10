@@ -1,29 +1,10 @@
 #include <mooncake_ep_buffer.h>
 #include <arpa/inet.h>
+#include <cstdlib>
+#include <cstring>
 #include <glog/logging.h>
 
 namespace mooncake {
-
-// Check if all GPUs support fabric memory handles (MNNVL).
-// Mirrors the check in nvlink_transport.cpp.
-static bool supportFabricMem() {
-    const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
-
-    bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;
-    if (!fabric_enabled) return false;
-
-    int num_devices = 0;
-    cudaError_t err = cudaGetDeviceCount(&num_devices);
-    if (err != cudaSuccess || num_devices == 0) return false;
-
-    for (int dev = 0; dev < num_devices; ++dev) {
-        int supported = 0;
-        cuDeviceGetAttribute(
-            &supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
-        if (!supported) return false;
-    }
-    return true;
-}
 
 // Check if IPv6 address is an IPv4-mapped address (::ffff:x.x.x.x)
 static inline bool ipv6_addr_v4mapped(const struct in6_addr* a) {
@@ -54,6 +35,32 @@ static int findBestGidIndex(ibv_context* ctx, uint8_t port,
     return -1;
 }
 
+// Returns -1 when unset, -2 when explicitly set to an invalid value.
+static int getForcedGidIndex(const ibv_port_attr& port_attr) {
+    const char* env = std::getenv("MC_GID_INDEX");
+    if (env == nullptr || env[0] == '\0') {
+        return -1;
+    }
+
+    char* end = nullptr;
+    long value = std::strtol(env, &end, 10);
+    if (*end != '\0' || value < 0 || value >= port_attr.gid_tbl_len) {
+        LOG(ERROR) << "[EP] Invalid MC_GID_INDEX='" << env
+                   << "', expected range [0, " << port_attr.gid_tbl_len
+                   << ")";
+        return -2;
+    }
+    return static_cast<int>(value);
+}
+
+static std::string gidToString(const ibv_gid& gid) {
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (inet_ntop(AF_INET6, gid.raw, buf, sizeof(buf)) == nullptr) {
+        return "<invalid-gid>";
+    }
+    return std::string(buf);
+}
+
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    std::string device_name)
@@ -61,145 +68,106 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       device_name(std::move(device_name)),
-      comm_stream(at::cuda::getStreamFromPool(true)) {
+      comm_stream(c10::hip::getStreamFromPoolMasqueradingAsCUDA(true)) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
     // Get ranks
-    CUDA_CHECK(cudaGetDevice(&device_id));
-    CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
-                                      device_id));
+    HIP_CHECK(hipGetDevice(&device_id));
+    LOG(INFO) << "[EP] Rank " << rank << " starts buffer initialization on GPU "
+              << device_id << " with HCA '" << this->device_name << "'";
+    HIP_CHECK(hipDeviceGetAttribute(&wall_clock_rate_khz,
+                                    hipDeviceAttributeWallClockRate, device_id));
 
-    // Allocate gdr_buffer. On MNNVL clusters, use cuMemCreate with a fabric
-    // handle so the buffer is accessible cross-node via NVLink fabric.
-    // On IB clusters or single-node setups, fall back to cudaMalloc.
-    use_fabric_mem_ = supportFabricMem();
-    if (use_fabric_mem_) {
-        CUdevice cu_dev;
-        CUresult res = cuDeviceGet(&cu_dev, device_id);
-        if (res != CUDA_SUCCESS) {
-            LOG(ERROR) << "[EP] cuDeviceGet failed: " << res;
-            throw std::runtime_error("cuDeviceGet failed");
-        }
+    HIP_CHECK(hipExtMallocWithFlags(&gdr_buffer, num_ep_buffer_bytes,
+                                    hipDeviceMallocFinegrained));
 
-        CUmemAllocationProp prop = {};
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id = cu_dev;
-        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-
-        int rdma_flag = 0;
-        cuDeviceGetAttribute(
-            &rdma_flag,
-            CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
-            cu_dev);
-        if (rdma_flag) prop.allocFlags.gpuDirectRDMACapable = 1;
-
-        size_t granularity = 0;
-        res = cuMemGetAllocationGranularity(&granularity, &prop,
-                                            CU_MEM_ALLOC_GRANULARITY_MINIMUM);
-        if (res != CUDA_SUCCESS) {
-            LOG(ERROR) << "[EP] cuMemGetAllocationGranularity failed: " << res;
-            throw std::runtime_error("cuMemGetAllocationGranularity failed");
-        }
-
-        fabric_alloc_size_ =
-            (num_ep_buffer_bytes + granularity - 1) & ~(granularity - 1);
-        if (fabric_alloc_size_ == 0) fabric_alloc_size_ = granularity;
-
-        res = cuMemCreate(&fabric_mem_handle_, fabric_alloc_size_, &prop, 0);
-        if (res != CUDA_SUCCESS) {
-            LOG(ERROR) << "[EP] cuMemCreate(FABRIC) failed: " << res;
-            throw std::runtime_error("cuMemCreate failed");
-        }
-
-        CUdeviceptr dptr = 0;
-        res = cuMemAddressReserve(&dptr, fabric_alloc_size_, granularity, 0, 0);
-        if (res != CUDA_SUCCESS) {
-            cuMemRelease(fabric_mem_handle_);
-            LOG(ERROR) << "[EP] cuMemAddressReserve failed: " << res;
-            throw std::runtime_error("cuMemAddressReserve failed");
-        }
-
-        res = cuMemMap(dptr, fabric_alloc_size_, 0, fabric_mem_handle_, 0);
-        if (res != CUDA_SUCCESS) {
-            cuMemAddressFree(dptr, fabric_alloc_size_);
-            cuMemRelease(fabric_mem_handle_);
-            LOG(ERROR) << "[EP] cuMemMap failed: " << res;
-            throw std::runtime_error("cuMemMap failed");
-        }
-
-        // Grant read/write access to all devices in the fabric clique
-        int device_count = 0;
-        cudaGetDeviceCount(&device_count);
-        std::vector<CUmemAccessDesc> access(device_count);
-        for (int i = 0; i < device_count; ++i) {
-            access[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            access[i].location.id = i;
-            access[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        }
-        res = cuMemSetAccess(dptr, fabric_alloc_size_, access.data(),
-                             device_count);
-        if (res != CUDA_SUCCESS) {
-            cuMemUnmap(dptr, fabric_alloc_size_);
-            cuMemAddressFree(dptr, fabric_alloc_size_);
-            cuMemRelease(fabric_mem_handle_);
-            LOG(ERROR) << "[EP] cuMemSetAccess failed: " << res;
-            throw std::runtime_error("cuMemSetAccess failed");
-        }
-
-        gdr_buffer = reinterpret_cast<void*>(dptr);
-        LOG(INFO) << "[EP] Allocated " << fabric_alloc_size_
-                  << " bytes with fabric handle on GPU " << device_id;
-    } else {
-        CUDA_CHECK(cudaMalloc(&gdr_buffer, num_ep_buffer_bytes));
-    }
-    CUDA_CHECK(cudaMalloc(&raddrs, num_ranks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
-    CUDA_CHECK(
-        cudaMalloc(&qp_devctxs, USE_QP_COUNT * sizeof(mlx5gda_qp_devctx)));
+    hipDeviceProp_t device_props{};
+    HIP_CHECK(hipGetDeviceProperties(&device_props, device_id));
+    gpu_hdp_reg = device_props.hdpMemFlushCntl;
+    LOG(INFO) << "[EP] Rank " << rank << " allocated " << num_ep_buffer_bytes
+              << " bytes for the finegrained EP data buffer";
+    HIP_CHECK(hipMalloc(&raddrs, num_ranks * sizeof(uint64_t)));
+    HIP_CHECK(hipMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
+    HIP_CHECK(
+        hipMalloc(&qp_devctxs, USE_QP_COUNT * sizeof(mlx5gda_qp_devctx)));
 
     // Allocate NVLink P2P arrays
-    CUDA_CHECK(cudaMalloc(&nvlink_available, num_ranks * sizeof(int32_t)));
-    CUDA_CHECK(cudaMemset(nvlink_available, 0, num_ranks * sizeof(int32_t)));
-    CUDA_CHECK(cudaMallocHost(&ipc_peer_ptrs_host, num_ranks * sizeof(void*)));
-    CUDA_CHECK(cudaMalloc(&ipc_peer_ptrs, num_ranks * sizeof(void*)));
+    HIP_CHECK(hipMalloc(&nvlink_available, num_ranks * sizeof(int32_t)));
+    HIP_CHECK(hipMemset(nvlink_available, 0, num_ranks * sizeof(int32_t)));
+    HIP_CHECK(hipHostMalloc(&ipc_peer_ptrs_host, num_ranks * sizeof(void*)));
+    HIP_CHECK(hipMalloc(&ipc_peer_ptrs, num_ranks * sizeof(void*)));
     for (int i = 0; i < num_ranks; ++i) {
         ipc_peer_ptrs_host[i] = nullptr;
     }
-    CUDA_CHECK(cudaMemset(ipc_peer_ptrs, 0, num_ranks * sizeof(void*)));
+    HIP_CHECK(hipMemset(ipc_peer_ptrs, 0, num_ranks * sizeof(void*)));
 
     int ret = init_ibgda();
+    LOG(INFO) << "[EP] Rank " << rank << " completed IBGDA initialization with "
+              << "status " << ret;
     if (ret != 0) {
         ibgda_disabled_ = true;
     }
 
     // Create 32 MiB workspace
-    CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
-    CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+    HIP_CHECK(hipMalloc(&workspace, NUM_WORKSPACE_BYTES));
+    HIP_CHECK(hipMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+    HIP_CHECK(hipStreamSynchronize(comm_stream.stream()));
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
-    if (use_fabric_mem_) {
-        CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(gdr_buffer);
-        cuMemUnmap(dptr, fabric_alloc_size_);
-        cuMemAddressFree(dptr, fabric_alloc_size_);
-        cuMemRelease(fabric_mem_handle_);
-    } else {
-        cudaFree(gdr_buffer);
-    }
-    cudaFree(raddrs);
-    cudaFree(rkeys);
-    cudaFree(qp_devctxs);
-    if (nvlink_available) cudaFree(nvlink_available);
-    if (ipc_peer_ptrs) cudaFree(ipc_peer_ptrs);
+    cleanup_ibgda();
+    hipFree(gdr_buffer);
+    hipFree(raddrs);
+    hipFree(rkeys);
+    hipFree(qp_devctxs);
+    if (nvlink_available) hipFree(nvlink_available);
+    if (ipc_peer_ptrs) hipFree(ipc_peer_ptrs);
     if (ipc_peer_ptrs_host) {
         // Close IPC handles
         for (int i = 0; i < num_ranks; ++i) {
             if (ipc_peer_ptrs_host[i] != nullptr &&
                 ipc_peer_ptrs_host[i] != gdr_buffer) {
-                cudaIpcCloseMemHandle(ipc_peer_ptrs_host[i]);
+                hipIpcCloseMemHandle(ipc_peer_ptrs_host[i]);
             }
         }
-        cudaFreeHost(ipc_peer_ptrs_host);
+        hipHostFree(ipc_peer_ptrs_host);
+    }
+}
+
+void MooncakeEpBuffer::cleanup_ibgda() {
+    for (auto* qp : qps) {
+        if (qp != nullptr && ctrl_buf_heap != nullptr) {
+            mlx5gda_destroy_qp(ctrl_buf_heap, qp);
+        }
+    }
+    qps.clear();
+    if (ctrl_buf_heap != nullptr) {
+        memheap_destroy(ctrl_buf_heap);
+        ctrl_buf_heap = nullptr;
+    }
+    if (ctrl_buf_umem != nullptr) {
+        mlx5dv_devx_umem_dereg(ctrl_buf_umem);
+        ctrl_buf_umem = nullptr;
+    }
+    if (mr != nullptr) {
+        ibv_dereg_mr(mr);
+        mr = nullptr;
+    }
+    if (pd != nullptr) {
+        ibv_dealloc_pd(pd);
+        pd = nullptr;
+    }
+    if (ib_ctx != nullptr) {
+        ibv_close_device(ib_ctx);
+        ib_ctx = nullptr;
+    }
+    if (ctrl_buf_registered) {
+        hipHostUnregister(ctrl_buf_host);
+        ctrl_buf_registered = false;
+    }
+    if (ctrl_buf_host != nullptr) {
+        free(ctrl_buf_host);
+        ctrl_buf_host = nullptr;
+        ctrl_buf_device = nullptr;
     }
 }
 
@@ -239,7 +207,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -275,8 +243,9 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     }
 
     int64_t timeout_ticks =
-        timeout_us == -1 ? -1
-                         : (int64_t)clock_rate_khz * (int64_t)timeout_us / 1000;
+        timeout_us == -1
+            ? -1
+            : (int64_t)wall_clock_rate_khz * (int64_t)timeout_us / 1000;
 
     auto launcher = [=](int phases) {
         mooncake::dispatch(
@@ -291,7 +260,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases);
+            gpu_hdp_reg, timeout_ticks, phases);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
@@ -368,7 +337,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -386,8 +355,9 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     }
 
     int64_t timeout_ticks =
-        timeout_us == -1 ? -1
-                         : (int64_t)clock_rate_khz * (int64_t)timeout_us / 1000;
+        timeout_us == -1
+            ? -1
+            : (int64_t)wall_clock_rate_khz * (int64_t)timeout_us / 1000;
 
     // Kernel launch
     auto launcher = [=](int phases) {
@@ -401,7 +371,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             layout_range.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, workspace, launch_stream, timeout_ticks, phases,
+            num_ranks, workspace, launch_stream, gpu_hdp_reg, timeout_ticks, phases,
             zero_copy);
     };
     launcher(return_recv_hook
@@ -435,7 +405,7 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
 
     auto buffer = layout.buffers[buffer_idx];
     auto dtype = torch::kBFloat16;
-    size_t num_bytes_per_combine_msg = hidden * sizeof(nv_bfloat16);
+    size_t num_bytes_per_combine_msg = hidden * sizeof(hip_bfloat16);
     auto num_msg_elems = static_cast<int>(num_bytes_per_combine_msg /
                                           elementSize(torch::kBFloat16));
 
@@ -453,6 +423,14 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
 int MooncakeEpBuffer::init_ibgda() {
     int num_devices;
     ibv_device** dev_list = ibv_get_device_list(&num_devices);
+    if (device_name.empty() || dev_list == nullptr || num_devices == 0) {
+        LOG(WARNING) << "[EP] No RDMA device selected or available; disabling "
+                        "IBGDA and continuing with local HIP IPC";
+        if (dev_list != nullptr && num_devices > 0) {
+            ibv_free_device_list(dev_list);
+        }
+        return -1;
+    }
     int nic_id = -1;
     for (int i = 0; i < num_devices; ++i) {
         const char* name = ibv_get_device_name(dev_list[i]);
@@ -462,13 +440,16 @@ int MooncakeEpBuffer::init_ibgda() {
         }
     }
     if (nic_id == -1) {
-        throw std::runtime_error("Device matching name '" + device_name +
-                                 "' not found.");
+        LOG(WARNING) << "[EP] RDMA device '" << device_name
+                     << "' not found; disabling IBGDA and continuing with "
+                        "local HIP IPC";
+        ibv_free_device_list(dev_list);
+        return -1;
     }
     LOG(INFO) << "[EP] GPU " << device_id << " uses NIC " << nic_id
               << " out of " << num_devices << " NIC(s)";
-    ibv_context* ctx = ibv_open_device(dev_list[nic_id]);
-    if (!ctx) {
+    ib_ctx = ibv_open_device(dev_list[nic_id]);
+    if (!ib_ctx) {
         perror("Failed to open device");
         return -1;
     }
@@ -476,28 +457,36 @@ int MooncakeEpBuffer::init_ibgda() {
     // Query port attributes to get GID table length
     ibv_port_attr port_attr;
     const uint8_t port_num = 1;
-    if (ibv_query_port(ctx, port_num, &port_attr)) {
+    if (ibv_query_port(ib_ctx, port_num, &port_attr)) {
         perror("Failed to query port");
+        cleanup_ibgda();
         return -1;
     }
 
-    // Dynamically find the best GID index (replaces hardcoded index 3)
-    gid_index_ = findBestGidIndex(ctx, port_num, port_attr);
+    // Prefer an explicit runtime GID index when provided; otherwise keep the
+    // dynamic RoCE/IB selection used by the EP path.
+    gid_index_ = getForcedGidIndex(port_attr);
+    if (gid_index_ == -1) {
+        gid_index_ = findBestGidIndex(ib_ctx, port_num, port_attr);
+    }
     if (gid_index_ < 0) {
         LOG(ERROR) << "[EP] Failed to find a suitable GID index on "
                    << device_name;
+        cleanup_ibgda();
         return -1;
     }
 
-    if (ibv_query_gid(ctx, port_num, gid_index_, &gid)) {
+    if (ibv_query_gid(ib_ctx, port_num, gid_index_, &gid)) {
         perror("Failed to query gid");
+        cleanup_ibgda();
         return -1;
     }
     ibv_free_device_list(dev_list);
 
-    pd = ibv_alloc_pd(ctx);
+    pd = ibv_alloc_pd(ib_ctx);
     if (!pd) {
         perror("Failed to allocate protection domain");
+        cleanup_ibgda();
         return -1;
     }
     mlx5dv_obj dv_obj = {};
@@ -505,69 +494,99 @@ int MooncakeEpBuffer::init_ibgda() {
     dv_obj.pd.out = &mpd;
     if (mlx5dv_init_obj(&dv_obj, MLX5DV_OBJ_PD)) {
         perror("Failed to initialize mlx5dv object");
+        cleanup_ibgda();
+        return -1;
     }
     mr = ibv_reg_mr(pd, gdr_buffer, num_ep_buffer_bytes,
                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                         IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
     if (!mr) {
         perror("Failed to reg mr");
+        cleanup_ibgda();
+        return -1;
     }
 
-    // Allocate ctrl_buf without zero-initialization. Individual regions will be
-    // initialized as needed: CQ needs -1 (hardware requirement), DBR needs 0.
-    // WQ doesn't need initialization as it's zeroed before each use.
-    CUDA_CHECK(cudaMalloc(&ctrl_buf, CTRL_BUF_SIZE));
-    ctrl_buf_umem = mlx5dv_devx_umem_reg(ctx, ctrl_buf, CTRL_BUF_SIZE,
-                                         IBV_ACCESS_LOCAL_WRITE);
+    // DEVX consumes the CPU VA while HIP kernels consume the mapped GPU VA.
+    // Both addresses refer to the same page-aligned control allocation.
+    if (posix_memalign(&ctrl_buf_host, 4096, CTRL_BUF_SIZE) != 0) {
+        perror("Failed to allocate control buffer");
+        cleanup_ibgda();
+        return -1;
+    }
+    auto hip_status = hipHostRegister(
+        ctrl_buf_host, CTRL_BUF_SIZE,
+        hipHostRegisterMapped | hipHostRegisterPortable);
+    if (hip_status != hipSuccess) {
+        LOG(ERROR) << "[EP] Failed to register control buffer: "
+                   << hipGetErrorString(hip_status);
+        cleanup_ibgda();
+        return -1;
+    }
+    ctrl_buf_registered = true;
+    hip_status =
+        hipHostGetDevicePointer(&ctrl_buf_device, ctrl_buf_host, 0);
+    if (hip_status != hipSuccess) {
+        LOG(ERROR) << "[EP] Failed to map control buffer to device: "
+                   << hipGetErrorString(hip_status);
+        cleanup_ibgda();
+        return -1;
+    }
+    ctrl_buf_umem = mlx5dv_devx_umem_reg(
+        ib_ctx, ctrl_buf_host, CTRL_BUF_SIZE, IBV_ACCESS_LOCAL_WRITE);
     if (!ctrl_buf_umem) {
         perror("Failed to register control buffer as umem");
-        fprintf(stderr,
-                "If the error is `Bad address`, probably because your GPU "
-                "does not support GPUDirect RDMA.\n");
-        // Keep internal state consistent: IBGDA init failed, so `mr` must not
-        // be treated as valid.
-        if (mr) {
-            ibv_dereg_mr(mr);
-            mr = nullptr;
-        }
+        cleanup_ibgda();
         return -1;
     }
     ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
     if (!ctrl_buf_heap) {
         perror("Failed to create memory heap");
+        cleanup_ibgda();
         return -1;
     }
     // Individual regions (CQ, DBR) will be initialized as needed via async
     // memset.
     for (int i = 0; i < USE_QP_COUNT; ++i) {
         mlx5gda_qp* qp =
-            mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
-                                 pd, 16384, 1, comm_stream.stream());
+            mlx5gda_create_rc_qp(mpd, ctrl_buf_device, ctrl_buf_umem,
+                                 ctrl_buf_heap, pd, 16384, 1,
+                                 comm_stream.stream());
         if (!qp) {
-            perror("Failed to create QP");
+            LOG(ERROR) << "[EP] Failed to create QP " << i << "/"
+                       << USE_QP_COUNT << ": " << strerror(errno);
+            cleanup_ibgda();
             return -1;
         }
         is_roce_ = qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
         if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
             perror("Failed to mlx5gda_modify_rc_qp_rst2init");
+            mlx5gda_destroy_qp(ctrl_buf_heap, qp);
+            cleanup_ibgda();
             return -1;
         }
         // Ensure all async memset operations are complete before accessing QP
         // structures
-        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+        HIP_CHECK(hipStreamSynchronize(comm_stream.stream()));
 
         mlx5gda_qp_devctx qp_devctx = {
             .qpn = qp->qpn,
             .wqeid_mask = qp->num_wqebb - 1,
-            .wq = (mlx5gda_wqebb*)(ctrl_buf + qp->wq_offset),
-            .cq = (mlx5_cqe64*)(ctrl_buf + qp->send_cq->cq_offset),
-            .dbr = (mlx5gda_wq_dbr*)(ctrl_buf + qp->dbr_offset),
-            .bf = (char*)qp->uar->reg_addr,
+            .wq = reinterpret_cast<mlx5gda_wqebb*>(
+                static_cast<char*>(ctrl_buf_device) + qp->wq_offset),
+            .cq = reinterpret_cast<mlx5_cqe64*>(
+                static_cast<char*>(ctrl_buf_device) +
+                qp->send_cq->cq_offset),
+            .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(
+                static_cast<char*>(ctrl_buf_device) + qp->dbr_offset),
+            .bf = static_cast<char*>(qp->uar_device_ptr),
         };
-        cudaMemcpy(qp_devctxs + i * sizeof(mlx5gda_qp_devctx), &qp_devctx,
-                   sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
+        HIP_CHECK(hipMemcpy(
+            static_cast<mlx5gda_qp_devctx*>(qp_devctxs) + i, &qp_devctx,
+            sizeof(mlx5gda_qp_devctx), hipMemcpyHostToDevice));
         qps.push_back(qp);
     }
+    LOG(INFO) << "[EP] IBGDA initialized with " << qps.size()
+              << " QPs on " << device_name;
     return 0;
 }
 
@@ -581,8 +600,9 @@ void MooncakeEpBuffer::update_local_qpns() {
 
     for (int i = 0; i < USE_QP_COUNT; ++i) {
         mlx5gda_qp* qp =
-            mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
-                                 pd, 16384, 1, comm_stream.stream());
+            mlx5gda_create_rc_qp(mpd, ctrl_buf_device, ctrl_buf_umem,
+                                 ctrl_buf_heap, pd, 16384, 1,
+                                 comm_stream.stream());
         if (!qp) {
             perror("Failed to recreate QP");
             ibgda_disabled_ = true;
@@ -596,18 +616,23 @@ void MooncakeEpBuffer::update_local_qpns() {
         }
         // Ensure all async memset operations are complete before accessing QP
         // structures
-        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+        HIP_CHECK(hipStreamSynchronize(comm_stream.stream()));
 
         mlx5gda_qp_devctx qp_devctx = {
             .qpn = qp->qpn,
             .wqeid_mask = qp->num_wqebb - 1,
-            .wq = (mlx5gda_wqebb*)(ctrl_buf + qp->wq_offset),
-            .cq = (mlx5_cqe64*)(ctrl_buf + qp->send_cq->cq_offset),
-            .dbr = (mlx5gda_wq_dbr*)(ctrl_buf + qp->dbr_offset),
-            .bf = (char*)qp->uar->reg_addr,
+            .wq = reinterpret_cast<mlx5gda_wqebb*>(
+                static_cast<char*>(ctrl_buf_device) + qp->wq_offset),
+            .cq = reinterpret_cast<mlx5_cqe64*>(
+                static_cast<char*>(ctrl_buf_device) +
+                qp->send_cq->cq_offset),
+            .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(
+                static_cast<char*>(ctrl_buf_device) + qp->dbr_offset),
+            .bf = static_cast<char*>(qp->uar_device_ptr),
         };
-        cudaMemcpy(qp_devctxs + i * sizeof(mlx5gda_qp_devctx), &qp_devctx,
-                   sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
+        HIP_CHECK(hipMemcpy(
+            static_cast<mlx5gda_qp_devctx*>(qp_devctxs) + i, &qp_devctx,
+            sizeof(mlx5gda_qp_devctx), hipMemcpyHostToDevice));
         qps[i] = qp;
     }
 }
@@ -638,11 +663,11 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
         if (active_ranks_mask[i] == 0) continue;
         uint64_t raddr =
             i == rank ? (uint64_t)mr->addr : (uint64_t)remote_addrs[i];
-        cudaMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
-                   cudaMemcpyHostToDevice);
+        hipMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
+                   hipMemcpyHostToDevice);
         uint32_t rkey = i == rank ? mr->lkey : (uint32_t)remote_keys[i];
-        cudaMemcpy(rkeys + i * sizeof(uint32_t), &rkey, sizeof(uint32_t),
-                   cudaMemcpyHostToDevice);
+        hipMemcpy(rkeys + i * sizeof(uint32_t), &rkey, sizeof(uint32_t),
+                   hipMemcpyHostToDevice);
     }
 }
 
@@ -668,7 +693,16 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
         ah_attr.dlid = qps[i]->port_attr.lid | 0xC000;
         if (mlx5gda_modify_rc_qp_init2rtr(
                 qps[i], ah_attr, (uint32_t)remote_qpns[i], IBV_MTU_4096)) {
-            perror("Failed to mlx5gda_modify_rc_qp_init2rtr");
+            LOG(ERROR) << "[EP][connect] init2rtr failed: rank=" << rank
+                       << " local_hca=" << device_name
+                       << " local_gid_index=" << gid_index_
+                       << " qp_index=" << i
+                       << " local_qpn=" << qps[i]->qpn
+                       << " peer_rank=" << peer_rank
+                       << " remote_qpn=" << remote_qpns[i]
+                       << " remote_gid=" << gidToString(remote_gid)
+                       << " active=" << active_ranks_mask[peer_rank]
+                       << " errno=" << errno << " " << strerror(errno);
             exit(1);
         }
         if (mlx5gda_modify_rc_qp_rtr2rts(qps[i])) {
@@ -680,25 +714,19 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
         if (active_ranks_mask[i] == 0) continue;
         uint64_t raddr =
             i == rank ? (uint64_t)mr->addr : (uint64_t)remote_addrs[i];
-        cudaMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
-                   cudaMemcpyHostToDevice);
+        hipMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
+                   hipMemcpyHostToDevice);
         uint32_t rkey = i == rank ? mr->lkey : (uint32_t)remote_keys[i];
-        cudaMemcpy(rkeys + i * sizeof(uint32_t), &rkey, sizeof(uint32_t),
-                   cudaMemcpyHostToDevice);
+        hipMemcpy(rkeys + i * sizeof(uint32_t), &rkey, sizeof(uint32_t),
+                   hipMemcpyHostToDevice);
     }
 }
 
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
-    if (use_fabric_mem_) {
-        // Fabric memory is globally accessible via cuMemSetAccess — no IPC
-        // handle exchange needed. Return an empty vector so the caller knows
-        // to skip IPC for this rank.
-        return {};
-    }
-    cudaIpcMemHandle_t handle;
-    CUDA_CHECK(cudaIpcGetMemHandle(&handle, gdr_buffer));
+    hipIpcMemHandle_t handle;
+    HIP_CHECK(hipIpcGetMemHandle(&handle, gdr_buffer));
     // Convert handle bytes to int32_t array
-    const size_t handle_size = sizeof(cudaIpcMemHandle_t);
+    const size_t handle_size = sizeof(hipIpcMemHandle_t);
     const size_t num_int32s =
         (handle_size + sizeof(int32_t) - 1) / sizeof(int32_t);
     std::vector<int32_t> handle_ints(num_int32s);
@@ -710,29 +738,13 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
     const std::vector<std::vector<int32_t>>& remote_handles,
     const std::vector<int>& active_ranks_mask) {
     int device_count = 0;
-    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+    HIP_CHECK(hipGetDeviceCount(&device_count));
 
     std::vector<int32_t> nvlink_array(num_ranks, 0);
     nvlink_array[rank] = 1;
 
-    if (use_fabric_mem_) {
-        // MNNVL: fabric addresses are globally visible across the clique.
-        // All ranks can directly access each other's gdr_buffer without IPC
-        // handle exchange — cuMemSetAccess already granted all devices
-        // read/write access during allocation.
-        for (int i = 0; i < num_ranks; ++i) {
-            if (active_ranks_mask[i] == 0) continue;
-            nvlink_array[i] = 1;
-            // Each rank's gdr_buffer is directly accessible; the remote
-            // addresses will be exchanged via the RDMA address sync path
-            // (sync_ib / sync_roce) or via a separate fabric address exchange.
-            // For local rank, point to our own buffer.
-            ipc_peer_ptrs_host[i] = (i == rank) ? gdr_buffer : nullptr;
-        }
-        p2p_ipc_all_enabled_ = true;
-        LOG(INFO) << "[EP] Fabric memory enabled, skipping IPC handle exchange";
-    } else {
-        // Non-MNNVL: use cudaIpc for intra-node P2P (original path)
+    {
+        // Use HIP IPC for intra-node P2P.
         int node_id = rank / device_count;
         int group_start = node_id * device_count;
         int group_end = std::min(group_start + device_count, num_ranks);
@@ -746,15 +758,15 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
 
             int dst_device = dst_rank % device_count;
             int can_access_peer = 0;
-            cudaError_t err = cudaDeviceCanAccessPeer(&can_access_peer,
+            hipError_t err = hipDeviceCanAccessPeer(&can_access_peer,
                                                       device_id, dst_device);
-            if (err == cudaSuccess && can_access_peer) {
-                cudaError_t peer_err =
-                    cudaDeviceEnablePeerAccess(dst_device, 0);
-                if (peer_err == cudaSuccess ||
-                    peer_err == cudaErrorPeerAccessAlreadyEnabled) {
-                    if (peer_err == cudaErrorPeerAccessAlreadyEnabled) {
-                        cudaGetLastError();
+            if (err == hipSuccess && can_access_peer) {
+                hipError_t peer_err =
+                    hipDeviceEnablePeerAccess(dst_device, 0);
+                if (peer_err == hipSuccess ||
+                    peer_err == hipErrorPeerAccessAlreadyEnabled) {
+                    if (peer_err == hipErrorPeerAccessAlreadyEnabled) {
+                        hipGetLastError();
                     }
                     nvlink_array[dst_rank] = 1;
 
@@ -765,7 +777,7 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
                         continue;
                     }
 
-                    const size_t handle_size = sizeof(cudaIpcMemHandle_t);
+                    const size_t handle_size = sizeof(hipIpcMemHandle_t);
                     const size_t num_int32s =
                         (handle_size + sizeof(int32_t) - 1) / sizeof(int32_t);
                     const auto& handle_ints = remote_handles[dst_rank];
@@ -776,18 +788,18 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
                         continue;
                     }
 
-                    cudaIpcMemHandle_t remote_handle;
+                    hipIpcMemHandle_t remote_handle;
                     memcpy(&remote_handle, handle_ints.data(), handle_size);
 
                     void* peer_ptr = nullptr;
-                    cudaError_t ipc_err =
-                        cudaIpcOpenMemHandle(&peer_ptr, remote_handle,
-                                             cudaIpcMemLazyEnablePeerAccess);
-                    if (ipc_err != cudaSuccess) {
+                    hipError_t ipc_err =
+                        hipIpcOpenMemHandle(&peer_ptr, remote_handle,
+                                             hipIpcMemLazyEnablePeerAccess);
+                    if (ipc_err != hipSuccess) {
                         LOG(WARNING)
                             << "[EP] Rank " << rank
                             << " failed to open IPC handle for rank "
-                            << dst_rank << ": " << cudaGetErrorString(ipc_err);
+                            << dst_rank << ": " << hipGetErrorString(ipc_err);
                         nvlink_array[dst_rank] = 0;
                     } else {
                         ipc_peer_ptrs_host[dst_rank] = peer_ptr;
@@ -813,10 +825,10 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
         }
     }
 
-    CUDA_CHECK(cudaMemcpy(nvlink_available, nvlink_array.data(),
-                          num_ranks * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ipc_peer_ptrs, ipc_peer_ptrs_host,
-                          num_ranks * sizeof(void*), cudaMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(nvlink_available, nvlink_array.data(),
+                          num_ranks * sizeof(int32_t), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(ipc_peer_ptrs, ipc_peer_ptrs_host,
+                          num_ranks * sizeof(void*), hipMemcpyHostToDevice));
 }
 
 }  // namespace mooncake

@@ -324,6 +324,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 LOG(ERROR) << "Failed to install TCP transport";
                 return -1;
             }
+            LOG(INFO) << "Using TCP transport";
         }
 #else
         if (local_topology_->getHcaList().size() > 0 &&

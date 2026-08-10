@@ -14,31 +14,14 @@
 
 #define LOW_LATENCY_SEND_PHASE 1
 #define LOW_LATENCY_RECV_PHASE 2
+#define EP_SIGNAL_PAD_INTS 4
+#define EP_SIGNAL_HEAD_PADDING_BYTES (2 * 1024 * 1024)
 
-// Make CLion CUDA indexing work
-#ifdef __CLION_IDE__
-#define __CUDA_ARCH__ 900  // NOLINT(*-reserved-identifier)
-#define __CUDACC_RDC__     // NOLINT(*-reserved-identifier)
-#endif
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_fp8.h>
+#include <hip/hip_runtime.h>
 
-// Remove Torch restrictions
-#ifdef __CUDA_NO_HALF_CONVERSIONS__
-#undef __CUDA_NO_HALF_CONVERSIONS__
-#endif
-#ifdef __CUDA_NO_HALF_OPERATORS__
-#undef __CUDA_NO_HALF_OPERATORS__
-#endif
-#ifdef __CUDA_NO_HALF2_OPERATORS__
-#undef __CUDA_NO_HALF2_OPERATORS__
-#endif
-#ifdef __CUDA_NO_BFLOAT16_CONVERSIONS__
-#undef __CUDA_NO_BFLOAT16_CONVERSIONS__
-#endif
-#ifdef __CUDA_NO_BFLOAT162_OPERATORS__
-#undef __CUDA_NO_BFLOAT162_OPERATORS__
-#endif
-
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+static constexpr int kWarpSize = 64;
+static constexpr int kEmulatedWarpSize = kWarpSize / 2;
+static constexpr uint64_t kFullWarpMask = 0xffffffffffffffffull;
 #include <infiniband/mlx5dv.h>

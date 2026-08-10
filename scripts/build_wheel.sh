@@ -267,7 +267,7 @@ echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
+python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
 auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \

@@ -21,14 +21,14 @@ class EPException : public std::exception {
     const char* what() const noexcept override { return message.c_str(); }
 };
 
-#ifndef CUDA_CHECK
-#define CUDA_CHECK(cmd)                                   \
-    do {                                                  \
-        cudaError_t e = (cmd);                            \
-        if (e != cudaSuccess) {                           \
-            throw EPException("CUDA", __FILE__, __LINE__, \
-                              cudaGetErrorString(e));     \
-        }                                                 \
+#ifndef HIP_CHECK
+#define HIP_CHECK(cmd)                                   \
+    do {                                                 \
+        hipError_t e = (cmd);                            \
+        if (e != hipSuccess) {                           \
+            throw EPException("HIP", __FILE__, __LINE__, \
+                              hipGetErrorString(e));     \
+        }                                                \
     } while (0)
 #endif
 
@@ -47,7 +47,7 @@ class EPException : public std::exception {
         if (not(cond)) {                                                 \
             printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, \
                    __LINE__, #cond);                                     \
-            asm("trap;");                                                \
+            __builtin_trap();                                            \
         }                                                                \
     } while (0)
 #endif

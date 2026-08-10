@@ -12,6 +12,7 @@ PYPROJECT_FILE="${REPO_ROOT}/mooncake-wheel/pyproject.toml"
 
 RUN_DEPS=1
 DRY_RUN=0
+BUILD_EP=0
 BUILD_VARIANT=""
 PYPROJECT_BACKUP=""
 BUILD_TYPE="Release"
@@ -157,6 +158,10 @@ build_variant() {
     esac
 
     echo "==> Building ${package_basename}"
+    if [ $BUILD_EP -eq 1 ]; then
+        echo "==> Building ${package_basename} with EP"
+        cmake_args+=(-DWITH_EP=ON)
+    fi
     run_cmd mkdir -p "${BUILD_DIR}" "${FINAL_DIST_DIR}"
     run_cmd cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" "${cmake_args[@]}" -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_SHARED_LIBS=ON
     run_cmd cmake --build "${BUILD_DIR}" -j"${JOBS}"
@@ -178,6 +183,9 @@ while [ $# -gt 0 ]; do
             ;;
         --dry-run)
             DRY_RUN=1
+            ;;
+        --build-ep)
+            BUILD_EP=1
             ;;
         --jobs)
             JOBS="$2"

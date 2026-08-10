@@ -1,10 +1,11 @@
 #ifndef MOONCAKE_EP_BUFFER_H
 #define MOONCAKE_EP_BUFFER_H
 
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include <c10/hip/HIPStream.h>
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_runtime.h>
 #include <fstream>
 #include <mooncake_ibgda/memheap.h>
 #include <mooncake_ibgda/mlx5gda.h>
@@ -39,7 +40,7 @@ struct BufferPair {
         size_t signaling_buffer_bytes = num_experts * sizeof(int);
         size_t send_recv_buffer_bytes =
             num_experts * num_max_dispatch_tokens_per_rank *
-            (2 * sizeof(int4) + hidden * sizeof(nv_bfloat16));
+            (2 * sizeof(int4) + hidden * sizeof(hip_bfloat16));
         for (int i = 0; i < 2; ++i) {
             size_t rdma_base_offset = total_bytes +
                                       2 * i * signaling_buffer_bytes +
@@ -64,16 +65,22 @@ struct MooncakeEpBuffer {
     // Device info and communication
     int device_id;
     int rank, num_ranks;
-    int clock_rate_khz;
+    int wall_clock_rate_khz;
 
     // MXA Buffer
     int buffer_idx{};
     int64_t num_ep_buffer_bytes;
     void* gdr_buffer = nullptr;
 
+    // HDP Register
+    uint32_t* gpu_hdp_reg = nullptr;
+
     // IBGDA
     static constexpr size_t CTRL_BUF_SIZE = 1024ULL * 1024 * 1024;  // 1024 MiB
-    void* ctrl_buf = nullptr;
+    // A single mapped allocation with distinct CPU and GPU virtual addresses.
+    void* ctrl_buf_host = nullptr;
+    void* ctrl_buf_device = nullptr;
+    bool ctrl_buf_registered = false;
     // RDMA memory region for `gdr_buffer`. Must be nullptr when IBGDA init
     // fails.
     ibv_mr* mr = nullptr;
@@ -88,24 +95,20 @@ struct MooncakeEpBuffer {
     int gid_index_ = -1;  // Dynamically discovered GID index
     int USE_QP_COUNT = MAX_QP_COUNT;
 
-    mlx5dv_devx_umem* ctrl_buf_umem;
-    ibv_pd* pd;
-    mlx5dv_pd mpd;
-    memheap* ctrl_buf_heap;
+    mlx5dv_devx_umem* ctrl_buf_umem = nullptr;
+    ibv_context* ib_ctx = nullptr;
+    ibv_pd* pd = nullptr;
+    mlx5dv_pd mpd{};
+    memheap* ctrl_buf_heap = nullptr;
 
-    // Fabric memory (MNNVL)
-    bool use_fabric_mem_ = false;
-    CUmemGenericAllocationHandle fabric_mem_handle_{};
-    size_t fabric_alloc_size_ = 0;
-
-    // NVLink P2P
+    // Intra-node HIP IPC
     int32_t* nvlink_available = nullptr;
     void** ipc_peer_ptrs_host = nullptr;
     void** ipc_peer_ptrs = nullptr;
     bool p2p_ipc_all_enabled_ = false;
 
     // Stream for communication
-    at::cuda::CUDAStream comm_stream;
+    c10::hip::HIPStreamMasqueradingAsCUDA comm_stream;
 
     // Workspace
     void* workspace = nullptr;
@@ -137,21 +140,22 @@ struct MooncakeEpBuffer {
                                           int hidden, int num_experts);
 
     int init_ibgda();
+    void cleanup_ibgda();
 
     bool ibgda_disabled() { return ibgda_disabled_; }
 
     bool is_roce() { return is_roce_; }
 
-    // Decide whether EP can safely run CUDA kernels (\"fast-path\").
+    // Decide whether EP can safely run HIP kernels (\"fast-path\").
     //
     // There are two independent ways EP kernels can work:
     // - IBGDA RDMA path: requires successful IBGDA init (qps/mr/etc).
-    // - NVLink P2P+IPC path: requires full P2P+IPC across ranks on the same
+    // - HIP P2P+IPC path: requires full P2P+IPC across ranks on the same
     // node.
     //
     // IMPORTANT INVARIANT:
     // If `p2p_ipc_all_enabled_ == true`, `sync_nvlink_ipc_handles()` guarantees
-    // `nvlink_available[dst_rank] == 1` for every rank pair, so the CUDA
+    // `nvlink_available[dst_rank] == 1` for every rank pair, so the HIP
     // kernels will never take the IBGDA branch and therefore do NOT require
     // `qps`.
     bool use_fast_path() {

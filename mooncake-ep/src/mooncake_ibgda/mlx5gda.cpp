@@ -1,6 +1,6 @@
 #include <cmath>
 
-#include <cuda_runtime_api.h>
+#include <hip/hip_runtime_api.h>
 
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
@@ -30,21 +30,30 @@ constexpr T round_up_pow2(T n) {
 #define IBGDA_ROUND_UP_POW2_OR_0(_n) (((_n) == 0) ? 0 : round_up_pow2(_n))
 
 static void print_cuda_error(const char* msg) {
-    const char* err_str = cudaGetErrorString(cudaGetLastError());
+    const char* err_str = hipGetErrorString(hipGetLastError());
     fprintf(stderr, "%s: %s\n", msg, err_str);
 }
 
-static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
+static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx,
+                                          void** device_ptr) {
+    *device_ptr = nullptr;
     struct mlx5dv_devx_uar* uar =
         mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
     if (!uar) {
         errno = EIO;
         return NULL;
     }
-    if (cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
-                         cudaHostRegisterPortable | cudaHostRegisterMapped |
-                             cudaHostRegisterIoMemory) != cudaSuccess) {
+    if (hipHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
+                         hipHostRegisterPortable | hipHostRegisterMapped |
+                             hipHostRegisterIoMemory) != hipSuccess) {
         print_cuda_error("Failed to register MMIO memory");
+        errno = EIO;
+        mlx5dv_devx_free_uar(uar);
+        return NULL;
+    }
+    if (hipHostGetDevicePointer(device_ptr, uar->reg_addr, 0) != hipSuccess) {
+        print_cuda_error("Failed to get MMIO device pointer");
+        hipHostUnregister(uar->reg_addr);
         errno = EIO;
         mlx5dv_devx_free_uar(uar);
         return NULL;
@@ -54,7 +63,7 @@ static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
 
 static void destroy_uar(struct mlx5dv_devx_uar* uar) {
     if (!uar) return;
-    if (cudaHostUnregister(uar->reg_addr) != cudaSuccess) {
+    if (hipHostUnregister(uar->reg_addr) != hipSuccess) {
         print_cuda_error("Failed to unregister MMIO memory");
     }
     mlx5dv_devx_free_uar(uar);
@@ -64,7 +73,7 @@ struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
                                      struct mlx5dv_devx_umem* ctrl_buf_umem,
                                      struct memheap* ctrl_buf_heap,
                                      struct ibv_pd* pd, int cqe,
-                                     cudaStream_t stream) {
+                                     hipStream_t stream) {
     struct mlx5gda_cq* cq = NULL;
     struct mlx5dv_devx_uar* uar = NULL;
     uint32_t eqn = 0;
@@ -96,9 +105,9 @@ struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
     // initialized to 0xFF (-1) to mark them as invalid. The hardware checks the
     // owner bit in CQE to determine if it's valid. This is mandatory for proper
     // CQ operation. Use async version to avoid blocking.
-    if (cudaMemsetAsync(ctrl_buf + cq_offset, -1,
+    if (hipMemsetAsync(ctrl_buf + cq_offset, -1,
                         num_cqe * sizeof(struct mlx5_cqe64),
-                        stream) != cudaSuccess) {
+                        stream) != hipSuccess) {
         print_cuda_error("Failed to memset CQ memory");
         goto fail;
     }
@@ -138,7 +147,7 @@ struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
 
     // Synchronize stream before creating CQ object, as hardware will read the
     // CQE memory
-    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+    if (hipStreamSynchronize(stream) != hipSuccess) {
         print_cuda_error("Failed to synchronize stream before CQ creation");
         goto fail;
     }
@@ -183,10 +192,11 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
                                         struct mlx5dv_devx_umem* ctrl_buf_umem,
                                         struct memheap* ctrl_buf_heap,
                                         struct ibv_pd* pd, int wqe,
-                                        uint8_t port_num, cudaStream_t stream) {
+                                        uint8_t port_num, hipStream_t stream) {
     struct mlx5gda_qp* qp = NULL;
     struct mlx5gda_cq* send_cq = NULL;
     struct mlx5dv_devx_uar* uar = NULL;
+    void* uar_device_ptr = nullptr;
     struct mlx5dv_devx_obj* mlx5_qp = NULL;
     size_t wq_offset = -1;
     size_t dbr_offset = -1;
@@ -247,7 +257,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
         goto fail;
     }
 
-    uar = create_uar(ctx);
+    uar = create_uar(ctx, &uar_device_ptr);
     if (!uar) {
         perror("Failed to create UAR");
         goto fail;
@@ -267,8 +277,8 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
         goto fail;
     }
     // DBR must be zero-initialized. Use async version to avoid blocking.
-    if (cudaMemsetAsync(ctrl_buf + dbr_offset, 0, sizeof(struct mlx5gda_wq_dbr),
-                        stream) != cudaSuccess) {
+    if (hipMemsetAsync(ctrl_buf + dbr_offset, 0, sizeof(struct mlx5gda_wq_dbr),
+                        stream) != hipSuccess) {
         print_cuda_error("Failed to zero DBR memory");
         goto fail;
     }
@@ -302,7 +312,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
 
     // Synchronize stream before creating QP object, as hardware will read the
     // DBR memory
-    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+    if (hipStreamSynchronize(stream) != hipSuccess) {
         print_cuda_error("Failed to synchronize stream before QP creation");
         goto fail;
     }
@@ -316,6 +326,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
     qp->mqp = mlx5_qp;
     qp->send_cq = send_cq;
     qp->uar = uar;
+    qp->uar_device_ptr = uar_device_ptr;
     qp->pd = pd;
     qp->qpn = DEVX_GET(create_qp_out, cmd_out, qpn);
     qp->num_wqebb = num_wqebb;
