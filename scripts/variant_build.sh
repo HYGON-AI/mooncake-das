@@ -29,6 +29,7 @@ Build variants:
 Options:
   --skip-deps   Skip `bash dependencies.sh`
   --dry-run     Print commands without executing them
+  --build-ep    Build with EP
   --jobs N      Override build parallelism
   -h, --help    Show this help
 
@@ -158,7 +159,7 @@ build_variant() {
     esac
 
     echo "==> Building ${package_basename}"
-    if [ $BUILD_EP -eq 1 ]; then
+    if [ "${BUILD_EP}" -eq 1 ]; then
         echo "==> Building ${package_basename} with EP"
         cmake_args+=(-DWITH_EP=ON)
     fi
