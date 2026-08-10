@@ -9,6 +9,7 @@
 #   EP_TORCH_VERSIONS   - pipe-separated (|) PyTorch versions to build for
 #                         (empty = use the currently-installed torch)
 #   TORCH_CUDA_ARCH_LIST - pipe-separated CUDA arch list forwarded to torch
+#   PYTORCH_ROCM_ARCH_LIST - pipe-separated HIP arch list forwarded to CMake
 #   STAGING_DIR         - destination directory for the built .so files
 #   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
 
@@ -24,8 +25,8 @@ endif()
 if(TORCH_CUDA_ARCH_LIST)
   string(REPLACE "|" ";" TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}")
 endif()
-if(PYTORCH_ROCM_ARCH)
-  string(REPLACE "|" ";" PYTORCH_ROCM_ARCH "${PYTORCH_ROCM_ARCH}")
+if(PYTORCH_ROCM_ARCH_LIST)
+  string(REPLACE "|" ";" PYTORCH_ROCM_ARCH_LIST "${PYTORCH_ROCM_ARCH_LIST}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ endif()
 set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
-set(ENV{PYTORCH_ROCM_ARCH} "${PYTORCH_ROCM_ARCH}")
+set(ENV{PYTORCH_ROCM_ARCH_LIST} "${PYTORCH_ROCM_ARCH_LIST}")
 set(ENV{MOONCAKE_GPU_BACKEND} "${EP_GPU_BACKEND}")
 
 # ---------------------------------------------------------------------------

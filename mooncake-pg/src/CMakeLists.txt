@@ -21,10 +21,6 @@ target_compile_definitions(mooncake_pg PRIVATE
     __HIP_PLATFORM_AMD__=1
     USE_ROCM=1
     HIPBLAS_V2=1)
-if(MOONCAKE_PG_DISABLE_DEFAULT_STREAM_BRIDGE)
-  target_compile_definitions(
-      mooncake_pg PRIVATE MOONCAKE_PG_DISABLE_DEFAULT_STREAM_BRIDGE=1)
-endif()
 target_compile_features(mooncake_pg PRIVATE cxx_std_20)
 target_compile_options(mooncake_pg PRIVATE -O3 -g0)
 target_link_options(mooncake_pg PRIVATE "-Wl,-Bsymbolic-functions")

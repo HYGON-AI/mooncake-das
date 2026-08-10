@@ -1,4 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
+
+include("${CMAKE_CURRENT_LIST_DIR}/../mooncake-common/DetectGPUArchitectures.cmake")
+if(NOT CMAKE_HIP_ARCHITECTURES)
+  detect_gpu_architectures(CMAKE_HIP_ARCHITECTURES)
+endif()
+if(NOT CMAKE_HIP_ARCHITECTURES)
+  set(CMAKE_HIP_ARCHITECTURES gfx936)
+endif()
+set(CMAKE_HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}" CACHE STRING
+    "HIP architectures to build Mooncake PG for" FORCE)
+message(STATUS "Building Mooncake PG for HIP architectures: ${CMAKE_HIP_ARCHITECTURES}")
+
 project(mooncake-pg LANGUAGES CXX HIP)
 
 # Find PyTorch's CMake prefix path
@@ -15,7 +27,6 @@ else ()
 endif()
 
 find_package(HIP REQUIRED)
-set(CMAKE_HIP_ARCHITECTURES gfx936)
 find_package(Torch REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Development)
 execute_process(

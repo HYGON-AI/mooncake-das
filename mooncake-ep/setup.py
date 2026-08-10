@@ -34,7 +34,7 @@ class CMakeBuild(build_ext):
                 f"-DMOONCAKE_EP_MODULE_NAME={module_leaf}",
                 f"-DMOONCAKE_EXTENSION_SUFFIX={sysconfig.get_config_var('EXT_SUFFIX')}",
                 f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={output_dir}",
-                f"-DCMAKE_HIP_ARCHITECTURES={os.getenv('PYTORCH_ROCM_ARCH', 'gfx936')}",
+                f"-DCMAKE_HIP_ARCHITECTURES={os.getenv('PYTORCH_ROCM_ARCH_LIST', '')}",
                 f"-DTORCH_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
                 "-DCMAKE_BUILD_TYPE=Release",
             ]
