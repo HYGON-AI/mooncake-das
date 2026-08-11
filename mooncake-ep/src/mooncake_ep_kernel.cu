@@ -12,8 +12,15 @@ namespace mooncake {
 
 using mooncake::device::CommCtx;
 using mooncake::device::make_comm_ctx;
+using mooncake::device::mc_comm_p2p_available;
 using mooncake::device::mc_route_put;
 using mooncake::device::mc_rdma_put;
+#ifdef MOONCAKE_EP_USE_HCU
+using mooncake::device::mc_commit_prepared_rdma_put;
+using mooncake::device::mc_flush_prepared_rdma_puts;
+using mooncake::device::mc_prepare_rdma_put;
+using mooncake::device::RdmaPreparedPut;
+#endif
 using mooncake::device::mc_signal;
 using mooncake::device::mc_red_add;
 using mooncake::device::mc_bar_sync;
@@ -40,8 +47,10 @@ __device__ __forceinline__ int ep_qp_channel(int expert_local_idx,
 __device__ __forceinline__ void publish_phase_ack(
         const CommCtx& comm_ctx, int* ack_buffer, int rank, int num_ranks,
         int active_qps_per_rank, int epoch) {
+#ifndef MOONCAKE_EP_USE_HCU
     if (threadIdx.x != 0)
         return;
+#endif
 
     const int qps_per_rank = MAX_QP_COUNT / num_ranks;
     const int active_qps =
@@ -49,6 +58,76 @@ __device__ __forceinline__ void publish_phase_ack(
             ? active_qps_per_rank
             : qps_per_rank;
 
+#ifdef MOONCAKE_EP_USE_HCU
+    __shared__ int rdma_peers[NUM_MAX_RDMA_PEERS];
+    __shared__ int num_rdma_peers;
+
+    // Keep one publisher for the local source slots and the phase-ordering
+    // fence.  The source slots are later consumed by the NIC, while the P2P
+    // destination stores below are already system-scope release operations.
+    if (threadIdx.x == 0) {
+        for (int channel = 0; channel < active_qps; ++channel)
+            mc_st_release(ack_buffer + rank * qps_per_rank + channel, epoch);
+        mc_fence();
+
+        num_rdma_peers = 0;
+        if (comm_ctx.ibgda.qp_devctxs != nullptr &&
+            comm_ctx.ibgda.raddrs != nullptr &&
+            comm_ctx.ibgda.rkeys != nullptr) {
+            for (int peer = 0; peer < num_ranks; ++peer) {
+                if (peer != rank &&
+                    !mc_comm_p2p_available(comm_ctx, peer)) {
+                    EP_DEVICE_ASSERT(num_rdma_peers < NUM_MAX_RDMA_PEERS);
+                    rdma_peers[num_rdma_peers++] = peer;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // P2P peers use direct system-scope stores and can be published by
+    // channel lanes without touching IBGDA producer state.
+    for (int peer = 0; peer < num_ranks; ++peer) {
+        if (peer != rank && mc_comm_p2p_available(comm_ctx, peer)) {
+            for (int channel = static_cast<int>(threadIdx.x);
+                 channel < active_qps;
+                 channel += static_cast<int>(blockDim.x)) {
+                int* ack_slot =
+                    ack_buffer + rank * qps_per_rank + channel;
+                void* dst = mc_route_put(comm_ctx, peer, ack_slot);
+                mc_st_release(reinterpret_cast<int*>(dst), epoch);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Pack only remote peer/channel pairs into cooperative batches. Every
+    // task maps to a distinct QP, so lanes may reserve and populate WQEs in
+    // parallel. One HDP flush makes the whole batch visible before lanes ring
+    // their own QP doorbells; RC QP ordering keeps each ACK behind its SEND
+    // data WQEs.
+    const int num_rdma_tasks = num_rdma_peers * active_qps;
+    for (int task_base = 0; task_base < num_rdma_tasks;
+         task_base += static_cast<int>(blockDim.x)) {
+        const int task = task_base + static_cast<int>(threadIdx.x);
+        RdmaPreparedPut request{nullptr};
+        if (task < num_rdma_tasks) {
+            const int peer = rdma_peers[task / active_qps];
+            const int channel = task % active_qps;
+            int* ack_slot = ack_buffer + rank * qps_per_rank + channel;
+            request = mc_prepare_rdma_put(
+                comm_ctx, channel, peer, qps_per_rank, ack_slot, ack_slot,
+                sizeof(int));
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+            mc_flush_prepared_rdma_puts(comm_ctx);
+        __syncthreads();
+        if (request.qp != nullptr)
+            mc_commit_prepared_rdma_put(request);
+        __syncthreads();
+    }
+#else
     // Each active QP gets its own exact epoch marker. The marker is appended
     // after all SEND-phase WQEs on that QP, so observing every marker provides
     // a per-QP ordering fence without relying on CQ polling.
@@ -75,19 +154,79 @@ __device__ __forceinline__ void publish_phase_ack(
             }
         }
     }
+#endif
 }
 
 __device__ __forceinline__ void await_phase_ack(
         int* ack_buffer, int32_t* active_ranks, int rank, int num_ranks,
         int active_qps_per_rank, int epoch, int64_t timeout_ticks) {
+#ifndef MOONCAKE_EP_USE_HCU
     if (threadIdx.x != 0)
         return;
+#endif
 
     const int qps_per_rank = MAX_QP_COUNT / num_ranks;
     const int active_qps =
         active_qps_per_rank > 0 && active_qps_per_rank <= qps_per_rank
             ? active_qps_per_rank
             : qps_per_rank;
+#ifdef MOONCAKE_EP_USE_HCU
+    __shared__ int timeout_abort;
+    __shared__ int timeout_channel;
+    __shared__ int timeout_observed;
+    __shared__ int peer_active;
+    for (int peer = 0; peer < num_ranks; ++peer) {
+        if (threadIdx.x == 0) {
+            timeout_abort = 0;
+            timeout_channel = -1;
+            timeout_observed = 0;
+            peer_active =
+                peer != rank && mc_ld_acquire(active_ranks + peer);
+        }
+        __syncthreads();
+
+        if (peer_active) {
+            for (int channel = static_cast<int>(threadIdx.x);
+                 channel < active_qps;
+                 channel += static_cast<int>(blockDim.x)) {
+                int64_t start_time = static_cast<int64_t>(ep_clock64());
+                int* ack_slot =
+                    ack_buffer + peer * qps_per_rank + channel;
+                int observed = mc_ld_acquire(ack_slot);
+                while (observed < epoch) {
+                    if (timeout_ticks != -1) {
+                        if (atomicAdd(&timeout_abort, 0) != 0)
+                            break;
+                        int64_t end_time =
+                            static_cast<int64_t>(ep_clock64());
+                        if (end_time - start_time > timeout_ticks) {
+                            if (atomicCAS(&timeout_abort, 0, 1) == 0) {
+                                timeout_channel = channel;
+                                timeout_observed = observed;
+                            }
+                            break;
+                        }
+                    }
+                    observed = mc_ld_acquire(ack_slot);
+                }
+                if (timeout_ticks != -1 &&
+                    atomicAdd(&timeout_abort, 0) != 0)
+                    break;
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0 && timeout_abort) {
+            mc_st_release(active_ranks + peer, 0);
+            printf("[EP] phase ACK timeout: peer=%d channel=%d "
+                   "epoch=%d observed=%d\n",
+                   peer, timeout_channel, epoch, timeout_observed);
+        }
+        __syncthreads();
+        if (timeout_abort)
+            return;
+    }
+#else
     for (int peer = 0; peer < num_ranks; ++peer) {
         if (peer == rank || !mc_ld_acquire(active_ranks + peer))
             continue;
@@ -108,6 +247,7 @@ __device__ __forceinline__ void await_phase_ack(
             }
         }
     }
+#endif
 }
 
 __global__ void mark_phase_ack_kernel(
@@ -452,8 +592,10 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         return;
 
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
+#ifndef MOONCAKE_EP_SPLIT_SEND_RECV
     if (phases & LOW_LATENCY_SEND_PHASE)
         mc_grid_sync();
+#endif
 
     // Receiving and packing
     if (responsible_expert_idx < num_experts) {
@@ -756,7 +898,7 @@ combine(void* combined_x, int32_t* active_ranks,
         }
     }
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-    // mc_grid_sync() is a no-op on split-kernel platforms; use a block-wide
+    // Split launches are ordered by the phase ACK; use a block-wide
     // fence/barrier before reduction so threads see peer writes.
     __syncthreads();
     mc_fence();

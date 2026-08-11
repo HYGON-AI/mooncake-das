@@ -5,6 +5,7 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_cooperative_groups.h>
 
 namespace mooncake {
 namespace device {
@@ -86,7 +87,11 @@ __device__ __forceinline__ void mc_bar_sync(int /*bar_id*/,
     __syncthreads();
 }
 
-__device__ __forceinline__ void mc_grid_sync() {}
+// Cooperative kernels may use a real device-wide barrier. Split SEND/RECV
+// kernels deliberately compile out this call and use phase ACK ordering.
+__device__ __forceinline__ void mc_grid_sync() {
+    cooperative_groups::this_grid().sync();
+}
 
 __device__ __forceinline__ void mc_fence() { __threadfence_system(); }
 

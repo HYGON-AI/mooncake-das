@@ -119,12 +119,11 @@ __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
     if (wq_tail != qp->wq_tail) qp->wq_tail = wq_tail;
 }
 
-__device__ __forceinline__ void mc_ibgda_post_send_db(
-    mlx5gda_qp_devctx* qp, uint32_t* hdp_flush) {
-    // HCU requires WQE stores to be visible through the DCU host data path
-    // before the NIC observes DBR/Blue Flame. Other platforms implement this
-    // hook as a no-op or a regular system fence.
-    mc_flush_hdp(hdp_flush);
+// Ring a QP after a caller has made a batch of WQEs visible with one shared
+// HDP flush.  Splitting flush from doorbell publication lets independent
+// lanes prepare different QPs concurrently without flushing once per WQE.
+__device__ __forceinline__ void mc_ibgda_post_send_db_after_flush(
+    mlx5gda_qp_devctx* qp) {
     uint32_t num_posted = static_cast<uint32_t>(qp->wq_head);
     // DBR write — always done (NIC polls doorbell record in GPU memory)
     mc_st_release_u32(reinterpret_cast<uint32_t*>(&qp->dbr->send_counter),
@@ -138,6 +137,15 @@ __device__ __forceinline__ void mc_ibgda_post_send_db(
                           *reinterpret_cast<uint64_t*>(last_wqe));
         qp->bf_offset ^= MLX5GDA_BF_SIZE;
     }
+}
+
+__device__ __forceinline__ void mc_ibgda_post_send_db(
+    mlx5gda_qp_devctx* qp, uint32_t* hdp_flush) {
+    // HCU requires WQE stores to be visible through the DCU host data path
+    // before the NIC observes DBR/Blue Flame. Other platforms implement this
+    // hook as a no-op or a regular system fence.
+    mc_flush_hdp(hdp_flush);
+    mc_ibgda_post_send_db_after_flush(qp);
 }
 
 // Issue an RDMA WRITE WQE.  laddr/raddr are device VAs; keys are big-endian.
@@ -202,6 +210,41 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
 // ---------------------------------------------------------------------------
 // High-level IBGDA operations
 // ---------------------------------------------------------------------------
+
+#if defined(MOONCAKE_EP_USE_HCU)
+
+// A prepared request owns qp->mutex until it is committed.  Callers must map
+// at most one lane to a given QP in each cooperative batch, synchronize all
+// participating lanes, perform one mc_ibgda_flush_prepared_puts(), and then
+// commit every valid request before leaving the batch.
+struct IbgdaPreparedPut {
+    mlx5gda_qp_devctx* qp;
+};
+
+__device__ __forceinline__ IbgdaPreparedPut mc_ibgda_prepare_put(
+    const IbgdaContext& ctx, int channel, int dst_rank, int src_rank,
+    int qps_per_rank, const void* send_ptr, uint64_t recv_raddr,
+    uint32_t nbytes) {
+    auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
+    mc_ibgda_lock(qp);
+    mc_ibgda_write_rdma_write_wqe(qp, reinterpret_cast<uint64_t>(send_ptr),
+                                  mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
+                                  mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
+    return {qp};
+}
+
+__device__ __forceinline__ void mc_ibgda_flush_prepared_puts(
+    const IbgdaContext& ctx) {
+    mc_flush_hdp(ctx.hdp_flush);
+}
+
+__device__ __forceinline__ void mc_ibgda_commit_prepared_put(
+    IbgdaPreparedPut request) {
+    mc_ibgda_post_send_db_after_flush(request.qp);
+    mc_ibgda_unlock(request.qp);
+}
+
+#endif  // MOONCAKE_EP_USE_HCU
 
 // RDMA WRITE: send `nbytes` from `send_ptr` to `recv_ptr` on `dst_rank`.
 // Must be called by lane 0 only.

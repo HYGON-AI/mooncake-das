@@ -99,6 +99,36 @@ __device__ __forceinline__ void mc_rdma_put(
     }
 }
 
+#ifdef MOONCAKE_EP_USE_HCU
+
+using RdmaPreparedPut = IbgdaPreparedPut;
+
+// Prepare one RDMA WRITE without ringing its QP.  This interface is intended
+// for cooperative batches in which every active lane owns a distinct QP.
+__device__ __forceinline__ RdmaPreparedPut mc_prepare_rdma_put(
+    const CommCtx& ctx, int channel, int dst_rank, int qps_per_rank,
+    const void* send_ptr, void* recv_ptr, uint32_t nbytes) {
+    uint64_t recv_raddr =
+        ctx.ibgda.raddrs[dst_rank] +
+        (reinterpret_cast<const char*>(recv_ptr) -
+         reinterpret_cast<const char*>(ctx.p2p.local_base));
+    return mc_ibgda_prepare_put(ctx.ibgda, channel, dst_rank, ctx.rank,
+                                qps_per_rank, send_ptr, recv_raddr, nbytes);
+}
+
+// All lanes must finish preparing their WQEs before one lane calls this.
+__device__ __forceinline__ void mc_flush_prepared_rdma_puts(
+    const CommCtx& ctx) {
+    mc_ibgda_flush_prepared_puts(ctx.ibgda);
+}
+
+__device__ __forceinline__ void mc_commit_prepared_rdma_put(
+    RdmaPreparedPut request) {
+    mc_ibgda_commit_prepared_put(request);
+}
+
+#endif  // MOONCAKE_EP_USE_HCU
+
 // ---------------------------------------------------------------------------
 // mc_signal / mc_red_add
 //
