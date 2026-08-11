@@ -14,7 +14,7 @@
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <transfer_engine.h>
 
-#include <ATen/cuda/CUDAContext.h>
+#include <mooncake_pg_device.h>
 
 namespace mooncake {
 
@@ -167,6 +167,13 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
     static void setExternalEngine(TransferEngine* engine);
 
     std::string getPreferredHca(std::string location) {
+#ifdef MOONCAKE_PG_USE_HCU
+        constexpr const char* cuda_prefix = "cuda:";
+        constexpr size_t cuda_prefix_size = 5;
+        if (location.compare(0, cuda_prefix_size, cuda_prefix) == 0) {
+            location.replace(0, cuda_prefix_size, "hip:");
+        }
+#endif
         static std::once_flag topo_once;
         static std::shared_ptr<Topology> topology;
         static TopologyMatrix matrix;

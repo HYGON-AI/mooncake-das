@@ -56,7 +56,7 @@ EfaContext::~EfaContext() {
 
 int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
                           int max_endpoints) {
-#if !defined(USE_CUDA) && !defined(USE_HIP)
+#if !defined(USE_CUDA) && !defined(MOONCAKE_USE_HIP_RUNTIME)
     // When built without GPU support, prevent libfabric's EFA provider from
     // dlopen-ing libcudart/libcuda at fi_getinfo/fi_domain time. That
     // initialization creates a CUDA primary context on GPU 0 and leaks
@@ -75,7 +75,7 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     hints_->caps =
         FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ |
         FI_REMOTE_WRITE
-#if defined(USE_CUDA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(MOONCAKE_USE_HIP_RUNTIME)
         // Declare FI_HMEM so the provider wires up HMEM-aware copy routines
         // (cudaMemcpy) on every data path, including the intra-node SHM SAR
         // segmentation/reassembly path. Registering device memory via
@@ -96,7 +96,7 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     hints_->domain_attr->name = strdup(domain_name.c_str());
     hints_->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR |
                                    FI_MR_ALLOCATED | FI_MR_PROV_KEY
-#if defined(USE_CUDA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(MOONCAKE_USE_HIP_RUNTIME)
                                    | FI_MR_HMEM
 #endif
         ;
@@ -377,7 +377,7 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
         iface = FI_HMEM_CUDA;
         device_ordinal = attributes.device;
     }
-#elif defined(USE_HIP)
+#elif defined(MOONCAKE_USE_HIP_RUNTIME)
     hipPointerAttribute_t attributes;
     hipError_t hip_ret = hipPointerGetAttributes(&attributes, addr);
     if (hip_ret == hipSuccess && attributes.type == hipMemoryTypeDevice) {
@@ -675,7 +675,8 @@ bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
     size_t len = slice->length;
     // GPU-aware copy.  Guard on the SAME backends that register GPU memory
     // as FI_HMEM (see the FI_MR_HMEM hint and the registration path: only
-    // USE_CUDA / USE_HIP tag MRs with a device iface).  Every other build —
+    // USE_CUDA / HIP-runtime builds tag MRs with a device iface). Every other
+    // build —
     // including non-EFA GPU backends such as MUSA/MLU/MACA, which never run
     // on AWS EFA hardware — registers loopback buffers as host memory, so a
     // plain memcpy is both correct and the only portable option (those
@@ -690,7 +691,7 @@ bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
         slice->markFailed();
         return true;
     }
-#elif defined(USE_HIP)
+#elif defined(MOONCAKE_USE_HIP_RUNTIME)
     auto rc = hipMemcpy(dst, src, len, hipMemcpyDefault);
     if (rc != hipSuccess) {
         LOG(ERROR) << "EFA loopback hipMemcpy failed: " << hipGetErrorString(rc)

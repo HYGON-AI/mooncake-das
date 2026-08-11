@@ -21,8 +21,21 @@ namespace device {
 // ---------------------------------------------------------------------------
 // Acquire loads
 // ---------------------------------------------------------------------------
+__device__ __forceinline__ uint16_t mc_ld_acquire_u16(
+    const uint16_t* ptr) {
+    uint16_t ret = *const_cast<volatile const uint16_t*>(ptr);
+    __threadfence_system();
+    return ret;
+}
+
 __device__ __forceinline__ int mc_ld_acquire(const int* ptr) {
     int ret = *const_cast<volatile const int*>(ptr);
+    __threadfence_system();
+    return ret;
+}
+
+__device__ __forceinline__ uint32_t mc_ld_acquire_u32(const uint32_t* ptr) {
+    uint32_t ret = *const_cast<volatile const uint32_t*>(ptr);
     __threadfence_system();
     return ret;
 }
@@ -129,6 +142,10 @@ __device__ __forceinline__ void mc_grid_sync() {}
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_fence() { __threadfence_system(); }
 
+__device__ __forceinline__ void mc_flush_hdp(uint32_t* /*hdp_flush*/) {
+    mc_fence();
+}
+
 // ---------------------------------------------------------------------------
 // Fence/barrier/fence: ensures all threads' writes are globally visible
 // before any thread proceeds.  On MUSA, __syncthreads() does NOT imply a
@@ -155,6 +172,8 @@ __device__ __forceinline__ uint64_t mc_bswap64(uint64_t x) {
     uint32_t lo = mc_bswap32((uint32_t)(x));
     return ((uint64_t)lo << 32) | hi;
 }
+
+__device__ __forceinline__ void mc_trap() { __trap(); }
 
 }  // namespace device
 }  // namespace mooncake

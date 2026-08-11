@@ -14,7 +14,7 @@
 
 #pragma once
 
-#if defined(USE_HIP) || defined(USE_HIP_DMABUF)
+#if defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_HIP_DMABUF)
 
 #include <hip/hip_runtime.h>
 
@@ -49,4 +49,4 @@ class HipDeviceGuard {
 
 }  // namespace mooncake
 
-#endif  // USE_HIP || USE_HIP_DMABUF
+#endif  // MOONCAKE_USE_HIP_RUNTIME || USE_HIP_DMABUF

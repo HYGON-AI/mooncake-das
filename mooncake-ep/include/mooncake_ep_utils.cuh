@@ -5,7 +5,7 @@
 #define UNROLLED_WARP_COPY(UNROLL_FACTOR, LANE_ID, N, DST, SRC, LD_FUNC,      \
                            ST_FUNC)                                           \
     {                                                                         \
-        constexpr int kLoopStride = 32 * (UNROLL_FACTOR);                     \
+        constexpr int kLoopStride = kWarpSize * (UNROLL_FACTOR);              \
         typename std::remove_reference<decltype(LD_FUNC((SRC) + 0))>::type    \
             unrolled_values[(UNROLL_FACTOR)];                                 \
         auto __src = (SRC);                                                   \
@@ -13,12 +13,14 @@
         for (int __i = (LANE_ID); __i < ((N) / kLoopStride) * kLoopStride;    \
              __i += kLoopStride) {                                            \
             _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) \
-                unrolled_values[__j] = LD_FUNC(__src + __i + __j * 32);       \
+                unrolled_values[__j] =                                        \
+                    LD_FUNC(__src + __i + __j * kWarpSize);                    \
             _Pragma("unroll") for (int __j = 0; __j < (UNROLL_FACTOR); ++__j) \
-                ST_FUNC(__dst + __i + __j * 32, unrolled_values[__j]);        \
+                ST_FUNC(__dst + __i + __j * kWarpSize,                        \
+                        unrolled_values[__j]);                                 \
         }                                                                     \
         for (int __i = ((N) / kLoopStride) * kLoopStride + (LANE_ID);         \
-             __i < (N); __i += 32)                                            \
+             __i < (N); __i += kWarpSize)                                     \
             ST_FUNC(__dst + __i, LD_FUNC(__src + __i));                       \
     }
 
@@ -48,7 +50,8 @@ struct VecInt<16> {
 };
 
 // ---- TMA / mbarrier helpers (CUDA only) ----
-#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
+#if !defined(MOONCAKE_EP_USE_HCU) && !defined(MOONCAKE_EP_USE_MUSA) && \
+    !defined(MOONCAKE_EP_USE_MACA)
 
 __device__ __forceinline__ void fence_view_async_shared() {
     asm volatile("fence.proxy.async.shared::cta; \n" ::);
@@ -136,7 +139,7 @@ __device__ __forceinline__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(N) : "memory");
 }
 
-#endif  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
+#endif  // CUDA-only TMA helpers
 
 template <typename dtype_t>
 __host__ __device__ dtype_t cell_div(dtype_t a, dtype_t b) {
@@ -183,28 +186,89 @@ __device__ __forceinline__ dtype_t broadcast(dtype_t &ptr, int src_lane_idx) {
     auto send_int_values = reinterpret_cast<int *>(&ptr);
     int recv_int_values[sizeof(dtype_t) / sizeof(int)];
 #pragma unroll
-    for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
+    for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i) {
+#ifdef MOONCAKE_EP_USE_HCU
+        recv_int_values[i] =
+            __shfl(send_int_values[i], src_lane_idx, kWarpSize);
+#else
         recv_int_values[i] =
             __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
+#endif
+    }
     return *reinterpret_cast<dtype_t *>(recv_int_values);
 }
 
+template <typename dtype_t>
+__forceinline__ __device__ dtype_t ep_shfl(dtype_t value, int src_lane_idx) {
+#ifdef MOONCAKE_EP_USE_HCU
+    return __shfl(value, src_lane_idx, kWarpSize);
+#else
+    return __shfl_sync(0xffffffff, value, src_lane_idx);
+#endif
+}
+
+template <typename dtype_t>
+__forceinline__ __device__ dtype_t ep_shfl_xor(dtype_t value, int lane_mask,
+                                               int width = kWarpSize) {
+#ifdef MOONCAKE_EP_USE_HCU
+    return __shfl_xor(value, lane_mask, width);
+#else
+    return __shfl_xor_sync(__activemask(), value, lane_mask, width);
+#endif
+}
+
+__forceinline__ __device__ void ep_syncwarp() {
+#ifdef MOONCAKE_EP_USE_HCU
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#else
+    __syncwarp();
+#endif
+}
+
+__forceinline__ __device__ unsigned long long ep_clock64() {
+#ifdef MOONCAKE_EP_USE_HCU
+    return wall_clock64();
+#else
+    return clock64();
+#endif
+}
+
+__forceinline__ __device__ float ep_bfloat16_to_float(ep_bfloat16 value) {
+#ifdef MOONCAKE_EP_USE_HCU
+    return static_cast<float>(value);
+#else
+    return __bfloat162float(value);
+#endif
+}
+
+__forceinline__ __device__ ep_bfloat16 ep_float_to_bfloat16(float value) {
+#ifdef MOONCAKE_EP_USE_HCU
+    return ep_bfloat16(value);
+#else
+    return __float2bfloat16(value);
+#endif
+}
+
 __forceinline__ __device__ int warp_reduce_sum(int value) {
-    value += __shfl_xor_sync(0xffffffff, value, 16);
-    value += __shfl_xor_sync(0xffffffff, value, 8);
-    value += __shfl_xor_sync(0xffffffff, value, 4);
-    value += __shfl_xor_sync(0xffffffff, value, 2);
-    value += __shfl_xor_sync(0xffffffff, value, 1);
+#ifdef MOONCAKE_EP_USE_HCU
+    value += ep_shfl_xor(value, 32);
+#endif
+    value += ep_shfl_xor(value, 16);
+    value += ep_shfl_xor(value, 8);
+    value += ep_shfl_xor(value, 4);
+    value += ep_shfl_xor(value, 2);
+    value += ep_shfl_xor(value, 1);
     return value;
 }
 
 __forceinline__ __device__ float half_warp_reduce_max(float value) {
-    auto mask = __activemask();
-    // The mask be in `{0xffffffff, 0xffff}`
-    value = max(value, __shfl_xor_sync(mask, value, 8));
-    value = max(value, __shfl_xor_sync(mask, value, 4));
-    value = max(value, __shfl_xor_sync(mask, value, 2));
-    value = max(value, __shfl_xor_sync(mask, value, 1));
+    constexpr int kQuantGroupThreads = 16;
+    value = fmaxf(value, ep_shfl_xor(value, 8, kQuantGroupThreads));
+    value = fmaxf(value, ep_shfl_xor(value, 4, kQuantGroupThreads));
+    value = fmaxf(value, ep_shfl_xor(value, 2, kQuantGroupThreads));
+    value = fmaxf(value, ep_shfl_xor(value, 1, kQuantGroupThreads));
     return value;
 }
 

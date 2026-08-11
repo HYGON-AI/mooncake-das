@@ -700,7 +700,11 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
 #ifdef ENABLE_MULTI_PROTOCOL
         desc.protocol = "hip";
 #endif
-        return metadata_->addLocalMemoryBuffer(desc, true);
+        int rc = metadata_->addLocalMemoryBuffer(desc, true);
+        if (rc == 0) {
+            registered_device_regions_.insert(addr);
+        }
+        return rc;
     }
 
     // Fabric memory registration
@@ -745,12 +749,29 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         desc.name = location;
         desc.shm_name = serializeBinaryData((const void*)&export_handle_raw,
                                             sizeof(hipxFabricHandle));
-        return metadata_->addLocalMemoryBuffer(desc, true);
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "hip";
+#endif
+        int rc = metadata_->addLocalMemoryBuffer(desc, true);
+        if (rc == 0) {
+            registered_device_regions_.insert(addr);
+        }
+        return rc;
     }
 }
 
 int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    auto it = registered_device_regions_.find(addr);
+    if (it == registered_device_regions_.end()) {
+        return 0;
+    }
+
+    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    if (rc == 0) {
+        registered_device_regions_.erase(it);
+    }
+    return rc;
 }
 
 int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,

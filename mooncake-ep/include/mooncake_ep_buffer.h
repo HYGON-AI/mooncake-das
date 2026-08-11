@@ -1,10 +1,18 @@
 #ifndef MOONCAKE_EP_BUFFER_H
 #define MOONCAKE_EP_BUFFER_H
 
+#ifdef MOONCAKE_EP_USE_HCU
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include <c10/hip/HIPStream.h>
+#include <hip/hip_bfloat16.h>
+#include <hip/hip_runtime.h>
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#endif
 #include <memory>
 #include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
@@ -17,6 +25,13 @@ namespace mooncake {
 
 class TransferEngine;
 
+#ifdef MOONCAKE_EP_USE_HCU
+using EpStream =
+    decltype(c10::hip::getCurrentHIPStreamMasqueradingAsCUDA());
+#else
+using EpStream = at::cuda::CUDAStream;
+#endif
+
 // MAX_QP_COUNT is defined in mooncake_ep_configs.cuh (shared with kernel code).
 
 struct BufferLayout {
@@ -24,6 +39,7 @@ struct BufferLayout {
     int* rdma_recv_signal_buffer;
     void* rdma_send_data_buffer;
     void* rdma_recv_data_buffer;
+    int* phase_ack_buffer;
 };
 
 struct BufferPair {
@@ -43,10 +59,18 @@ struct BufferPair {
         size_t send_recv_buffer_bytes =
             num_experts * num_max_dispatch_tokens_per_rank *
             (2 * sizeof(int4) + hidden * EP_BF16_SIZE);
+        // One exact epoch marker per QP. Keeping phase synchronization out of
+        // the data-path signal buffers avoids aliasing the atomic scratch
+        // region used by dispatch/combine.
+        size_t phase_ack_buffer_bytes =
+            ((MAX_QP_COUNT * sizeof(int) + sizeof(int4) - 1) /
+             sizeof(int4)) *
+            sizeof(int4);
+        size_t bytes_per_buffer = 2 * signaling_buffer_bytes +
+                                  2 * send_recv_buffer_bytes +
+                                  phase_ack_buffer_bytes;
         for (int i = 0; i < 2; ++i) {
-            size_t rdma_base_offset = total_bytes +
-                                      2 * i * signaling_buffer_bytes +
-                                      2 * i * send_recv_buffer_bytes;
+            size_t rdma_base_offset = i * bytes_per_buffer;
             buffers[i] = {
                 advance<int*>(rdma_buffer, rdma_base_offset),
                 advance<int*>(rdma_buffer,
@@ -56,9 +80,12 @@ struct BufferPair {
                 advance<int*>(rdma_buffer, rdma_base_offset +
                                                2 * signaling_buffer_bytes +
                                                send_recv_buffer_bytes),
+                advance<int*>(rdma_buffer, rdma_base_offset +
+                                               2 * signaling_buffer_bytes +
+                                               2 * send_recv_buffer_bytes),
             };
         }
-        total_bytes += 4 * signaling_buffer_bytes + 4 * send_recv_buffer_bytes;
+        total_bytes = 2 * bytes_per_buffer;
     }
 };
 
@@ -96,7 +123,7 @@ struct MooncakeEpBuffer {
     int active_qps_cap_ = 8;
 
     // Stream for communication
-    at::cuda::CUDAStream comm_stream;
+    EpStream comm_stream;
 
     // Workspace
     void* workspace = nullptr;

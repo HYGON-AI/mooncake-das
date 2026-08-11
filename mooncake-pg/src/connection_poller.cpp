@@ -20,7 +20,8 @@ namespace mooncake {
 // On MNNVL clusters all GPUs support fabric mem handles, meaning
 // NVLink transport can only access cuMemCreate(FABRIC) memory
 // cross-node -- CPU heap buffers are invisible to remote peers.
-#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(USE_MACA)
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(USE_MACA) && \
+    !defined(MOONCAKE_PG_USE_HCU)
 static bool supportFabricMem() {
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
 
@@ -40,7 +41,7 @@ static bool supportFabricMem() {
     return true;
 }
 #else
-// MUSA and MACA do not use NVIDIA NVLink fabric memory handles here.
+// HIP/DCU, MUSA and MACA do not use NVIDIA NVLink fabric memory handles here.
 static bool supportFabricMem() { return false; }
 #endif
 ConnectionContext::ConnectionContext(int backendIndex, int rank, int size,
@@ -281,7 +282,26 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                 return false;
             }
 
+            // Several PG backends may share a peer segment. Refresh the TE
+            // descriptor so buffers registered by a later backend are visible
+            // before transport selection and warmup.
+            if (engine_->syncSegmentCache(peerServerName) != 0) {
+                LOG(WARNING)
+                    << "Rank " << rank_
+                    << " failed to refresh segment metadata for rank "
+                    << pollingRank << ".";
+                peerState.increaseCheckStoreBackoff();
+                return false;
+            }
             auto segment_id = engine_->openSegment(peerServerName);
+            if (segment_id ==
+                static_cast<TransferMetadata::SegmentID>(-1)) {
+                LOG(WARNING) << "Rank " << rank_
+                             << " failed to open segment for rank "
+                             << pollingRank << ".";
+                peerState.increaseCheckStoreBackoff();
+                return false;
+            }
             meta_->segmentIDs[pollingRank] = segment_id;
             peerState.segmentId = segment_id;
 
@@ -307,7 +327,7 @@ bool ConnectionContext::pollPeer(int pollingRank) {
             } else if (pollingRank <= rank_) {
                 // Send a warmup request to establish connections
                 auto batchID = engine_->allocateBatchID(1);
-                engine_->submitTransfer(
+                auto submit_status = engine_->submitTransfer(
                     batchID,
                     {TransferRequest{
                         .opcode = TransferRequest::WRITE,
@@ -318,6 +338,16 @@ bool ConnectionContext::pollPeer(int pollingRank) {
                             rank_ * sizeof(int32_t),
                         .length = sizeof(int32_t),
                     }});
+                if (!submit_status.ok()) {
+                    LOG(WARNING) << "Warmup request " << rank_ << " -> "
+                                 << pollingRank << " was not submitted: "
+                                 << submit_status.ToString();
+                    engine_->freeBatchID(batchID);
+                    engine_->closeSegment(segment_id);
+                    peerState.segmentId = std::nullopt;
+                    peerState.increaseCheckStoreBackoff();
+                    return false;
+                }
                 peerState.warmupBatchId = batchID;
                 peerState.state = PeerConnectionState::WAITING_WARMUP_TRANSFER;
             } else {

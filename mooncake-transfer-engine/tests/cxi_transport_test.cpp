@@ -25,7 +25,7 @@
 #include "transport/transport.h"
 #include "cuda_alike.h"
 
-#if defined(USE_CUDA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(MOONCAKE_USE_HIP_RUNTIME)
 #define USE_GPU
 #endif
 

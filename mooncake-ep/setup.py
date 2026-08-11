@@ -1,14 +1,23 @@
 import os
 import re
+import subprocess
+import sys
+import sysconfig
 
-from setuptools import setup
+from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext
 import torch
 
 use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
+use_hcu = os.getenv("MOONCAKE_EP_USE_HCU", "").upper() in {"1", "ON", "TRUE", "YES"}
 use_maca = (
     os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
     or (hasattr(torch.version, "maca") and torch.version.maca is not None)
 )
+if use_hcu and not getattr(torch.version, "hip", None):
+    raise RuntimeError("HCU EP requires a DTK PyTorch build with HIP support")
+if use_hcu and (use_musa or use_maca):
+    raise RuntimeError("HCU, MUSA, and MACA EP extension backends are mutually exclusive")
 if use_musa:
     try:
         import torchada  # noqa: F401
@@ -104,9 +113,51 @@ else:
             cuda_libraries.insert(0, "cuda")
             cuda_library_dirs.append(cuda_stub_dir)
 
-setup(
-    name=module_name,
-    ext_modules=[
+
+class CMakeBuild(build_ext):
+    def build_extension(self, ext):
+        source_dir = os.path.abspath(os.path.dirname(__file__))
+        build_dir = os.path.abspath(self.build_temp)
+        output_dir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.name)))
+        module_leaf = ext.name.rsplit(".", 1)[-1]
+        os.makedirs(build_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+
+        subprocess.check_call(
+            [
+                "cmake",
+                "-S",
+                source_dir,
+                "-B",
+                build_dir,
+                "-DMOONCAKE_GPU_BACKEND=hcu",
+                f"-DPYTHON_EXECUTABLE={sys.executable}",
+                f"-DMOONCAKE_EP_MODULE_NAME={module_leaf}",
+                f"-DMOONCAKE_EXTENSION_SUFFIX={sysconfig.get_config_var('EXT_SUFFIX')}",
+                f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={output_dir}",
+                f"-DCMAKE_HIP_ARCHITECTURES={os.getenv('PYTORCH_ROCM_ARCH', 'gfx936')}",
+                f"-DTORCH_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}",
+                "-DCMAKE_BUILD_TYPE=Release",
+            ]
+        )
+        subprocess.check_call(
+            [
+                "cmake",
+                "--build",
+                build_dir,
+                "--target",
+                "mooncake_ep",
+                "-j",
+                os.getenv("MAX_JOBS", "8"),
+            ]
+        )
+
+
+if use_hcu:
+    ext_modules = [Extension(module_name, sources=[])]
+    build_ext_cmd = CMakeBuild
+else:
+    ext_modules = [
         CUDAExtension(
             name=module_name,
             include_dirs=include_dirs,
@@ -126,6 +177,12 @@ setup(
                 "-Wl,--pop-state",
             ],
         )
-    ],
-    cmdclass={"build_ext": BuildExtension},
+    ]
+    build_ext_cmd = BuildExtension
+
+
+setup(
+    name=module_name,
+    ext_modules=ext_modules,
+    cmdclass={"build_ext": build_ext_cmd},
 )

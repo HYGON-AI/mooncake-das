@@ -1,4 +1,7 @@
 #include <mooncake_ep_buffer.h>
+#ifdef MOONCAKE_EP_USE_HCU
+#include <transport/device/hcu/hcu_runtime_aliases.h>
+#endif
 #include <glog/logging.h>
 #include <algorithm>
 #include <cstdlib>
@@ -8,6 +11,14 @@
 namespace mooncake {
 
 namespace {
+
+#ifdef MOONCAKE_EP_USE_HCU
+EpStream ep_stream_from_pool() {
+    return c10::hip::getStreamFromPoolMasqueradingAsCUDA(true);
+}
+#else
+EpStream ep_stream_from_pool() { return at::cuda::getStreamFromPool(true); }
+#endif
 
 int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap) {
     if (!is_roce) return qps_per_rank;
@@ -48,7 +59,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
-      comm_stream(at::cuda::getStreamFromPool(true)) {
+      comm_stream(ep_stream_from_pool()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
     // Optional runtime override for the RoCE active-QP cap (default 8).
@@ -126,6 +137,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+    CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
@@ -171,6 +183,9 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and
                    x.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(active_ranks.dim() == 1 and active_ranks.is_contiguous() and
+                   active_ranks.scalar_type() == torch::kInt32 and
+                   active_ranks.numel() >= num_ranks);
     EP_HOST_ASSERT(num_experts % num_ranks == 0);
     EP_HOST_ASSERT(USE_QP_COUNT % num_ranks == 0);
 
@@ -191,7 +206,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = ep_current_stream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -234,6 +249,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     void* rkeys_ptr = rdma_transport_ ? rdma_transport_->rkeysPtr() : nullptr;
     void* qp_devctxs_ptr =
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
+    void* hdp_flush =
+        rdma_transport_ ? rdma_transport_->deviceFlushPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
     int active_qps_per_rank = active_qps_per_rank_for_ep(
@@ -242,25 +259,30 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
-                                 buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream);
+        mooncake::mark_phase_ack(
+            gdr_buffer, nvlink_avail, ipc_ptrs, raddrs_ptr, rkeys_ptr,
+            qp_devctxs_ptr, buffer.phase_ack_buffer, rank, num_ranks,
+            active_qps_per_rank, phase_epoch, launch_stream, hdp_flush);
 #endif
     };
 
     auto wait_peer_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
+        mooncake::wait_phase_ack(
+            buffer.phase_ack_buffer, active_ranks.data_ptr<int32_t>(), rank,
+            num_ranks, active_qps_per_rank, phase_epoch, launch_stream,
+            timeout_ticks);
 #endif
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
+            gdr_buffer, nvlink_avail, ipc_ptrs, raddrs_ptr, rkeys_ptr,
+            qp_devctxs_ptr, buffer.phase_ack_buffer,
+            active_ranks.data_ptr<int32_t>(), rank, num_ranks,
+            active_qps_per_rank, phase_epoch, launch_stream, hdp_flush,
+            timeout_ticks);
 #endif
     };
 
@@ -277,7 +299,7 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
             num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
             num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
-            timeout_ticks, phases, active_qps_per_rank);
+            hdp_flush, timeout_ticks, phases, active_qps_per_rank);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -347,6 +369,9 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     EP_HOST_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
     EP_HOST_ASSERT(topk_weights.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
+    EP_HOST_ASSERT(active_ranks.dim() == 1 and active_ranks.is_contiguous() and
+                   active_ranks.scalar_type() == torch::kInt32 and
+                   active_ranks.numel() >= num_ranks);
     EP_HOST_ASSERT(src_info.dim() == 2 and src_info.is_contiguous());
     EP_HOST_ASSERT(src_info.scalar_type() == torch::kInt32 and
                    x.size(0) == src_info.size(0));
@@ -370,7 +395,7 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
-    auto compute_stream = at::cuda::getCurrentCUDAStream();
+    auto compute_stream = ep_current_stream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
@@ -395,6 +420,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     void* rkeys_ptr = rdma_transport_ ? rdma_transport_->rkeysPtr() : nullptr;
     void* qp_devctxs_ptr =
         rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
+    void* hdp_flush =
+        rdma_transport_ ? rdma_transport_->deviceFlushPtr() : nullptr;
     int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
     int active_qps_per_rank = active_qps_per_rank_for_ep(
@@ -403,25 +430,30 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
-                                 buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream);
+        mooncake::mark_phase_ack(
+            gdr_buffer, nvlink_avail, ipc_ptrs, raddrs_ptr, rkeys_ptr,
+            qp_devctxs_ptr, buffer.phase_ack_buffer, rank, num_ranks,
+            active_qps_per_rank, phase_epoch, launch_stream, hdp_flush);
 #endif
     };
 
     auto wait_peer_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
-        mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
-                                 num_ranks, phase_epoch, launch_stream,
-                                 timeout_ticks);
+        mooncake::wait_phase_ack(
+            buffer.phase_ack_buffer, active_ranks.data_ptr<int32_t>(), rank,
+            num_ranks, active_qps_per_rank, phase_epoch, launch_stream,
+            timeout_ticks);
 #endif
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         mooncake::mark_and_wait_phase_ack(
-            gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
-            rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
+            gdr_buffer, nvlink_avail, ipc_ptrs, raddrs_ptr, rkeys_ptr,
+            qp_devctxs_ptr, buffer.phase_ack_buffer,
+            active_ranks.data_ptr<int32_t>(), rank, num_ranks,
+            active_qps_per_rank, phase_epoch, launch_stream, hdp_flush,
+            timeout_ticks);
 #endif
     };
 
@@ -437,8 +469,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             layout_range.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy, active_qps_per_rank);
+            num_ranks, workspace, launch_stream, hdp_flush, timeout_ticks,
+            phases, zero_copy, active_qps_per_rank);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);

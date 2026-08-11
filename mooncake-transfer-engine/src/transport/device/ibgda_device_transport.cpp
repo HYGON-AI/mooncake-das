@@ -25,13 +25,19 @@
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
+#ifdef USE_HCU
+#include "transport/device/hcu/hcu_runtime_aliases.h"
+#else
 #include "cuda_alike.h"
+#endif
 #include "transport/device/ibgda/memheap.h"
 #include "transport/device/ibgda/mlx5gda.h"
 #include "topology.h"
+#include "config.h"
 
 namespace mooncake {
 namespace device {
@@ -71,10 +77,15 @@ static std::string autoDetectNic(const std::vector<std::string>& filter) {
     if (hca_list.empty()) return "";
 
     // Build a location string for the current GPU so Topology picks the
-    // topologically closest NIC.  Fall back to wildcard if cudaGetDevice fails.
+    // topologically closest NIC. Fall back to wildcard if runtime discovery
+    // fails.
     int device_id = 0;
     cudaGetDevice(&device_id);
+#ifdef USE_HCU
+    std::string location = "hip:" + std::to_string(device_id);
+#else
     std::string location = "cuda:" + std::to_string(device_id);
+#endif
 
     int idx = topo.selectDevice(location);
     if (idx < 0) idx = topo.selectDevice("*");  // wildcard fallback
@@ -98,6 +109,18 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
         num_ranks_ = num_ranks;
         num_qps_ = num_qps;
+
+#ifdef USE_HCU
+        int device_id = 0;
+        hipDeviceProp_t props{};
+        if (hipGetDevice(&device_id) == hipSuccess &&
+            hipGetDeviceProperties(&props, device_id) == hipSuccess) {
+            device_flush_ptr_ = props.hdpMemFlushCntl;
+        } else {
+            LOG(WARNING) << "[EP IBGDA] failed to query HIP HDP flush register";
+            (void)hipGetLastError();
+        }
+#endif
 
         std::string nic =
             device_name.empty() ? autoDetectNic(device_filter_) : device_name;
@@ -140,10 +163,20 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             return -1;
         }
 
-        gid_index_ = findBestGidIndex(ctx_, port, port_attr);
-        if (gid_index_ < 0) {
-            LOG(ERROR) << "[EP IBGDA] No suitable GID on " << nic;
-            return -1;
+        int configured_gid_index = globalConfig().gid_index;
+        if (configured_gid_index >= 0) {
+            gid_index_ = configured_gid_index;
+            LOG(INFO) << "[EP IBGDA] Using configured GID index "
+                      << gid_index_ << " for " << nic;
+        } else {
+            LOG(INFO) << "[EP IBGDA] Auto-selecting Best GID index for " << nic;
+            gid_index_ = findBestGidIndex(ctx_, port, port_attr);
+            if (gid_index_ < 0) {
+                LOG(ERROR) << "[EP IBGDA] No suitable GID on " << nic;
+                return -1;
+            }
+            LOG(INFO) << "[EP IBGDA] Auto-selected GID index " << gid_index_
+                      << " for " << nic;
         }
 
         if (ibv_query_gid(ctx_, port, gid_index_, &gid_)) {
@@ -199,21 +232,53 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateControlBuffer() override {
+#ifdef USE_HCU
+        // DEVX registers a CPU VA, while the HIP kernel consumes the mapped
+        // device VA. The HCU path uses one page-aligned host allocation for
+        // views; keep that ownership inside RdmaTransport.
+        if (posix_memalign(&ctrl_buf_host_, 4096, kCtrlBufSize) != 0) {
+            LOG(ERROR) << "[EP IBGDA] failed to allocate HIP control buffer";
+            return -1;
+        }
+        cudaError_t err =
+            cudaHostRegister(ctrl_buf_host_, kCtrlBufSize,
+                             cudaHostRegisterMapped | cudaHostRegisterPortable);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "[EP IBGDA] hipHostRegister ctrl_buf failed: "
+                       << cudaGetErrorString(err);
+            return -1;
+        }
+        ctrl_buf_registered_ = true;
+        err = cudaHostGetDevicePointer(&ctrl_buf_, ctrl_buf_host_, 0);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "[EP IBGDA] hipHostGetDevicePointer failed: "
+                       << cudaGetErrorString(err);
+            return -1;
+        }
+        void* umem_addr = ctrl_buf_host_;
+#else
         cudaError_t err = cudaMalloc(&ctrl_buf_, kCtrlBufSize);
         if (err != cudaSuccess) {
             LOG(ERROR) << "[EP IBGDA] cudaMalloc ctrl_buf failed: "
                        << cudaGetErrorString(err);
             return -1;
         }
+        void* umem_addr = ctrl_buf_;
+#endif
 
-        ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, kCtrlBufSize,
+        ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, umem_addr, kCtrlBufSize,
                                               IBV_ACCESS_LOCAL_WRITE);
         if (!ctrl_buf_umem_) {
             LOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg failed (errno="
                        << errno << ")";
             return -1;
         }
-        LOG(INFO) << "[EP IBGDA] ctrl_buf UMEM registered via VA path";
+        LOG(INFO) << "[EP IBGDA] ctrl_buf UMEM registered via "
+#ifdef USE_HCU
+                  << "mapped host/device VA path";
+#else
+                  << "device VA path";
+#endif
 
         ctrl_buf_heap_ = memheap_create(kCtrlBufSize);
         if (!ctrl_buf_heap_) {
@@ -248,7 +313,12 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                     static_cast<char*>(ctrl_buf_) + qp->send_cq->cq_offset),
                 .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(
                     static_cast<char*>(ctrl_buf_) + qp->dbr_offset),
-                .bf = static_cast<char*>(qp->uar->reg_addr),
+                .bf =
+#ifdef USE_HCU
+                    static_cast<char*>(qp->uar_device_ptr),
+#else
+                    static_cast<char*>(qp->uar->reg_addr),
+#endif
             };
             cudaMemcpy(
                 static_cast<char*>(qp_devctxs_) + i * sizeof(mlx5gda_qp_devctx),
@@ -345,6 +415,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     void* raddrsPtr() override { return raddrs_; }
     void* rkeysPtr() override { return rkeys_; }
     void* qpDevCtxsPtr() override { return qp_devctxs_; }
+    void* deviceFlushPtr() const override { return device_flush_ptr_; }
     bool isRoce() const override { return is_roce_; }
     int gidIndex() const override { return gid_index_; }
 
@@ -363,9 +434,23 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             ctrl_buf_umem_ = nullptr;
         }
         if (ctrl_buf_) {
+#ifdef USE_HCU
+            ctrl_buf_ = nullptr;
+#else
             cudaFree(ctrl_buf_);
             ctrl_buf_ = nullptr;
+#endif
         }
+#ifdef USE_HCU
+        if (ctrl_buf_registered_) {
+            cudaHostUnregister(ctrl_buf_host_);
+            ctrl_buf_registered_ = false;
+        }
+        if (ctrl_buf_host_) {
+            std::free(ctrl_buf_host_);
+            ctrl_buf_host_ = nullptr;
+        }
+#endif
         if (mr_) {
             ibv_dereg_mr(mr_);
             mr_ = nullptr;
@@ -407,8 +492,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     // Control buffer
     void* ctrl_buf_ = nullptr;  // GPU VA
+    void* ctrl_buf_host_ = nullptr;
+    bool ctrl_buf_registered_ = false;
     mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
     memheap* ctrl_buf_heap_ = nullptr;
+    void* device_flush_ptr_ = nullptr;
 
     // QPs
     std::vector<mlx5gda_qp*> qps_;

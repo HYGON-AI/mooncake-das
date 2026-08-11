@@ -37,7 +37,8 @@
 #endif
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 #include <cassert>
 
@@ -87,7 +88,8 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_int32(gpu_id, 0, "GPU ID to use, -1 for all GPUs");
@@ -97,7 +99,8 @@ using namespace mooncake;
 
 static void *allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     if (from_vram) {
         int gpu_id;
@@ -122,7 +125,8 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 #ifdef USE_MNNVL
     if (FLAGS_use_vram) {
@@ -223,7 +227,8 @@ Status submitRequestSync(TransferEngine *engine, SegmentID handle,
     return Status::OK();
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 class PinnedBuffer {
    public:
@@ -259,7 +264,8 @@ thread_local std::vector<uint8_t> user_buf(FLAGS_block_size);
 #endif
 
 void fillData(int thread_id, void *addr, uint8_t seed) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     memset(ref_buf.data(), seed, FLAGS_block_size);
     cudaStream_t s;
@@ -289,7 +295,8 @@ void checkData(int thread_id, void *addr, uint8_t seed) {
         uint8_t *local_addr =
             (uint8_t *)(addr) +
             FLAGS_block_size * (i * FLAGS_threads + thread_id);
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
         cudaStream_t s;
         cudaStreamCreate(&s);
@@ -424,7 +431,8 @@ int initiator() {
     }
 
     std::vector<void *> addr;
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     if (FLAGS_use_vram) {
         int gpu_num;
@@ -548,7 +556,8 @@ int target() {
     }
 
     std::vector<void *> addr;
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     if (FLAGS_use_vram) {
         int gpu_num;

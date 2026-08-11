@@ -841,7 +841,9 @@ class _ElasticMixin:
             replacement_ready,
             start_recovery,
             nprocs=self.world_size + 1,
-            timeout_s=30.0,
+            # Allow for initial PG setup, HCU fault detection, replacement PG
+            # setup, and teardown in addition to the 30-second peer wait above.
+            timeout_s=60.0,
         )
 
         # Verify all participants completed

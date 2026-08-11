@@ -3,7 +3,7 @@
 #include <mooncake_ep_configs.cuh>
 
 // SETUP_LAUNCH_CONFIG and LAUNCH_KERNEL are defined in mooncake_ep_device.h
-// (unified CUDA/MUSA launch configuration).
+// (unified CUDA/HCU/MUSA/MACA launch configuration).
 
 #define SWITCH_RANKS(case_macro)                           \
     switch (num_ranks) {                                   \
@@ -52,6 +52,18 @@
     }                                                     \
     while (false)
 
+#ifdef MOONCAKE_EP_USE_HCU
+#define SWITCH_TYPES(case_macro)                         \
+    switch (type) {                                      \
+        case HIP_R_16BF:                                 \
+            case_macro(ep_bfloat16);                     \
+        case HIP_R_32F:                                  \
+            case_macro(float);                           \
+        default:                                         \
+            EP_HOST_ASSERT(false && "Unsupported type"); \
+    }                                                    \
+    while (false)
+#else
 #define SWITCH_TYPES(case_macro)                         \
     switch (type) {                                      \
         case CUDA_R_16BF:                                \
@@ -62,6 +74,7 @@
             EP_HOST_ASSERT(false && "Unsupported type"); \
     }                                                    \
     while (false)
+#endif
 
 #define SWITCH_HIDDEN(case_macro)                          \
     switch (hidden) {                                      \

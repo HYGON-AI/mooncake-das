@@ -1,7 +1,9 @@
 include(${CMAKE_CURRENT_SOURCE_DIR}/../fabric_allocator.cmake)
 
 set(_extra_build_opts "")
-if(USE_HIP)
+if(USE_HCU)
+  list(APPEND _extra_build_opts --use-hcu)
+elseif(USE_HIP)
   list(APPEND _extra_build_opts --use-hipcc)
 elseif(USE_MUSA)
   list(APPEND _extra_build_opts --use-mcc)
@@ -11,7 +13,7 @@ endif()
 
 set(_enable_nvlink_allocator_build FALSE)
 if(USE_CUDA
-   OR USE_HIP
+   OR MOONCAKE_USE_HIP_RUNTIME
    OR USE_MUSA
    OR USE_MACA)
   set(_enable_nvlink_allocator_build TRUE)

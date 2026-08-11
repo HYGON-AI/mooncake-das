@@ -36,7 +36,7 @@
 #include "cuda_alike.h"
 #endif
 
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
 #include <hip/hip_runtime.h>
 #endif
 
@@ -161,7 +161,7 @@ static inline bool isCudaMemory(void* ptr) {
 }
 #endif
 
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
 static inline bool isHipMemory(void* ptr) {
     hipPointerAttribute_t attr;
     auto ret = hipPointerGetAttributes(&attr, ptr);
@@ -173,7 +173,7 @@ static inline bool isGpuMemory(void* ptr) {
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     if (isCudaMemory(ptr)) return true;
 #endif
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
     if (isHipMemory(ptr)) return true;
 #endif
     return false;
@@ -197,7 +197,7 @@ static inline uint8_t fillData(void* addr, size_t length) {
         return seed;
     }
 #endif
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
     if (isHipMemory(addr)) {
         std::vector<uint8_t> ref_data(length, seed);
         hipMemcpy(addr, ref_data.data(), length, hipMemcpyDefault);
@@ -232,7 +232,7 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
         return;
     }
 #endif
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
     if (isHipMemory(addr)) {
         std::vector<uint8_t> act_data(length);
         hipMemcpy(act_data.data(), addr, length, hipMemcpyDefault);

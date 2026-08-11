@@ -120,7 +120,7 @@ class RdmaTransport {
     virtual int allocateControlBuffer() = 0;
 
     // Create QPs in RST→INIT state.  Call after allocateControlBuffer.
-    // stream is a cudaStream_t / musaStream_t cast to void*.
+    // stream is a cudaStream_t / hipStream_t / musaStream_t cast to void*.
     virtual int createQueuePairs(void* stream) = 0;
 
     // Destroy and recreate QPs (used when active_ranks changes).
@@ -144,6 +144,10 @@ class RdmaTransport {
     virtual void* raddrsPtr() = 0;     // uint64_t[num_ranks]
     virtual void* rkeysPtr() = 0;      // uint32_t[num_ranks]
     virtual void* qpDevCtxsPtr() = 0;  // mlx5gda_qp_devctx[num_qps]
+
+    // Optional device-visible host-data-path flush register. HCU uses it
+    // before ringing an IBGDA doorbell; other platforms return nullptr.
+    virtual void* deviceFlushPtr() const = 0;
 
     virtual bool isRoce() const = 0;
     virtual int gidIndex() const = 0;

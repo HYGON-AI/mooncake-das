@@ -71,28 +71,71 @@ option(BUILD_EXAMPLES "Build examples" ON)
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
+
+# 寒武纪 GPU/MLU
 option(USE_MLU "option for enabling Cambricon MLU features" OFF)
+
+# 摩尔线程 GPU/MUSA
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
+
+# 沐曦 GPU/MACA
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
+
+# AMD GPU/HIP
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
+
+# Hygon GPU/DCU through the native DTK HIP toolchain
+option(USE_HCU
+       "option for enabling Hygon HCU features through the DTK HIP runtime"
+       OFF)
+
+# Legacy Hygon CUDA-compatible DTK path
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
+
+if(USE_HCU AND USE_HIP)
+  message(FATAL_ERROR
+          "USE_HCU and USE_HIP are mutually exclusive backend selections")
+endif()
+if(USE_HCU AND USE_HYGON)
+  message(FATAL_ERROR
+          "USE_HCU and legacy USE_HYGON cannot be enabled together")
+endif()
+if(USE_HCU AND (USE_CUDA OR USE_MUSA OR USE_MACA))
+  message(FATAL_ERROR
+          "USE_HCU cannot be combined with USE_CUDA, USE_MUSA, or USE_MACA")
+endif()
+
+# CMake capability used by generic HIP-runtime components.  USE_HCU remains
+# the backend identity; do not turn the public USE_HIP option on implicitly.
+set(MOONCAKE_USE_HIP_RUNTIME OFF)
+if(USE_HIP OR USE_HCU)
+  set(MOONCAKE_USE_HIP_RUNTIME ON)
+endif()
+
+# 天数智芯 GPU/CoreX
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
+
+# 曦望 GPU/Tang
+option(USE_SUNRISE
+       "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
+
+# 华为昇腾 GPU/Ascend/UB
+option(USE_ASCEND "option for using npu with HCCL" OFF)
+option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
+option(USE_UB "option for using UB protocol transport" OFF)
+option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
+option(USE_ASCEND_HETEROGENEOUS "option for transferring between ascend npu and gpu" OFF)
+
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
-option(USE_ASCEND "option for using npu with HCCL" OFF)
-option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
-option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
-option(USE_ASCEND_HETEROGENEOUS
-       "option for transferring between ascend npu and gpu" OFF)
 option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_EFA "option for using AWS EFA transport" OFF)
-option(USE_UB "option for using UB protocol transport" OFF)
-option(USE_SUNRISE
-       "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
+
 option(USE_TPU
-       "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
+       "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter
+        is loaded at runtime via dlopen, no build-time SDK required"
        OFF)
 
 if(USE_UB)
@@ -191,6 +234,7 @@ endif()
 
 if(USE_MNNVL)
   if(NOT USE_HIP
+     AND NOT USE_HCU
      AND NOT USE_MUSA
      AND NOT USE_MACA)
     set(USE_CUDA ON)
@@ -365,12 +409,38 @@ if(USE_COREX)
   endif()
 endif()
 
-if(USE_HIP)
-  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
+if(MOONCAKE_USE_HIP_RUNTIME)
+  if(USE_HCU)
+    if(NOT DEFINED DTK_ROOT OR DTK_ROOT STREQUAL "")
+      if(DEFINED ENV{DTK_HOME} AND NOT "$ENV{DTK_HOME}" STREQUAL "")
+        set(DTK_ROOT
+            "$ENV{DTK_HOME}"
+            CACHE PATH "Path to Hygon DTK SDK" FORCE)
+      else()
+        set(DTK_ROOT
+            "/opt/dtk"
+            CACHE PATH "Path to Hygon DTK SDK" FORCE)
+      endif()
+    endif()
+    list(APPEND CMAKE_PREFIX_PATH
+         "${DTK_ROOT}/lib/cmake"
+         "${DTK_ROOT}/lib64/cmake"
+         "${DTK_ROOT}/hip/lib/cmake")
+  else()
+    list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
+  endif()
+
   find_package(HIP REQUIRED)
   include_directories(${HIP_INCLUDE_DIRS})
-  add_compile_definitions(USE_HIP __HIP_PLATFORM_AMD__)
-  message(STATUS "HIP support is enabled")
+  if(USE_HCU)
+    add_compile_definitions(USE_HCU MOONCAKE_USE_HIP_RUNTIME
+                            __HIP_PLATFORM_AMD__)
+    message(STATUS "Hygon HCU support through the DTK HIP runtime is enabled")
+  else()
+    add_compile_definitions(USE_HIP MOONCAKE_USE_HIP_RUNTIME
+                            __HIP_PLATFORM_AMD__)
+    message(STATUS "AMD HIP support is enabled")
+  endif()
 
   find_program(HIPIFY_PERL_EXECUTABLE hipify-perl)
   if(NOT HIPIFY_PERL_EXECUTABLE)

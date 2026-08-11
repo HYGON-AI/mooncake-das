@@ -35,7 +35,8 @@
 #include <cufile.h>
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 #include <cassert>
 
@@ -76,7 +77,8 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
@@ -87,7 +89,8 @@ using namespace mooncake;
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     if (from_vram) {
         int gpu_id = FLAGS_gpu_id;
@@ -110,7 +113,8 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     // check pointer on GPU
     cudaPointerAttributes attributes;
@@ -303,7 +307,8 @@ int initiator() {
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                     \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                          \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     buffer_num = FLAGS_use_vram ? 1 : NR_SOCKETS;
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";

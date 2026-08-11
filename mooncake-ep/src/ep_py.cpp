@@ -12,6 +12,11 @@ namespace py = pybind11;
 namespace mooncake {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+#ifdef MOONCAKE_EP_USE_HCU
+    m.attr("IS_HCU") = pybind11::bool_(true);
+#else
+    m.attr("IS_HCU") = pybind11::bool_(false);
+#endif
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
 
     py::class_<EventHandle>(m, "EventHandle")

@@ -15,7 +15,8 @@ _USE_MACA = (
     _env_enabled("MOONCAKE_EP_USE_MACA")
     or bool(getattr(torch.version, "maca", None))
 )
-_USE_SPLIT_SEND_RECV = (
+_HCU_REQUESTED = _env_enabled("MOONCAKE_EP_USE_HCU")
+_USE_SPLIT_SEND_RECV_BY_DEFAULT = (
     _env_enabled("MOONCAKE_EP_USE_MUSA")
     or _USE_MACA
 )
@@ -52,8 +53,8 @@ class EventOverlap:
         """
         The current stream `torch.cuda.current_stream()` waits for the event to be finished.
         """
-        assert self.event is not None
-        self.event.current_stream_wait()
+        if self.event is not None:
+            self.event.current_stream_wait()
 
     def __enter__(self) -> Any:
         """
@@ -83,13 +84,24 @@ class Buffer:
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
         from mooncake import ep
 
+        self._use_hcu = bool(getattr(ep, "IS_HCU", False))
+        if _HCU_REQUESTED and not self._use_hcu:
+            raise RuntimeError(
+                "MOONCAKE_EP_USE_HCU is set, but the loaded EP extension "
+                "was not built with HCU support"
+            )
+        self._use_split_send_recv = (
+            _USE_SPLIT_SEND_RECV_BY_DEFAULT or self._use_hcu
+        )
+
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         self.backend = self.group
-        # NIC auto-detection happens inside ep.Buffer via Topology::discover().
+        # NIC auto-detection and transport ownership live in the Transfer
+        # Engine Device API after the EP transport refactor.
         self.runtime = ep.Buffer(
             self.rank, self.group_size, num_ep_buffer_bytes
         )
@@ -366,7 +378,7 @@ class Buffer:
         # splits no-hook calls into SEND -> phase-ack -> RECV instead of using
         # a single cooperative kernel.  async_finish still returns a stream
         # event, but it is not the CUDA single-kernel cooperative path.
-        if _USE_SPLIT_SEND_RECV and async_finish:
+        if self._use_split_send_recv and async_finish:
             import warnings
 
             warnings.warn(
@@ -466,7 +478,7 @@ class Buffer:
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         # Same split-kernel behavior as dispatch().
-        if _USE_SPLIT_SEND_RECV and async_finish:
+        if self._use_split_send_recv and async_finish:
             import warnings
 
             warnings.warn(

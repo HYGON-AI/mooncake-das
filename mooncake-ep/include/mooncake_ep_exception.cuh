@@ -22,6 +22,16 @@ class EPException : public std::exception {
 };
 
 #ifndef CUDA_CHECK
+#ifdef MOONCAKE_EP_USE_HCU
+#define CUDA_CHECK(cmd)                                  \
+    do {                                                 \
+        hipError_t e = (cmd);                            \
+        if (e != hipSuccess) {                           \
+            throw EPException("HIP", __FILE__, __LINE__, \
+                              hipGetErrorString(e));     \
+        }                                                \
+    } while (0)
+#else
 #define CUDA_CHECK(cmd)                                   \
     do {                                                  \
         cudaError_t e = (cmd);                            \
@@ -30,6 +40,7 @@ class EPException : public std::exception {
                               cudaGetErrorString(e));     \
         }                                                 \
     } while (0)
+#endif
 #endif
 
 #ifndef EP_HOST_ASSERT
@@ -49,6 +60,15 @@ class EPException : public std::exception {
 #define EP_DEVICE_ASSERT(cond) \
     do {                       \
         (void)sizeof(cond);    \
+    } while (0)
+#elif defined(MOONCAKE_EP_USE_HCU)
+#define EP_DEVICE_ASSERT(cond)                                           \
+    do {                                                                 \
+        if (not(cond)) {                                                 \
+            printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, \
+                   __LINE__, #cond);                                     \
+            __builtin_trap();                                            \
+        }                                                                \
     } while (0)
 #else
 #define EP_DEVICE_ASSERT(cond)                                           \

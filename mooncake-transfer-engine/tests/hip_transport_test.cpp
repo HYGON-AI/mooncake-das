@@ -64,7 +64,7 @@ TEST(HipTransportTest, RestoresActiveDeviceAfterTransfer) {
     Transport* transport = engine->installTransport("hip", nullptr);
     if (transport == nullptr) {
         GTEST_SKIP()
-            << "HIP transport unavailable (built without -DUSE_HIP=ON?).";
+            << "HIP transport unavailable (built without a HIP-runtime backend?).";
     }
 
     // Both buffers on kSourceDevice so the source GPU differs from the caller.

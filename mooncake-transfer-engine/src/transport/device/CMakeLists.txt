@@ -5,7 +5,7 @@
 # consumers that link transfer_engine via hand- written ldflags (Go p2p-store /
 # mooncake-store), which bypass CMake's target_link_libraries propagation.
 set(DEVICE_TRANSPORT_SOURCES p2p_device_transport.cpp)
-if((USE_CUDA OR USE_MUSA) AND NOT USE_CXI)
+if((USE_CUDA OR USE_MUSA OR USE_HCU) AND NOT USE_CXI)
     list(APPEND DEVICE_TRANSPORT_SOURCES ibgda_device_transport.cpp mlx5gda.cpp)
 elseif(USE_MACA)
     list(APPEND DEVICE_TRANSPORT_SOURCES ibgda_device_transport_maca_stub.cpp)
@@ -20,6 +20,12 @@ endif()
 if(USE_MUSA)
   target_include_directories(device_transport PRIVATE /usr/local/musa/include)
   target_compile_definitions(device_transport PRIVATE USE_MUSA)
+endif()
+if(USE_HCU)
+  target_include_directories(device_transport PRIVATE ${HIP_INCLUDE_DIRS})
+  target_compile_definitions(
+      device_transport PRIVATE USE_HCU MOONCAKE_USE_HIP_RUNTIME
+                               __HIP_PLATFORM_AMD__)
 endif()
 if(USE_MACA)
     target_compile_definitions(device_transport PRIVATE USE_MACA)

@@ -7,6 +7,7 @@ source "$(dirname "$(readlink -f "$0")")/../scripts/allocator_build_common.sh"
 # Check for flags
 USE_NVCC=false
 USE_HIPCC=false
+USE_HCU=false
 USE_MCC=false
 USE_MACA=false
 CI_BUILD=false
@@ -16,6 +17,9 @@ if [[ "$1" == "--use-nvcc" ]]; then
     shift
 elif [[ "$1" == "--use-hipcc" ]]; then
     USE_HIPCC=true
+    shift
+elif [[ "$1" == "--use-hcu" ]]; then
+    USE_HCU=true
     shift
 elif [[ "$1" == "--use-mcc" ]]; then
     USE_MCC=true
@@ -47,6 +51,9 @@ elif [ "$USE_NVCC" = true ]; then
 elif [ "$USE_HIPCC" = true ]; then
     hipify-perl "$CPP_FILE" > "${OUTPUT_DIR}/nvlink_allocator.cpp"
     hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} -DUSE_HIP=1
+elif [ "$USE_HCU" = true ]; then
+    hipify-perl "$CPP_FILE" > "${OUTPUT_DIR}/nvlink_allocator.cpp"
+    hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 ${INCLUDE_FLAGS} -DUSE_HCU=1 -DMOONCAKE_USE_HIP_RUNTIME=1
 elif [ "$USE_MCC" = true ]; then
     mcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lmusa -I/usr/local/musa/include ${INCLUDE_FLAGS} -DUSE_MUSA=1
 elif [ "$USE_MACA" = true ]; then

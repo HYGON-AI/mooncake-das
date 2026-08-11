@@ -1,6 +1,10 @@
 #include <cmath>
 
+#ifdef USE_HCU
+#include "transport/device/hcu/hcu_runtime_aliases.h"
+#else
 #include "cuda_alike.h"
+#endif
 
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
@@ -39,14 +43,16 @@ static void print_cuda_error(const char* msg) {
 }
 
 // Create UAR for BF (Blue Flame) doorbell ringing.
-// On CUDA: registers the BF MMIO region into GPU address space so the
-//          GPU kernel can directly write the doorbell (lowest latency).
+// On CUDA/HIP: registers the BF MMIO region into GPU address space so the GPU
+//              kernel can directly write the doorbell (lowest latency).
 // On MUSA: musaHostRegisterIoMemory is not supported for MMIO addresses,
 //          so we skip BF registration and return a UAR with reg_addr=NULL.
 //          The GPU kernel will use DBR-only mode (write to memory-mapped
 //          doorbell record, NIC polls it) — slightly higher latency but
 //          functionally correct.
-static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
+static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx,
+                                          void** device_ptr) {
+    *device_ptr = nullptr;
     struct mlx5dv_devx_uar* uar =
         mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
     if (!uar) {
@@ -70,6 +76,17 @@ static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
         mlx5dv_devx_free_uar(uar);
         return NULL;
     }
+#ifdef USE_HCU
+    if (cudaHostGetDevicePointer(device_ptr, uar->reg_addr, 0) != cudaSuccess) {
+        print_cuda_error("Failed to get MMIO device pointer");
+        cudaHostUnregister(uar->reg_addr);
+        errno = EIO;
+        mlx5dv_devx_free_uar(uar);
+        return NULL;
+    }
+#else
+    *device_ptr = uar->reg_addr;
+#endif
 #endif
     return uar;
 }
@@ -211,6 +228,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
     struct mlx5gda_qp* qp = NULL;
     struct mlx5gda_cq* send_cq = NULL;
     struct mlx5dv_devx_uar* uar = NULL;
+    void* uar_device_ptr = nullptr;
     struct mlx5dv_devx_obj* mlx5_qp = NULL;
     size_t wq_offset = -1;
     size_t dbr_offset = -1;
@@ -271,7 +289,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
         goto fail;
     }
 
-    uar = create_uar(ctx);
+    uar = create_uar(ctx, &uar_device_ptr);
     if (!uar) {
         perror("Failed to create UAR");
         goto fail;
@@ -340,6 +358,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
     qp->mqp = mlx5_qp;
     qp->send_cq = send_cq;
     qp->uar = uar;
+    qp->uar_device_ptr = uar_device_ptr;
     qp->pd = pd;
     qp->qpn = DEVX_GET(create_qp_out, cmd_out, qpn);
     qp->num_wqebb = num_wqebb;

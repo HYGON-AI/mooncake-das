@@ -3,8 +3,8 @@
 
 #if !defined(__MUSA__)
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <c10/util/intrusive_ptr.h>
+#include <mooncake_pg_device.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -28,6 +29,8 @@ namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
 static constexpr size_t kMaxNumRanks = 64;
+static constexpr uint32_t kTaskInactive = 0;
+static constexpr uint32_t kTaskActive = 1;
 
 struct SegmentInfo {
     uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
@@ -61,7 +64,7 @@ struct TransferGroupMeta {
 __global__
 #endif
     struct Task {
-    volatile bool active = false;
+    alignas(uint32_t) uint32_t active = kTaskInactive;
     int opType =
         0;  // c10d::OpType as int, for ABI compatibility with kernel code
     size_t tensorSize;  // In bytes
@@ -73,6 +76,15 @@ __global__
 };
 
 #if !defined(__MUSA__)
+inline bool loadTaskActiveHost(const Task& task) {
+    return __atomic_load_n(&task.active, __ATOMIC_ACQUIRE) == kTaskActive;
+}
+
+inline void storeTaskActiveHost(Task& task, bool active) {
+    __atomic_store_n(&task.active, active ? kTaskActive : kTaskInactive,
+                     __ATOMIC_RELEASE);
+}
+
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
@@ -106,11 +118,11 @@ class MooncakeWorker {
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         const std::shared_ptr<TransferGroupMeta>& meta,
         const std::shared_ptr<ConnectionContext>& connection_ctx,
-        const at::cuda::CUDAStream& issue_stream,
+        const PgStream& issue_stream,
         const std::function<void(void* dst, size_t pos, size_t realSize,
-                                 const at::cuda::CUDAStream&)>& tensorToBuffer,
+                                 const PgStream&)>& tensorToBuffer,
         const std::function<void(void* src, size_t pos, size_t realSize,
-                                 const at::cuda::CUDAStream&)>& bufferToTensor);
+                                 const PgStream&)>& bufferToTensor);
 
     void Start();
 
@@ -137,7 +149,11 @@ class MooncakeWorker {
 
     static constexpr size_t kNumTasks_ = 4;
 
+#ifdef MOONCAKE_PG_USE_HCU
+    static constexpr size_t kPingTimeoutMicroseconds_ = 5'000'000;
+#else
     static constexpr size_t kPingTimeoutMicroseconds_ = 100;
+#endif
     static constexpr size_t kDrainTasksTimeoutMs = 5000;  // 5s
 
     std::atomic<bool> running_{false};

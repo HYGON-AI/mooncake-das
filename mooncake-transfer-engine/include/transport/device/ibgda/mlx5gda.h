@@ -3,7 +3,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#ifdef USE_MUSA
+#ifdef USE_HCU
+#include <hip/hip_runtime.h>
+#define cudaStream_t hipStream_t
+#elif defined(USE_MUSA)
 #include <musa_runtime.h>
 #define cudaStream_t musaStream_t
 #else
@@ -12,7 +15,9 @@
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
 
+#ifndef MAX_QP_COUNT
 #define MAX_QP_COUNT 256
+#endif
 
 struct mlx5gda_cq_dbr {
     uint64_t unused;
@@ -62,6 +67,7 @@ struct mlx5gda_qp {
     struct mlx5dv_devx_obj *mqp;
     struct mlx5gda_cq *send_cq;
     struct mlx5dv_devx_uar *uar;
+    void *uar_device_ptr;
 
     uint8_t port_num;
     struct ibv_port_attr port_attr;

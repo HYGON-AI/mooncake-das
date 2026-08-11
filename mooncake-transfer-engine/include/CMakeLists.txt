@@ -20,6 +20,9 @@ install(FILES transport/device/ibgda_device.cuh DESTINATION include/transport/de
 install(FILES transport/device/cuda/cuda_ops.cuh DESTINATION include/transport/device/cuda)
 install(FILES transport/device/musa/musa_ops.cuh DESTINATION include/transport/device/musa)
 install(FILES transport/device/maca/maca_ops.cuh DESTINATION include/transport/device/maca)
+install(FILES transport/device/hcu/hcu_ops.cuh
+              transport/device/hcu/hcu_runtime_aliases.h
+        DESTINATION include/transport/device/hcu)
 
 # IBGDA library headers
 install(DIRECTORY transport/device/ibgda/ DESTINATION include/transport/device/ibgda

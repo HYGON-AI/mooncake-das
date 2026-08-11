@@ -24,7 +24,7 @@
 #include "cuda_alike.h"
 #endif
 
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
 #include <hip/hip_runtime.h>
 #endif
 
@@ -120,7 +120,7 @@ int TENTBenchRunner::allocateBuffers() {
                 << "local_gpu_id " << start_idx << " out of range [0, "
                 << gpu_count << ")";
         }
-#elif defined(USE_HIP)
+#elif defined(MOONCAKE_USE_HIP_RUNTIME)
     } else if (seg_type == "VRAM") {
         device_prefix = "rocm";
         int gpu_count = 0;
@@ -261,7 +261,7 @@ static inline int getGpuDeviceNumaID(int gpu_id) {
     for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
-#elif defined(USE_HIP)
+#elif defined(MOONCAKE_USE_HIP_RUNTIME)
 static inline int getGpuDeviceNumaID(int gpu_id) {
     hipDeviceProp_t prop;
     if (hipGetDeviceProperties(&prop, gpu_id) != hipSuccess) return 0;

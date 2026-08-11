@@ -11,9 +11,24 @@ namespace device {
 // ---------------------------------------------------------------------------
 // Acquire loads — cross-GPU visibility (sys scope)
 // ---------------------------------------------------------------------------
+__device__ __forceinline__ uint16_t mc_ld_acquire_u16(
+    const uint16_t* ptr) {
+    uint16_t ret;
+    asm volatile("ld.acquire.sys.global.u16 %0, [%1];"
+                 : "=h"(ret)
+                 : "l"(ptr));
+    return ret;
+}
+
 __device__ __forceinline__ int mc_ld_acquire(const int* ptr) {
     int ret;
     asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+    return ret;
+}
+
+__device__ __forceinline__ uint32_t mc_ld_acquire_u32(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(ret) : "l"(ptr));
     return ret;
 }
 
@@ -131,6 +146,8 @@ __device__ __forceinline__ void mc_grid_sync() {
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void mc_fence() {}
 
+__device__ __forceinline__ void mc_flush_hdp(uint32_t* /*hdp_flush*/) {}
+
 // ---------------------------------------------------------------------------
 // Fence/barrier/fence: ensures all threads' writes are globally visible
 // before any thread proceeds.  On CUDA, __syncthreads() implies a memory
@@ -152,6 +169,8 @@ __device__ __forceinline__ uint64_t mc_bswap64(uint64_t x) {
     uint32_t lo = __byte_perm((uint32_t)(x), 0, 0x0123);
     return ((uint64_t)lo << 32) | hi;
 }
+
+__device__ __forceinline__ void mc_trap() { __trap(); }
 
 }  // namespace device
 }  // namespace mooncake

@@ -102,8 +102,35 @@ if (WITH_EP)
     include_directories(mooncake-pg/include)
   else ()
     message(STATUS "WITH_EP enabled: building Mooncake EP and PG Python extensions")
-    if(USE_CUDA)
+    set(EP_GPU_BACKEND "cuda")
+    set(EP_TOOLKIT_MAJOR "${CUDAToolkit_VERSION_MAJOR}")
+    set(EP_TOOLKIT_MINOR "${CUDAToolkit_VERSION_MINOR}")
+    if(USE_HCU)
+      if(USE_CUDA OR USE_MUSA OR USE_MACA)
+        message(FATAL_ERROR
+                "USE_HCU cannot be combined with USE_CUDA, USE_MUSA, or USE_MACA for EP/PG")
+      endif()
+      find_package(HIP REQUIRED)
+      set(EP_GPU_BACKEND "hcu")
+      set(EP_TOOLKIT_MAJOR "0")
+      set(EP_TOOLKIT_MINOR "0")
+      if(NOT PYTORCH_ROCM_ARCH)
+        set(PYTORCH_ROCM_ARCH "$ENV{PYTORCH_ROCM_ARCH}")
+      endif()
+      if(NOT PYTORCH_ROCM_ARCH)
+        set(PYTORCH_ROCM_ARCH "gfx936")
+      endif()
+      set(PYTORCH_ROCM_ARCH "${PYTORCH_ROCM_ARCH}" CACHE STRING
+          "DTK HIP arch list for HCU EP/PG extension builds")
+      message(STATUS
+          "Building Mooncake EP/PG for HCU architectures: ${PYTORCH_ROCM_ARCH}")
+    elseif(USE_HIP)
+      message(FATAL_ERROR
+              "Mooncake EP/PG does not use the generic AMD USE_HIP backend; use USE_HCU for the Hygon DTK HIP path")
+    elseif(USE_CUDA)
       find_package(CUDAToolkit REQUIRED)
+      set(EP_TOOLKIT_MAJOR "${CUDAToolkit_VERSION_MAJOR}")
+      set(EP_TOOLKIT_MINOR "${CUDAToolkit_VERSION_MINOR}")
       message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
     endif()
 
@@ -135,20 +162,24 @@ if (WITH_EP)
     # CMake's COMMAND list-splitting (semicolons are CMake list separators).
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
+    string(REPLACE ";" "|" _pytorch_rocm_arch_pipe "${PYTORCH_ROCM_ARCH}")
 
     add_custom_target(mooncake_ep_ext ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
       COMMAND ${CMAKE_COMMAND}
         "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep"
-        "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
-        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
+        "-DEP_GPU_BACKEND=${EP_GPU_BACKEND}"
+        "-DEP_CUDA_MAJOR=${EP_TOOLKIT_MAJOR}"
+        "-DEP_CUDA_MINOR=${EP_TOOLKIT_MINOR}"
         "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
+        "-DPYTORCH_ROCM_ARCH=${_pytorch_rocm_arch_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
         "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
+        "-DEP_USE_HCU=$<IF:$<BOOL:${USE_HCU}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
       COMMENT "Building Mooncake EP Python extension(s)"
       DEPENDS engine
@@ -159,15 +190,18 @@ if (WITH_EP)
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
       COMMAND ${CMAKE_COMMAND}
         "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg"
-        "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
-        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
+        "-DEP_GPU_BACKEND=${EP_GPU_BACKEND}"
+        "-DEP_CUDA_MAJOR=${EP_TOOLKIT_MAJOR}"
+        "-DEP_CUDA_MINOR=${EP_TOOLKIT_MINOR}"
         "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
+        "-DPYTORCH_ROCM_ARCH=${_pytorch_rocm_arch_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
         "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
+        "-DEP_USE_HCU=$<IF:$<BOOL:${USE_HCU}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
       DEPENDS engine mooncake_ep_ext

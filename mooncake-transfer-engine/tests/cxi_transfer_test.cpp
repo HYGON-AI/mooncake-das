@@ -46,7 +46,7 @@
 #include "transfer_engine.h"
 #include "transport/cxi_transport/cxi_transport.h"
 
-#if defined(USE_CUDA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(MOONCAKE_USE_HIP_RUNTIME)
 #include <cuda_alike.h>
 #endif
 
@@ -99,7 +99,7 @@ static void* allocateHugepage(size_t size, int node_id) {
     return buf;
 }
 
-#if defined(USE_CUDA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(MOONCAKE_USE_HIP_RUNTIME)
 static constexpr bool can_use_device = true;
 
 static void* allocateDevice(size_t size, int device) {
@@ -171,7 +171,7 @@ static int runTarget(TransferEngine* engine) {
                 return 1;
             }
         } else {
-#if defined(USE_CUDA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(MOONCAKE_USE_HIP_RUNTIME)
             int buf_device = i % 4;
             buf = allocateDevice(buf_bytes, buf_device);
             if (!buf) {
@@ -231,7 +231,7 @@ static int runTarget(TransferEngine* engine) {
         if (!FLAGS_use_device) {
             munmap(p, buf_bytes);
         } else {
-#if defined(USE_CUDA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(MOONCAKE_USE_HIP_RUNTIME)
             freeDeviceMem(p, buf_bytes);
 #endif
         }
@@ -291,7 +291,7 @@ static int runInitiator(TransferEngine* engine) {
                 return 1;
             }
         } else {
-#if defined(USE_CUDA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(MOONCAKE_USE_HIP_RUNTIME)
             int tid_device = t % 4;
             recv_bufs[t] = allocateDevice(recv_bytes, tid_device);
             if (!recv_bufs[t]) {
@@ -528,7 +528,7 @@ static int runInitiator(TransferEngine* engine) {
             engine->unregisterLocalMemory(recv_bufs[t]);
             munmap(recv_bufs[t], recv_bytes);
         } else {
-#if defined(USE_CUDA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(MOONCAKE_USE_HIP_RUNTIME)
             bool result = checkDeviceMem(recv_bufs[t], t % 4, 42);
             if (!result) {
                 LOG(ERROR)

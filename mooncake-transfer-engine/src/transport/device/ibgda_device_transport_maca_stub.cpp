@@ -21,6 +21,7 @@ class NullRdmaTransport : public RdmaTransport {
     void* raddrsPtr() override { return nullptr; }
     void* rkeysPtr() override { return nullptr; }
     void* qpDevCtxsPtr() override { return nullptr; }
+    void* deviceFlushPtr() const override { return nullptr; }
     bool isRoce() const override { return false; }
     int gidIndex() const override { return -1; }
 };

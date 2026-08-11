@@ -42,7 +42,8 @@
 #endif
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                        \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                             \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
 #include <cassert>
@@ -108,7 +109,8 @@ DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                        \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                             \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU/NPU VRAM");
@@ -121,7 +123,8 @@ using namespace mooncake;
 
 static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                        \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                             \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (from_vram) {
@@ -193,7 +196,8 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
 }
 
 static void freeMemoryPool(void* addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                        \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                             \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "hip") {
@@ -294,7 +298,8 @@ std::atomic<size_t> total_batch_count(0);
 
 // Ensure each worker thread has a valid GPU context before issuing transfers.
 static inline void setWorkerDeviceIfNeeded() {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                        \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                             \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_SUNRISE)
     if (FLAGS_use_vram && FLAGS_gpu_id >= 0) {
@@ -306,7 +311,8 @@ static inline void setWorkerDeviceIfNeeded() {
 
 // Common helper to determine buffer count based on GPU/NUMA configuration
 static int determineBufferCount() {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                        \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                             \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
@@ -338,7 +344,8 @@ static int determineBufferCount() {
 static std::vector<void*> allocateBuffers() {
     buffer_num = determineBufferCount();
     std::vector<void*> addr(buffer_num);
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                        \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                             \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     for (int i = 0; i < buffer_num; ++i) {
@@ -362,7 +369,8 @@ static void freeBuffers(std::vector<void*>& addr) {
 
 // Helper to get location name for classic backend
 static std::string getLocationName(int buffer_id) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                        \
+    defined(MOONCAKE_USE_HIP_RUNTIME) ||                             \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUNRISE)
     if (FLAGS_use_vram) {
@@ -537,6 +545,11 @@ int initiator() {
 
     auto addr = allocateBuffers();
     for (int i = 0; i < buffer_num; ++i) {
+        if (addr[i] == nullptr) {
+            LOG(ERROR) << "Failed to allocate buffer " << i;
+            freeBuffers(addr);
+            return 1;
+        }
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              getLocationName(i));
         LOG_ASSERT(!rc);
@@ -607,6 +620,11 @@ int target() {
 
     auto addr = allocateBuffers();
     for (int i = 0; i < buffer_num; ++i) {
+        if (addr[i] == nullptr) {
+            LOG(ERROR) << "Failed to allocate buffer " << i;
+            freeBuffers(addr);
+            return 1;
+        }
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              getLocationName(i));
         LOG_ASSERT(!rc);

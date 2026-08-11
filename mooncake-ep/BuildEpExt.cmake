@@ -8,10 +8,13 @@
 #   EP_TORCH_VERSIONS   - pipe-separated (|) PyTorch versions to build for
 #                         (empty = use the currently-installed torch)
 #   TORCH_CUDA_ARCH_LIST - pipe-separated CUDA arch list forwarded to torch
+#   PYTORCH_ROCM_ARCH   - pipe-separated ROCm arch list forwarded to HIP
 #   STAGING_DIR         - destination directory for the built .so files
 #   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
+#   EP_GPU_BACKEND      - "hcu" for Hygon DTK HIP; "cuda" for CUDA-like builds
 #   EP_USE_MUSA         - set to "1" when building for MUSA (MTLink path)
 #   EP_USE_MACA         - set to "1" when building for MACA (MTLink path)
+#   EP_USE_HCU          - set to "1" when building for Hygon HCU/DTK
 
 cmake_minimum_required(VERSION 3.16)
 
@@ -25,6 +28,9 @@ endif()
 if(TORCH_CUDA_ARCH_LIST)
   string(REPLACE "|" ";" TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}")
 endif()
+if(PYTORCH_ROCM_ARCH)
+  string(REPLACE "|" ";" PYTORCH_ROCM_ARCH "${PYTORCH_ROCM_ARCH}")
+endif()
 
 # ---------------------------------------------------------------------------
 # 1. Set up the build environment.
@@ -36,6 +42,13 @@ endif()
 set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
+set(ENV{PYTORCH_ROCM_ARCH} "${PYTORCH_ROCM_ARCH}")
+set(ENV{MOONCAKE_GPU_BACKEND} "${EP_GPU_BACKEND}")
+if(EP_USE_HCU)
+  set(ENV{MOONCAKE_EP_USE_HCU} "1")
+else()
+  unset(ENV{MOONCAKE_EP_USE_HCU})
+endif()
 if(EP_USE_MUSA)
   set(ENV{MOONCAKE_EP_USE_MUSA} "1")
 else()
@@ -81,6 +94,11 @@ if("${EP_TORCH_VERSIONS}" STREQUAL "")
     message(FATAL_ERROR "[EP] Extension build failed (exit code: ${_ret})")
   endif()
 else()
+  if(EP_GPU_BACKEND STREQUAL "hcu")
+    message(FATAL_ERROR
+      "[EP] Multi-version PyTorch wheel installation is not supported for HCU. "
+      "Use the DTK-compatible PyTorch already installed in the container.")
+  endif()
   message(STATUS "[EP] Building for PyTorch versions: ${EP_TORCH_VERSIONS}")
   foreach(_version IN LISTS EP_TORCH_VERSIONS)
     install_pytorch_wheel("${_version}" "${EP_CUDA_MAJOR}" "${EP_CUDA_MINOR}" "[EP]")

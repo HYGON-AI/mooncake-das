@@ -1,6 +1,6 @@
 // mooncake_worker_host.cpp — Host-side code for PG collectives.
-// Compiled by g++ for both CUDA and MUSA builds. Uses kernel launch wrappers
-// from mooncake_worker_kernels.cuh instead of <<<>>> syntax.
+// Compiled by the host compiler for CUDA, HIP/DCU and MUSA builds. Uses kernel
+// launch wrappers from mooncake_worker_kernels.cuh instead of <<<>>> syntax.
 
 #include <mooncake_backend.h>
 #include <cstdio>
@@ -8,11 +8,18 @@
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
 
 #include "pg_utils.h"
 
 namespace mooncake {
+
+PgStream pgTaskEnqueueStream(int device_index) {
+#ifdef MOONCAKE_PG_USE_HCU
+    return c10::hip::getStreamFromPoolMasqueradingAsCUDA(false, device_index);
+#else
+    return at::cuda::getStreamFromPool(false, device_index);
+#endif
+}
 
 class MooncakeWorkCpu : public ::c10d::Work {
    public:
@@ -93,8 +100,7 @@ class MooncakeWorkCuda : public ::c10d::Work {
         // waitUntilTasksSubmitted is totally unnecessary, but we keep it for
         // uniform behavior to avoid invasive changes to TE/TENT.
         bool submitted = true;
-        if (at::cuda::currentStreamCaptureStatus() ==
-            c10::cuda::CaptureStatus::None) {
+        if (!pgStreamCaptureActive()) {
             // Normal execution: block until tasks are submitted.
             submitted =
                 worker_->waitUntilTasksSubmitted(submitted_tasks_, timeout);
@@ -122,7 +128,7 @@ class MooncakeWorkCuda : public ::c10d::Work {
         //    until the operation is completed. In the case of CUDA collectives,
         //    will block the currently active CUDA stream until the operation
         //    is completed (but will not block the CPU)."
-        auto current_stream = at::cuda::getCurrentCUDAStream();
+        auto current_stream = pgCurrentStream();
         event_->block(current_stream);
         return true;
     }
@@ -141,12 +147,11 @@ class MooncakeBarrierWorkCuda : public MooncakeWorkCuda {
     bool wait(std::chrono::milliseconds timeout) override {
         // Skip host-side synchronization during CUDA graph capture.
         // cudaEventSynchronize is not permitted while a stream is capturing.
-        if (at::cuda::currentStreamCaptureStatus() !=
-            c10::cuda::CaptureStatus::None) {
+        if (pgStreamCaptureActive()) {
             // We still need stream-level synchronization so that subsequent
             // operations on the capture stream are ordered after the barrier
             // task on the enqueue stream.
-            auto current_stream = at::cuda::getCurrentCUDAStream();
+            auto current_stream = pgCurrentStream();
             event_->block(current_stream);
             return true;
         }
@@ -299,15 +304,31 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     int deviceCount = 0;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
     if (!err && deviceCount > 0) {
+#ifdef MOONCAKE_PG_USE_HCU
+        constexpr unsigned int flags =
+            hipHostMallocMapped | hipHostMallocCoherent |
+            hipHostMallocPortable;
+        err = hipHostMalloc(&tasks_, kNumTasks_ * sizeof(Task), flags);
+        TORCH_CHECK(err == hipSuccess,
+                    "Failed to allocate coherent mapped task ring: ",
+                    hipGetErrorString(err));
+        err = hipHostGetDevicePointer(
+            reinterpret_cast<void**>(&tasks_device_), tasks_, 0);
+        TORCH_CHECK(err == hipSuccess,
+                    "Failed to map task ring into HIP address space: ",
+                    hipGetErrorString(err));
+#else
         cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
         cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
+#endif
     } else {
         LOG(WARNING) << "No GPU device found. Only the `mooncake-cpu` backend "
                         "can be used.";
         tasks_ = new Task[kNumTasks_];
+        tasks_device_ = nullptr;
     }
     for (size_t i = 0; i < kNumTasks_; ++i) {
-        tasks_[i].active = false;
+        storeTaskActiveHost(tasks_[i], false);
         tasks_[i].submitSequence = 0;
         submitted_task_sequence_[i].store(0, std::memory_order_relaxed);
     }
@@ -354,7 +375,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         }
 
         int taskId = cpuTaskCount % 2;
-        TORCH_CHECK(!tasks_[taskId].active);
+        TORCH_CHECK(!loadTaskActiveHost(tasks_[taskId]));
 
         size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
         int bufferOffset = meta->taskCount % 2;
@@ -387,7 +408,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
             (*processNextChunk)();
         };
 
-        tasks_[taskId].active = true;
+        storeTaskActiveHost(tasks_[taskId], true);
         ++cpuTaskCount;
         ++meta->taskCount;
     };
@@ -401,17 +422,16 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     const std::shared_ptr<TransferGroupMeta>& meta,
     const std::shared_ptr<ConnectionContext>& connection_ctx,
-    const at::cuda::CUDAStream& issue_stream,
+    const PgStream& issue_stream,
     const std::function<void(void* dst, size_t pos, size_t realSize,
-                             const at::cuda::CUDAStream&)>& tensorToBuffer,
+                             const PgStream&)>& tensorToBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize,
-                             const at::cuda::CUDAStream&)>& bufferToTensor) {
+                             const PgStream&)>& bufferToTensor) {
     connection_ctx->waitUntilNewRanksConnected();
 
     size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
 
-    at::cuda::CUDAStream enq_stream =
-        at::cuda::getStreamFromPool(false, issue_stream.device_index());
+    PgStream enq_stream = pgTaskEnqueueStream(issue_stream.device_index());
 
     auto event_start = std::make_shared<torch::Event>(torch::kCUDA);
     event_start->record(issue_stream);

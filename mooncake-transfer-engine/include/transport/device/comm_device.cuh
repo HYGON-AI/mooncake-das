@@ -28,7 +28,7 @@ __device__ __forceinline__ CommCtx make_comm_ctx(
     void* gdr_buffer, const int32_t* nvlink_available,
     void* const* ipc_peer_ptrs, void* raddrs, void* rkeys, void* qp_devctxs,
     const void* rdma_send_signal_buffer, const void* rdma_recv_signal_buffer,
-    int rank, int num_ranks, int num_qps) {
+    int rank, int num_ranks, int num_qps, void* hdp_flush = nullptr) {
     CommCtx ctx;
     ctx.rank = rank;
 
@@ -45,6 +45,7 @@ __device__ __forceinline__ CommCtx make_comm_ctx(
     ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(rkeys);
     ctx.ibgda.local_atomic_base = rdma_send_signal_buffer;
     ctx.ibgda.remote_atomic_base = rdma_recv_signal_buffer;
+    ctx.ibgda.hdp_flush = reinterpret_cast<uint32_t*>(hdp_flush);
 
     return ctx;
 }

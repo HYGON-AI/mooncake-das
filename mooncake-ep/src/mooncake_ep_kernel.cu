@@ -37,106 +37,153 @@ __device__ __forceinline__ int ep_qp_channel(int expert_local_idx,
     return expert_local_idx % active_qps;
 }
 
-__global__ void mark_phase_ack_kernel(void* mxa_buffer,
-                                      const int32_t* nvlink_available,
-                                      void* const* ipc_peer_ptrs,
-                                      int* ack_buffer, int rank,
-                                      int num_ranks, int epoch) {
-    const CommCtx comm_ctx = make_comm_ctx(
-        mxa_buffer, nvlink_available, ipc_peer_ptrs, nullptr, nullptr, nullptr,
-        ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT);
+__device__ __forceinline__ void publish_phase_ack(
+        const CommCtx& comm_ctx, int* ack_buffer, int rank, int num_ranks,
+        int active_qps_per_rank, int epoch) {
+    if (threadIdx.x != 0)
+        return;
 
-    for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
-         peer += static_cast<int>(blockDim.x)) {
-        if (peer == rank) {
-            mc_st_release(ack_buffer + rank, epoch);
-        } else {
-            void* dst = mc_route_put(comm_ctx, peer, ack_buffer + rank);
-            if (dst != nullptr)
+    const int qps_per_rank = MAX_QP_COUNT / num_ranks;
+    const int active_qps =
+        active_qps_per_rank > 0 && active_qps_per_rank <= qps_per_rank
+            ? active_qps_per_rank
+            : qps_per_rank;
+
+    // Each active QP gets its own exact epoch marker. The marker is appended
+    // after all SEND-phase WQEs on that QP, so observing every marker provides
+    // a per-QP ordering fence without relying on CQ polling.
+    for (int channel = 0; channel < active_qps; ++channel)
+        mc_st_release(ack_buffer + rank * qps_per_rank + channel, epoch);
+    mc_fence();
+
+    for (int peer = 0; peer < num_ranks; ++peer) {
+        if (peer == rank)
+            continue;
+        for (int channel = 0; channel < active_qps; ++channel) {
+            int* ack_slot =
+                ack_buffer + rank * qps_per_rank + channel;
+            void* dst = mc_route_put(comm_ctx, peer, ack_slot);
+            if (dst != nullptr) {
                 mc_st_release(reinterpret_cast<int*>(dst), epoch);
+            } else if (comm_ctx.ibgda.qp_devctxs != nullptr &&
+                       comm_ctx.ibgda.raddrs != nullptr &&
+                       comm_ctx.ibgda.rkeys != nullptr) {
+                // This kernel intentionally serializes publication in lane 0;
+                // mc_rdma_put must not be issued by an arbitrary peer lane.
+                mc_rdma_put(comm_ctx, channel, peer, qps_per_rank, ack_slot,
+                            ack_slot, sizeof(int), 0);
+            }
         }
     }
 }
 
-__global__ void wait_phase_ack_kernel(int* ack_buffer, int rank, int num_ranks,
-                                      int epoch, int64_t timeout_ticks) {
-    for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
-         peer += static_cast<int>(blockDim.x)) {
-        if (peer == rank)
-            continue;
+__device__ __forceinline__ void await_phase_ack(
+        int* ack_buffer, int32_t* active_ranks, int rank, int num_ranks,
+        int active_qps_per_rank, int epoch, int64_t timeout_ticks) {
+    if (threadIdx.x != 0)
+        return;
 
-        int64_t start_time = static_cast<int64_t>(clock64());
-        while (mc_ld_acquire(ack_buffer + peer) < epoch) {
-            int64_t end_time = static_cast<int64_t>(clock64());
-            if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
-                return;
+    const int qps_per_rank = MAX_QP_COUNT / num_ranks;
+    const int active_qps =
+        active_qps_per_rank > 0 && active_qps_per_rank <= qps_per_rank
+            ? active_qps_per_rank
+            : qps_per_rank;
+    for (int peer = 0; peer < num_ranks; ++peer) {
+        if (peer == rank || !mc_ld_acquire(active_ranks + peer))
+            continue;
+        for (int channel = 0; channel < active_qps; ++channel) {
+            int64_t start_time = static_cast<int64_t>(ep_clock64());
+            int* ack_slot =
+                ack_buffer + peer * qps_per_rank + channel;
+            while (mc_ld_acquire(ack_slot) < epoch) {
+                int64_t end_time = static_cast<int64_t>(ep_clock64());
+                if (timeout_ticks != -1 &&
+                    end_time - start_time > timeout_ticks) {
+                    mc_st_release(active_ranks + peer, 0);
+                    printf("[EP] phase ACK timeout: peer=%d channel=%d "
+                           "epoch=%d observed=%d\n",
+                           peer, channel, epoch, mc_ld_acquire(ack_slot));
+                    return;
+                }
+            }
         }
     }
+}
+
+__global__ void mark_phase_ack_kernel(
+        void* mxa_buffer, const int32_t* nvlink_available,
+        void* const* ipc_peer_ptrs, void* raddrs, void* rkeys,
+        void* qp_devctxs, int* ack_buffer, int rank, int num_ranks,
+        int active_qps_per_rank, int epoch, void* hdp_flush) {
+    const CommCtx comm_ctx = make_comm_ctx(
+        mxa_buffer, nvlink_available, ipc_peer_ptrs, raddrs, rkeys,
+        qp_devctxs, ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT,
+        hdp_flush);
+    publish_phase_ack(comm_ctx, ack_buffer, rank, num_ranks,
+                      active_qps_per_rank, epoch);
+}
+
+__global__ void wait_phase_ack_kernel(
+        int* ack_buffer, int32_t* active_ranks, int rank, int num_ranks,
+        int active_qps_per_rank, int epoch, int64_t timeout_ticks) {
+    await_phase_ack(ack_buffer, active_ranks, rank, num_ranks,
+                    active_qps_per_rank, epoch, timeout_ticks);
 }
 
 __global__ void mark_and_wait_phase_ack_kernel(
         void* mxa_buffer, const int32_t* nvlink_available,
-        void* const* ipc_peer_ptrs, int* ack_buffer, int rank, int num_ranks,
-        int epoch, int64_t timeout_ticks) {
+        void* const* ipc_peer_ptrs, void* raddrs, void* rkeys,
+        void* qp_devctxs, int* ack_buffer, int32_t* active_ranks, int rank,
+        int num_ranks, int active_qps_per_rank, int epoch, void* hdp_flush,
+        int64_t timeout_ticks) {
     const CommCtx comm_ctx = make_comm_ctx(
-        mxa_buffer, nvlink_available, ipc_peer_ptrs, nullptr, nullptr, nullptr,
-        ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT);
-
-    for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
-         peer += static_cast<int>(blockDim.x)) {
-        if (peer == rank) {
-            mc_st_release(ack_buffer + rank, epoch);
-        } else {
-            void* dst = mc_route_put(comm_ctx, peer, ack_buffer + rank);
-            if (dst != nullptr)
-                mc_st_release(reinterpret_cast<int*>(dst), epoch);
-        }
-    }
-
+        mxa_buffer, nvlink_available, ipc_peer_ptrs, raddrs, rkeys,
+        qp_devctxs, ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT,
+        hdp_flush);
+    publish_phase_ack(comm_ctx, ack_buffer, rank, num_ranks,
+                      active_qps_per_rank, epoch);
     __syncthreads();
-
-    for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
-         peer += static_cast<int>(blockDim.x)) {
-        if (peer == rank)
-            continue;
-
-        int64_t start_time = static_cast<int64_t>(clock64());
-        while (mc_ld_acquire(ack_buffer + peer) < epoch) {
-            int64_t end_time = static_cast<int64_t>(clock64());
-            if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
-                return;
-        }
-    }
+    await_phase_ack(ack_buffer, active_ranks, rank, num_ranks,
+                    active_qps_per_rank, epoch, timeout_ticks);
 }
 
 void mark_phase_ack(void* mxa_buffer, const int32_t* nvlink_available,
-                    void* const* ipc_peer_ptrs, int* ack_buffer, int rank,
-                    int num_ranks, int epoch, cudaStream_t stream) {
-    SETUP_LAUNCH_CONFIG(1, 32, stream);
+                    void* const* ipc_peer_ptrs, void* raddrs, void* rkeys,
+                    void* qp_devctxs, int* ack_buffer, int rank, int num_ranks,
+                    int active_qps_per_rank, int epoch, ep_stream_t stream,
+                    void* hdp_flush) {
+    SETUP_LAUNCH_CONFIG(1, kWarpSize, stream);
     LAUNCH_KERNEL(&cfg, mark_phase_ack_kernel, mxa_buffer, nvlink_available,
-                  ipc_peer_ptrs, ack_buffer, rank, num_ranks, epoch);
+                  ipc_peer_ptrs, raddrs, rkeys, qp_devctxs, ack_buffer, rank,
+                  num_ranks, active_qps_per_rank, epoch, hdp_flush);
 }
 
-void wait_phase_ack(int* ack_buffer, int rank, int num_ranks, int epoch,
-                    cudaStream_t stream, int64_t timeout_ticks) {
-    SETUP_LAUNCH_CONFIG(1, 32, stream);
-    LAUNCH_KERNEL(&cfg, wait_phase_ack_kernel, ack_buffer, rank, num_ranks,
-                  epoch, timeout_ticks);
+void wait_phase_ack(int* ack_buffer, int32_t* active_ranks, int rank,
+                    int num_ranks, int active_qps_per_rank, int epoch,
+                    ep_stream_t stream, int64_t timeout_ticks) {
+    SETUP_LAUNCH_CONFIG(1, kWarpSize, stream);
+    LAUNCH_KERNEL(&cfg, wait_phase_ack_kernel, ack_buffer, active_ranks, rank,
+                  num_ranks, active_qps_per_rank, epoch, timeout_ticks);
 }
 
 void mark_and_wait_phase_ack(void* mxa_buffer,
                              const int32_t* nvlink_available,
-                             void* const* ipc_peer_ptrs, int* ack_buffer,
-                             int rank, int num_ranks, int epoch,
-                             cudaStream_t stream, int64_t timeout_ticks) {
-    SETUP_LAUNCH_CONFIG(1, 32, stream);
+                             void* const* ipc_peer_ptrs, void* raddrs,
+                             void* rkeys, void* qp_devctxs, int* ack_buffer,
+                             int32_t* active_ranks, int rank, int num_ranks,
+                             int active_qps_per_rank, int epoch,
+                             ep_stream_t stream, void* hdp_flush,
+                             int64_t timeout_ticks) {
+    SETUP_LAUNCH_CONFIG(1, kWarpSize, stream);
     LAUNCH_KERNEL(&cfg, mark_and_wait_phase_ack_kernel, mxa_buffer,
-                  nvlink_available, ipc_peer_ptrs, ack_buffer, rank, num_ranks,
-                  epoch, timeout_ticks);
+                  nvlink_available, ipc_peer_ptrs, raddrs, rkeys, qp_devctxs,
+                  ack_buffer, active_ranks, rank, num_ranks,
+                  active_qps_per_rank, epoch, hdp_flush, timeout_ticks);
 }
 
 template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
-__global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
+__global__ EP_LAUNCH_BOUNDS(
+    kNumWarpGroups * kNumWarpsPerGroup * kWarpSize, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count, int32_t* active_ranks,
@@ -151,18 +198,25 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* next_clean_buffer,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
-         int64_t timeout_ticks,
+         void* hdp_flush, int64_t timeout_ticks,
          int phases, int active_qps_per_rank) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
-    const auto warp_id = thread_id / 32, lane_id = get_lane_id();
+    const auto warp_id = thread_id / kWarpSize, lane_id = get_lane_id();
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const auto num_local_experts = num_experts / num_ranks;
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
     const auto responsible_expert_idx = sm_id * kNumWarpGroups + warp_group_id;
-#ifdef MOONCAKE_EP_USE_MACA
+#if defined(MOONCAKE_EP_USE_HCU)
+    // Every DCU wave participates in packing. The final wave subsequently
+    // computes expert counts; this keeps every wave at the workgroup barrier.
+    const bool is_count_warp = warp_id == num_warps - 1;
+    const bool is_count_worker = is_count_warp;
+    const bool is_data_warp = true;
+    const int num_send_threads = num_warps * kWarpSize;
+#elif defined(MOONCAKE_EP_USE_MACA)
     // C500 reports 64-thread hardware warps. Do not split the last hardware
     // warp by assigning only the final 32-thread pseudo-warp to count work.
     // Reserve one full warp group from the data path, but write counts from a
@@ -171,12 +225,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const bool is_count_worker = is_count_warp && sub_warp_id == 0;
     const bool is_data_warp = warp_group_id < kNumWarpGroups - 1;
     const int num_send_threads =
-        (kNumWarpGroups - 1) * kNumWarpsPerGroup * 32;
+        (kNumWarpGroups - 1) * kNumWarpsPerGroup * kWarpSize;
 #else
     const bool is_count_warp = warp_id == num_warps - 1;
     const bool is_count_worker = is_count_warp;
     const bool is_data_warp = warp_id < num_warps - 1;
-    const int num_send_threads = (num_warps - 1) * 32;
+    const int num_send_threads = (num_warps - 1) * kWarpSize;
 #endif
 
     // FP8 staffs
@@ -198,7 +252,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
         rdma_send_signal_buffer, rdma_recv_signal_buffer,
-        rank, num_ranks, MAX_QP_COUNT);
+        rank, num_ranks, MAX_QP_COUNT, hdp_flush);
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
@@ -216,7 +270,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     if (is_data_warp) {
         constexpr int kNumElemsPerRead = sizeof(int4) / EP_BF16_SIZE;
         EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
-        EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
+        EP_STATIC_ASSERT(kNumElemsPerRead * kWarpSize % kNumPerChannels == 0,
+                         "Invalid vectorization");
         const auto num_threads = num_send_threads;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
@@ -238,19 +293,26 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
                     if (kUseFP8) {
                         // Calculate local amax
-                        auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
+                        auto bf16_values =
+                            reinterpret_cast<ep_bfloat16*>(&int4_value);
                         float fp32_values[kNumElemsPerRead];
                         float amax = kFP8Margin, scale, scale_inv;
                         #pragma unroll
                         for (int j = 0; j < kNumElemsPerRead; ++ j) {
-                            fp32_values[j] = __bfloat162float(bf16_values[j]);
+                            fp32_values[j] =
+                                ep_bfloat16_to_float(bf16_values[j]);
                             amax = fmaxf(amax, fabsf(fp32_values[j]));
                         }
 
                         // Reduce amax and scale
-                        EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
+                        EP_STATIC_ASSERT(
+                            kNumElemsPerRead * kWarpSize / kNumPerChannels ==
+                                kWarpSize / 16,
+                            "Invalid vectorization");
                         amax = half_warp_reduce_max(amax), scale = kFP8Amax / amax, scale_inv = amax * kFP8AmaxInv;
-                        if (lane_id == 0 or lane_id == 16)
+                        if (lane_id %
+                                (kNumPerChannels / kNumElemsPerRead) ==
+                            0)
                             rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
 
                         // Cast into send buffer
@@ -272,7 +334,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             // Issue sends
             if (dst_expert_idx >= 0) {
                 int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
-                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
+                slot_idx = ep_shfl(slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
                 const auto src_ptr = reinterpret_cast<const void*>(rdma_x_src_idx);
@@ -301,7 +363,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 }
 
                 // Increase counter after finishing
-                __syncwarp();
+                ep_syncwarp();
                 lane_id == 0 ? mc_atomic_add_release(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
@@ -320,13 +382,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (sm_id == 0) {
             // The first SM is also responsible for cleaning the next buffer
             #pragma unroll
-            for (int i = lane_id; i < num_experts; i += 32)
+            for (int i = lane_id; i < num_experts; i += kWarpSize)
                 next_clean_buffer[i] = 0;
 
             // Notify before executing `int_p`
-            __syncwarp();
+            ep_syncwarp();
             #pragma unroll
-            for (int i = lane_id; i < num_experts; i += 32)
+            for (int i = lane_id; i < num_experts; i += kWarpSize)
                 mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
         }
 
@@ -337,7 +399,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
         // Per lane count
         #pragma unroll 8
-        for (int i = lane_id; i < num_tokens * num_topk; i += 32) {
+        for (int i = lane_id; i < num_tokens * num_topk; i += kWarpSize) {
             auto idx = static_cast<int>(__ldg(topk_idx + i));
             if (idx >= expert_begin_idx and idx < expert_end_idx)
                 expert_count[idx - expert_begin_idx] ++;
@@ -382,7 +444,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank == 0)
             packed_recv_count[dst_expert_local_idx] = 0;
     }
-    __syncwarp();
+    ep_syncwarp();
 
     // Receiving phase
     LOW_LATENCY_DISPATCH_RECV:
@@ -414,9 +476,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         int num_recv_tokens, recv_token_begin_idx;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         if (sub_warp_id == 1 and lane_id == 0) {
-            unsigned long long start_time = clock64();
+            unsigned long long start_time = ep_clock64();
             while ((num_recv_tokens = mc_ld_acquire(rdma_recv_signal_buffer + local_expert_idx * num_ranks + src_rank)) == 0) {
-                unsigned long long end_time = clock64();
+                unsigned long long end_time = ep_clock64();
                 if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
                     active_ranks[src_rank] = 0;
                 }
@@ -431,7 +493,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
             recv_range[src_rank] = pack2<int, int64_t>(num_recv_tokens, recv_token_begin_idx);
         }
-        mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+        mc_bar_sync(warp_group_id + 2,
+                    kNumWarpsPerGroup * kWarpSize);
         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
 
@@ -443,7 +506,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
             if (lane_id == 0)
                 recv_src_info[recv_token_begin_idx + i] = mc_ld_nc_s32(src_src_idx);
-            __syncwarp();
+            ep_syncwarp();
 
             // Copy data
             // NOTES: only 2 load iterations for 7K hidden with 7 unrolls
@@ -458,13 +521,20 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 const auto dst_scales = reinterpret_cast<float*>(recv_x_scales + recv_token_begin_idx + i);
                 const auto scale_stride = num_ranks * num_max_dispatch_tokens_per_rank;
                 auto scale_0 = lane_id < num_scales ? mc_ld_nc_f32(src_scales + lane_id) : 0;
-                auto scale_1 = (lane_id + 32) < num_scales ? mc_ld_nc_f32(src_scales + lane_id + 32) : 0;
+                auto scale_1 =
+                    (lane_id + kWarpSize) < num_scales
+                        ? mc_ld_nc_f32(src_scales + lane_id + kWarpSize)
+                        : 0;
                 lane_id < num_scales ? dst_scales[lane_id * scale_stride] = scale_0 : 0.0f;
-                (lane_id + 32) < num_scales ? dst_scales[(lane_id + 32) * scale_stride] = scale_1 : 0.0f;
+                (lane_id + kWarpSize) < num_scales
+                    ? dst_scales[(lane_id + kWarpSize) * scale_stride] =
+                          scale_1
+                    : 0.0f;
             }
         }
     } else {
-        mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+        mc_bar_sync(warp_group_id + 2,
+                    kNumWarpsPerGroup * kWarpSize);
     }
 }
 
@@ -481,10 +551,14 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-              void* workspace, cudaStream_t stream, int64_t timeout_ticks,
-              int phases, int active_qps_per_rank) {
+              void* workspace, ep_stream_t stream, void* hdp_flush,
+              int64_t timeout_ticks, int phases, int active_qps_per_rank) {
     constexpr int kNumMaxTopK = 11;
+#ifdef MOONCAKE_EP_USE_HCU
+    constexpr int kNumWarpsPerGroup = 2;
+#else
     constexpr int kNumWarpsPerGroup = 4;
+#endif
 #ifdef MOONCAKE_EP_USE_MUSA
     // MT S5000 benefits from slightly more CTAs while keeping enough warps for top-k<=11.
     constexpr int kNumWarpGroups = 5;
@@ -519,16 +593,17 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
-              num_topk, num_experts, rank, num_ranks, timeout_ticks, phases, \
-              active_qps_per_rank); } break
+              num_topk, num_experts, rank, num_ranks, hdp_flush, \
+              timeout_ticks, phases, active_qps_per_rank); } break
 
-    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * kWarpSize, stream);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
 
 template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
-__global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
+__global__ EP_LAUNCH_BOUNDS(
+    kNumWarpGroups * kNumWarpsPerGroup * kWarpSize, 1) void
 combine(void* combined_x, int32_t* active_ranks,
         void* mxa_buffer,
         int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
@@ -543,13 +618,13 @@ combine(void* combined_x, int32_t* active_ranks,
         int num_combined_tokens, int hidden, int num_topk,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
-        int64_t timeout_ticks,
+        void* hdp_flush, int64_t timeout_ticks,
         int phases, bool zero_copy, int active_qps_per_rank) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto num_threads = static_cast<int>(blockDim.x);
-    const auto warp_id = thread_id / 32, lane_id = get_lane_id();
+    const auto warp_id = thread_id / kWarpSize, lane_id = get_lane_id();
     const auto num_local_experts = num_experts / num_ranks;
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
@@ -568,7 +643,7 @@ combine(void* combined_x, int32_t* active_ranks,
         mxa_buffer, nvlink_available, ipc_peer_ptrs,
         raddrs, rkeys, qp_devctxs,
         rdma_send_signal_buffer, rdma_recv_signal_buffer,
-        rank, num_ranks, MAX_QP_COUNT);
+        rank, num_ranks, MAX_QP_COUNT, hdp_flush);
     const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
@@ -578,11 +653,11 @@ combine(void* combined_x, int32_t* active_ranks,
     // Clean up next buffer
     if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
         #pragma unroll
-        for (int i = lane_id; i < num_experts; i += 32)
+        for (int i = lane_id; i < num_experts; i += kWarpSize)
             next_clean_buffer[i] = 0;
 
         // Notify before executing `int_p`
-        __syncwarp();
+        ep_syncwarp();
         if (lane_id == 0)
             mc_atomic_add_release(atomic_clean_flag, num_experts);
     }
@@ -627,7 +702,7 @@ combine(void* combined_x, int32_t* active_ranks,
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                 if (not zero_copy)
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
-                __syncwarp();
+                ep_syncwarp();
                 mc_rdma_put(comm_ctx,
                             ep_qp_channel(local_expert_idx, num_qp_per_rank,
                                           active_qps_per_rank),
@@ -637,7 +712,8 @@ combine(void* combined_x, int32_t* active_ranks,
         }
         // Put finishing flag
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
-        mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+        mc_bar_sync(warp_group_id + 1,
+                    kNumWarpsPerGroup * kWarpSize);
         if (sub_warp_id == 1 and lane_id == 0) {
             while (mc_ld_acquire(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
@@ -651,9 +727,10 @@ combine(void* combined_x, int32_t* active_ranks,
             }
             mc_atomic_add_release(atomic_clean_flag, -1);
         }
-        __syncwarp();
+        ep_syncwarp();
     } else {
-        mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+        mc_bar_sync(warp_group_id + 1,
+                    kNumWarpsPerGroup * kWarpSize);
     }
 
     // Receiving phase
@@ -666,9 +743,9 @@ combine(void* combined_x, int32_t* active_ranks,
         const auto src_rank = responsible_expert_idx / num_local_experts;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0) {
-            unsigned long long start_time = clock64();
+            unsigned long long start_time = ep_clock64();
             while (mc_ld_acquire(rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
-                unsigned long long end_time = clock64();
+                unsigned long long end_time = ep_clock64();
                 if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
                     active_ranks[src_rank] = 0;
                 }
@@ -690,7 +767,8 @@ combine(void* combined_x, int32_t* active_ranks,
 
     // Reduce tokens with FP8 cast
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
-    EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
+    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumElemsPerInt4) == 0,
+                     "Invalid vectorization");
     if (thread_id < hidden_bf16_int4) {
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
             mc_fence();
@@ -716,18 +794,23 @@ combine(void* combined_x, int32_t* active_ranks,
 
                 // Reduce
                 auto x_vec = mc_ld_nc(reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id);
-                const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
+                const auto x_bf16 =
+                    reinterpret_cast<ep_bfloat16*>(&x_vec);
                 #pragma unroll
                 for (int j = 0; j < kNumElemsPerInt4; ++ j)
-                    combined_values[j] += __bfloat162float(x_bf16[j]) * reg_topk_weights[i];
+                    combined_values[j] +=
+                        ep_bfloat16_to_float(x_bf16[j]) *
+                        reg_topk_weights[i];
             }
 
             // Write results
             int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
-            auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
+            auto combined_bf16 =
+                reinterpret_cast<ep_bfloat16*>(&combined_values);
             #pragma unroll
             for (int j = 0; j < kNumElemsPerInt4; ++ j)
-                combined_bf16[j] = __float2bfloat16(combined_values[j]);
+                combined_bf16[j] =
+                    ep_float_to_bfloat16(combined_values[j]);
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
         }
     }
@@ -745,10 +828,14 @@ void combine(void* combined_x, int32_t* active_ranks,
              int* next_clean_buffer,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
-             void* workspace, cudaStream_t stream,
+             void* workspace, ep_stream_t stream, void* hdp_flush,
              int64_t timeout_ticks, int phases, bool zero_copy,
              int active_qps_per_rank) {
+#ifdef MOONCAKE_EP_USE_HCU
+    constexpr int kNumWarpsPerGroup = 2;
+#else
     constexpr int kNumWarpsPerGroup = 4;
+#endif
     constexpr int kNumWarpGroups = 8;
     constexpr int kNumMaxTopk = 11;
 
@@ -775,10 +862,10 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               atomic_clean_flag, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
-              num_experts, rank, num_ranks, \
+              num_experts, rank, num_ranks, hdp_flush, \
               timeout_ticks, phases, zero_copy, active_qps_per_rank); } break
 
-    SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+    SETUP_LAUNCH_CONFIG(num_sms, num_warps * kWarpSize, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }

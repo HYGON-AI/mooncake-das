@@ -29,8 +29,8 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
 // Host-callable kernel launch wrappers (compiled by mcc/nvcc, callable from
 // g++) g++ cannot compile <<<>>> syntax, so these wrappers are compiled by the
 // GPU compiler and provide plain C++ functions that the host code can call.
-// Both CUDA and MUSA use cudaStream_t in the declaration: on MUSA,
-// cuda_alike.h typedefs cudaStream_t to musaStream_t.
+// CUDA, HIP and MUSA use cudaStream_t in the declaration; cuda_alike.h maps
+// that surface to hipStream_t or musaStream_t for non-CUDA builds.
 
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,

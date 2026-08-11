@@ -1,14 +1,19 @@
 // mooncake_worker.cu — GPU kernel functions and launch wrappers.
-// Compiled by nvcc (CUDA) and mcc (MUSA, via mooncake_worker.mu symlink).
-// The __MUSA__ branch avoids torch headers to stay compatible with mcc.
+// Compiled by nvcc (CUDA), hipcc (HIP/DCU), and mcc (MUSA, via the generated
+// mooncake_worker.mu source). The __MUSA__ branch avoids torch headers to stay
+// compatible with mcc.
 
 #include <mooncake_worker_kernels.cuh>
+#include <transport/device/device_ops.cuh>
 
 #ifdef __MUSA__
 #include <musa_bf16.h>
 #endif
 
 namespace mooncake {
+
+using mooncake::device::mc_ld_acquire_u32;
+using mooncake::device::mc_st_release_u32;
 
 // ── Kernel functions ──────────────────────────────────────────────
 // Both CUDA and MUSA share the same kernel bodies. Parameters use plain
@@ -29,14 +34,13 @@ __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
     tasks[taskId].submitSequence = submitSequence;
     tasks[taskId].transferGroupMeta = meta;
 
-    // Publish task metadata before notifying the host worker thread.
-    __threadfence_system();
-    tasks[taskId].active = true;
+    // Publish task metadata before notifying the host worker thread.  The
+    // Device API supplies the system-scope semantics needed by CUDA, MUSA and
+    // HIP/DCU mapped host memory.
+    mc_st_release_u32(&tasks[taskId].active, kTaskActive);
 
     // Spin-wait until CPU proxy sets DONE
-    while (tasks[taskId].active) {
-        __threadfence_system();
-    }
+    while (mc_ld_acquire_u32(&tasks[taskId].active) == kTaskActive);
     for (int i = 0; i < numRanks; ++i) {
         activeRanksTensor[i] = activeRanks[i] ? 1 : 0;
     }

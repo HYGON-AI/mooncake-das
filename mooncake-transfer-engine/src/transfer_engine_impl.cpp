@@ -465,7 +465,8 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
 }
 
-#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HCU) ||  \
+     defined(USE_MACA)) &&                                          \
     !defined(USE_CXI)
 device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
     int num_ranks) {

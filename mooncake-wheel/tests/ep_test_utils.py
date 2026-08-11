@@ -5,16 +5,20 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 
-import mooncake.pg
+from mooncake import pg
 
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
     ip = os.getenv('MASTER_ADDR', '127.0.0.1')
     port = int(os.getenv('MASTER_PORT', '8361'))
-    num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    node_rank = int(os.getenv('RANK', 0))
-    assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
+    num_nodes = int(os.getenv('NNODES', 1))
+    node_rank = int(os.getenv('NODE_RANK', 0))
+    assert (num_local_ranks <= 8 and num_nodes == 1) or (
+        num_local_ranks >= 1 and num_nodes > 1
+    )
+
+    pg.set_host_ip(os.getenv('HOST_IP', '127.0.0.1'))
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(

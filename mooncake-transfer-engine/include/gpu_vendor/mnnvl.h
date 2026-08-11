@@ -14,7 +14,7 @@
 
 #pragma once
 
-#if defined(USE_HIP)
+#if defined(MOONCAKE_USE_HIP_RUNTIME)
 #include <transport/hip_transport/hip_transport.h>
 #define allocateFabricMemory(size) \
     mooncake::HipTransport::allocatePinnedLocalMemory(size)

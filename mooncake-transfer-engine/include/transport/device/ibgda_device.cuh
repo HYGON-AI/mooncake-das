@@ -22,6 +22,7 @@ struct IbgdaContext {
     const uint32_t* rkeys;
     const void* local_atomic_base;
     const void* remote_atomic_base;
+    uint32_t* hdp_flush;
 };
 
 __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext&, int, int, int,
@@ -37,7 +38,7 @@ __device__ __forceinline__ void mc_ibgda_red_add(const IbgdaContext&, int, int,
 
 #else  // !MOONCAKE_EP_USE_MACA
 
-#ifndef MOONCAKE_EP_USE_MUSA
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_HCU)
 #include <cuda/atomic>
 #endif
 #include <transport/device/ibgda/mlx5gda.h>
@@ -63,6 +64,7 @@ struct IbgdaContext {
     const uint32_t* rkeys;           // device ptr: [num_ranks] remote rkey
     const void* local_atomic_base;   // local scratch base for atomic responses
     const void* remote_atomic_base;  // symmetric remote signal base
+    uint32_t* hdp_flush;             // HCU host-data-path flush register
 };
 
 // ---------------------------------------------------------------------------
@@ -76,7 +78,10 @@ __device__ __forceinline__ mlx5gda_qp_devctx* mc_ibgda_channel(
 }
 
 __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_HCU)
+    while (__hip_atomic_exchange(&qp->mutex, 1u, __ATOMIC_ACQUIRE,
+                                 __HIP_MEMORY_SCOPE_SYSTEM) != 0u);
+#elif defined(MOONCAKE_EP_USE_MUSA)
     uint32_t old;
     do {
         old = atomicCAS(&qp->mutex, 0u, 1u);
@@ -88,7 +93,7 @@ __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
 }
 
 __device__ __forceinline__ void mc_ibgda_unlock(mlx5gda_qp_devctx* qp) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_HCU) || defined(MOONCAKE_EP_USE_MUSA)
     mc_st_release_u32(&qp->mutex, 0u);
 #else
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
@@ -100,22 +105,26 @@ __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
                                                  uint16_t expect) {
     uint16_t wq_tail = qp->wq_tail;
     while (static_cast<int16_t>(wq_tail - expect) <= 0) {
-        uint16_t cq_be =
-            *reinterpret_cast<volatile uint16_t*>(&qp->cq->wqe_counter);
+        uint16_t cq_be = mc_ld_acquire_u16(&qp->cq->wqe_counter);
         uint8_t opcode = qp->cq->op_own >> 4;
         if (opcode == 0xD)
             printf("[EP IBGDA] Requester error: syndrome=0x%lx\n",
                    qp->cq->timestamp >> 56);
         if (!(opcode == 0x0 || opcode == 0xF)) {
             printf("[EP IBGDA] Unexpected CQE opcode=0x%x, trapping\n", opcode);
-            __trap();
+            mc_trap();
         }
         wq_tail = mc_bswap16(cq_be) + 1;
     }
     if (wq_tail != qp->wq_tail) qp->wq_tail = wq_tail;
 }
 
-__device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
+__device__ __forceinline__ void mc_ibgda_post_send_db(
+    mlx5gda_qp_devctx* qp, uint32_t* hdp_flush) {
+    // HCU requires WQE stores to be visible through the DCU host data path
+    // before the NIC observes DBR/Blue Flame. Other platforms implement this
+    // hook as a no-op or a regular system fence.
+    mc_flush_hdp(hdp_flush);
     uint32_t num_posted = static_cast<uint32_t>(qp->wq_head);
     // DBR write — always done (NIC polls doorbell record in GPU memory)
     mc_st_release_u32(reinterpret_cast<uint32_t*>(&qp->dbr->send_counter),
@@ -207,7 +216,7 @@ __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
     mc_ibgda_write_rdma_write_wqe(qp, reinterpret_cast<uint64_t>(send_ptr),
                                   mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
                                   mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
-    mc_ibgda_post_send_db(qp);
+    mc_ibgda_post_send_db(qp, ctx.hdp_flush);
     mc_ibgda_unlock(qp);
 }
 
@@ -224,7 +233,7 @@ __device__ __forceinline__ void mc_ibgda_red_add(
     mc_ibgda_write_rdma_atomic_add_wqe(
         qp, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
         mc_bswap32(ctx.rkeys[dst_rank]));
-    mc_ibgda_post_send_db(qp);
+    mc_ibgda_post_send_db(qp, ctx.hdp_flush);
     mc_ibgda_unlock(qp);
 }
 

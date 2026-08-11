@@ -12,7 +12,7 @@
 using namespace mooncake;
 
 // Select protocol based on build configuration
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
 #define MNNVL_PROTOCOL "hip"
 #else
 #define MNNVL_PROTOCOL "nvlink"

@@ -68,11 +68,18 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                 recv_x_amin = recv_x[:, :-128].amin(dim=-1)
                 recv_src_info = recv_src_info[:num_valid_tokens]
                 assert torch.equal(recv_x_amin, recv_x[:, :-128].amax(dim=-1))
-                assert (recv_x[:, -128:] - recv_src_info.view(-1, 1) % num_tokens).sum().item() == 0
+                assert (
+                    recv_x[:, -128:]
+                    - recv_src_info.view(-1, 1) % num_tokens
+                ).abs().sum().item() == 0
                 for j in range(num_ranks):
                     begin_idx, count = (recv_layout_range[j] >> 32).item(), (recv_layout_range[j] & int_mask).item()
                     assert (recv_x_amin == j - rank_offset).sum().item() == (all_topk_idx[j] == expert_id).sum().item()
-                    assert (recv_x[begin_idx:begin_idx + count][:-128] - j).sum().item() == 0
+                    recv_segment = recv_x[begin_idx:begin_idx + count]
+                    if count:
+                        assert (
+                            recv_segment[:, :-128] - (j - rank_offset)
+                        ).abs().sum().item() == 0
                 if dispatch_use_fp8:
                     hash_value ^= hash_tensor(packed_recv_x[0][i, :num_valid_tokens])
                     hash_value ^= hash_tensor(packed_recv_x[1][i, :num_valid_tokens])
@@ -174,8 +181,8 @@ def test_loop(local_rank: int, num_local_ranks: int):
     if local_rank == 0:
         print(f'Allocating buffer size: {num_ep_buffer_bytes / 1e6} MB ...', flush=True)
     buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
-    # Mock a broken rank 1 to test effectiveness of EP recovery
-    if local_rank != 1:
+    # Mock global rank 1. local_rank would select one rank on every node.
+    if rank != 1:
         buffer.update_ep_member()
     else:
         buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
@@ -200,5 +207,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
 if __name__ == '__main__':
     # TODO: you may modify NUMA binding for less CPU overhead
-    num_processes = 2
+    num_processes = int(
+        os.getenv("LOCAL_WORLD_SIZE", torch.cuda.device_count())
+    )
     torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)

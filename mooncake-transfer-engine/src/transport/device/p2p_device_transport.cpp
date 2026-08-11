@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// P2P device transport — unified NVLink (CUDA) + MTLink (MUSA) implementation.
+// P2P device transport — unified CUDA/MUSA/MACA/HIP implementation.
 //
 // Uses cuda_alike.h so all cuda* APIs map to musa* when USE_MUSA is defined.
 // No #ifdef USE_MUSA / MOONCAKE_EP_USE_MUSA in this file.
@@ -26,7 +26,11 @@
 #include <cstring>
 #include <string>
 
+#ifdef USE_HCU
+#include "transport/device/hcu/hcu_runtime_aliases.h"
+#else
 #include "cuda_alike.h"
+#endif
 
 namespace mooncake {
 namespace device {
@@ -192,7 +196,13 @@ class P2pDeviceTransportImpl : public P2pTransport {
 
     void* allocateBuffer(size_t bytes) override {
         void* ptr = nullptr;
-#ifdef USE_MACA
+#ifdef USE_HCU
+        // GPU/CPU/NIC-visible EP state on DCU requires a fine-grained
+        // allocation. This is the allocation mode used by Hygon before the
+        // responsibility moved into Device API.
+        cudaError_t err =
+            hipExtMallocWithFlags(&ptr, bytes, hipDeviceMallocFinegrained);
+#elif defined(USE_MACA)
         int alloc_flag = macaAllocFlagFromEnv();
         cudaError_t err = alloc_flag == mcDeviceMallocDefault
                               ? cudaMalloc(&ptr, bytes)
@@ -285,7 +295,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
         cudaGetDevice(&device_id);
         int device_count = 0;
         cudaGetDeviceCount(&device_count);
-        CHECK_GT(device_count, 0) << "No CUDA/MUSA devices found";
+        CHECK_GT(device_count, 0) << "No accelerator devices found";
 
         std::vector<int32_t> available(num_ranks_, 0);
         available[rank] = 1;

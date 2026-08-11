@@ -1,4 +1,5 @@
 #pragma once
+#include <mooncake_ep_configs.cuh>
 // ============================================================================
 // mooncake_ep_device.h - Minimal platform-specific definitions
 // ============================================================================
@@ -7,7 +8,49 @@
 // to MUSA equivalents at build time via SimplePorting text replacement.
 // ============================================================================
 
-#ifdef MOONCAKE_EP_USE_MUSA
+#ifdef MOONCAKE_EP_USE_HCU
+
+#include <hip/hip_fp8.h>
+
+using ep_fp8_storage_t = __hip_fp8_storage_t;
+using ep_fp8x2_storage_t = __hip_fp8x2_storage_t;
+#if defined(__HIPCC__) || defined(__HIP_DEVICE_COMPILE__)
+__device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(
+    float2 x) {
+    return __hip_cvt_float2_to_fp8x2(x, __HIP_SATFINITE, __HIP_E4M3);
+}
+
+__forceinline__ __device__ int get_lane_id() {
+    return threadIdx.x % kWarpSize;
+}
+#endif
+
+#ifndef __ldg
+#define __ldg(ptr) (*(ptr))
+#endif
+
+// HIP/DCU uses split SEND/RECV launches, so grid synchronization is supplied
+// by stream ordering and a regular kernel launch is sufficient.
+#define EP_LAUNCH_BOUNDS(max_threads, min_blocks) \
+    __launch_bounds__(max_threads, min_blocks)
+
+#define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream) \
+    dim3 _grid(num_sms);                                  \
+    dim3 _block(num_threads);                             \
+    hipStream_t _stream = stream
+
+#define LAUNCH_KERNEL(config, kernel, ...)                    \
+    kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__);       \
+    {                                                         \
+        auto _err = hipGetLastError();                        \
+        if (_err != hipSuccess) {                             \
+            fprintf(stderr, "[EP] kernel launch failed: %s\n",\
+                    hipGetErrorString(_err));                 \
+        }                                                     \
+        CUDA_CHECK(_err);                                     \
+    }
+
+#elif defined(MOONCAKE_EP_USE_MUSA)
 
 // -- FP8 types (MUSA uses different names; not in torchada mapping) ----------
 #include <musa_fp8.h>
@@ -91,7 +134,7 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
         }                                                      \
     }
 
-#else  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
+#else  // CUDA
 
 // -- FP8 types (CUDA native names) -------------------------------------------
 #include <cuda_fp8.h>
@@ -128,7 +171,7 @@ __forceinline__ __device__ int get_lane_id() {
 #define LAUNCH_KERNEL(config, kernel, ...) \
     CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
 
-#endif  // MOONCAKE_EP_USE_MUSA / MOONCAKE_EP_USE_MACA
+#endif  // platform
 
 // Both platforms need IB verbs
 #ifndef MOONCAKE_EP_USE_MACA

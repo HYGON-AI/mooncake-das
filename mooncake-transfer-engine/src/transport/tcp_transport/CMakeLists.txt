@@ -1,6 +1,6 @@
 file(GLOB TCP_SOURCES "*.cpp")
 
-if (USE_HIP)
+if (MOONCAKE_USE_HIP_RUNTIME)
   hipify_files(TCP_SOURCES)
 endif()
 

@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -90,6 +91,7 @@ class HipTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+    std::unordered_set<void*> registered_device_regions_;
 
     // Stream and event pools for async operations
     StreamPool stream_pool_;

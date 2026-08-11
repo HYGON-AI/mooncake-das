@@ -69,9 +69,9 @@ struct SessionHeader {
     uint8_t opcode;
 };
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                         \
+    defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_MLU) ||         \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 static bool isCudaMemory(void* addr) {
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, addr);
@@ -186,9 +186,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                         \
+    defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_MLU) ||         \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
@@ -216,9 +216,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             *socket_, asio::buffer(dram_buffer, buffer_size),
             [this, addr, dram_buffer, cuda_device, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                         \
+    defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_MLU) ||         \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
                 if (cuda_device >= 0) {
                     delete[] dram_buffer;
                 }
@@ -255,9 +255,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                         \
+    defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_MLU) ||         \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
@@ -285,9 +285,9 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                     return;  // Connection will be closed
                 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                         \
+    defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_MLU) ||         \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
                 if (cuda_device >= 0) {
                     cudaSetDevice(cuda_device);
 #ifdef USE_MACA
@@ -393,9 +393,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                         \
+    defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_MLU) ||         \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];
@@ -421,9 +421,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                                 on_complete = std::move(on_complete_)]() {
                                    if (on_finalize)
                                        on_finalize(TransferStatusEnum::FAILED);
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                         \
+    defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_MLU) ||         \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
                                    if (cuda_device >= 0) delete[] dram_buffer;
 #endif
                                    session_mutex_.unlock();
@@ -432,9 +432,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     return;
                 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                         \
+    defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_MLU) ||         \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
                 if (cuda_device >= 0) {
                     cudaSetDevice(cuda_device);
 #ifdef USE_MACA
@@ -497,9 +497,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
+#if defined(USE_CUDA) || defined(USE_MUSA) ||                         \
+    defined(MOONCAKE_USE_HIP_RUNTIME) || defined(USE_MLU) ||         \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
             dram_buffer = new char[buffer_size];

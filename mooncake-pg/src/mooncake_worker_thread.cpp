@@ -35,7 +35,8 @@ bool MooncakeWorker::drainTasks(const TransferGroupMeta* meta) const {
     return waiter.wait_for(
         std::chrono::milliseconds(kDrainTasksTimeoutMs), [this, meta] {
             for (size_t i = 0; i < kNumTasks_; ++i) {
-                if (tasks_[i].active && tasks_[i].transferGroupMeta == meta)
+                if (loadTaskActiveHost(tasks_[i]) &&
+                    tasks_[i].transferGroupMeta == meta)
                     return false;
             }
             return true;
@@ -79,6 +80,9 @@ void MooncakeWorker::startWorker() {
             cudaSetDevice(cuda_device_index_);
         }
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
+        for (size_t i = 0; i < kNumTasks_; ++i) {
+            task_status[i].store(IDLE, std::memory_order_relaxed);
+        }
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
@@ -86,7 +90,7 @@ void MooncakeWorker::startWorker() {
             PAUSE();
             for (size_t i = 0; i < kNumTasks_; ++i) {
                 auto& task = tasks_[i];
-                if (!task.active) {
+                if (!loadTaskActiveHost(task)) {
                     task_status[i].store(IDLE, std::memory_order_release);
                     continue;
                 }
@@ -321,7 +325,7 @@ void MooncakeWorker::startWorker() {
                             signal_ptr[j] = 0;
                         }
                         task_status[i].store(DONE, std::memory_order_release);
-                        task.active = false;
+                        storeTaskActiveHost(task, false);
                         if (hasCallback_[i]) {
                             // Move the callback to release the captured values
                             // immediately after execution.

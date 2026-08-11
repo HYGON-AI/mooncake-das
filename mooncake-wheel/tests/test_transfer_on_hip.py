@@ -56,6 +56,7 @@ class TestTransferOnHip(unittest.TestCase):
     def test_transfer_sync_write(self):
         self.src_tensor.fill_(123)
         self.dst_tensor.zero_()
+        torch.cuda.synchronize()
 
         ret = self.engine.transfer_sync_write(
             self.target_name,
@@ -70,6 +71,7 @@ class TestTransferOnHip(unittest.TestCase):
     def test_transfer_sync_read(self):
         self.src_tensor.zero_()
         self.dst_tensor.fill_(77)
+        torch.cuda.synchronize()
 
         ret = self.engine.transfer_sync_read(
             self.target_name,
