@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #include "environ.h"
 
 #include <algorithm>
@@ -184,7 +188,7 @@ Environ::Environ(const EnvironSource& source) {
     redis_db_index_ = ReadInt(source, "MC_REDIS_DB_INDEX", 0);
     fragment_ratio_ = ReadInt(source, "MC_FRAGMENT_RATIO", 4);
     enable_dest_device_affinity_ =
-        ReadBool(source, "MC_ENABLE_DEST_DEVICE_AFFINITY", false);
+        ReadBool(source, "MC_ENABLE_DEST_DEVICE_AFFINITY", true);
     use_ipv6_ = ReadBool(source, "MC_USE_IPV6", false);
     min_rpc_port_ = ReadInt(source, "MC_MIN_RPC_PORT",
                             ReadInt(source, "MC_MIN_PRC_PORT", 15000));
