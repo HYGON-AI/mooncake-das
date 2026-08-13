@@ -60,7 +60,7 @@
     } while (0)
 #endif
 
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
 #define CHECK_HIP(call)                                                      \
     do {                                                                     \
         auto err = call;                                                     \

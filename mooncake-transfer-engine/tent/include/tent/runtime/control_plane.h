@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #ifndef TRANSFER_METADATA_V1_H
 #define TRANSFER_METADATA_V1_H
 
@@ -43,7 +47,7 @@ struct BootstrapDesc {
     std::string peer_nic_path;
     std::vector<uint32_t> qp_num;
     // RDMA address of local_nic_path.
-    uint16_t local_lid = 0;
+    uint32_t local_lid = 0;
     std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)

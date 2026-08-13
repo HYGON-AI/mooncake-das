@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 if(MOONCAKE_USE_HIP_RUNTIME)
@@ -84,14 +86,14 @@ add_executable(tcp_address_validation_test
 target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
 add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
 
-if(USE_MNNVL)
+if(USE_MNNVL OR MOONCAKE_USE_HIP_RUNTIME)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
   add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
 endif()
 
-if(USE_HIP)
+if(MOONCAKE_USE_HIP_RUNTIME)
   add_executable(hip_transport_test ${WORKSPACE}/hip_transport_test.cpp)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)

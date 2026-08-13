@@ -43,7 +43,7 @@
 #ifdef USE_INTRA_NVLINK
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 #endif
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
 #include "transport/hip_transport/hip_transport.h"
 #endif
 #ifdef USE_MACA
@@ -359,7 +359,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
 
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
     else if (std::string(proto) == "hip") {
         transport = new HipTransport();
     }

@@ -99,7 +99,7 @@ endif()
 
 if(MOONCAKE_USE_HIP_RUNTIME)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
-  target_link_libraries(transfer_engine PUBLIC hip::host rt)
+  target_link_libraries(transfer_engine PUBLIC hip::host rt ${CMAKE_DL_LIBS})
 
   # Optional dmabuf MR registration path (requires hsa-runtime64 and a kernel
   # with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).

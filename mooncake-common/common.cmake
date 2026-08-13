@@ -1,8 +1,12 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 
-option(ENABLE_DEBUG_SYMBOLS "Include debug symbols (-g) in compilation" ON)
+option(ENABLE_DEBUG_SYMBOLS "Include debug symbols (-g) in compilation" OFF)
 
 set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter -fPIC")
@@ -19,11 +23,13 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
       "${CMAKE_CXX_FLAGS_RELEASE} -fno-tree-slp-vectorize")
 endif()
 
-set(CMAKE_C_FLAGS_RELEASE "-O3")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 
-set(CMAKE_C_FLAGS_DEBUG "-O0")
-set(CMAKE_CXX_FLAGS_DEBUG "-O0")
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -g")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -g")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -g")
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror=thread-safety")
@@ -91,6 +97,7 @@ option(USE_HCU
 
 # Legacy Hygon CUDA-compatible DTK path
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
+option(USE_FAKE_HIP_RPC "option for using fake HCU RPC implementation" OFF)
 
 if(USE_HCU AND USE_HIP)
   message(FATAL_ERROR
@@ -137,6 +144,20 @@ option(USE_TPU
        "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter
         is loaded at runtime via dlopen, no build-time SDK required"
        OFF)
+option(USE_SHCA "option for using TianLong SHCA InfiniBand" OFF)
+
+if(USE_SHCA)
+  add_compile_definitions(USE_SHCA)
+  message(STATUS "TianLong SHCA InfiniBand is enabled")
+endif()
+
+if(USE_FAKE_HIP_RPC)
+  if(NOT USE_HCU)
+    message(FATAL_ERROR "USE_FAKE_HIP_RPC requires USE_HCU=ON")
+  endif()
+  add_compile_definitions(USE_FAKE_HIP_RPC)
+  message(STATUS "Using fake HCU RPC implementation")
+endif()
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -235,6 +256,7 @@ endif()
 if(USE_MNNVL)
   if(NOT USE_HIP
      AND NOT USE_HCU
+     AND NOT USE_HYGON
      AND NOT USE_MUSA
      AND NOT USE_MACA)
     set(USE_CUDA ON)
@@ -593,4 +615,8 @@ if(NOT TARGET gflags::gflags)
   endforeach()
 endif()
 find_package(yalantinglibs CONFIG REQUIRED)
-add_compile_definitions(YLT_ENABLE_IBV)
+# SHCA uses extended 17-bit LIDs incompatible with yalantinglibs ib_socket;
+# skip IBV RPC and fall back to TCP when USE_SHCA is ON.
+if(NOT USE_SHCA)
+  add_compile_definitions(YLT_ENABLE_IBV)
+endif()

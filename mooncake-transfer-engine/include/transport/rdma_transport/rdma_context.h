@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #ifndef RDMA_CONTEXT_H
 #define RDMA_CONTEXT_H
 
@@ -155,7 +159,7 @@ class RdmaContext {
     std::string nicPath() const;
 
    public:
-    uint16_t lid() const { return lid_; }
+    uint32_t lid() const { return lid_; }
 
     std::string gid() const;
 
@@ -230,7 +234,7 @@ class RdmaContext {
     ibv_comp_channel **comp_channel_ = nullptr;
 
     uint8_t port_ = 0;
-    uint16_t lid_ = 0;
+    uint32_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;
     int active_width_ = 1;

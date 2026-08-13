@@ -29,7 +29,7 @@
 #include "transport/efa_transport/efa_transport.h"
 #endif
 
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
 #include "transport/hip_transport/hip_transport.h"
 #endif
 
@@ -70,7 +70,7 @@ void initMemoryAllocator(const char* protocol) {
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
 #endif
     } else if (strcmp(protocol, "hip") == 0) {
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
         allocateMemory = [](size_t s) -> void* {
             return mooncake::HipTransport::allocatePinnedLocalMemory(s);
         };
@@ -79,7 +79,7 @@ void initMemoryAllocator(const char* protocol) {
         };
         LOG(INFO) << "Selected HIP memory allocator";
 #else
-        LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON";
+        LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON or -DUSE_HCU=ON";
 #endif
     } else if (strcmp(protocol, "nvlink_intra") == 0) {
 #ifdef USE_INTRA_NVLINK
@@ -182,7 +182,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* device_name,
                                     const char* metadata_type) {
     if (strcmp(protocol, "xgmi") == 0) {
-        LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
+        LOG(ERROR) << "This protocol alias is not exposed in the Python API. "
                    << "Use 'hip' instead.";
         return -1;
     }
@@ -1122,7 +1122,7 @@ PYBIND11_MODULE(engine, m) {
     m.attr("SUPPORT_EFA") = false;
 #endif
 
-#ifdef USE_HIP
+#ifdef MOONCAKE_USE_HIP_RUNTIME
     m.attr("SUPPORT_HIP") = true;
 #else
     m.attr("SUPPORT_HIP") = false;

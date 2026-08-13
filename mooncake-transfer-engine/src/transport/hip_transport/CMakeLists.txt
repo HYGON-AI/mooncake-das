@@ -1,6 +1,27 @@
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 file(GLOB HIP_TRANSPORT_SOURCES "*.cpp")
 
-add_library(hip_transport OBJECT ${HIP_TRANSPORT_SOURCES})
+if(USE_HCU)
+    set(COPY_KERNEL ${CMAKE_CURRENT_BINARY_DIR}/mc_copy_kernel.co)
+    find_program(HCU_HIPCC_EXECUTABLE NAMES hipcc REQUIRED)
+
+    add_custom_command(
+        OUTPUT ${COPY_KERNEL}
+        COMMAND ${HCU_HIPCC_EXECUTABLE} --genco -fPIC -x hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip
+                -o ${COPY_KERNEL}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip
+        COMMENT "Building HCU mc_copy_kernel.co"
+        VERBATIM
+    )
+
+    add_custom_target(mc_copy_kernel ALL DEPENDS ${COPY_KERNEL})
+    add_library(hip_transport OBJECT ${HIP_TRANSPORT_SOURCES})
+    add_dependencies(hip_transport mc_copy_kernel)
+else()
+    add_library(hip_transport OBJECT ${HIP_TRANSPORT_SOURCES})
+endif()
 
 target_include_directories(hip_transport PUBLIC ${HIP_INCLUDE_DIRS})
 

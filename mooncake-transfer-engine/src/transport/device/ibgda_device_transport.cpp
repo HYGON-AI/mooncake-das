@@ -24,6 +24,9 @@
 #include <glog/logging.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -185,7 +188,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         is_roce_ = (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET);
+#ifdef USE_SHCA
+        lid_ = u17_to_32(port_attr.lid);
+#else
         lid_ = port_attr.lid;
+#endif
         device_name_ = nic;
 
         pd_ = ibv_alloc_pd(ctx_);
@@ -364,7 +371,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 ah_attr.port_num = 1;
                 ah_attr.dlid = qps_[i]->port_attr.lid | 0xC000;
             } else {
+#ifdef USE_SHCA
+                ah_attr.dlid = u32_to_17(static_cast<uint32_t>(remote_lids[i]));
+#else
                 ah_attr.dlid = static_cast<uint16_t>(remote_lids[i]);
+#endif
                 ah_attr.port_num = 0;
             }
 
@@ -485,7 +496,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     void* mr_ptr_ = nullptr;
     ibv_gid gid_{};
     int gid_index_ = -1;
-    uint16_t lid_ = 0;
+    uint32_t lid_ = 0;
     bool is_roce_ = false;
     std::string device_name_;
     std::vector<std::string> device_filter_;

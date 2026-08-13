@@ -1,7 +1,19 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 import sys
+import os
 import platform
 from setuptools import setup, Distribution
 from wheel.bdist_wheel import bdist_wheel
+import subprocess
+from typing import Optional
+
+pwd = os.path.dirname(os.path.abspath(__file__))
+add_git_version = False
+if int(os.environ.get('ADD_GIT_VERSION', '0')) == 1:
+    add_git_version = True
 
 # ---------------------------------------------------------------------------
 # Platform guard
@@ -29,8 +41,14 @@ def _detect_manylinux_tag() -> str:
     Falls back to 'manylinux_2_17' if detection fails for maximum compatibility.
     """
     if glibc_version_string is not None:
-        ver = glibc_version_string()
+        try:
+            ver = glibc_version_string()
+        except Exception:
+            ver = None
     else:
+        ver = None
+
+    if ver is None:
         import subprocess
         import shutil
 
@@ -146,13 +164,94 @@ def get_platform() -> str:
     return f"{get_system()}_{get_arch()}"
 
 
+def get_version_add(sha: Optional[str] = None) -> str:
+    deepep_root = os.path.dirname(os.path.abspath(__file__))
+    add_version_path = os.path.join(os.path.join(deepep_root, "mooncake"), "version.py")
+    version = "das.opt1"
+
+    if add_git_version:
+        if sha != 'Unknown':
+            if sha is None:
+                sha = subprocess.check_output(
+                    ['git', '-c', f'safe.directory={deepep_root}', 'rev-parse', 'HEAD'],
+                    cwd=deepep_root,
+                ).decode('ascii').strip()
+            version = f"{version}.{sha[:7]}"
+
+    sdk_path = os.getenv("DTK_HOME") or os.getenv("ROCM_PATH")
+    if sdk_path:
+        rocm_path = sdk_path
+        rocm_version_path = os.path.join(rocm_path, '.info', "rocm_version")
+        if os.path.isfile(rocm_version_path):
+            with open(rocm_version_path, 'r', encoding='utf-8') as file:
+                rocm_version = file.readline().strip().replace(".", "")
+            if rocm_version:
+                version += ".dtk" + rocm_version
+
+    new_version_content = f"""
+try:
+    __version__ = "0.3.11.post1"
+    __version_tuple__ = (0, 3, 11, 'post1')
+    __hcu_version__ = f'0.3.11.post1+{version}'
+
+    from mooncake.version import __version__, __version_tuple__, __hcu_version__
+except Exception as e:
+    import warnings
+    warnings.warn(f"Failed to read generated version metadata:\\n{{e}}",
+                  RuntimeWarning, stacklevel=2)
+    __version__ = "dev"
+    __version_tuple__ = (0, 0, __version__)
+
+def _prev_minor_version_was(version_str):
+    '''Check whether a given version matches the previous minor version.
+
+    Return True if version_str matches the previous minor version.
+
+    For example - return True if the current version is 0.7.4 and the
+    supplied version_str is '0.6'.
+
+    Used for --show-hidden-metrics-for-version.
+    '''
+    # Match anything if this is a dev tree
+    if __version_tuple__[0:2] == (0, 0):
+        return True
+
+    # Note - this won't do the right thing when we release 1.0!
+    # assert __version_tuple__[0] == 0
+    assert isinstance(__version_tuple__[1], int)
+    return version_str == f"{{__version_tuple__[0]}}.{{__version_tuple__[1] - 1}}"
+
+def _prev_minor_version():
+    '''For the purpose of testing, return a previous minor version number.'''
+    # In dev tree, this will return "0.-1", but that will work fine"
+    assert isinstance(__version_tuple__[1], int)
+    return f"{{__version_tuple__[0]}}.{{__version_tuple__[1] - 1}}"
+"""
+
+    with open(add_version_path, encoding="utf-8",mode="w") as file:
+        file.write(new_version_content)
+    file.close()
+
+
+def get_version() -> str:
+    get_version_add()
+    version_file = 'mooncake/version.py'
+    with open(version_file, encoding='utf-8') as f:
+        exec(compile(f.read(), version_file, 'exec'))
+    return locals()['__hcu_version__']
+
+
+def get_mooncake_version() -> str:
+    version = get_version()
+    return version
+
+
 # ---------------------------------------------------------------------------
 # dist / cmd hooks
 # ---------------------------------------------------------------------------
 class BinaryDistribution(Distribution):
     def has_ext_modules(self):
         return True
-
 
 class CustomBdistWheel(bdist_wheel):
     def finalize_options(self):
@@ -166,6 +265,7 @@ class CustomBdistWheel(bdist_wheel):
 # setup()
 # ---------------------------------------------------------------------------
 setup(
+    version=get_mooncake_version(),
     distclass=BinaryDistribution,
     cmdclass={"bdist_wheel": CustomBdistWheel},
 )

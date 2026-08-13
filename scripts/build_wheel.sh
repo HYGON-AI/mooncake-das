@@ -1,4 +1,8 @@
 #!/bin/bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Script to build the mooncake wheel package
 # Usage: ./scripts/build_wheel.sh [python_version] [output_dir]
 # Example: ./scripts/build_wheel.sh 3.10 dist-3.10
@@ -23,6 +27,8 @@ echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
+# Hygon HCU copy kernel artifact (only present when built with -DUSE_HCU=ON)
+rm -f mooncake-wheel/mooncake/*.co
 
 echo "Creating directory structure..."
 
@@ -31,6 +37,13 @@ cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
+
+# Copy Hygon HCU mc_copy_kernel.co when built with -DUSE_HCU=ON
+MC_COPY_KERNEL="${BUILD_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co"
+if [ -f "${MC_COPY_KERNEL}" ]; then
+    echo "Copying mc_copy_kernel (USE_HCU)..."
+    cp "${MC_COPY_KERNEL}" mooncake-wheel/mooncake/mc_copy_kernel.co
+fi
 
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
@@ -261,6 +274,20 @@ else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
 
+# Handle package name modification for TianLong SHCA builds
+if [ "$SHCA_BUILD" = "1" ]; then
+    echo "Modifying package name for TianLong SHCA build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-shca"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (TianLong SHCA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "tianlong", "shca"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-shca"
+else
+    echo "Using standard package name: mooncake-transfer-engine"
+fi
+
 echo "Cleaning up previous build artifacts..."
 rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
@@ -275,7 +302,7 @@ if [ "$NPU_BUILD" = "1" ]; then
     max_attempts=3
     attempt=1
     while [ $attempt -le $max_attempts ]; do
-        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel; then
+        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel==6.7.0; then
             break
         fi
         echo "pip install attempt $attempt/$max_attempts failed, retrying in 5s..."
@@ -287,10 +314,10 @@ if [ "$NPU_BUILD" = "1" ]; then
         exit 1
     fi
 elif command -v pip &>/dev/null; then
-    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
+    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel==6.7.0
 elif command -v uv &>/dev/null; then
     uv pip install --upgrade pip
-    uv pip install build setuptools wheel auditwheel
+    uv pip install build setuptools wheel auditwheel==6.7.0
 else
     echo "Error: Neither python${PYTHON_VERSION}, pip nor uv found"
     exit 1
@@ -363,6 +390,7 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 
+set +x
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
@@ -412,6 +440,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libamdhip64.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \
+    --exclude libgalaxyhip.so* \
     --exclude libc10.so* \
     --exclude libc10_cuda.so* \
     --exclude libtorch.so* \
@@ -454,6 +483,8 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
+set -x
+echo "auditwheel repair finished"
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
 # can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so

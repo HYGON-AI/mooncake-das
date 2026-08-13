@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #include "transport/rdma_transport/rdma_context.h"
 
 #include <algorithm>
@@ -21,6 +25,9 @@
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <unistd.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <atomic>
 #include <cassert>
@@ -813,7 +820,7 @@ bool RdmaContext::reprobeAutoGid(
     std::string next_gid_string;
     int current_gid_index = -1;
     int next_gid_index = -1;
-    uint16_t current_lid = 0;
+    uint32_t current_lid = 0;
     ibv_context *current_context = nullptr;
     uint8_t current_port = 0;
     AutoGidCandidateClass next_candidate_class =
@@ -1133,7 +1140,11 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // All checks passed, assign member variables
         context_ = context;
         port_ = port;
+#ifdef USE_SHCA
+        lid_ = u17_to_32(attr.lid);
+#else
         lid_ = attr.lid;
+#endif
         active_mtu_ = attr.active_mtu;
         active_speed_ = attr.active_speed;
         active_width_ = attr.active_width;

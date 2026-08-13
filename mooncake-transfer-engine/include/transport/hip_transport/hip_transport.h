@@ -1,5 +1,9 @@
 // Copyright(C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #ifndef HIP_TRANSPORT_H_
 #define HIP_TRANSPORT_H_
 
@@ -96,6 +100,14 @@ class HipTransport : public Transport {
     // Stream and event pools for async operations
     StreamPool stream_pool_;
     EventPool event_pool_;
+
+#ifdef USE_HCU
+    // Copy kernels for Hygon HCU fabric memory
+    bool module_loaded_ = false;
+    std::unordered_map<int, hipModule_t> device_copy_modules_;
+    std::unordered_map<int, hipFunction_t> device_copy_funcs_;
+    void loadCopyModule();
+#endif
 };
 
 }  // namespace mooncake

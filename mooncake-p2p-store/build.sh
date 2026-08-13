@@ -74,10 +74,13 @@ if [ "$USE_HTTP" = "ON" ]; then
 fi
 
 go get
-go build -o "$TARGET/p2p-store-example" -ldflags="-extldflags '$EXT_LDFLAGS'" "../example/p2p-store-example.go"
-if [ $? -ne 0 ]; then
+BUILD_ERR=$(mktemp)
+if ! go build -o "$TARGET/p2p-store-example" -ldflags="-extldflags '$EXT_LDFLAGS'" "../example/p2p-store-example.go" >"$BUILD_ERR" 2>&1; then
+    cat "$BUILD_ERR" >&2
     echo "Error: Failed to build the example."
+    rm -f "$BUILD_ERR"
     exit 1
 fi
+rm -f "$BUILD_ERR"
 
 echo "P2P Store: build successfully"

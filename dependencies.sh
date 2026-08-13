@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Color definitions
 GREEN="\033[0;32m"
 BLUE="\033[0;34m"
@@ -110,7 +114,7 @@ echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
 echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
-echo -e "  - Git submodules (including pybind11 and yalantinglibs)"
+echo -e "  - Bundled third-party sources (including pybind11 and yalantinglibs)"
 echo -e "  - Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  - SPDK (for NVMe-oF support)"
@@ -149,6 +153,14 @@ fi
 print_section "Installing system packages"
 echo -e "${YELLOW}This may take a few minutes...${NC}"
 
+USE_SHCA=OFF
+if [ -f "/usr/include/infiniband/shca_17b_types.h" ]; then
+    USE_SHCA=ON
+    echo -e "${GREEN}SHCA headers detected. Will build with SHCA support.${NC}"
+else
+    echo -e "${YELLOW}SHCA headers not found. Will build without SHCA support.${NC}"
+fi
+
 if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     SYSTEM_PACKAGES="build-essential \
                      cmake \
@@ -183,6 +195,16 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      patchelf \
                      libc6-dev \
                      libc-bin"
+
+    # TianLong SHCA (shca-tools) ships its own libibverbs headers/libs; installing
+    # libibverbs-dev conflicts with it. libboost-all-dev pulls OpenMPI/libfabric,
+    # which also depend on distro ibverbs and fail on SHCA systems.
+    if [ "$USE_SHCA" = "ON" ]; then
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/libibverbs-dev//g')
+        SAFE_BOOST="libboost-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-program-options-dev libboost-regex-dev libboost-serialization-dev"
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed "s/libboost-all-dev/$SAFE_BOOST/g")
+        echo -e "${GREEN}SHCA headers detected. Will build with SHCA support and adjust system packages accordingly.${NC}"
+    fi
 
     apt-get install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
@@ -224,31 +246,10 @@ fi
 
 print_success "System packages installed successfully"
 
-# Initialize and update git submodules
-print_section "Initializing Git Submodules"
-
-# Check if .gitmodules exists
-if [ -f "${REPO_ROOT}/.gitmodules" ]; then
-    echo "Enter repository root: ${REPO_ROOT}"
-    cd "${REPO_ROOT}"
-    check_success "Failed to change to repository root directory"
-
-    echo "Initializing git submodules..."
-    git submodule sync --recursive
-    check_success "Failed to sync git submodules"
-    git submodule update --init --recursive
-    check_success "Failed to initialize git submodules"
-
-    print_success "Git submodules initialized and updated successfully"
-else
-    echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
-    exit 1
-fi
-
-# Build and install yalantinglibs from submodule
+# Build and install the bundled yalantinglibs source tree
 print_section "Installing yalantinglibs"
 cd "${REPO_ROOT}/extern/yalantinglibs"
-check_success "Failed to change to yalantinglibs submodule directory"
+check_success "Failed to change to bundled yalantinglibs directory"
 
 mkdir -p build
 check_success "Failed to create build directory"
@@ -300,6 +301,7 @@ install_go() {
     fi
 
     GO_TARBALL="go$GOVER.linux-$ARCH.tar.gz"
+    GO_LOCAL_TARBALL="/tmp/go-install.tar.gz"
 
     # Try multiple download mirrors with fallback
     GO_DOWNLOAD_URLS=(
@@ -309,18 +311,20 @@ install_go() {
     )
 
     DOWNLOAD_SUCCESS=false
+    mirror_idx=0
     for url in "${GO_DOWNLOAD_URLS[@]}"; do
-        echo "Downloading Go $GOVER from ${url}..."
-        if wget -q --show-progress --timeout=30 --tries=2 -O "${GO_TARBALL}" "${url}"; then
+        mirror_idx=$((mirror_idx + 1))
+        echo "Downloading Go $GOVER (mirror ${mirror_idx}/${#GO_DOWNLOAD_URLS[@]})..."
+        if wget -q --timeout=30 --tries=2 -O "${GO_LOCAL_TARBALL}" "${url}"; then
             DOWNLOAD_SUCCESS=true
             if [[ "$url" != "https://go.dev/dl/${GO_TARBALL}" ]]; then
                 USED_CN_MIRROR=true
             fi
-            print_success "Downloaded Go $GOVER from ${url}"
+            print_success "Downloaded Go $GOVER"
             break
         else
-            echo -e "${YELLOW}Failed to download from ${url}, trying next mirror...${NC}"
-            rm -f "${GO_TARBALL}"
+            echo -e "${YELLOW}Download failed, trying next mirror...${NC}"
+            rm -f "${GO_LOCAL_TARBALL}"
         fi
     done
 
@@ -329,10 +333,11 @@ install_go() {
     fi
 
     echo "Installing Go $GOVER..."
-    tar -C /usr/local -xzf "${GO_TARBALL}"
+    tar -C /usr/local -xzf "${GO_LOCAL_TARBALL}"
     check_success "Failed to install Go $GOVER"
 
-    rm -f "${GO_TARBALL}"
+    # Clean up downloaded file
+    rm -f "${GO_LOCAL_TARBALL}"
     check_success "Failed to clean up Go installation file"
 
     print_success "Go $GOVER installed successfully"
@@ -442,7 +447,7 @@ echo -e "${GREEN}All dependencies have been successfully installed!${NC}"
 echo -e "The following components were installed:"
 echo -e "  ${GREEN}✓${NC} System packages"
 echo -e "  ${GREEN}✓${NC} yalantinglibs"
-echo -e "  ${GREEN}✓${NC} Git submodules"
+echo -e "  ${GREEN}✓${NC} Bundled third-party sources"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"

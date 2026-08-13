@@ -16,7 +16,7 @@
 
 #ifdef USE_CUDA
 #include "tent/platform/cuda.h"
-#elif defined(USE_HIP)
+#elif defined(MOONCAKE_USE_HIP_RUNTIME)
 #include "tent/platform/rocm.h"
 #elif defined(USE_SUNRISE)
 #include "tent/platform/sunrise.h"
@@ -37,7 +37,7 @@ Platform& Platform::getLoader(std::shared_ptr<Config> conf) {
     std::call_once(flag, [&]() {
 #ifdef USE_CUDA
         g_instance = std::make_shared<CudaPlatform>(conf);
-#elif defined(USE_HIP)
+#elif defined(MOONCAKE_USE_HIP_RUNTIME)
         g_instance = std::make_shared<RocmPlatform>(conf);
 #elif defined(USE_SUNRISE)
         g_instance = std::make_shared<SunrisePlatform>(conf);

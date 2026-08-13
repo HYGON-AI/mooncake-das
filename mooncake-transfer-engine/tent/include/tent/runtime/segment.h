@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #ifndef SEGMENT_H
 #define SEGMENT_H
 
@@ -47,7 +51,7 @@ struct DeviceDesc {
     std::unordered_map<TransportType, std::string> transport_attrs;
 
     // backward compatilble
-    uint16_t lid;
+    uint32_t lid;
     std::string gid;
 
    public:
