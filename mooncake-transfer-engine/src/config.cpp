@@ -270,11 +270,13 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* slice_size_env = std::getenv("MC_SLICE_SIZE");
     if (slice_size_env) {
         size_t val = atoi(slice_size_env);
-        if (val > 0)
+        if (val > 0) {
             config.slice_size = val;
-        else
+            config.fragment_limit = config.slice_size / 4;
+        } else {
             LOG(WARNING)
                 << "Ignore value from environment variable MC_SLICE_SIZE";
+        }
     }
 
     const char* min_reg_size_env = std::getenv("MC_MIN_REG_SIZE");

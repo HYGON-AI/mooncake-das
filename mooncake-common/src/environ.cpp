@@ -176,7 +176,7 @@ Environ::Environ(const EnvironSource& source) {
     max_inline_ = ReadInt(source, "MC_MAX_INLINE", 64);
     mtu_ = ReadInt(source, "MC_MTU", 4096);
     workers_per_ctx_ = ReadInt(source, "MC_WORKERS_PER_CTX", 2);
-    slice_size_ = ReadSizeT(source, "MC_SLICE_SIZE", 65536);
+    slice_size_ = ReadSizeT(source, "MC_SLICE_SIZE", 1048576);
     retry_cnt_ = ReadInt(source, "MC_RETRY_CNT", 9);
     log_level_ = ReadString(source, "MC_LOG_LEVEL", "INFO");
     disable_metacache_ = ReadBool(source, "MC_DISABLE_METACACHE", false);

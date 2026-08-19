@@ -552,14 +552,19 @@ TEST_F(NumCqEnvTest, AlsoSetsJfcAndJfce) {
 
 class SliceSizeEnvTest : public ::testing::Test {
    protected:
-    void TearDown() override { ::unsetenv("MC_SLICE_SIZE"); }
+    void TearDown() override {
+        ::unsetenv("MC_SLICE_SIZE");
+        ::unsetenv("MC_FRAGMENT_RATIO");
+    }
 };
 
-TEST_F(SliceSizeEnvTest, DefaultIs65536) {
+TEST_F(SliceSizeEnvTest, DefaultIs1048576) {
     ::unsetenv("MC_SLICE_SIZE");
+    ::unsetenv("MC_FRAGMENT_RATIO");
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.slice_size, 65536u);
+    EXPECT_EQ(config.slice_size, 1048576u);
+    EXPECT_EQ(config.fragment_limit, config.slice_size / 4);
 }
 
 TEST_F(SliceSizeEnvTest, ValidOverride) {
@@ -567,6 +572,7 @@ TEST_F(SliceSizeEnvTest, ValidOverride) {
     GlobalConfig config;
     loadGlobalConfig(config);
     EXPECT_EQ(config.slice_size, 131072u);
+    EXPECT_EQ(config.fragment_limit, config.slice_size / 4);
 }
 
 TEST_F(SliceSizeEnvTest, ZeroIsRejected) {

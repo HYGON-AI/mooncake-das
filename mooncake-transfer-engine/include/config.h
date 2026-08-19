@@ -65,7 +65,7 @@ struct GlobalConfig {
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
     int workers_per_ctx = 2;
-    size_t slice_size = 65536;
+    size_t slice_size = 1048576;
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
@@ -98,7 +98,7 @@ struct GlobalConfig {
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
-    size_t fragment_limit = 16384;
+    size_t fragment_limit = slice_size / 4;
     bool enable_dest_device_affinity = true;
     bool enable_hca_peer_affinity = false;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
