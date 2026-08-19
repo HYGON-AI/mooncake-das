@@ -38,6 +38,7 @@ This project is based on upstream [Mooncake](https://github.com/kvcache-ai/Moonc
 
 - Upstream repository: https://github.com/kvcache-ai/Mooncake
 - Upstream branch: `main`
+- Upstream Tag: `v0.3.13.post1`
 - Upstream Commit: `719735896c86b56fabec6cf3e825fb2ea640597a`
 - Upstream license: Apache-2.0
 
