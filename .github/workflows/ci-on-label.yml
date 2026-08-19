@@ -1,0 +1,86 @@
+name: Retrigger CI on run-ci label
+
+# Same-SHA retrigger for Build & Test. This is a separate workflow so labels
+# other than `run-ci` (especially `run-e2e-ci`) cannot start or cancel
+# `.github/workflows/ci.yml`.
+#
+# pull_request_target is required so fork PRs can rerun Actions. This
+# workflow only calls the GitHub API; it does not check out PR code.
+on:
+  pull_request_target:
+    branches:
+      - "main"
+      - "release/**"
+    types: [labeled]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  retrigger:
+    if: >
+      github.event.label.name == 'run-ci' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Re-run Build & Test for this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_id=""
+          status=""
+          last_observation=""
+          for _ in {1..60}; do
+            run_json=$(gh api \
+              "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=pull_request&per_page=20")
+            run_id=$(echo "$run_json" | jq -r '.workflow_runs[0].id // empty')
+            status=$(echo "$run_json" | jq -r '.workflow_runs[0].status // empty')
+
+            observation="${run_id:-not-found}:${status:-unknown}"
+            if [ "$observation" != "$last_observation" ]; then
+              echo "Build & Test observation: ${observation}"
+              last_observation="$observation"
+            fi
+            if [ -n "$run_id" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ -z "$run_id" ]; then
+            echo "::error::Timed out waiting for a Build & Test run for SHA ${SHA}."
+            exit 1
+          fi
+
+          if [ "$status" != "completed" ]; then
+            echo "Cancelling active Build & Test run ${run_id} before the full rerun."
+            if ! gh run cancel "$run_id" --repo "$REPO"; then
+              status=$(gh api "repos/${REPO}/actions/runs/${run_id}" --jq '.status')
+              if [ "$status" != "completed" ]; then
+                echo "::error::Failed to cancel Build & Test run ${run_id}."
+                exit 1
+              fi
+            fi
+
+            for _ in {1..120}; do
+              status=$(gh api "repos/${REPO}/actions/runs/${run_id}" --jq '.status')
+              if [ "$status" = "completed" ]; then
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$status" != "completed" ]; then
+              echo "::error::Timed out waiting for cancelled Build & Test run ${run_id}."
+              exit 1
+            fi
+          fi
+
+          gh run rerun "$run_id" --repo "$REPO"
