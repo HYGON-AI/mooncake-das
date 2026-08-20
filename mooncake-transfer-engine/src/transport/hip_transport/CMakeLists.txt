@@ -4,7 +4,8 @@
 
 file(GLOB HIP_TRANSPORT_SOURCES "*.cpp")
 
-if (USE_HYGON)
+# mc_copy_kernel.co is only needed for Hygon fabric/hylink transfers.
+if (USE_HYGON AND NOT USE_FAKE_HIP_RPC)
     set(COPY_KERNEL ${CMAKE_CURRENT_BINARY_DIR}/mc_copy_kernel.co)
 
     add_custom_command(

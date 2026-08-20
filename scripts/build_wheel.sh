@@ -57,7 +57,8 @@ fi
 # Copy the shared segment wrapper, which builds on engine.so
 cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment.py
 
-# Copy Hygon HCU mc_copy_kernel.co when built with -DUSE_HYGON=ON
+# Copy Hygon HCU mc_copy_kernel.co when present (built with USE_HYGON and
+# without USE_FAKE_HIP_RPC; standard/shca variants skip compiling it).
 if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co" ]; then
     echo "Copying mc_copy_kernel (USE_HYGON)..."
     cp "${BUILD_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co" mooncake-wheel/mooncake/mc_copy_kernel.co
