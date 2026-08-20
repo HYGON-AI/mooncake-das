@@ -60,7 +60,7 @@ jobs:
           pip install patchelf==0.14.5
           bash scripts/variant_build.sh ${{ matrix.build_variant }}
           pip install ciupload
-          DTK_VER=$(echo ${{ matrix.dtk_pkg_url }} | grep -oP 'dtk\K[0-9]+\.[0-9]+' | tr -d '.')
+          DTK_VER=$(echo ${{ matrix.dtk_pkg_url }} | grep -oP 'dtk\K[0-9]+(?:\.[0-9]+)+' | tr -d '.')
           CIUpload REPAIR --dtk_version ${DTK_VER} --git_commit $(git rev-parse --short=6 HEAD) --outputdir repaired -f mooncake-wheel/dist/*.whl
           CIUpload --devpi_url ${DEVPI_URL} --devpi_user ${{ secrets.DEVPI_NIGHTLY_USER }} --devpi_password ${{ secrets.DEVPI_NIGHTLY_PASSWORD }} --dtk_pkg_name $(basename ${{ matrix.dtk_pkg_url }}) -f repaired/*.whl
 
