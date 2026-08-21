@@ -62,8 +62,9 @@ jobs:
           pip_host="${PIP_INDEX_URL#*://}"
           export PIP_TRUSTED_HOST="${pip_host%%[:/]*}"
           export RESOURCE_SERVER_URL="${{ vars.RESOURCE_SERVER_URL }}"
+          set +u
           source /opt/dtk/env.sh
-
+          set -u
           pip install patchelf==0.14.5 ciupload
           bash scripts/variant_build.sh standard
 
