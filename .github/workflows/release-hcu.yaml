@@ -63,7 +63,7 @@ jobs:
           pip install ciupload
           DTK_VER=$(echo ${{ matrix.dtk_pkg_url }} | grep -oP 'dtk\K[0-9]+(?:\.[0-9]+)+' | tr -d '.')
           CIUpload REPAIR --dtk_version ${DTK_VER} --git_commit $(git rev-parse --short=6 HEAD) --outputdir repaired -f mooncake-wheel/dist/*.whl
-          CIUpload --devpi_url ${DEVPI_URL} --devpi_user ${{ secrets.DEVPI_NIGHTLY_USER }} --devpi_password ${{ secrets.DEVPI_NIGHTLY_PASSWORD }} --dtk_pkg_name $(basename ${{ matrix.dtk_pkg_url }}) -f repaired/*.whl
+          CIUpload --devpi_url ${DEVPI_URL} --devpi_user ${{ secrets.PYPI_USERNAME }} --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename ${{ matrix.dtk_pkg_url }}) -f repaired/*.whl
 
       - name: Cleanup environment
         if: always()
