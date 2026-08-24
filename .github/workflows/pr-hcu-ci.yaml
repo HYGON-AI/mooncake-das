@@ -130,23 +130,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+          path: hcu-test-source
 
       - name: Download standard wheel
         uses: actions/download-artifact@v4
         with:
           name: hcu-wheel-standard
-          path: artifacts/standard
+          path: ${{ runner.temp }}/hcu-artifacts/standard
 
       - name: Run standard wheel cross-node test
         shell: bash
         run: |
           set -Eeuo pipefail
-          mapfile -t wheels < <(find artifacts/standard -maxdepth 1 -type f -name '*.whl' -print)
+          artifact_dir="${RUNNER_TEMP}/hcu-artifacts/standard"
+          mapfile -t wheels < <(find "${artifact_dir}" -maxdepth 1 -type f -name '*.whl' -print)
           if [ "${#wheels[@]}" -ne 1 ]; then
             echo "Expected exactly one standard wheel, found ${#wheels[@]}" >&2
             exit 1
           fi
-          bash scripts/test_hcu_standard_wheel.sh "${wheels[0]}"
+          bash hcu-test-source/scripts/test_hcu_standard_wheel.sh "${wheels[0]}"
 
       - name: Upload cross-node test logs
         if: always()
@@ -175,23 +177,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+          path: hcu-test-source
 
       - name: Download standard wheel
         uses: actions/download-artifact@v4
         with:
           name: hcu-wheel-standard
-          path: artifacts/standard
+          path: ${{ runner.temp }}/hcu-artifacts/standard
 
       - name: Run Mooncake Store etcd/HA test
         shell: bash
         run: |
           set -Eeuo pipefail
-          mapfile -t wheels < <(find artifacts/standard -maxdepth 1 -type f -name '*.whl' -print)
+          artifact_dir="${RUNNER_TEMP}/hcu-artifacts/standard"
+          mapfile -t wheels < <(find "${artifact_dir}" -maxdepth 1 -type f -name '*.whl' -print)
           if [ "${#wheels[@]}" -ne 1 ]; then
             echo "Expected exactly one standard wheel, found ${#wheels[@]}" >&2
             exit 1
           fi
-          bash scripts/test_hcu_store_wheel.sh "${wheels[0]}"
+          bash hcu-test-source/scripts/test_hcu_store_wheel.sh "${wheels[0]}"
 
       - name: Upload Mooncake Store test logs
         if: always()
