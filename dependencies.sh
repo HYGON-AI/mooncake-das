@@ -27,7 +27,7 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.25.9
+GOVER=1.25.10
 OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
@@ -250,6 +250,8 @@ print_section "Installing yalantinglibs"
 cd "${REPO_ROOT}/extern/yalantinglibs"
 check_success "Failed to change to yalantinglibs submodule directory"
 
+rm -rf build
+check_success "Failed to clean yalantinglibs build directory"
 mkdir -p build
 check_success "Failed to create build directory"
 cd build

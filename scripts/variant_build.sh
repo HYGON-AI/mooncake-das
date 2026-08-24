@@ -157,14 +157,14 @@ build_variant() {
     case "${variant}" in
         standard)
             package_basename="mooncake_transfer_engine"
-            cmake_args=(-DUSE_HYGON=ON -DUSE_FAKE_HIP_RPC=ON)
+            cmake_args=(-DUSE_HYGON=ON -DUSE_FAKE_HIP_RPC=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON)
             if [ "${DRY_RUN}" -eq 0 ]; then
                 restore_pyproject
             fi
             ;;
         rpc)
             package_basename="mooncake_transfer_engine_rpc"
-            cmake_args=(-DUSE_HYGON=ON -DUSE_FAKE_HIP_RPC=OFF)
+            cmake_args=(-DUSE_HYGON=ON -DUSE_FAKE_HIP_RPC=OFF -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON)
             if [ "${DRY_RUN}" -eq 0 ]; then
                 patch_pyproject \
                     "mooncake-transfer-engine-rpc" \
@@ -174,7 +174,7 @@ build_variant() {
             ;;
         shca)
             package_basename="mooncake_transfer_engine_shca"
-            cmake_args=(-DUSE_HYGON=ON -DUSE_SHCA=ON -DUSE_FAKE_HIP_RPC=ON)
+            cmake_args=(-DUSE_HYGON=ON -DUSE_SHCA=ON -DUSE_FAKE_HIP_RPC=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON)
             setup_shca_env
             if [ "${DRY_RUN}" -eq 0 ]; then
                 patch_pyproject \
