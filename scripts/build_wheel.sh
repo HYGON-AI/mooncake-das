@@ -38,7 +38,8 @@ cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
-# Copy Hygon HCU mc_copy_kernel.co when built with -DUSE_HYGON=ON
+# Copy Hygon HCU mc_copy_kernel.co when present (built with USE_HYGON and
+# without USE_FAKE_HIP_RPC; standard/shca variants skip compiling it).
 if [ -f build/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co ]; then
     echo "Copying mc_copy_kernel (USE_HYGON)..."
     cp build/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co mooncake-wheel/mooncake/mc_copy_kernel.co
