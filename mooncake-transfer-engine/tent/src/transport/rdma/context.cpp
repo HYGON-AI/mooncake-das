@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef USE_SHCA
@@ -635,6 +636,16 @@ int RdmaContext::unregisterMemReg(MemReg id) {
         const void* end = static_cast<const char*>(entry->addr) + entry->length;
         LOG(ERROR) << "Failed to unregister memory from " << entry->addr
                    << " to " << end << " in RDMA device " << device_name_;
+        return -1;
+    }
+    // Restore mergeability after ibv_dereg_mr. ibv_reg_mr calls
+    // madvise(MADV_DONTFORK) on the registered range when fork protection
+    // is active; failing to undo this on unregister leaves VMAs permanently
+    // split, exhausting vm.max_map_count under high register/unregister churn.
+    // See issue #3639.
+    if (madvise(entry->addr, entry->length, MADV_DOFORK) != 0) {
+        PLOG(WARNING) << "Failed to restore fork state for memory region at "
+                      << entry->addr << " (" << entry->length << " bytes)";
     }
 
     return 0;
