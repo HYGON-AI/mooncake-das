@@ -1,0 +1,245 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: HCU PR Build & Test
+
+on:
+  pull_request:
+    branches:
+      - v0.3.13.post1_dev
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-wheels:
+    name: Build ${{ matrix.build_variant }} wheel
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build_variant: standard
+            dtk_package: dtk26.04/DTK-26.04-rc4-ubuntu20.04-x86_64.tar.gz
+          - build_variant: shca
+            dtk_package: dtk26.04/DTK-26.04-rc4-ubuntu20.04-x86_64.tar.gz
+          - build_variant: rpc
+            dtk_package: dtk26.04.1/DTK-26.04.1-rc1-ubuntu20.04-x86_64.tar.gz
+    runs-on: [self-hosted, Linux, X64, hcu, hcu-ci-pr]
+    timeout-minutes: 120
+    container:
+      image: ${{ vars.BASE_COMPILE_IMAGE_UBUNTU_PY310 }}
+      options: >-
+        --volume /opt/hyhal:/opt/hyhal:ro
+        --device /dev/kfd:/dev/kfd
+        --device /dev/dri:/dev/dri
+        --cap-add=SYS_PTRACE
+        --privileged
+    env:
+      CI: "false"
+      FREE_BUILD_DIR: "0"
+      DTK_PKG_URL: "${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/${{ matrix.dtk_package }}"
+    steps:
+      - name: Checkout PR source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory '*'
+
+      - name: Install DTK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd /opt
+          wget -q "${DTK_PKG_URL}"
+          tarball="$(basename "${DTK_PKG_URL}")"
+          tar -xzf "${tarball}"
+          ln -s dtk-* dtk
+
+      - name: Build and repair ${{ matrix.build_variant }} wheel
+        shell: bash
+        env:
+          BUILD_VARIANT: ${{ matrix.build_variant }}
+        run: |
+          set -Eeuo pipefail
+          export PIP_INDEX_URL="${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/"
+          pip_host="${PIP_INDEX_URL#*://}"
+          export PIP_TRUSTED_HOST="${pip_host%%[:/]*}"
+          export RESOURCE_SERVER_URL="${{ vars.RESOURCE_SERVER_URL }}"
+          export GOPROXY="${GOPROXY:-https://goproxy.cn,https://goproxy.io,direct}"
+          set +u
+          source /opt/dtk/env.sh
+          set -u
+
+          pip install patchelf==0.14.5 ciupload
+          bash scripts/variant_build.sh "${BUILD_VARIANT}"
+
+          dtk_ver="$(echo "${DTK_PKG_URL}" | grep -oP 'dtk\K[0-9]+(?:\.[0-9]+)+' | tr -d '.')"
+          CIUpload REPAIR \
+            --dtk_version "${dtk_ver}" \
+            --git_commit "$(git rev-parse --short=6 HEAD)" \
+            --outputdir repaired \
+            -f mooncake-wheel/dist/*.whl
+
+          wheel_count="$(find repaired -maxdepth 1 -type f -name '*.whl' | wc -l)"
+          if [ "${wheel_count}" -ne 1 ]; then
+            echo "Expected exactly one repaired ${BUILD_VARIANT} wheel, found ${wheel_count}" >&2
+            find repaired -maxdepth 1 -type f -print || true
+            exit 1
+          fi
+          ls -lh repaired/*.whl
+
+      - name: Upload ${{ matrix.build_variant }} wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcu-wheel-${{ matrix.build_variant }}
+          path: repaired/*.whl
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Cleanup build environment
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          tarball="$(basename "${DTK_PKG_URL}")"
+          rm -rf /opt/dtk "/opt/${tarball}"
+          rm -rf build repaired mooncake-wheel/dist
+
+  test-te-standard:
+    name: TE-Cross-node test standard wheel
+    needs: build-wheels
+    runs-on: [self-hosted, Linux, X64, hcu, hcu-ci-pr, bw1100, nmz4]
+    timeout-minutes: 30
+    env:
+      HCU_TEST_IMAGE: "${{ vars.BASE_COMPILE_IMAGE_UBUNTU_PY310 }}"
+      HCU_TEST_DTK_PKG_URL: "${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-ubuntu20.04-x86_64.tar.gz"
+      HCU_TEST_TARGET_HOST: github-nmz1
+      HCU_TEST_INITIATOR_HOST: github-nmz2
+      HCU_TEST_REMOTE_USER: github
+      HCU_CROSS_NODE_LOCK_TIMEOUT: "900"
+      PIP_INDEX_URL: "${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/"
+    steps:
+      - name: Checkout test script
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: hcu-test-source
+
+      - name: Download standard wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: hcu-wheel-standard
+          path: ${{ runner.temp }}/hcu-artifacts/standard
+
+      - name: Run standard wheel te-cross-node test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          artifact_dir="${RUNNER_TEMP}/hcu-artifacts/standard"
+          mapfile -t wheels < <(find "${artifact_dir}" -maxdepth 1 -type f -name '*.whl' -print)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "Expected exactly one standard wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          bash hcu-test-source/scripts/hygon/test_hcu_standard_wheel.sh "${wheels[0]}"
+
+      - name: Upload te-cross-node test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcu-standard-te-cross-node-logs
+          path: ${{ runner.temp }}/hcu-standard-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  test-store:
+    name: Test Mooncake Store with standard wheel
+    needs: test-te-standard
+    runs-on: [self-hosted, Linux, X64, hcu, hcu-ci-pr, bw1100, nmz4]
+    timeout-minutes: 45
+    env:
+      HCU_TEST_IMAGE: "${{ vars.BASE_COMPILE_IMAGE_UBUNTU_PY310 }}"
+      HCU_TEST_DTK_PKG_URL: "${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-ubuntu20.04-x86_64.tar.gz"
+      HCU_TEST_TARGET_HOST: github-nmz1
+      HCU_TEST_INITIATOR_HOST: github-nmz2
+      HCU_TEST_REMOTE_USER: github
+      HCU_STORE_ETCD_URL: "${{ vars.HCU_STORE_ETCD_URL }}"
+      HCU_STORE_PORT_RANGE_MIN: "20000"
+      HCU_STORE_PORT_RANGE_MAX: "29999"
+      HCU_CROSS_NODE_LOCK_TIMEOUT: "900"
+      PIP_INDEX_URL: "${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/"
+    steps:
+      - name: Checkout Store benchmark source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: hcu-test-source
+
+      - name: Download standard wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: hcu-wheel-standard
+          path: ${{ runner.temp }}/hcu-artifacts/standard
+
+      - name: Run Mooncake Store RDMA KV benchmark (run_store_kv_bench.sh)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          artifact_dir="${RUNNER_TEMP}/hcu-artifacts/standard"
+          mapfile -t wheels < <(find "${artifact_dir}" -maxdepth 1 -type f -name '*.whl' -print)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "Expected exactly one standard wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          # The CI orchestrator starts etcd/master/client on both nodes, then
+          # runs scripts/hygon/run_store_kv_bench.sh inside the primary container.
+          bash hcu-test-source/scripts/hygon/run_hcu_store_kv_bench_ci.sh "${wheels[0]}"
+
+      - name: Upload Mooncake Store test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hcu-store-kv-benchmark-logs
+          path: ${{ runner.temp }}/hcu-store-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  hcu-pr-gate:
+    name: HCU PR Gate
+    if: always()
+    needs:
+      - build-wheels
+      - test-te-standard
+      - test-store
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all builds and standard-wheel tests to pass
+        shell: bash
+        env:
+          BUILD_RESULT: ${{ needs.build-wheels.result }}
+          RDMA_TEST_RESULT: ${{ needs.test-te-standard.result }}
+          STORE_TEST_RESULT: ${{ needs.test-store.result }}
+        run: |
+          set -Eeuo pipefail
+          printf 'Build standard/rpc/shca wheels: %s\n' "${BUILD_RESULT}"
+          printf 'Standard wheel RDMA test:       %s\n' "${RDMA_TEST_RESULT}"
+          printf 'Standard wheel Store benchmark: %s\n' "${STORE_TEST_RESULT}"
+
+          if [ "${BUILD_RESULT}" != "success" ] || \
+             [ "${RDMA_TEST_RESULT}" != "success" ] || \
+             [ "${STORE_TEST_RESULT}" != "success" ]; then
+            echo "::error::HCU PR validation failed or was skipped."
+            exit 1
+          fi
+
+          echo "All three wheels built successfully and all standard-wheel tests passed."
