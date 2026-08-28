@@ -46,7 +46,7 @@ jobs:
       - name: Install DTK
         run: |
           cd /opt && wget -q ${{ matrix.dtk_pkg_url }}
-          cd /opt && tar -xzf $(basename ${{ matrix.dtk_pkg_url }}) && mv dtk-* dtk
+          cd /opt && tar -xzf $(basename ${{ matrix.dtk_pkg_url }}) && ln -s dtk-* dtk
 
       - name: Build, repair and upload wheels
         shell: bash
