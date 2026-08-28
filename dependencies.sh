@@ -250,6 +250,8 @@ print_section "Installing yalantinglibs"
 cd "${REPO_ROOT}/extern/yalantinglibs"
 check_success "Failed to change to yalantinglibs submodule directory"
 
+rm -rf build
+check_success "Failed to clean yalantinglibs build directory"
 mkdir -p build
 check_success "Failed to create build directory"
 cd build
