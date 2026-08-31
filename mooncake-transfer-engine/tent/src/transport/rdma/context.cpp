@@ -399,9 +399,9 @@ int RdmaContext::enable() {
     }
 
     // Check PCIe Relaxed Ordering support from config
-    // Mode: 0 = disabled, 1 = enabled if supported, 2 = auto (default)
+    // Mode: 0 = disabled (default), 1 = enabled if supported, 2 = auto
     auto mode =
-        transport_.config()->get("transports/rdma/pci_relaxed_ordering", 1);
+        transport_.config()->get("transports/rdma/pci_relaxed_ordering", 0);
     if (mode != 0) {
         // Check if ibv_reg_mr_iova2 symbol is available (IBVERBS_1.8+)
         void* sym = dlsym(RTLD_DEFAULT, "ibv_reg_mr_iova2");

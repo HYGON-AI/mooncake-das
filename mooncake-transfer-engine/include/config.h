@@ -152,8 +152,9 @@ struct GlobalConfig {
     // handshake that may never complete.
     // MC_RDMA_NOTIFY_CONNECT_TIMEOUT_MS.
     uint32_t rdma_notify_connect_timeout_ms = 10000;
-    // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
-    int ib_pci_relaxed_ordering_mode = 1;
+    // ib_pci_relaxed_ordering_mode: 0: off (default), 1: on if supported,
+    // 2: auto
+    int ib_pci_relaxed_ordering_mode = 0;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
     bool sunrise_use_device_mem = false;
