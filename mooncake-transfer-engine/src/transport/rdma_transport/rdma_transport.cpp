@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
 
 #include "transport/rdma_transport/rdma_transport.h"
 
@@ -127,7 +130,7 @@ struct SliceLengthCalculator {
 };
 
 // Mode definition for MC_IB_PCI_RELAXED_ORDERING env.
-// 0 - disabled, 1 - enabled if supported (default), 2 - auto (same as 1 today).
+// 0 - disabled (default), 1 - enabled if supported, 2 - auto (same as 1 today).
 static int getIbRelaxedOrderingMode() {
     int val = globalConfig().ib_pci_relaxed_ordering_mode;
     if (val < 0 || val > 2) {
@@ -693,7 +696,7 @@ int RdmaTransport::allocateLocalSegmentID() {
 }
 
 int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
-                                          uint16_t lid,
+                                          uint32_t lid,
                                           const std::string &gid) {
     std::lock_guard<std::mutex> guard(local_desc_lock_);
     auto original_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);

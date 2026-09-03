@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #ifndef RDMA_ENDPOINT_H
 #define RDMA_ENDPOINT_H
 
@@ -177,14 +181,14 @@ class RdmaEndPoint {
 
     std::vector<uint32_t> qpNum() const;
 
-    int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
+    int doSetupConnection(const std::string &peer_gid, uint32_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
                           Status connected_status = CONNECTED,
                           std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 
     int doSetupConnection(int qp_index, const ibv_gid &peer_gid,
-                          uint16_t peer_lid, uint32_t peer_qp_num,
+                          uint32_t peer_lid, uint32_t peer_qp_num,
                           int local_gid_index, std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 

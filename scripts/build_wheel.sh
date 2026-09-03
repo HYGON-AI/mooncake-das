@@ -1,4 +1,8 @@
 #!/bin/bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Script to build the mooncake wheel package
 # Usage: ./scripts/build_wheel.sh [python_version] [output_dir]
 # Example: ./scripts/build_wheel.sh 3.10 dist-3.10
@@ -24,6 +28,8 @@ echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
+# Hygon HCU copy kernel artifact (only present when built with -DUSE_HYGON=ON)
+rm -f mooncake-wheel/mooncake/*.co
 
 echo "Creating directory structure..."
 
@@ -50,6 +56,13 @@ fi
 
 # Copy the shared segment wrapper, which builds on engine.so
 cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment.py
+
+# Copy Hygon HCU mc_copy_kernel.co when present (built with USE_HYGON and
+# without USE_FAKE_HIP_RPC; standard/shca variants skip compiling it).
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co" ]; then
+    echo "Copying mc_copy_kernel (USE_HYGON)..."
+    cp "${BUILD_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co" mooncake-wheel/mooncake/mc_copy_kernel.co
+fi
 
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
@@ -315,6 +328,20 @@ else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
 
+# Handle package name modification for TianLong SHCA builds
+if [ "$SHCA_BUILD" = "1" ]; then
+    echo "Modifying package name for TianLong SHCA build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-shca"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (TianLong SHCA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "tianlong", "shca"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-shca"
+else
+    echo "Using standard package name: mooncake-transfer-engine"
+fi
+
 echo "Cleaning up previous build artifacts..."
 rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
@@ -431,6 +458,7 @@ fi
 # libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
 # (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
 # corruption risk the EP/PG extensions are kept away from below.
+set +x
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
@@ -482,6 +510,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libamdhip64.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \
+    --exclude libgalaxyhip.so* \
     --exclude libc10.so* \
     --exclude libc10_cuda.so* \
     --exclude libtorch.so* \
@@ -525,6 +554,8 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude liburma.so* \
     --exclude libmpcomm.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
+set -x
+echo "auditwheel repair finished"
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
 # can corrupt CUDA fatbins, causing cudaErrorInvalidKernelImage, so these .so
@@ -563,6 +594,40 @@ fi
 if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
     rm -rf "$CUDA_EP_STAGING_TEMP"
 fi
+
+# auditwheel/patchelf can scramble SONAME (e.g. transfer_engine -> glog) and leave
+# absolute build RPATHs. Force SONAME=basename and $ORIGIN RPATH before shipping.
+REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
+if [ -n "$REPAIRED_WHEEL" ]; then
+    echo "Fixing SONAME/RPATH after auditwheel..."
+    WHEEL_UNPACK_DIR=$(mktemp -d)
+    python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+    UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+    VENDORED_LIBS_DIR=$(find "$UNPACKED_PKG_DIR" -mindepth 1 -maxdepth 1 -type d -name "*.libs" | head -1)
+
+    if [ -n "$VENDORED_LIBS_DIR" ]; then
+        for f in "$VENDORED_LIBS_DIR"/*; do
+            [ -f "$f" ] || continue
+            file "$f" | grep -q ELF || continue
+            patchelf --set-soname "$(basename "$f")" "$f"
+            patchelf --force-rpath --set-rpath '$ORIGIN' "$f"
+        done
+        PKG_RPATH="\$ORIGIN:\$ORIGIN/../$(basename "$VENDORED_LIBS_DIR")"
+    else
+        PKG_RPATH='$ORIGIN'
+    fi
+
+    find "${UNPACKED_PKG_DIR}/mooncake" -type f -print0 2>/dev/null \
+        | while IFS= read -r -d '' f; do
+            file "$f" | grep -q ELF || continue
+            patchelf --force-rpath --set-rpath "$PKG_RPATH" "$f"
+        done
+
+    rm "$REPAIRED_WHEEL"
+    python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+    rm -rf "$WHEEL_UNPACK_DIR"
+fi
+
 # NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
 # on all ELF files so everything resolves from a single directory.
 if [ "$NPU_BUILD" = "1" ]; then

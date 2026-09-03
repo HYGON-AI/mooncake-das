@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
+# Find Python package
 add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
 
@@ -536,6 +541,7 @@ if(STORE_USE_ETCD)
   add_dependencies(mooncake_master build_etcd_wrapper)
 endif()
 if(CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
+  target_link_options(mooncake_store PRIVATE -s)
   target_compile_options(mooncake_master PRIVATE -Os)
   target_link_options(mooncake_master PRIVATE -Os -s)
 endif()

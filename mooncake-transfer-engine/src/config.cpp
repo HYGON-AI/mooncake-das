@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #include "config.h"
 
 #include <charconv>
@@ -266,11 +270,13 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* slice_size_env = std::getenv("MC_SLICE_SIZE");
     if (slice_size_env) {
         size_t val = atoi(slice_size_env);
-        if (val > 0)
+        if (val > 0) {
             config.slice_size = val;
-        else
+            config.fragment_limit = config.slice_size / 4;
+        } else {
             LOG(WARNING)
                 << "Ignore value from environment variable MC_SLICE_SIZE";
+        }
     }
 
     const char* min_reg_size_env = std::getenv("MC_MIN_REG_SIZE");
@@ -490,8 +496,11 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
-        config.enable_dest_device_affinity = true;
+    if (const char* dest_device_affinity_env =
+            std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
+        parseBoolConfigEnv(dest_device_affinity_env,
+                           "MC_ENABLE_DEST_DEVICE_AFFINITY",
+                           config.enable_dest_device_affinity);
     }
 
     const char* enable_hca_peer_affinity_env =

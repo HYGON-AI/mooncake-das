@@ -32,6 +32,18 @@
 Mooncake is the serving platform for  <a href="https://kimi.ai/"><img src="image/kimi.png" alt="icon" style="height: 16px; vertical-align: middle;"> Kimi</a>, a leading LLM service provided by <a href="https://www.moonshot.cn/"><img src="image/moonshot.jpg" alt="icon" style="height: 16px; vertical-align: middle;"> Moonshot AI</a>.
 Under real workloads, Mooncake’s innovative architecture enables Kimi to handle 75% more requests while adhering to SLOs.
 
+<h2 id="attribution">🏷️ Attribution</h2>
+
+This project is based on upstream [Mooncake](https://github.com/kvcache-ai/Mooncake).
+
+- Upstream repository: https://github.com/kvcache-ai/Mooncake
+- Upstream branch: `main`
+- Upstream Tag: `v0.3.13.post1`
+- Upstream Commit: `719735896c86b56fabec6cf3e825fb2ea640597a`
+- Upstream license: Apache-2.0
+
+Modified by Hygon Information Technology Co., Ltd.
+
 <h2 id="updates">🔄 Updates</h2>
 
 - **Aug 24, 2026**: Mooncake now supports [UCL-MPComm](https://github.com/Tencent/UCL-MPComm) as a TENT transport backend, an RDMA-native multi-rail data plane open-sourced by the Tencent Astral Network Team. It can achieve maximum performance in both DRAM and VRAM transfer scenarios.
@@ -215,38 +227,36 @@ pip install mooncake-transfer-engine
 pip install mooncake-transfer-engine-cuda13
 ```
 
+### Build wheel variants for Hygon HCU
+For Hygon HCU packaging (standard NIC / HyLink RPC / TianLong SHCA), build wheels with `scripts/variant_build.sh`.
+All variants enable `-DUSE_HYGON=ON`; `standard`/`shca` also set `-DUSE_FAKE_HIP_RPC=ON`, and `shca` sets `-DUSE_SHCA=ON`:
+
+```bash
+# Standard NIC, without HyLink
+bash scripts/variant_build.sh standard
+
+# Standard NIC, with HyLink (Hygon HCU RPC)
+bash scripts/variant_build.sh rpc
+
+# TianLong SHCA NIC, without HyLink
+bash scripts/variant_build.sh shca
+```
+
+Common options:
+
+```bash
+# Skip dependency installation
+bash scripts/variant_build.sh --skip-deps standard
+
+# Override parallel build jobs
+bash scripts/variant_build.sh --jobs 32 rpc
+```
+
 In addition to CUDA, Mooncake also supports other accelerator backends, along with flexible installation and deployment options. See the guides below for details:
 
 - [Quick Start](https://kvcache-ai.github.io/Mooncake/getting_started/quick-start.html)
 - [Build from Source](https://kvcache-ai.github.io/Mooncake/getting_started/build.html)
 - [Deployment Guide](https://kvcache-ai.github.io/Mooncake/deployment/mooncake-store-deployment-guide.html)
-
-
-### Skills for AI Assistants
-
-Mooncake ships a set of **built-in skills** under [`.claude/skills`](.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command.
-
-<details>
-<summary>Details</summary>
-
-| Skill | Description |
-|-------|-------------|
-| `/mooncake-troubleshoot` | Diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, logs). |
-| `/mooncake-ci-local` | Run pre-PR local validation via `scripts/run_ci_test.sh`. |
-| `/mooncake-api` | Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
-
-Install them without cloning the repository via the [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
-
-```text
-/plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
-/plugin install mooncake-troubleshoot@mooncake
-/plugin install mooncake-ci-local@mooncake
-/plugin install mooncake-api@mooncake
-```
-
-The `--sparse .claude-plugin` flag fetches only the marketplace catalog, and each plugin is published as a `git-subdir` source, so installing one fetches only that single skill directory — never the whole repo. If you are already working inside a Mooncake checkout, the skills under `.claude/skills/` load automatically with no setup.
-
-</details>
 
 <h2 id="trace">📦 Open Source Traces and Tools </h2>
 

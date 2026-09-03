@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -31,6 +34,9 @@
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #if defined(__has_feature)
 #define MC_HAS_FEATURE(x) __has_feature(x)
@@ -110,7 +116,11 @@ int ibv_query_port(ibv_context *context, uint8_t,
     auto *port_attr = reinterpret_cast<ibv_port_attr *>(compat_port_attr);
     *port_attr = {};
     port_attr->state = IBV_PORT_ACTIVE;
+#ifdef USE_SHCA
+    port_attr->lid = u32_to_17(1);
+#else
     port_attr->lid = 1;
+#endif
     port_attr->active_mtu = IBV_MTU_4096;
     return 0;
 }

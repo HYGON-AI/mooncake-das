@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
 
 // IBGDA device transport — wraps mlx5gda QP lifecycle behind RdmaTransport.
 //
@@ -25,6 +28,9 @@
 #include <glog/logging.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -88,6 +94,10 @@ static Mlx5DevxUmemRegEx dmabufUmemRegEx() {
     return reg_ex;
 }
 #endif
+// RoCEv2 reserves the high two bits as a validity marker for the UDP source
+// port. The remaining 14 bits carry entropy, keeping the port in 49152-65535.
+static constexpr uint16_t kRoceUdpEncapValidPort = 0xC000;
+static constexpr uint32_t kRoceUdpEntropyMask = 0x3FFF;
 
 // Check if IPv6 address is IPv4-mapped (::ffff:x.x.x.x)
 static bool isIpv4Mapped(const struct in6_addr* a) {
@@ -203,7 +213,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         is_roce_ = (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET);
+#ifdef USE_SHCA
+        lid_ = u17_to_32(port_attr.lid);
+#else
         lid_ = port_attr.lid;
+#endif
         device_name_ = nic;
 
         pd_ = ibv_alloc_pd(ctx_);
@@ -385,18 +399,44 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 // setup into the device transport this value reaches hardware.
                 ah_attr.grh.hop_limit = 255;
                 ah_attr.port_num = 1;
-                ah_attr.dlid = qps_[i]->port_attr.lid | 0xC000;
+#ifdef USE_SHCA
+                const uint32_t local_lid =
+                    u17_to_32(qps_[i]->port_attr.lid);
+#else
+                const uint32_t local_lid = qps_[i]->port_attr.lid;
+#endif
+                // mlx5gda uses ah_attr.dlid as a carrier for the QPC's RoCE
+                // UDP source port. It is not a destination LID in this branch.
+                const uint16_t roce_udp_sport = static_cast<uint16_t>(
+                    kRoceUdpEncapValidPort |
+                    (local_lid & kRoceUdpEntropyMask));
+#ifdef USE_SHCA
+                ah_attr.dlid = u32_to_17(roce_udp_sport);
+#else
+                ah_attr.dlid = roce_udp_sport;
+#endif
             } else {
+#ifdef USE_SHCA
+                ah_attr.dlid =
+                    u32_to_17(static_cast<uint32_t>(remote_lids[i]));
+#else
                 ah_attr.dlid = static_cast<uint16_t>(remote_lids[i]);
+#endif
                 ah_attr.port_num = 0;
             }
 
+#ifdef USE_SHCA
+            const uint32_t path_value = u17_to_32(ah_attr.dlid);
+#else
+            const uint32_t path_value = ah_attr.dlid;
+#endif
             if (mlx5gda_modify_rc_qp_init2rtr(qps_[i], ah_attr, remote_qpns[i],
                                               IBV_MTU_4096)) {
                 LOG(ERROR) << "[EP IBGDA] init2rtr failed for QP " << i
                            << " (roce=" << is_roce << " gid_idx=" << gid_index_
                            << " remote_qpn=" << remote_qpns[i]
-                           << " udp_sport=" << ah_attr.dlid
+                           << (is_roce ? " udp_sport=" : " dlid=")
+                           << path_value
                            << " hop_limit=" << (int)ah_attr.grh.hop_limit
                            << ")";
                 return -1;
@@ -920,7 +960,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     void* mr_ptr_ = nullptr;
     ibv_gid gid_{};
     int gid_index_ = -1;
-    uint16_t lid_ = 0;
+    uint32_t lid_ = 0;
     bool is_roce_ = false;
     std::string device_name_;
     std::vector<std::string> device_filter_;

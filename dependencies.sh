@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Color definitions
 GREEN="\033[0;32m"
 BLUE="\033[0;34m"
@@ -23,7 +27,7 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.25.9
+GOVER=1.25.10
 OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
@@ -149,6 +153,14 @@ fi
 print_section "Installing system packages"
 echo -e "${YELLOW}This may take a few minutes...${NC}"
 
+USE_SHCA=OFF
+if [ -f "/usr/include/infiniband/shca_17b_types.h" ]; then
+    USE_SHCA=ON
+    echo -e "${GREEN}SHCA headers detected. Will build with SHCA support.${NC}"
+else
+    echo -e "${YELLOW}SHCA headers not found. Will build without SHCA support.${NC}"
+fi
+
 if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     SYSTEM_PACKAGES="build-essential \
                      cmake \
@@ -182,6 +194,16 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      patchelf \
                      libc6-dev \
                      libc-bin"
+
+    # TianLong SHCA (shca-tools) ships its own libibverbs headers/libs; installing
+    # libibverbs-dev conflicts with it. libboost-all-dev pulls OpenMPI/libfabric,
+    # which also depend on distro ibverbs and fail on SHCA systems.
+    if [ "$USE_SHCA" = "ON" ]; then
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/libibverbs-dev//g')
+        SAFE_BOOST="libboost-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-program-options-dev libboost-regex-dev libboost-serialization-dev"
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed "s/libboost-all-dev/$SAFE_BOOST/g")
+        echo -e "${GREEN}SHCA headers detected. Will build with SHCA support and adjust system packages accordingly.${NC}"
+    fi
 
     apt-get install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
@@ -274,6 +296,7 @@ install_go() {
     fi
 
     GO_TARBALL="go$GOVER.linux-$ARCH.tar.gz"
+    GO_LOCAL_TARBALL="/tmp/go-install.tar.gz"
 
     # Try multiple download mirrors with fallback
     GO_DOWNLOAD_URLS=(
@@ -283,18 +306,20 @@ install_go() {
     )
 
     DOWNLOAD_SUCCESS=false
+    mirror_idx=0
     for url in "${GO_DOWNLOAD_URLS[@]}"; do
-        echo "Downloading Go $GOVER from ${url}..."
-        if wget -q --show-progress --timeout=30 --tries=2 -O "${GO_TARBALL}" "${url}"; then
+        mirror_idx=$((mirror_idx + 1))
+        echo "Downloading Go $GOVER (mirror ${mirror_idx}/${#GO_DOWNLOAD_URLS[@]})..."
+        if wget -q --timeout=30 --tries=2 -O "${GO_LOCAL_TARBALL}" "${url}"; then
             DOWNLOAD_SUCCESS=true
             if [[ "$url" != "https://go.dev/dl/${GO_TARBALL}" ]]; then
                 USED_CN_MIRROR=true
             fi
-            print_success "Downloaded Go $GOVER from ${url}"
+            print_success "Downloaded Go $GOVER"
             break
         else
-            echo -e "${YELLOW}Failed to download from ${url}, trying next mirror...${NC}"
-            rm -f "${GO_TARBALL}"
+            echo -e "${YELLOW}Download failed, trying next mirror...${NC}"
+            rm -f "${GO_LOCAL_TARBALL}"
         fi
     done
 
@@ -303,10 +328,11 @@ install_go() {
     fi
 
     echo "Installing Go $GOVER..."
-    tar -C /usr/local -xzf "${GO_TARBALL}"
+    tar -C /usr/local -xzf "${GO_LOCAL_TARBALL}"
     check_success "Failed to install Go $GOVER"
 
-    rm -f "${GO_TARBALL}"
+    # Clean up downloaded file
+    rm -f "${GO_LOCAL_TARBALL}"
     check_success "Failed to clean up Go installation file"
 
     print_success "Go $GOVER installed successfully"

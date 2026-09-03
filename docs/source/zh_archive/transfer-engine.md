@@ -394,7 +394,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_NUM_COMP_CHANNELS_PER_CTX` 每个设备实例创建的 Completion Channel 数量，默认值 1
 - `MC_IB_PORT` 每个设备实例使用的 IB 端口号，默认值 1
 - `MC_IB_TC` 当使用`RDMA`通信协议时，在交换机和网卡默认配置不一致场景/需要流量规划场景下，可能需要修改 RDMA 网卡的 Traffic Class 配置，默认值 -1
-- `MC_IB_PCI_RELAXED_ORDERING` 控制 RDMA 内存区域的 PCIe Relaxed Ordering（RO）功能。`0`：禁用，`1`：硬件支持时启用（默认），`2`：自动。需要 `ibv_reg_mr_iova2`（libibverbs ≥ 1.8），不支持时自动回退到严格顺序模式。
+- `MC_IB_PCI_RELAXED_ORDERING` 控制 RDMA 内存区域的 PCIe Relaxed Ordering（RO）功能。`0`：禁用（默认），`1`：硬件支持时启用，`2`：自动。需要 `ibv_reg_mr_iova2`（libibverbs ≥ 1.8），不支持时自动回退到严格顺序模式。
 - `MC_GID_INDEX` 每个设备实例使用的 GID 序号，默认值 3（或平台支持的最大值）
 - `MC_PKEY_INDEX` QP 转换到 INIT 状态时使用的 `pkey_index`（partition key 表索引）。有效范围：0 到 65535，默认值 0。当 fabric 所需的 partition key 不在 HCA pkey 表的 0 号位置时需要设置该值
 - `MC_MAX_CQE_PER_CTX` 每个设备实例中 CQ 缓冲区大小，默认值 4096
@@ -415,7 +415,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_REDIS_PASSWORD` Redis 存储插件的密码，仅在指定 Redis 作为 metadata server 时生效。如果未设置，将不会尝试进行密码认证登录 Redis。
 - `MC_REDIS_DB_INDEX` Redis 存储插件的数据库索引，必须为 0 到 255 之间的整数。仅在指定 Redis 作为 metadata server 时生效。如果未设置或无效，默认值为 0。
 - `MC_FRAGMENT_RATIO` 在将RdmaTransport::submitTransferTask中切割传输任务为传输块时，当切割完成后最后一块数据大小小于等于切割块大小的1/MC_FRAGMENT_RATIO，最后一块数据将合并进前一块的切割块进行传输以减少开销，默认值为4。
-- `MC_ENABLE_DEST_DEVICE_AFFINITY` 启用设备亲和性以优化 RDMA 性能。启用后，Transfer Engine 将优先选择和本地网卡同名的远端网卡进行通信，以减少 QP 数量并改善 Rail-optimized 拓扑中的网络性能。默认值为 false
+- `MC_ENABLE_DEST_DEVICE_AFFINITY` 启用设备亲和性以优化 RDMA 性能。启用后，Transfer Engine 将优先选择和本地网卡同名的远端网卡进行通信，以减少 QP 数量并改善 Rail-optimized 拓扑中的网络性能。默认值为 true
 - `MC_FORCE_HCA` 强制使用RDMA作为主要传输方式，如果没有探测到有效的RDMA网卡，返回失败
 - `MC_FORCE_MNNVL` 强制使用 Multi-Node NVLink 作为主要传输方式，无论是否安装了有效的 RDMA 网卡
 - `MC_INTRA_NVLINK` 指定使用Intra-Node NVLink 作为主要传输方式，同时注意该设置不能与MC_FORCE_MNNVL一起使用

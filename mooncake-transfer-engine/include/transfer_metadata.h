@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #ifndef TRANSFER_METADATA
 #define TRANSFER_METADATA
 
@@ -46,7 +50,7 @@ class TransferMetadata {
    public:
     struct DeviceDesc {
         std::string name;
-        uint16_t lid;
+        uint32_t lid;
         std::string gid;
         std::string eid;  // for ub
 
@@ -164,7 +168,7 @@ class TransferMetadata {
     struct HandShakeDesc {
         std::string payload;  // opaque transport-specific handshake data
         std::string local_nic_path;
-        uint16_t local_lid = 0;
+        uint32_t local_lid = 0;
         std::string local_gid;
         std::string peer_nic_path;
 #ifdef USE_UB

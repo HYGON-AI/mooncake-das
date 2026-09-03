@@ -6,7 +6,7 @@ This document describes how to quickly start using Mooncake Transfer Engine and 
 
 Install the following prerequisites before running any Mooncake component:
 - Python 3.10 or later; a virtual environment is recommended.
-- RDMA driver and SDK (for example, Mellanox OFED), if you plan to use RDMA for data transfer.
+- RDMA driver and SDK (for example, Mellanox OFED), if you plan to use RDMA for data transfer. On TianLong SHCA systems, install `shca-tools` and build with `-DUSE_SHCA=ON`.
 - CUDA 12.1 or later, if the package is built with `-DUSE_CUDA` (disabled by default). For most CUDA-enabled use cases, such as RDMA-based KV cache transfer between GPUs or between GPU and DRAM, NVIDIA GPUDirect support is also required. *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
 - Cambricon Neuware, if the package is built with `-DUSE_MLU`. By default Mooncake looks for Neuware under `NEUWARE_HOME` or `/usr/local/neuware`.
 - Hygon DTK SDK, if the package is built with `-DUSE_HYGON`. By default Mooncake looks for DTK under `DTK_HOME` or `/opt/dtk`.
@@ -95,27 +95,6 @@ data = store.get("hello_key")
 print(data.decode())  # Output: Hello, Mooncake Store!
 
 store.close()
-```
-
-## AI Coding Assistant Skills
-
-If you use Claude Code or another coding assistant that supports reusable
-skills, Mooncake provides built-in playbooks for common development tasks:
-
-| Skill | Use it for |
-|-------|------------|
-| `/mooncake-troubleshoot` | Diagnose services, RDMA, environment variables, and runtime logs. |
-| `/mooncake-ci-local` | Run pre-PR local validation with Mooncake's CI script. |
-| `/mooncake-api` | Work with Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
-
-Install them from the Claude Code plugin marketplace without cloning the full
-repository:
-
-```text
-/plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
-/plugin install mooncake-troubleshoot@mooncake
-/plugin install mooncake-ci-local@mooncake
-/plugin install mooncake-api@mooncake
 ```
 
 ## Next Steps

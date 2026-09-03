@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
 
 /*
  * RDMA Endpoint Re-establishment Test
@@ -840,7 +843,7 @@ class RdmaEndPointTestPeer {
     }
 
     static int doSetupConnection(RdmaEndPoint &endpoint, int qp_index,
-                                 const ibv_gid &peer_gid, uint16_t peer_lid,
+                                 const ibv_gid &peer_gid, uint32_t peer_lid,
                                  uint32_t peer_qp_num, int local_gid_index,
                                  std::string *reply_msg,
                                  int &out_stage, int &out_sys_errno) {

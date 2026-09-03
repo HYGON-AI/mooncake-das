@@ -1,6 +1,29 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 file(GLOB HIP_TRANSPORT_SOURCES "*.cpp")
 
-add_library(hip_transport OBJECT ${HIP_TRANSPORT_SOURCES})
+# mc_copy_kernel.co is only needed for Hygon fabric/hylink transfers.
+if (USE_HYGON AND NOT USE_FAKE_HIP_RPC)
+    set(COPY_KERNEL ${CMAKE_CURRENT_BINARY_DIR}/mc_copy_kernel.co)
+
+    add_custom_command(
+        OUTPUT ${COPY_KERNEL}
+        COMMAND hipcc --genco -fPIC -x hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip
+                -o ${COPY_KERNEL}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip
+    )
+
+    add_library(hip_transport OBJECT
+        ${HIP_TRANSPORT_SOURCES}
+        ${COPY_KERNEL}
+    )
+else()
+    add_library(hip_transport OBJECT ${HIP_TRANSPORT_SOURCES})
+endif()
+
 target_link_libraries(hip_transport PRIVATE glog::glog)
 
 target_include_directories(hip_transport PUBLIC ${HIP_INCLUDE_DIRS})

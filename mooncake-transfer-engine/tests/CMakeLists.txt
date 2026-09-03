@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 if(USE_HIP)
@@ -189,7 +193,7 @@ target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 
-if(USE_MNNVL)
+if(USE_MNNVL OR USE_HIP)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
@@ -367,12 +371,16 @@ add_test(NAME multi_transport_locality_test
 
 add_executable(rdma_context_reprobe_test
                ${WORKSPACE}/rdma_context_reprobe_test.cpp)
+target_include_directories(rdma_context_reprobe_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
 
 add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
+target_include_directories(rdma_transport_submit_task_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
                                                              gtest gtest_main)
 add_test(NAME rdma_transport_submit_task_test

@@ -161,6 +161,25 @@ TEST_F(PkeyIndexEnvTest, IbSlNonNumericKeepsDefault) {
     EXPECT_EQ(config.ib_service_level, 9);
 }
 
+class IbPciRelaxedOrderingEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_IB_PCI_RELAXED_ORDERING"); }
+};
+
+TEST_F(IbPciRelaxedOrderingEnvTest, DisabledByDefault) {
+    ::unsetenv("MC_IB_PCI_RELAXED_ORDERING");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.ib_pci_relaxed_ordering_mode, 0);
+}
+
+TEST_F(IbPciRelaxedOrderingEnvTest, ExplicitEnableIsApplied) {
+    ASSERT_EQ(::setenv("MC_IB_PCI_RELAXED_ORDERING", "1", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.ib_pci_relaxed_ordering_mode, 1);
+}
+
 TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalDefaultsToZeroWhenUnset) {
     ::unsetenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS");
     GlobalConfig config;
@@ -552,14 +571,19 @@ TEST_F(NumCqEnvTest, AlsoSetsJfcAndJfce) {
 
 class SliceSizeEnvTest : public ::testing::Test {
    protected:
-    void TearDown() override { ::unsetenv("MC_SLICE_SIZE"); }
+    void TearDown() override {
+        ::unsetenv("MC_SLICE_SIZE");
+        ::unsetenv("MC_FRAGMENT_RATIO");
+    }
 };
 
-TEST_F(SliceSizeEnvTest, DefaultIs65536) {
+TEST_F(SliceSizeEnvTest, DefaultIs1048576) {
     ::unsetenv("MC_SLICE_SIZE");
+    ::unsetenv("MC_FRAGMENT_RATIO");
     GlobalConfig config;
     loadGlobalConfig(config);
-    EXPECT_EQ(config.slice_size, 65536u);
+    EXPECT_EQ(config.slice_size, 1048576u);
+    EXPECT_EQ(config.fragment_limit, config.slice_size / 4);
 }
 
 TEST_F(SliceSizeEnvTest, ValidOverride) {
@@ -567,6 +591,7 @@ TEST_F(SliceSizeEnvTest, ValidOverride) {
     GlobalConfig config;
     loadGlobalConfig(config);
     EXPECT_EQ(config.slice_size, 131072u);
+    EXPECT_EQ(config.fragment_limit, config.slice_size / 4);
 }
 
 TEST_F(SliceSizeEnvTest, ZeroIsRejected) {

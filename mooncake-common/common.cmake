@@ -1,8 +1,12 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 
-option(ENABLE_DEBUG_SYMBOLS "Include debug symbols (-g) in compilation" ON)
+option(ENABLE_DEBUG_SYMBOLS "Include debug symbols (-g) in compilation" OFF)
 
 set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wno-unused-parameter -fPIC")
@@ -19,11 +23,13 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
       "${CMAKE_CXX_FLAGS_RELEASE} -fno-tree-slp-vectorize")
 endif()
 
-set(CMAKE_C_FLAGS_RELEASE "-O3")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 
-set(CMAKE_C_FLAGS_DEBUG "-O0")
-set(CMAKE_CXX_FLAGS_DEBUG "-O0")
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -g")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -g")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -g")
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror=thread-safety")
@@ -87,6 +93,7 @@ option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
 option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
+option(USE_FAKE_HIP_RPC "option for using fake HIP RPC implementation" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -107,6 +114,18 @@ option(
   OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_SHCA "option for using TianLong SHCA InfiniBand" OFF)
+
+if (USE_SHCA)
+  message(STATUS "TianLong SHCA InfiniBand is enabled")
+endif()
+
+if (USE_FAKE_HIP_RPC)
+  # Fake HIP RPC stubs live under USE_HYGON paths in hip_transport.
+  set(USE_HYGON ON)
+  add_compile_definitions(USE_FAKE_HIP_RPC)
+  message(STATUS "Using fake HIP RPC implementation")
+endif()
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -204,6 +223,7 @@ endif()
 
 if(USE_MNNVL)
   if(NOT USE_HIP
+     AND NOT USE_HYGON
      AND NOT USE_MUSA
      AND NOT USE_MACA
      AND NOT USE_SUPA)
@@ -373,6 +393,10 @@ if(USE_MUSA)
 endif()
 
 if(USE_HYGON)
+  # Enable shared HIP IPC/stream paths,
+  # Hygon fabric/RPC remains gated by USE_HYGON in hip_transport.
+  set(USE_HIP ON)
+
   if(NOT DEFINED DTK_ROOT OR DTK_ROOT STREQUAL "")
     if(DEFINED ENV{DTK_HOME} AND NOT "$ENV{DTK_HOME}" STREQUAL "")
       set(DTK_ROOT
@@ -435,6 +459,9 @@ if(USE_HIP)
   find_package(HIP REQUIRED)
   include_directories(${HIP_INCLUDE_DIRS})
   add_compile_definitions(USE_HIP __HIP_PLATFORM_AMD__)
+  if (USE_HYGON)
+    set(CMAKE_VERBOSE_MAKEFILE OFF CACHE BOOL "" FORCE)
+  endif()
   message(STATUS "HIP support is enabled")
 
   find_program(HIPIFY_PERL_EXECUTABLE hipify-perl)
@@ -666,13 +693,18 @@ if(NOT TARGET gflags::gflags)
     endif()
   endforeach()
 endif()
-
 set(GH_MIRROR "")
 if(DEFINED ENV{ASCEND_GITHUB_MIRROR_URLS})
   set(GH_MIRROR $ENV{ASCEND_GITHUB_MIRROR_URLS})
 endif()
 if(GH_MIRROR)
   message(STATUS "Using Github mirror: ${GH_MIRROR}")
+endif()
+
+# SHCA uses extended 17-bit LIDs incompatible with yalantinglibs ib_socket.
+if(USE_SHCA)
+  set(YLT_ENABLE_IBV OFF CACHE BOOL "Enable yalantinglibs ibverbs support" FORCE)
+  add_compile_definitions(USE_SHCA)
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/FindYLT.cmake)
