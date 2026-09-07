@@ -85,6 +85,7 @@ option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
+option(USE_FAKE_HIP_RPC "Use HIP IPC without Hygon fabric RPC" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
 option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
 option(USE_RISCV "Enable RISC-V build compatibility settings" OFF)
@@ -121,6 +122,18 @@ option(
   OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_SHCA "option for using TianLong SHCA InfiniBand" OFF)
+
+if (USE_SHCA)
+  message(STATUS "TianLong SHCA InfiniBand is enabled")
+endif()
+
+if (USE_FAKE_HIP_RPC)
+  # Fake HIP RPC stubs live under USE_HYGON paths in hip_transport.
+  set(USE_HYGON ON)
+  add_compile_definitions(USE_FAKE_HIP_RPC)
+  message(STATUS "Using fake HIP RPC implementation")
+endif()
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -218,6 +231,7 @@ endif()
 
 if(USE_MNNVL)
   if(NOT USE_HIP
+     AND NOT USE_HYGON
      AND NOT USE_MUSA
      AND NOT USE_MACA
      AND NOT USE_SUPA)
@@ -387,6 +401,10 @@ if(USE_MUSA)
 endif()
 
 if(USE_HYGON)
+  # Enable shared HIP IPC/stream paths,
+  # Hygon fabric/RPC remains gated by USE_HYGON in hip_transport.
+  set(USE_HIP ON)
+
   if(NOT DEFINED DTK_ROOT OR DTK_ROOT STREQUAL "")
     if(DEFINED ENV{DTK_HOME} AND NOT "$ENV{DTK_HOME}" STREQUAL "")
       set(DTK_ROOT
@@ -680,13 +698,18 @@ if(NOT TARGET gflags::gflags)
     endif()
   endforeach()
 endif()
-
 set(GH_MIRROR "")
 if(DEFINED ENV{ASCEND_GITHUB_MIRROR_URLS})
   set(GH_MIRROR $ENV{ASCEND_GITHUB_MIRROR_URLS})
 endif()
 if(GH_MIRROR)
   message(STATUS "Using Github mirror: ${GH_MIRROR}")
+endif()
+
+# SHCA uses extended 17-bit LIDs incompatible with yalantinglibs ib_socket.
+if(USE_SHCA)
+  set(YLT_ENABLE_IBV OFF CACHE BOOL "Enable yalantinglibs ibverbs support" FORCE)
+  add_compile_definitions(USE_SHCA)
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/FindYLT.cmake)

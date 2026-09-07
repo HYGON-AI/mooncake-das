@@ -15,6 +15,8 @@
 #ifndef TRANSFER_METADATA
 #define TRANSFER_METADATA
 
+#include "rdma_lid.h"
+
 #include <glog/logging.h>
 #if __has_include(<jsoncpp/json/json.h>)
 #include <jsoncpp/json/json.h>  // Ubuntu
@@ -46,7 +48,7 @@ class TransferMetadata {
    public:
     struct DeviceDesc {
         std::string name;
-        uint16_t lid;
+        RdmaLid lid;
         std::string gid;
         std::string eid;  // for ub
 
@@ -164,7 +166,7 @@ class TransferMetadata {
     struct HandShakeDesc {
         std::string payload;  // opaque transport-specific handshake data
         std::string local_nic_path;
-        uint16_t local_lid = 0;
+        RdmaLid local_lid = 0;
         std::string local_gid;
         std::string peer_nic_path;
 #ifdef USE_UB

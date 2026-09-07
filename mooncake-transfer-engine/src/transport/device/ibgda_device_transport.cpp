@@ -18,6 +18,8 @@
 // Uses ibv_open_device / ibv_alloc_pd directly (same as the original
 // MooncakeEpBuffer::init_ibgda()), but encapsulated in a reusable class.
 
+#include "rdma_lid.h"
+
 #include "transport/device/device_transport.h"
 
 #include <arpa/inet.h>
@@ -25,6 +27,9 @@
 #include <glog/logging.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -88,7 +93,6 @@ static Mlx5DevxUmemRegEx dmabufUmemRegEx() {
     return reg_ex;
 }
 #endif
-
 // Check if IPv6 address is IPv4-mapped (::ffff:x.x.x.x)
 static bool isIpv4Mapped(const struct in6_addr* a) {
     return ((a->s6_addr32[0] | a->s6_addr32[1]) == 0 &&
@@ -203,7 +207,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
 
         is_roce_ = (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET);
+#ifdef USE_SHCA
+        lid_ = u17_to_32(port_attr.lid);
+#else
         lid_ = port_attr.lid;
+#endif
         device_name_ = nic;
 
         pd_ = ibv_alloc_pd(ctx_);
@@ -385,18 +393,34 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 // setup into the device transport this value reaches hardware.
                 ah_attr.grh.hop_limit = 255;
                 ah_attr.port_num = 1;
+#ifdef USE_SHCA
+                ah_attr.dlid = u32_to_17(
+                    (u17_to_32(qps_[i]->port_attr.lid) & 0x3FFF) | 0xC000);
+#else
                 ah_attr.dlid = qps_[i]->port_attr.lid | 0xC000;
+#endif
             } else {
+#ifdef USE_SHCA
+                ah_attr.dlid =
+                    u32_to_17(static_cast<uint32_t>(remote_lids[i]));
+#else
                 ah_attr.dlid = static_cast<uint16_t>(remote_lids[i]);
+#endif
                 ah_attr.port_num = 0;
             }
 
+#ifdef USE_SHCA
+            const uint32_t path_value = u17_to_32(ah_attr.dlid);
+#else
+            const uint32_t path_value = ah_attr.dlid;
+#endif
             if (mlx5gda_modify_rc_qp_init2rtr(qps_[i], ah_attr, remote_qpns[i],
                                               IBV_MTU_4096)) {
                 LOG(ERROR) << "[EP IBGDA] init2rtr failed for QP " << i
                            << " (roce=" << is_roce << " gid_idx=" << gid_index_
                            << " remote_qpn=" << remote_qpns[i]
-                           << " udp_sport=" << ah_attr.dlid
+                           << (is_roce ? " udp_sport=" : " dlid=")
+                           << path_value
                            << " hop_limit=" << (int)ah_attr.grh.hop_limit
                            << ")";
                 return -1;
@@ -920,7 +944,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     void* mr_ptr_ = nullptr;
     ibv_gid gid_{};
     int gid_index_ = -1;
-    uint16_t lid_ = 0;
+    RdmaLid lid_ = 0;
     bool is_roce_ = false;
     std::string device_name_;
     std::vector<std::string> device_filter_;

@@ -183,6 +183,16 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libc6-dev \
                      libc-bin"
 
+    # Explicit opt-in: setup_shca_env installed the SHCA ibverbs userspace stack.
+    if [ "${MOONCAKE_DEPS_SHCA:-0}" = "1" ]; then
+        if [ ! -f /usr/include/infiniband/shca_17b_types.h ]; then
+            print_error "MOONCAKE_DEPS_SHCA=1 requires preinstalled SHCA headers"
+        fi
+        SYSTEM_PACKAGES=${SYSTEM_PACKAGES//libibverbs-dev/}
+        SAFE_BOOST="libboost-dev libboost-system-dev libboost-filesystem-dev libboost-thread-dev libboost-program-options-dev libboost-regex-dev libboost-serialization-dev"
+        SYSTEM_PACKAGES=${SYSTEM_PACKAGES//libboost-all-dev/$SAFE_BOOST}
+    fi
+
     apt-get install -y $SYSTEM_PACKAGES
     check_success "Failed to install system packages"
 

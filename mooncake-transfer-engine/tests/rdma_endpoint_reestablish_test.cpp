@@ -28,6 +28,8 @@
  *     ./build/mooncake-transfer-engine/tests/rdma_endpoint_reestablish_test
  */
 
+#include "rdma_lid.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -840,7 +842,7 @@ class RdmaEndPointTestPeer {
     }
 
     static int doSetupConnection(RdmaEndPoint &endpoint, int qp_index,
-                                 const ibv_gid &peer_gid, uint16_t peer_lid,
+                                 const ibv_gid &peer_gid, RdmaLid peer_lid,
                                  uint32_t peer_qp_num, int local_gid_index,
                                  std::string *reply_msg,
                                  int &out_stage, int &out_sys_errno) {

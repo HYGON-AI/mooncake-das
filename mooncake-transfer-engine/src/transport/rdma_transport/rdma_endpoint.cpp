@@ -12,9 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "rdma_lid.h"
+
 #include "transport/rdma_transport/rdma_endpoint.h"
 
 #include <glog/logging.h>
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
 
 #include <cassert>
 #include <cerrno>
@@ -790,7 +795,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     status_.store(CONNECTING, std::memory_order_relaxed);
 
     auto attempt_setup_with_peer = [&](const std::string &peer_gid,
-                                       uint16_t peer_lid) -> int {
+                                       RdmaLid peer_lid) -> int {
         int auto_gid_retry_count = 0;
         std::vector<AutoGidSelectionIdentity> attempted_auto_gid_selections;
         for (;;) {
@@ -1128,7 +1133,7 @@ static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
 }
 
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
-                                    uint16_t peer_lid,
+                                    RdmaLid peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
                                     Status connected_status,
                                     std::string *reply_msg,
@@ -1175,7 +1180,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
 }
 
 int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
-                                    uint16_t peer_lid, uint32_t peer_qp_num,
+                                    RdmaLid peer_lid, uint32_t peer_qp_num,
                                     int local_gid_index, std::string *reply_msg,
                                     SetupConnectionFailureInfo *failure_info) {
     if (qp_index < 0 || qp_index >= (int)qp_list_.size())
@@ -1235,7 +1240,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         attr.ah_attr.grh.traffic_class =
             static_cast<uint8_t>(globalConfig().ib_traffic_class);
     }
-    attr.ah_attr.dlid = peer_lid;
+#ifdef USE_SHCA
+    attr.ah_attr.dlid = u32_to_17(peer_lid);
+#else
+    attr.ah_attr.dlid = static_cast<uint16_t>(peer_lid);
+#endif
     // Set service level if configured (-1 means use default)
     attr.ah_attr.sl = 0;
     if (globalConfig().ib_service_level >= 0) {

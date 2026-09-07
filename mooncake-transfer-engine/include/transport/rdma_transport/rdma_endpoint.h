@@ -15,6 +15,8 @@
 #ifndef RDMA_ENDPOINT_H
 #define RDMA_ENDPOINT_H
 
+#include "rdma_lid.h"
+
 #include <atomic>
 #include <queue>
 
@@ -178,14 +180,14 @@ class RdmaEndPoint {
 
     std::vector<uint32_t> qpNum() const;
 
-    int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
+    int doSetupConnection(const std::string &peer_gid, RdmaLid peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
                           Status connected_status = CONNECTED,
                           std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 
     int doSetupConnection(int qp_index, const ibv_gid &peer_gid,
-                          uint16_t peer_lid, uint32_t peer_qp_num,
+                          RdmaLid peer_lid, uint32_t peer_qp_num,
                           int local_gid_index, std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 

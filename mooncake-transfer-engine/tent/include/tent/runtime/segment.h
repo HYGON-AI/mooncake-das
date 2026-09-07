@@ -15,6 +15,8 @@
 #ifndef SEGMENT_H
 #define SEGMENT_H
 
+#include "rdma_lid.h"
+
 #include <glog/logging.h>
 #include <netdb.h>
 
@@ -47,7 +49,7 @@ struct DeviceDesc {
     std::unordered_map<TransportType, std::string> transport_attrs;
 
     // backward compatilble
-    uint16_t lid;
+    RdmaLid lid;
     std::string gid;
 
    public:

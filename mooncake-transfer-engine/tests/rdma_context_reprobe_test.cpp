@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
+
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -118,7 +122,11 @@ int ibv_query_port(ibv_context *context, uint8_t,
     auto *port_attr = reinterpret_cast<ibv_port_attr *>(compat_port_attr);
     *port_attr = {};
     port_attr->state = IBV_PORT_ACTIVE;
+#ifdef USE_SHCA
+    port_attr->lid = u32_to_17(1);
+#else
     port_attr->lid = 1;
+#endif
     port_attr->active_mtu = IBV_MTU_4096;
     port_attr->active_speed = fake_verbs.active_speed;
     port_attr->active_width = fake_verbs.active_width;

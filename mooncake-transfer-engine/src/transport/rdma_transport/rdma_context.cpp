@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
+
+#include "rdma_lid.h"
+
 #include "transport/rdma_transport/rdma_context.h"
 
 #include <algorithm>
@@ -1047,7 +1053,7 @@ bool RdmaContext::reprobeAutoGid(
     std::string next_gid_string;
     int current_gid_index = -1;
     int next_gid_index = -1;
-    uint16_t current_lid = 0;
+    RdmaLid current_lid = 0;
     ibv_context *current_context = nullptr;
     uint8_t current_port = 0;
     AutoGidCandidateClass next_candidate_class =
@@ -1167,7 +1173,7 @@ GidRefreshResult RdmaContext::refreshCurrentGid(std::string *previous_gid,
     std::string current_gid_string;
     int current_gid_index = -1;
     int next_gid_index = -1;
-    uint16_t current_lid = 0;
+    RdmaLid current_lid = 0;
     ibv_context *current_context = nullptr;
     uint8_t current_port = 0;
     bool auto_gid_selection_enabled = false;
@@ -1498,7 +1504,11 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         // All checks passed, assign member variables
         context_ = context;
         port_ = port;
+#ifdef USE_SHCA
+        lid_ = u17_to_32(attr.lid);
+#else
         lid_ = attr.lid;
+#endif
         active_mtu_ = attr.active_mtu;
         active_speed_ = attr.active_speed;
 #ifdef HAVE_IBV_ACTIVE_SPEED_EX

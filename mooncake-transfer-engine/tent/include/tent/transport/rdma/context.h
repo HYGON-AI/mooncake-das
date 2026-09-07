@@ -15,6 +15,8 @@
 #ifndef TENT_CONTEXT_H
 #define TENT_CONTEXT_H
 
+#include "rdma_lid.h"
+
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <infiniband/verbs.h>
@@ -101,7 +103,7 @@ class RdmaContext {
     const std::string name() const { return device_name_; }
 
    public:
-    uint16_t lid() const { return lid_; }
+    RdmaLid lid() const { return lid_; }
 
     std::string gid() const;
 
@@ -193,7 +195,7 @@ class RdmaContext {
     size_t num_comp_channel_ = 0;
     std::vector<ibv_comp_channel *> comp_channel_;
 
-    uint16_t lid_ = 0;
+    RdmaLid lid_ = 0;
     // Set by openDevice() and refreshed by refreshPortAttributes() on the
     // monitor thread. Today every runtime reader is that same thread;
     // atomic so a reader added elsewhere stays well-defined.

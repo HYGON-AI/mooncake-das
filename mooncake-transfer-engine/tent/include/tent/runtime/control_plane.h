@@ -31,6 +31,8 @@
 #include <unordered_map>
 #include <variant>
 
+#include "rdma_lid.h"
+
 #include "tent/runtime/metastore.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_manager.h"
@@ -47,7 +49,7 @@ struct BootstrapDesc {
     std::string peer_nic_path;
     std::vector<uint32_t> qp_num;
     // RDMA address of local_nic_path.
-    uint16_t local_lid = 0;
+    RdmaLid local_lid = 0;
     std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)

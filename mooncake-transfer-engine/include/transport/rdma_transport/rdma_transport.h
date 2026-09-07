@@ -15,6 +15,8 @@
 #ifndef RDMA_TRANSPORT_H_
 #define RDMA_TRANSPORT_H_
 
+#include "rdma_lid.h"
+
 #include <infiniband/verbs.h>
 
 #include <atomic>
@@ -105,7 +107,7 @@ class RdmaTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
-    int refreshLocalDeviceDesc(const std::string &device_name, uint16_t lid,
+    int refreshLocalDeviceDesc(const std::string &device_name, RdmaLid lid,
                                const std::string &gid);
 
     int preTouchMemory(void *addr, size_t length);

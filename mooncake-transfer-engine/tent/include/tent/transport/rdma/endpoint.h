@@ -15,6 +15,8 @@
 #ifndef TENT_ENDPOINT_H
 #define TENT_ENDPOINT_H
 
+#include "rdma_lid.h"
+
 #include <atomic>
 #include <memory>
 #include <queue>
@@ -171,11 +173,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     }
 
    private:
-    int setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
+    int setupAllQPs(const std::string& peer_gid, RdmaLid peer_lid,
                     std::vector<uint32_t> peer_qp_num_list,
                     std::string* reply_msg = nullptr);
 
-    int setupOneQP(int qp_index, const std::string& peer_gid, uint16_t peer_lid,
+    int setupOneQP(int qp_index, const std::string& peer_gid, RdmaLid peer_lid,
                    uint32_t peer_qp_num, std::string* reply_msg = nullptr);
 
     // Returns the pool segment owning qp_index, or nullptr when no pools are

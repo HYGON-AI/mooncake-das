@@ -1,0 +1,39 @@
+name: HCU branch validation
+
+# Fork-only validation entry. Exclude this file from the upstream PR.
+on:
+  pull_request:
+    branches: [official_code_ci]
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  hcu:
+    if: >-
+      github.repository == 'HYGON-AI/mooncake-das' &&
+      github.event.label.name == 'run-hygon-ci' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/ci_hygon.yaml
+    with:
+      checkout_ref: ${{ github.event.pull_request.head.sha }}
+
+  cleanup-label:
+    needs: hcu
+    if: always() && needs.hcu.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Remove request label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label run-hygon-ci
