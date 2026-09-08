@@ -485,12 +485,41 @@ if [ "${TARGET_PREP_RC}" -ne 0 ] || [ "${INITIATOR_PREP_RC}" -ne 0 ]; then
 fi
 echo "Both test containers are ready."
 
-echo "Waiting for an idle GPU on ${TARGET_HOST}..."
-TARGET_GPU_ID="$(python3 "${GPU_SELECTOR_PATH}" "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}")"
-echo "Selected GPU ${TARGET_GPU_ID} on ${TARGET_HOST}."
+TARGET_GPU_RESULT="${LOG_DIR}/target-gpu-id"
+INITIATOR_GPU_RESULT="${LOG_DIR}/initiator-gpu-id"
+TARGET_GPU_LOG="${LOG_DIR}/target-gpu-probe.log"
+INITIATOR_GPU_LOG="${LOG_DIR}/initiator-gpu-probe.log"
 
-echo "Waiting for an idle GPU on ${INITIATOR_HOST}..."
-INITIATOR_GPU_ID="$(ssh "${SSH_OPTIONS[@]}" "${REMOTE}" python3 - "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}" <"${GPU_SELECTOR_PATH}")"
+echo "Waiting for idle GPUs on ${TARGET_HOST} and ${INITIATOR_HOST} in parallel..."
+python3 "${GPU_SELECTOR_PATH}" "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}" \
+    >"${TARGET_GPU_RESULT}" 2>"${TARGET_GPU_LOG}" &
+TARGET_GPU_PROBE_PID=$!
+ssh "${SSH_OPTIONS[@]}" "${REMOTE}" python3 - \
+    "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}" <"${GPU_SELECTOR_PATH}" \
+    >"${INITIATOR_GPU_RESULT}" 2>"${INITIATOR_GPU_LOG}" &
+INITIATOR_GPU_PROBE_PID=$!
+
+set +e
+wait "${TARGET_GPU_PROBE_PID}"
+TARGET_GPU_PROBE_RC=$?
+wait "${INITIATOR_GPU_PROBE_PID}"
+INITIATOR_GPU_PROBE_RC=$?
+set -e
+
+cat "${TARGET_GPU_LOG}"
+cat "${INITIATOR_GPU_LOG}"
+if [ "${TARGET_GPU_PROBE_RC}" -ne 0 ] || [ "${INITIATOR_GPU_PROBE_RC}" -ne 0 ]; then
+    echo "ERROR: GPU discovery failed (target=${TARGET_GPU_PROBE_RC}, initiator=${INITIATOR_GPU_PROBE_RC})" >&2
+    exit 1
+fi
+
+TARGET_GPU_ID="$(tail -n 1 "${TARGET_GPU_RESULT}")"
+INITIATOR_GPU_ID="$(tail -n 1 "${INITIATOR_GPU_RESULT}")"
+if ! [[ "${TARGET_GPU_ID}" =~ ^[0-9]+$ ]] || ! [[ "${INITIATOR_GPU_ID}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: GPU discovery returned invalid IDs (target=${TARGET_GPU_ID}, initiator=${INITIATOR_GPU_ID})" >&2
+    exit 1
+fi
+echo "Selected GPU ${TARGET_GPU_ID} on ${TARGET_HOST}."
 echo "Selected GPU ${INITIATOR_GPU_ID} on ${INITIATOR_HOST}."
 
 echo "Starting target service on ${TARGET_HOST}..."

@@ -18,7 +18,11 @@ def available_gpus(threshold: float):
             "hy-smi not found at /opt/hyhal/bin/hy-smi or in PATH"
         )
     result = subprocess.run(
-        [hy_smi], check=True, capture_output=True, text=True
+        [hy_smi],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
     )
     available = set()
     for line in result.stdout.splitlines():
