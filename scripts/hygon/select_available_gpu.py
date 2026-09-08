@@ -7,7 +7,7 @@ import sys
 import time
 
 
-def available_gpus(threshold: float) -> set[int]:
+def available_gpus(threshold: float):
     result = subprocess.run(
         ["hy-smi"], check=True, capture_output=True, text=True
     )
