@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wait for one consistently idle Hygon GPU and print its device ID."""
+"""Select consistently idle Hygon GPUs inside an HCU test container."""
 
 import os
 import re
@@ -9,7 +9,7 @@ import sys
 import time
 
 
-def available_gpus(threshold: float):
+def available_gpus(threshold: float) -> set[int]:
     hy_smi = "/opt/hyhal/bin/hy-smi"
     if not os.path.isfile(hy_smi):
         hy_smi = shutil.which("hy-smi")
@@ -18,11 +18,7 @@ def available_gpus(threshold: float):
             "hy-smi not found at /opt/hyhal/bin/hy-smi or in PATH"
         )
     result = subprocess.run(
-        [hy_smi],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
+        [hy_smi], check=True, capture_output=True, text=True
     )
     available = set()
     for line in result.stdout.splitlines():
