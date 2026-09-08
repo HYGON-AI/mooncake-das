@@ -177,6 +177,7 @@ SETTLE_SECONDS="${HCU_TEST_SETTLE_SECONDS:-5}"
 RUN_TIMEOUT="${HCU_TEST_RUN_TIMEOUT:-300}"
 GPU_USAGE_THRESHOLD="${HCU_GPU_USAGE_THRESHOLD:-0}"
 GPU_WAIT_TIMEOUT="${HCU_GPU_WAIT_TIMEOUT:-9999}"
+GPU_COUNT_PER_NODE=1
 LOCK_FILE="${HCU_CROSS_NODE_LOCK_FILE:-/tmp/mooncake-hcu-cross-node.lock}"
 LOCK_TIMEOUT="${HCU_CROSS_NODE_LOCK_TIMEOUT:-9999}"
 REDACT_IPS="${HCU_TEST_REDACT_IPS:-${GITHUB_ACTIONS:-false}}"
@@ -490,32 +491,49 @@ INITIATOR_GPU_RESULT="${LOG_DIR}/initiator-gpu-id"
 TARGET_GPU_LOG="${LOG_DIR}/target-gpu-probe.log"
 INITIATOR_GPU_LOG="${LOG_DIR}/initiator-gpu-probe.log"
 
-echo "Waiting for idle GPUs on ${TARGET_HOST} and ${INITIATOR_HOST} in parallel..."
-python3 "${GPU_SELECTOR_PATH}" "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}" \
-    >"${TARGET_GPU_RESULT}" 2>"${TARGET_GPU_LOG}" &
-TARGET_GPU_PROBE_PID=$!
-ssh "${SSH_OPTIONS[@]}" "${REMOTE}" python3 - \
-    "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}" <"${GPU_SELECTOR_PATH}" \
-    >"${INITIATOR_GPU_RESULT}" 2>"${INITIATOR_GPU_LOG}" &
-INITIATOR_GPU_PROBE_PID=$!
+echo "Waiting for ${GPU_COUNT_PER_NODE} idle GPU(s) on both nodes in the same sampling round..."
+GPU_WAIT_STARTED="${SECONDS}"
+while true; do
+    GPU_WAIT_REMAINING=$((GPU_WAIT_TIMEOUT - (SECONDS - GPU_WAIT_STARTED)))
+    if ((GPU_WAIT_REMAINING <= 0)); then
+        echo "ERROR: both nodes did not have ${GPU_COUNT_PER_NODE} stable GPU(s) within ${GPU_WAIT_TIMEOUT}s" >&2
+        exit 1
+    fi
+    GPU_ROUND_TIMEOUT=10
+    if ((GPU_WAIT_REMAINING < GPU_ROUND_TIMEOUT)); then
+        GPU_ROUND_TIMEOUT="${GPU_WAIT_REMAINING}"
+    fi
 
-set +e
-wait "${TARGET_GPU_PROBE_PID}"
-TARGET_GPU_PROBE_RC=$?
-wait "${INITIATOR_GPU_PROBE_PID}"
-INITIATOR_GPU_PROBE_RC=$?
-set -e
+    python3 "${GPU_SELECTOR_PATH}" "${GPU_USAGE_THRESHOLD}" "${GPU_ROUND_TIMEOUT}" \
+        "${GPU_COUNT_PER_NODE}" >"${TARGET_GPU_RESULT}" 2>"${TARGET_GPU_LOG}" &
+    TARGET_GPU_PROBE_PID=$!
+    ssh "${SSH_OPTIONS[@]}" "${REMOTE}" python3 - \
+        "${GPU_USAGE_THRESHOLD}" "${GPU_ROUND_TIMEOUT}" "${GPU_COUNT_PER_NODE}" \
+        <"${GPU_SELECTOR_PATH}" >"${INITIATOR_GPU_RESULT}" 2>"${INITIATOR_GPU_LOG}" &
+    INITIATOR_GPU_PROBE_PID=$!
 
-cat "${TARGET_GPU_LOG}"
-cat "${INITIATOR_GPU_LOG}"
-if [ "${TARGET_GPU_PROBE_RC}" -ne 0 ] || [ "${INITIATOR_GPU_PROBE_RC}" -ne 0 ]; then
-    echo "ERROR: GPU discovery failed (target=${TARGET_GPU_PROBE_RC}, initiator=${INITIATOR_GPU_PROBE_RC})" >&2
-    exit 1
-fi
+    set +e
+    wait "${TARGET_GPU_PROBE_PID}"
+    TARGET_GPU_PROBE_RC=$?
+    wait "${INITIATOR_GPU_PROBE_PID}"
+    INITIATOR_GPU_PROBE_RC=$?
+    set -e
+
+    echo "===== target GPU probe (${TARGET_HOST}) ====="
+    cat "${TARGET_GPU_LOG}"
+    echo "===== initiator GPU probe (${INITIATOR_HOST}) ====="
+    cat "${INITIATOR_GPU_LOG}"
+    if [ "${TARGET_GPU_PROBE_RC}" -eq 0 ] && [ "${INITIATOR_GPU_PROBE_RC}" -eq 0 ]; then
+        break
+    fi
+    echo "Both nodes were not ready in the same sampling round; retrying..."
+    sleep 1
+done
 
 TARGET_GPU_ID="$(tail -n 1 "${TARGET_GPU_RESULT}")"
 INITIATOR_GPU_ID="$(tail -n 1 "${INITIATOR_GPU_RESULT}")"
-if ! [[ "${TARGET_GPU_ID}" =~ ^[0-9]+$ ]] || ! [[ "${INITIATOR_GPU_ID}" =~ ^[0-9]+$ ]]; then
+if ! [[ "${TARGET_GPU_ID}" =~ ^[0-9]+(,[0-9]+)*$ ]] || \
+    ! [[ "${INITIATOR_GPU_ID}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
     echo "ERROR: GPU discovery returned invalid IDs (target=${TARGET_GPU_ID}, initiator=${INITIATOR_GPU_ID})" >&2
     exit 1
 fi
@@ -556,6 +574,12 @@ if ! kill -0 "${TARGET_PROCESS_PID}" 2>/dev/null; then
     echo "ERROR: target service exited during initialization" >&2
     exit 1
 fi
+
+echo "Rechecking the initiator GPU immediately before startup..."
+INITIATOR_GPU_ID="$(ssh "${SSH_OPTIONS[@]}" "${REMOTE}" python3 - \
+    "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}" "${GPU_COUNT_PER_NODE}" \
+    <"${GPU_SELECTOR_PATH}")"
+echo "Selected GPU ${INITIATOR_GPU_ID} on ${INITIATOR_HOST}."
 
 echo "Starting initiator service on ${INITIATOR_HOST}..."
 if ! ssh "${SSH_OPTIONS[@]}" "${REMOTE}" bash -s -- \

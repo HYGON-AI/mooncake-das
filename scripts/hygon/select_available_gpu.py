@@ -43,12 +43,20 @@ def available_gpus(threshold: float):
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("usage: select_available_gpu.py <usage-threshold> <max-wait-seconds>", file=sys.stderr)
+    if len(sys.argv) not in (3, 4):
+        print(
+            "usage: select_available_gpu.py <usage-threshold> "
+            "<max-wait-seconds> [gpu-count]",
+            file=sys.stderr,
+        )
         return 2
 
     threshold = float(sys.argv[1])
     max_wait = int(sys.argv[2])
+    gpu_count = int(sys.argv[3]) if len(sys.argv) == 4 else 1
+    if gpu_count < 1:
+        print("ERROR: gpu-count must be a positive integer", file=sys.stderr)
+        return 2
     deadline = time.monotonic() + max_wait
     poll_count = 10
 
@@ -66,10 +74,15 @@ def main() -> int:
                     time.sleep(1)
 
             stable = sorted(set.intersection(*samples)) if samples else []
-            if stable:
-                print(stable[0])
+            if len(stable) >= gpu_count:
+                print(",".join(str(gpu) for gpu in stable[:gpu_count]))
                 return 0
-            print("No consistently idle GPU; retrying...", file=sys.stderr)
+            print(
+                "Need {} stable GPU(s), found {}; retrying...".format(
+                    gpu_count, len(stable)
+                ),
+                file=sys.stderr,
+            )
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         print(f"ERROR: failed to query Hygon GPUs: {error}", file=sys.stderr)
         return 1
