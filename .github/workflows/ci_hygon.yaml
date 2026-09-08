@@ -78,14 +78,14 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Record tested commit
         shell: bash
         run: |
           git rev-parse HEAD
           printf 'HCU source commit: `%s`\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Install DTK
         shell: bash
