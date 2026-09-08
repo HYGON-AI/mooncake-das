@@ -42,6 +42,8 @@ SHCA 适配及 CI。没有合并整个厂商分支，也没有移植厂商的全
 | `HCU_TEST_REMOTE_USER` | 否 | SSH 用户，默认 `github` |
 | `HCU_TEST_INITIATOR_SSH_HOST` | 否 | 若管理网 SSH 地址不同于第二节点服务 IP，填管理网主机名/IP |
 | `HCU_TEST_SSH_PORT` | 否 | 默认 `22` |
+| `HCU_GPU_USAGE_THRESHOLD` | 否 | GPU 显存或计算利用率允许的最大百分比，默认 `10` |
+| `HCU_GPU_WAIT_TIMEOUT` | 否 | 每个节点等待稳定空闲 GPU 的最长秒数，默认 `900` |
 | `HCU_STORE_ETCD_URL` | 否 | 可访问的 etcd v3.6.1 linux-amd64 tarball；默认使用 GitHub release |
 | `HCU_CI_ENABLED` | 官方接入时 | 官方环境准备完成后才设置 `true`；本仓库分支验证无需设置 |
 

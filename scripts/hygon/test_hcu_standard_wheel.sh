@@ -29,6 +29,8 @@ Optional environment variables:
   HCU_TEST_READY_TIMEOUT    Target startup timeout in seconds (default: 300)
   HCU_TEST_SETTLE_SECONDS   Delay after target publishes its port (default: 5)
   HCU_TEST_RUN_TIMEOUT      Initiator container timeout in seconds (default: 300)
+  HCU_GPU_USAGE_THRESHOLD   Maximum VRAM/HCU usage percentage (default: 10)
+  HCU_GPU_WAIT_TIMEOUT      Seconds to wait for an idle GPU per node (default: 900)
   HCU_TEST_LOG_DIR          Directory for target and initiator logs
   HCU_CROSS_NODE_LOCK_FILE  Shared test lock file on both nodes
   HCU_CROSS_NODE_LOCK_TIMEOUT Seconds to wait for each node lock (default: 900)
@@ -91,6 +93,7 @@ activate_container_runtime() {
 
 run_container_target() {
     local target_ip="$1"
+    local gpu_id="$2"
 
     activate_container_runtime
     export MC_TE_FILTERS="${HCU_TEST_TARGET_FILTER}"
@@ -100,7 +103,7 @@ run_container_target() {
         --auto_discovery \
         --protocol=rdma \
         --metadata_server=P2PHANDSHAKE \
-        --gpu_id=-1 \
+        --gpu_id="${gpu_id}" \
         --local_server_name="${target_ip}"
 }
 
@@ -108,6 +111,7 @@ run_container_initiator() {
     local initiator_ip="$1"
     local target_ip="$2"
     local target_port="$3"
+    local gpu_id="$4"
 
     activate_container_runtime
     echo "Starting initiator on ${initiator_ip}; target is ${target_ip}:${target_port}..."
@@ -116,7 +120,7 @@ run_container_initiator() {
         --auto_discovery \
         --protocol=rdma \
         --metadata_server=P2PHANDSHAKE \
-        --gpu_id=-1 \
+        --gpu_id="${gpu_id}" \
         --local_server_name="${initiator_ip}" \
         --segment_id="${target_ip}:${target_port}"
 }
@@ -130,11 +134,11 @@ case "${1:-}" in
         ;;
     __container_target)
         require_env HCU_TEST_TARGET_FILTER
-        run_container_target "$2"
+        run_container_target "$2" "$3"
         exit 0
         ;;
     __container_initiator)
-        run_container_initiator "$2" "$3" "$4"
+        run_container_initiator "$2" "$3" "$4" "$5"
         exit 0
         ;;
 esac
@@ -156,6 +160,7 @@ done
 
 WHEEL_PATH="$(realpath "$1")"
 SELF_PATH="$(realpath "${BASH_SOURCE[0]}")"
+GPU_SELECTOR_PATH="$(realpath "$(dirname "${BASH_SOURCE[0]}")/select_available_gpu.py")"
 if [ ! -f "${WHEEL_PATH}" ]; then
     echo "ERROR: wheel not found: ${WHEEL_PATH}" >&2
     exit 1
@@ -170,6 +175,8 @@ SETUP_TIMEOUT="${HCU_TEST_SETUP_TIMEOUT:-600}"
 READY_TIMEOUT="${HCU_TEST_READY_TIMEOUT:-300}"
 SETTLE_SECONDS="${HCU_TEST_SETTLE_SECONDS:-5}"
 RUN_TIMEOUT="${HCU_TEST_RUN_TIMEOUT:-300}"
+GPU_USAGE_THRESHOLD="${HCU_GPU_USAGE_THRESHOLD:-10}"
+GPU_WAIT_TIMEOUT="${HCU_GPU_WAIT_TIMEOUT:-900}"
 LOCK_FILE="${HCU_CROSS_NODE_LOCK_FILE:-/tmp/mooncake-hcu-cross-node.lock}"
 LOCK_TIMEOUT="${HCU_CROSS_NODE_LOCK_TIMEOUT:-900}"
 REDACT_IPS="${HCU_TEST_REDACT_IPS:-${GITHUB_ACTIONS:-false}}"
@@ -187,6 +194,10 @@ INITIATOR_LOCK_LOG="${LOG_DIR}/initiator-lock.log"
 
 if ! [[ "${LOCK_TIMEOUT}" =~ ^[0-9]+$ ]] || ((LOCK_TIMEOUT < 1)); then
     echo "ERROR: HCU_CROSS_NODE_LOCK_TIMEOUT must be a positive integer" >&2
+    exit 2
+fi
+if ! [[ "${GPU_WAIT_TIMEOUT}" =~ ^[0-9]+$ ]] || ((GPU_WAIT_TIMEOUT < 1)); then
+    echo "ERROR: HCU_GPU_WAIT_TIMEOUT must be a positive integer" >&2
     exit 2
 fi
 
@@ -474,10 +485,18 @@ if [ "${TARGET_PREP_RC}" -ne 0 ] || [ "${INITIATOR_PREP_RC}" -ne 0 ]; then
 fi
 echo "Both test containers are ready."
 
+echo "Waiting for an idle GPU on ${TARGET_HOST}..."
+TARGET_GPU_ID="$(python3 "${GPU_SELECTOR_PATH}" "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}")"
+echo "Selected GPU ${TARGET_GPU_ID} on ${TARGET_HOST}."
+
+echo "Waiting for an idle GPU on ${INITIATOR_HOST}..."
+INITIATOR_GPU_ID="$(ssh "${SSH_OPTIONS[@]}" "${REMOTE}" python3 - "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}" <"${GPU_SELECTOR_PATH}")"
+echo "Selected GPU ${INITIATOR_GPU_ID} on ${INITIATOR_HOST}."
+
 echo "Starting target service on ${TARGET_HOST}..."
 docker exec -e "HCU_TEST_TARGET_FILTER=${TARGET_FILTER}" "${TARGET_CONTAINER}" \
     /bin/bash /work/test_hcu_standard_wheel.sh \
-    __container_target "${TARGET_IP}" \
+    __container_target "${TARGET_IP}" "${TARGET_GPU_ID}" \
     >>"${TARGET_LOG}" 2>&1 &
 TARGET_PROCESS_PID=$!
 
@@ -512,17 +531,18 @@ fi
 echo "Starting initiator service on ${INITIATOR_HOST}..."
 if ! ssh "${SSH_OPTIONS[@]}" "${REMOTE}" bash -s -- \
     "${INITIATOR_CONTAINER}" "${INITIATOR_IP}" "${TARGET_IP}" \
-    "${TARGET_PORT}" "${RUN_TIMEOUT}" >>"${INITIATOR_LOG}" 2>&1 <<'REMOTE_TEST'; then
+    "${TARGET_PORT}" "${INITIATOR_GPU_ID}" "${RUN_TIMEOUT}" >>"${INITIATOR_LOG}" 2>&1 <<'REMOTE_TEST'; then
 set -Eeuo pipefail
 container_name="$1"
 initiator_ip="$2"
 target_ip="$3"
 target_port="$4"
-run_timeout="$5"
+gpu_id="$5"
+run_timeout="$6"
 
 timeout "${run_timeout}" docker exec "${container_name}" \
     /bin/bash /work/test_hcu_standard_wheel.sh \
-    __container_initiator "${initiator_ip}" "${target_ip}" "${target_port}"
+    __container_initiator "${initiator_ip}" "${target_ip}" "${target_port}" "${gpu_id}"
 REMOTE_TEST
     echo "ERROR: initiator service failed" >&2
     exit 1

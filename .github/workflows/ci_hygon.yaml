@@ -166,6 +166,8 @@ jobs:
       HCU_TEST_INITIATOR_SSH_HOST: "${{ vars.HCU_TEST_INITIATOR_SSH_HOST }}"
       HCU_TEST_SSH_PORT: "${{ vars.HCU_TEST_SSH_PORT || '22' }}"
       HCU_CROSS_NODE_LOCK_TIMEOUT: "900"
+      HCU_GPU_USAGE_THRESHOLD: "${{ vars.HCU_GPU_USAGE_THRESHOLD || '10' }}"
+      HCU_GPU_WAIT_TIMEOUT: "${{ vars.HCU_GPU_WAIT_TIMEOUT || '900' }}"
       PIP_INDEX_URL: "${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/"
     steps:
       - name: Checkout test script
