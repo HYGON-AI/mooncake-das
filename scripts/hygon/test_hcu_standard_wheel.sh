@@ -397,9 +397,10 @@ INITIATOR_LOCK_PID=$!
 wait_for_lock "${INITIATOR_LOCK_LOG}" "${INITIATOR_LOCK_PID}" "${INITIATOR_HOST}"
 echo "Cross-node test locks acquired."
 
-echo "Copying the wheel and test entry script to ${INITIATOR_HOST}..."
+echo "Copying the wheel and test scripts to ${INITIATOR_HOST}..."
 ssh "${SSH_OPTIONS[@]}" "${REMOTE}" mkdir -p "${REMOTE_WORK_DIR}"
-scp "${SCP_OPTIONS[@]}" "${WHEEL_PATH}" "${SELF_PATH}" "${REMOTE}:${REMOTE_WORK_DIR}/"
+scp "${SCP_OPTIONS[@]}" "${WHEEL_PATH}" "${SELF_PATH}" "${GPU_SELECTOR_PATH}" \
+    "${REMOTE}:${REMOTE_WORK_DIR}/"
 
 echo "Creating target container ${TARGET_CONTAINER} on ${TARGET_HOST}..."
 docker run -d \
@@ -412,6 +413,7 @@ docker run -d \
     --volume /opt/hyhal:/opt/hyhal:ro \
     --volume "${WHEEL_PATH}:/work/${WHEEL_BASENAME}:ro" \
     --volume "${SELF_PATH}:/work/test_hcu_standard_wheel.sh:ro" \
+    --volume "${GPU_SELECTOR_PATH}:/work/select_available_gpu.py:ro" \
     "${DOCKER_ENV_ARGS[@]}" \
     -e "HCU_TEST_TARGET_FILTER=${TARGET_FILTER}" \
     --entrypoint /bin/bash \
@@ -421,17 +423,19 @@ docker run -d \
 echo "Creating initiator container ${INITIATOR_CONTAINER} on ${INITIATOR_HOST}..."
 ssh "${SSH_OPTIONS[@]}" "${REMOTE}" bash -s -- \
     "${REMOTE_WORK_DIR}" "${WHEEL_BASENAME}" "$(basename "${SELF_PATH}")" \
+    "$(basename "${GPU_SELECTOR_PATH}")" \
     "${INITIATOR_CONTAINER}" "${HCU_TEST_IMAGE}" "${HCU_TEST_DTK_PKG_URL}" \
     "${PIP_INDEX_URL:-}" "${PIP_TRUSTED_HOST:-}" <<'REMOTE_START' >/dev/null
 set -Eeuo pipefail
 remote_dir="$1"
 wheel_basename="$2"
 script_basename="$3"
-container_name="$4"
-image="$5"
-dtk_pkg_url="$6"
-pip_index_url="$7"
-pip_trusted_host="$8"
+gpu_selector_basename="$4"
+container_name="$5"
+image="$6"
+dtk_pkg_url="$7"
+pip_index_url="$8"
+pip_trusted_host="$9"
 
 docker_env_args=(-e "HCU_TEST_DTK_PKG_URL=${dtk_pkg_url}")
 [ -n "${pip_index_url}" ] && docker_env_args+=(-e "PIP_INDEX_URL=${pip_index_url}")
@@ -447,6 +451,7 @@ docker run -d \
     --volume /opt/hyhal:/opt/hyhal:ro \
     --volume "${remote_dir}/${wheel_basename}:/work/${wheel_basename}:ro" \
     --volume "${remote_dir}/${script_basename}:/work/test_hcu_standard_wheel.sh:ro" \
+    --volume "${remote_dir}/${gpu_selector_basename}:/work/select_available_gpu.py:ro" \
     "${docker_env_args[@]}" \
     --entrypoint /bin/bash \
     "${image}" \
@@ -504,12 +509,14 @@ while true; do
         GPU_ROUND_TIMEOUT="${GPU_WAIT_REMAINING}"
     fi
 
-    python3 "${GPU_SELECTOR_PATH}" "${GPU_USAGE_THRESHOLD}" "${GPU_ROUND_TIMEOUT}" \
+    docker exec "${TARGET_CONTAINER}" python3 /work/select_available_gpu.py \
+        "${GPU_USAGE_THRESHOLD}" "${GPU_ROUND_TIMEOUT}" \
         "${GPU_COUNT_PER_NODE}" >"${TARGET_GPU_RESULT}" 2>"${TARGET_GPU_LOG}" &
     TARGET_GPU_PROBE_PID=$!
-    ssh "${SSH_OPTIONS[@]}" "${REMOTE}" python3 - \
-        "${GPU_USAGE_THRESHOLD}" "${GPU_ROUND_TIMEOUT}" "${GPU_COUNT_PER_NODE}" \
-        <"${GPU_SELECTOR_PATH}" >"${INITIATOR_GPU_RESULT}" 2>"${INITIATOR_GPU_LOG}" &
+    ssh "${SSH_OPTIONS[@]}" "${REMOTE}" docker exec "${INITIATOR_CONTAINER}" \
+        python3 /work/select_available_gpu.py "${GPU_USAGE_THRESHOLD}" \
+        "${GPU_ROUND_TIMEOUT}" "${GPU_COUNT_PER_NODE}" \
+        >"${INITIATOR_GPU_RESULT}" 2>"${INITIATOR_GPU_LOG}" &
     INITIATOR_GPU_PROBE_PID=$!
 
     set +e
@@ -576,9 +583,9 @@ if ! kill -0 "${TARGET_PROCESS_PID}" 2>/dev/null; then
 fi
 
 echo "Rechecking the initiator GPU immediately before startup..."
-INITIATOR_GPU_ID="$(ssh "${SSH_OPTIONS[@]}" "${REMOTE}" python3 - \
-    "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}" "${GPU_COUNT_PER_NODE}" \
-    <"${GPU_SELECTOR_PATH}")"
+INITIATOR_GPU_ID="$(ssh "${SSH_OPTIONS[@]}" "${REMOTE}" \
+    docker exec "${INITIATOR_CONTAINER}" python3 /work/select_available_gpu.py \
+    "${GPU_USAGE_THRESHOLD}" "${GPU_WAIT_TIMEOUT}" "${GPU_COUNT_PER_NODE}")"
 echo "Selected GPU ${INITIATOR_GPU_ID} on ${INITIATOR_HOST}."
 
 echo "Starting initiator service on ${INITIATOR_HOST}..."
