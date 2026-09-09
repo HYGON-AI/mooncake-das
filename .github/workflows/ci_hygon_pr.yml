@@ -3,7 +3,7 @@ name: HCU PR CI
 # Independent job graph: existing upstream workflows keep their own triggers.
 # Enable only after configuring isolated runners and hcu-ci environment review.
 on:
-  pull_request_target:
+  pull_request:
     branches: [main, official_code_ci]
     types: [labeled]
 
