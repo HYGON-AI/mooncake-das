@@ -3175,6 +3175,140 @@ assert store.batch_get_session_end(keys) == 0
 ```
 </details>
 
+### Ordered ReadPlan
+
+`MooncakeDistributedStore.create_read_plan()` creates a one-shot sequence of
+range reads against memory replicas. It caches replica metadata in a get session
+and publishes groups in order. Use it with an initialized real Store client;
+DummyClient does not implement the underlying session operations.
+
+#### create_read_plan()
+
+```python
+plan = store.create_read_plan(
+    layouts, num_groups, buffer_owners=None
+)
+```
+
+Each layout is `(keys, rows, packed, groups)`. `groups` has exactly `num_groups`
+entries. Each entry contains components of the form
+`(destination_base, destination_row_stride, byte_count, object_source_offset)`.
+All addresses, strides, sizes and offsets are integers in bytes. For row `r`,
+the destination address is `destination_base + r * destination_row_stride`.
+An empty component list skips that layout for that group.
+
+- With `packed=True`, each row maps to one key; all components for that row read
+  different ranges of that object. `len(keys) == len(rows)` for nonempty groups.
+- With `packed=False`, each row/component pair maps to one key in row-major
+  order. For a group with `c` components, `len(keys) == len(rows) * c`.
+  Nonempty groups therefore have the same component count in an unpacked layout.
+
+For example, suppose `store` is initialized and `a` and `b` contain at least
+eight bytes each. Allocate one NumPy row per object:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+
+dst = np.zeros((2, 8), dtype=np.uint8)
+base = dst.ctypes.data
+row_stride = dst.strides[0]  # NumPy strides are already in bytes.
+layouts = [
+    (["a", "b"], [0, 1], True, [
+        [(base,     row_stride, 4, 0)],  # first four bytes of each object
+        [(base + 4, row_stride, 4, 4)],  # remaining four bytes
+    ]),
+]
+rc = store.register_buffer(base, dst.nbytes)
+if rc != 0:
+    raise RuntimeError(f"register_buffer failed: {rc}")
+try:
+    plan = store.create_read_plan(layouts, 2, buffer_owners=[dst])
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        running = executor.submit(plan.run)
+        plan.wait(0)
+        first_parts = dst[:, :4].copy()  # Consume only the published group.
+        plan.wait(1)
+        running.result()  # Propagate any run() exception.
+    print(dst)  # Each row now contains the first eight bytes of its object.
+finally:
+    # The executor has joined the reader before memory is unregistered.
+    store.unregister_buffer(base)
+```
+
+For unpacked objects, replace `layouts` above before creating the plan. This
+variant uses four objects, two per row, with two components per group. Each
+object contains at least four bytes:
+
+```python
+layouts = [
+    (["a0", "a1", "b0", "b1"], [0, 1], False, [
+        [(base,     row_stride, 2, 0), (base + 4, row_stride, 2, 0)],
+        [(base + 2, row_stride, 2, 2), (base + 6, row_stride, 2, 2)],
+    ]),
+]
+```
+
+`run()` blocks until reads and cleanup complete and may only be called once.
+Both `run()` and `wait(group)` release the Python GIL. A waiter may start before
+`run()`, but it will block until another thread runs the plan. A synchronous
+caller can simply call `plan.run()` without a worker thread.
+
+#### Readiness and failure
+
+`wait(g)` succeeds after group `g` has passed read-result validation and all
+earlier groups have been published. Only the final group's successful readiness
+also guarantees that session cleanup has completed. Already published groups
+remain successful if a later read or cleanup fails. Unpublished groups report
+the failure after in-flight reads have drained and cleanup has been attempted.
+
+Failure does not roll back destination writes. Even an unpublished group may
+have written some or all of its destination bytes. Do not consume a group whose
+`wait()` failed. `run()` propagates the failure as well.
+
+#### Memory and session ownership
+
+All destination byte ranges belonging to different groups must be disjoint,
+including across layouts and nonadjacent groups. This applies to sequential
+and pipeline modes: a later group must not overwrite data an earlier
+consumer is still using. ReadPlan does not check this precondition. Within a
+group, avoid conflicting destination writes as well.
+
+`buffer_owners` is an optional iterable of allocation owners. ReadPlan takes a
+tuple snapshot, retains each owner until the Python plan is destroyed, and
+exposes that tuple through the read-only `_buffer_owners` property. Clearing the
+original list does not release these references. This does not register memory
+or prevent explicit buffer unregistration, resizing or freeing of underlying
+storage. Keep allocations valid and registered until `run()` finishes, and
+keep them alive for any subsequent consumption of their data.
+
+The plan also retains its Store wrapper. `store.close()` rejects unfinished
+plans, including plans not yet started. Run them to completion or release all
+references to unstarted plans before closing. Completed and failed plans do not
+prevent close.
+
+Concurrent plans on the same client with overlapping keys are rejected. Do not
+mix a plan with legacy get sessions on those keys: the two APIs share a
+key-indexed session table, and legacy session ownership is not checked by
+ReadPlan.
+
+#### Pipeline and statistics
+
+By default groups execute sequentially. Set `MOONCAKE_READ_PLAN_PIPELINE=1`
+before `run()` to enable a two-group window with two worker threads. Publication
+remains ordered even when a later read completes first. On failure, workers are
+drained before session cleanup. Values other than exactly `1` do not enable it.
+
+A one-group plan executes sequentially even when the pipeline environment
+variable is enabled.
+
+After the plan finishes (successfully or after failure cleanup), `stats()` returns
+`[validated_calls, validated_key_entries, validated_bytes]`. Only fully validated,
+nonempty groups contribute. Keys repeated in different groups are counted again.
+`stats()` raises while the plan is unfinished.
+
+
 ## MooncakeHostMemAllocator Class
 
 The `MooncakeHostMemAllocator` class provides host memory allocation capabilities for Mooncake Store operations.
