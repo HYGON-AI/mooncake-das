@@ -5523,6 +5523,14 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     std::vector<size_t> idx_map;  // batch entry -> original key index
     std::vector<std::chrono::steady_clock::time_point> lease_deadlines;
 
+    // Each key contributes at most one entry. Allocate before taking the
+    // session lock so array growth does not serialize concurrent range reads.
+    replicas.reserve(keys.size());
+    slices.reserve(keys.size());
+    src_offsets.reserve(keys.size());
+    idx_map.reserve(keys.size());
+    lease_deadlines.reserve(keys.size());
+
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         auto now = std::chrono::steady_clock::now();
