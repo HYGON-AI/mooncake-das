@@ -11,9 +11,10 @@ on:
 
 jobs:
   publish:
+    name: Publish ${{ matrix.build_variant }} wheel (${{ matrix.platform }})
     runs-on: [self-hosted, Linux, X64, hcu]
     container:
-      image: ${{ vars.BASE_COMPILE_IMAGE_UBUNTU_PY310 }}
+      image: ${{ matrix.compile_image }}
       options: >-
         --volume /opt/hyhal:/opt/hyhal:ro
         --device /dev/kfd:/dev/kfd
@@ -24,7 +25,13 @@ jobs:
       contents: read
     strategy:
       matrix:
+        platform: [ubuntu-py310, ubuntu-py312]
+        build_variant: [standard, shca, rpc]
         include:
+          - platform: ubuntu-py310
+            compile_image: ${{ vars.BASE_COMPILE_IMAGE_UBUNTU_PY310 }}
+          - platform: ubuntu-py312
+            compile_image: ${{ vars.BASE_COMPILE_IMAGE_ROCKY_PY312 }}
           - build_variant: standard
             dtk_pkg_url: "${{ vars.RESOURCE_SERVER_URL }}/dtk-pkg/dtk26.04/DTK-26.04-rc4-ubuntu20.04-x86_64.tar.gz"
           - build_variant: shca
