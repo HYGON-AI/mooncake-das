@@ -15,6 +15,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
+#include "read_plan.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
 
@@ -400,6 +401,8 @@ inline int to_py_ret(ErrorCode error_code) {
 class MooncakeStorePyWrapper {
    public:
     std::shared_ptr<PyClient> store_{nullptr};
+    // Accessed only with the GIL held. Unstarted plans also reserve the client.
+    std::vector<std::weak_ptr<mooncake::ReadPlan>> read_plans_;
     std::shared_ptr<RealClient> real_client_{nullptr};
     bool use_dummy_client_{false};
 
@@ -1889,6 +1892,14 @@ class MooncakeDistributedNoFRegisterPyWrapper {
 };
 
 PYBIND11_MODULE(store, m) {
+    py::class_<mooncake::ReadPlan, std::shared_ptr<mooncake::ReadPlan>>(
+        m, "ReadPlan", py::dynamic_attr())
+        .def("run", &mooncake::ReadPlan::run, py::call_guard<py::gil_scoped_release>())
+        .def("wait", &mooncake::ReadPlan::wait, py::arg("group"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("stats", &mooncake::ReadPlan::stats)
+        .def("reuse_stats", &mooncake::ReadPlan::reuse_stats);
+
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");
@@ -2395,6 +2406,12 @@ PYBIND11_MODULE(store, m) {
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;
+                 for (const auto &weak : self.read_plans_) {
+                     if (auto plan = weak.lock(); plan && !plan->is_finished())
+                         throw std::runtime_error(
+                             "Cannot close client with unfinished ReadPlans; "
+                             "finish run() or release unstarted plans first");
+                 }
                  int rc = self.store_->tearDownAll();
                  self.store_.reset();
                  return rc;
@@ -3026,6 +3043,38 @@ PYBIND11_MODULE(store, m) {
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")
+        .def(
+            "create_read_plan",
+            [](MooncakeStorePyWrapper &self,
+               std::vector<mooncake::ReadLayout> layouts, int num_groups,
+               bool reuse_ranges, py::object buffer_owners) {
+                if (!self.is_client_initialized())
+                    throw std::runtime_error("Client is not initialized");
+                // Keep the GIL through construction and registration so close()
+                // cannot tear down the client between those two operations.
+                auto client = self.store_;
+                auto plan = std::make_shared<mooncake::ReadPlan>(
+                    std::move(client), std::move(layouts), num_groups, reuse_ranges);
+                auto &plans = self.read_plans_;
+                plans.erase(std::remove_if(plans.begin(), plans.end(),
+                                           [](const auto &weak) {
+                                               auto p = weak.lock();
+                                               return !p || p->is_finished();
+                                           }), plans.end());
+                plans.emplace_back(plan);
+                auto object = py::cast(plan);
+                object.attr("_buffer_owners") = std::move(buffer_owners);
+                return object;
+            }, py::arg("layouts"), py::arg("num_groups"),
+            py::arg("reuse_ranges") = false, py::arg("buffer_owners") = py::none(),
+            py::keep_alive<0, 1>(),
+            "Create ordered range reads; retain registered destination memory "
+            "until run completes. Callers must ensure destination byte ranges across "
+            "groups (including different layouts) do not overlap in any execution "
+            "mode. This is not checked; violations may corrupt consumed data. "
+            "close() rejects unfinished plans, including unstarted plans; finish "
+            "run() or release unstarted plans before closing the client. "
+            "No concurrent legacy sessions on these keys.")
         .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,
