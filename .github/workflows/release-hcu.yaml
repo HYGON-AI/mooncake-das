@@ -23,6 +23,8 @@ jobs:
         --privileged
     permissions:
       contents: read
+      checks: read
+      pull-requests: read
     strategy:
       matrix:
         platform: [ubuntu-py310, ubuntu-py312]
@@ -57,6 +59,10 @@ jobs:
 
       - name: Build, repair and upload wheels
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CI_TOKEN: ${{ secrets.DASHUB_CI_TOKEN }}
+          DASHUB_BASE: ${{ vars.DASHUB_BASE }}
         run: |
           export PIP_INDEX_URL="${{ vars.PYPI_URL }}/nightly/dtk2604/+simple/"
           export DEVPI_URL="${{ vars.PYPI_URL }}/"
@@ -70,8 +76,14 @@ jobs:
           pip install ciupload
           DTK_VER=$(echo ${{ matrix.dtk_pkg_url }} | grep -oP 'dtk\K[0-9]+(?:\.[0-9]+)+' | tr -d '.')
           CIUpload REPAIR --dtk_version ${DTK_VER} --git_commit $(git rev-parse --short=6 HEAD) --outputdir repaired -f mooncake-wheel/dist/*.whl
-          CIUpload --devpi_url ${DEVPI_URL} --devpi_user ${{ secrets.PYPI_USERNAME }} --devpi_password ${{ secrets.PYPI_PASSWORD }} --dtk_pkg_name $(basename ${{ matrix.dtk_pkg_url }}) -f repaired/*.whl
-
+          CIUpload NIGHTLY --help | grep -q -- "--record"
+          CIUpload NIGHTLY \
+            --devpi_url "${DEVPI_URL}" \
+            --password "${{ secrets.PYPI_PASSWORD }}" \
+            --dtk_pkg_name "$(basename "${{ matrix.dtk_pkg_url }}")" \
+            --record \
+            --repo "${GITHUB_WORKSPACE}" \
+            -f repaired/*.whl
       - name: Cleanup environment
         if: always()
         run: |
