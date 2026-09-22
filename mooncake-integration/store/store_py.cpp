@@ -15,6 +15,7 @@
 #include "types.h"
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
+#include "read_plan.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
 
@@ -400,6 +401,8 @@ inline int to_py_ret(ErrorCode error_code) {
 class MooncakeStorePyWrapper {
    public:
     std::shared_ptr<PyClient> store_{nullptr};
+    // Accessed only with the GIL held. Unstarted plans also reserve the client.
+    std::vector<std::weak_ptr<mooncake::ReadPlan>> read_plans_;
     std::shared_ptr<RealClient> real_client_{nullptr};
     bool use_dummy_client_{false};
 
@@ -1888,7 +1891,29 @@ class MooncakeDistributedNoFRegisterPyWrapper {
     MooncakeDistributedNoFRegisterPyWrapper() = default;
 };
 
+// Python ownership stays in the Python wrapper: native weak references used by
+// close() must never destroy Python objects while the GIL is released.
+struct ReadPlanPyWrapper {
+    std::shared_ptr<mooncake::ReadPlan> plan;
+    py::tuple buffer_owners;
+
+    void run() { plan->run(); }
+    void wait(int group) { plan->wait(group); }
+    std::vector<uint64_t> stats() { return plan->stats(); }
+};
+
 PYBIND11_MODULE(store, m) {
+    py::class_<ReadPlanPyWrapper, std::shared_ptr<ReadPlanPyWrapper>>(
+        m, "ReadPlan", py::dynamic_attr())
+        .def("run", &ReadPlanPyWrapper::run,
+             py::call_guard<py::gil_scoped_release>())
+        .def("wait", &ReadPlanPyWrapper::wait, py::arg("group"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("stats", &ReadPlanPyWrapper::stats)
+        .def_property_readonly(
+            "_buffer_owners",
+            [](const ReadPlanPyWrapper &self) { return self.buffer_owners; });
+
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");
@@ -2395,6 +2420,12 @@ PYBIND11_MODULE(store, m) {
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;
+                 for (const auto &weak : self.read_plans_) {
+                     if (auto plan = weak.lock(); plan && !plan->is_finished())
+                         throw std::runtime_error(
+                             "Cannot close client with unfinished ReadPlans; "
+                             "finish run() or release unstarted plans first");
+                 }
                  int rc = self.store_->tearDownAll();
                  self.store_.reset();
                  return rc;
@@ -3026,6 +3057,50 @@ PYBIND11_MODULE(store, m) {
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")
+        .def(
+            "create_read_plan",
+            [](MooncakeStorePyWrapper &self,
+               std::vector<mooncake::ReadLayout> layouts, int num_groups,
+               py::object buffer_owners) {
+                if (!self.is_client_initialized())
+                    throw std::runtime_error("Client is not initialized");
+                // Snapshot the iterable so clearing a caller-owned list cannot
+                // release destination allocations before the plan is destroyed.
+                py::tuple owners = buffer_owners.is_none()
+                                       ? py::tuple()
+                                       : py::tuple(buffer_owners);
+                // Keep the GIL through construction and registration so close()
+                // cannot tear down the client between those two operations.
+                auto client = self.store_;
+                auto plan = std::make_shared<mooncake::ReadPlan>(
+                    std::move(client), std::move(layouts), num_groups);
+                auto &plans = self.read_plans_;
+                plans.erase(std::remove_if(plans.begin(), plans.end(),
+                                           [](const auto &weak) {
+                                               auto p = weak.lock();
+                                               return !p || p->is_finished();
+                                           }),
+                            plans.end());
+                plans.emplace_back(plan);
+                return std::make_shared<ReadPlanPyWrapper>(
+                    ReadPlanPyWrapper{std::move(plan), std::move(owners)});
+            },
+            py::arg("layouts"), py::arg("num_groups"),
+            py::arg("buffer_owners") = py::none(), py::keep_alive<0, 1>(),
+            "Create ordered range reads. buffer_owners is an optional iterable "
+            "snapshotted as a read-only tuple and retained until plan "
+            "destruction. "
+            "Keep destination memory registered until run completes. "
+            "Callers must ensure destination byte ranges across "
+            "groups (including different layouts) do not overlap in any "
+            "execution "
+            "mode. This is not checked; violations may corrupt consumed data. "
+            "close() rejects unfinished plans, including unstarted plans; "
+            "finish "
+            "run() or release unstarted plans before closing the client. "
+            "No concurrent legacy sessions on these keys. Only final group "
+            "readiness includes session cleanup. Failure does not roll back "
+            "writes to unpublished groups.")
         .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,
