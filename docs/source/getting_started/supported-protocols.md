@@ -13,7 +13,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **nvlink** | NVIDIA MNNVL | Inter-node GPU communication | ⚠️ Advanced |
 | **musa** | Moore Threads GPU + MTLink | Intra-node GPU IPC/P2P | ⚠️ Advanced |
 | **nvlink_intra** | NVIDIA NVLink | Intra-node GPU communication | ⚠️ Advanced |
-| **hip** | AMD ROCm/HIP | AMD GPU communication | ⚠️ Advanced |
+| **hip** | AMD ROCm/HIP or Hygon DTK | AMD/Hygon GPU communication | ⚠️ Advanced |
 | **barex** | RDMA-capable NIC | Bare-metal RDMA extension | ⚠️ Advanced |
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
@@ -275,15 +275,26 @@ export MC_INTRANODE_NVLINK=true
 
 ### HIP Transport (hip)
 
-**Description:** AMD ROCm/HIP transport for GPU communication using IPC handles or Shareable handles.
+**Description:** AMD ROCm/HIP and Hygon DTK transport for GPU communication using IPC handles or Shareable handles.
 
 **Use When:**
-- Working with AMD GPUs
-- Need intra-node GPU communication on AMD hardware
+- Working with AMD GPUs or Hygon DCUs
+- Need intra-node GPU communication (IPC or POSIX-fd shareable handles)
+- Need cross-node GPU memory sharing on Hygon DTK (fabric handle type `0x8`)
 
 **Requirements:**
-- AMD ROCm/HIP runtime
-- AMD GPUs
+- AMD ROCm/HIP runtime, or Hygon DTK
+- AMD GPUs or Hygon DCUs
+
+**Configuration:**
+```bash
+# Intra-node POSIX-fd shareable handles (instead of hipIpc*):
+export MC_USE_HIP_IPC=0
+
+# Hygon DTK cross-node fabric handles:
+export MC_USE_HIP_IPC=0
+export MC_USE_HYLINK=1
+```
 
 ### Barex Transport (barex)
 

@@ -16,11 +16,14 @@
 
 #include <glog/logging.h>
 
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cerrno>
 #include <cstring>
+#include <fstream>
+#include <mutex>
 #include <unistd.h>
 #include <sys/syscall.h>
 
@@ -44,6 +47,15 @@ constexpr int kDefaultNumEvents = 64;
 constexpr auto HIPX_MEM_HANDLE_TYPE_FABRIC =
     hipMemHandleTypePosixFileDescriptor;
 
+// Enabled Hygon DTK fabric handle when MC_USE_HYLINK=1
+constexpr auto HIPX_MEM_HANDLE_TYPE_DTK_FABRIC =
+    static_cast<hipMemAllocationHandleType>(0x8);
+constexpr size_t kDtkFabricHandleBytes = 512;
+using DtkFabricHandle =
+    std::array<unsigned char, kDtkFabricHandleBytes>;
+static bool g_use_dtk_fabric_handle = false;
+static std::once_flag g_dtk_fabric_once;
+
 struct hipxFabricHandle {
     int fd;
     int pid;
@@ -64,6 +76,12 @@ struct FdGuard {
     FdGuard(FdGuard&&) = delete;
     FdGuard& operator=(FdGuard&&) = delete;
 };
+
+// MC_HYLINK_USE_KERNEL_COPY=1 (default) uses MCCopyKernel. =0 uses hipMemcpyAsync.
+static bool vmmUseKernelCopy() {
+    const char* value = getenv("MC_HYLINK_USE_KERNEL_COPY");
+    return !(value && strcmp(value, "0") == 0);
+}
 
 static bool checkHip(hipError_t result, const char* message) {
     if (result != hipSuccess) {
@@ -187,6 +205,64 @@ static int openShareableHandle(const std::vector<unsigned char>& buffer,
                   "HipTransport: hipMemSetAccess failed")) {
         (void)hipMemUnmap((hipDeviceptr_t)*shm_addr, length);
         (void)hipMemAddressFree((hipDeviceptr_t)*shm_addr, length);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int openDtkFabricShareableHandle(
+    const std::vector<unsigned char>& buffer, size_t length, void** shm_addr) {
+    if (buffer.size() != kDtkFabricHandleBytes) {
+        LOG(ERROR) << "HIPTransport: invalid DTK fabric handle buffer size "
+                   << buffer.size();
+        return -1;
+    }
+
+    DtkFabricHandle fabric{};
+    memcpy(fabric.data(), buffer.data(), fabric.size());
+
+    hipMemGenericAllocationHandle_t handle;
+    if (!checkHip(hipMemImportFromShareableHandle(
+                      &handle, fabric.data(), HIPX_MEM_HANDLE_TYPE_DTK_FABRIC),
+                  "HipTransport: hipMemImportFromShareableHandle(dtk fabric) "
+                  "failed")) {
+        return -1;
+    }
+
+    if (!checkHip(hipMemAddressReserve((hipDeviceptr_t*)shm_addr, length, 0,
+                                       nullptr, 0),
+                  "HipTransport: hipMemAddressReserve failed")) {
+        (void)hipMemRelease(handle);
+        return -1;
+    }
+
+    if (!checkHip(hipMemMap((hipDeviceptr_t)*shm_addr, length, 0, handle, 0),
+                  "HipTransport: hipMemMap failed")) {
+        (void)hipMemAddressFree((hipDeviceptr_t)*shm_addr, length);
+        (void)hipMemRelease(handle);
+        return -1;
+    }
+
+    int device_id = 0;
+    if (!checkHip(hipGetDevice(&device_id),
+                  "HipTransport: hipGetDevice failed")) {
+        (void)hipMemUnmap((hipDeviceptr_t)*shm_addr, length);
+        (void)hipMemAddressFree((hipDeviceptr_t)*shm_addr, length);
+        (void)hipMemRelease(handle);
+        return -1;
+    }
+
+    hipMemAccessDesc accessDesc{};
+    accessDesc.location.type = hipMemLocationTypeDevice;
+    accessDesc.location.id = device_id;
+    accessDesc.flags = hipMemAccessFlagsProtReadWrite;
+    if (!checkHip(hipMemSetAccess((hipDeviceptr_t)*shm_addr, length,
+                                  &accessDesc, 1),
+                  "HipTransport: hipMemSetAccess failed")) {
+        (void)hipMemUnmap((hipDeviceptr_t)*shm_addr, length);
+        (void)hipMemAddressFree((hipDeviceptr_t)*shm_addr, length);
+        (void)hipMemRelease(handle);
         return -1;
     }
 
@@ -392,10 +468,174 @@ static bool supportFabricMem() {
     return true;
 }
 
+static void probeDtkFabricHandle() {
+    const char* v = getenv("MC_USE_HYLINK");
+    if (!v || strcmp(v, "1") != 0) {
+        g_use_dtk_fabric_handle = false;
+        return;
+    }
+
+    int hipDev = 0;
+    hipError_t err = hipGetDevice(&hipDev);
+    if (err != hipSuccess) {
+        LOG(ERROR) << "HipTransport: MC_USE_HYLINK=1 but hipGetDevice failed: "
+                   << hipGetErrorString(err);
+        g_use_dtk_fabric_handle = false;
+        return;
+    }
+    hipDevice_t currentDev;
+    err = hipDeviceGet(&currentDev, hipDev);
+    if (err != hipSuccess) {
+        LOG(ERROR)
+            << "HipTransport: MC_USE_HYLINK=1 but hipDeviceGet failed: "
+            << hipGetErrorString(err);
+        g_use_dtk_fabric_handle = false;
+        return;
+    }
+
+    hipMemAllocationProp prop = {};
+    prop.type = hipMemAllocationTypePinned;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = currentDev;
+    prop.requestedHandleType = HIPX_MEM_HANDLE_TYPE_DTK_FABRIC;
+
+    size_t granularity = 0;
+    err = hipMemGetAllocationGranularity(
+        &granularity, &prop, hipMemAllocationGranularityMinimum);
+    if (err != hipSuccess) {
+        LOG(ERROR) << "HipTransport: MC_USE_HYLINK=1 but fabric handle "
+                      "type 0x8 is not supported ("
+                   << hipGetErrorString(err) << ")";
+        (void)hipGetLastError();
+        g_use_dtk_fabric_handle = false;
+        return;
+    }
+    if (granularity == 0) {
+        granularity = 4096;
+    }
+
+    hipMemGenericAllocationHandle_t handle;
+    err = hipMemCreate(&handle, granularity, &prop, 0);
+    if (err != hipSuccess) {
+        LOG(ERROR) << "HipTransport: MC_USE_HYLINK=1 but fabric handle "
+                      "type 0x8 is not supported ("
+                   << hipGetErrorString(err) << ")";
+        (void)hipGetLastError();
+        g_use_dtk_fabric_handle = false;
+        return;
+    }
+    (void)hipMemRelease(handle);
+    LOG(INFO) << "HipTransport: DTK fabric handle type 0x8 enabled";
+    g_use_dtk_fabric_handle = true;
+}
+
+static void initDtkFabricHandle() {
+    std::call_once(g_dtk_fabric_once, probeDtkFabricHandle);
+}
+
+static bool useDtkFabricHandle() {
+    initDtkFabricHandle();
+    return g_use_dtk_fabric_handle;
+}
+
+
+#ifdef USE_HYGON
+static std::string getCopyKernelPath() {
+    static std::string cached_path;
+    static std::once_flag flag;
+
+    std::call_once(flag, []() {
+        const char* env_path = getenv("MC_COPY_KERNEL_PATH");
+        if (env_path && strlen(env_path) > 0) {
+            cached_path = std::string(env_path) + "/mc_copy_kernel.co";
+            std::ifstream f(cached_path);
+            if (f.good()) {
+                LOG(INFO) << "HipTransport: Found mc_copy_kernel.co via environment: "
+                          << cached_path;
+                return;
+            }
+        }
+
+        std::string default_path =
+            "/usr/local/lib/python3.10/dist-packages/mooncake/mc_copy_kernel.co";
+        std::ifstream f(default_path);
+        if (f.good()) {
+            cached_path = default_path;
+            LOG(INFO) << "HipTransport: Found mc_copy_kernel.co in default path: "
+                      << cached_path;
+            return;
+        }
+
+        LOG(ERROR) << "HipTransport: mc_copy_kernel.co not found. "
+                   << "Set MC_COPY_KERNEL_PATH or install it under "
+                   << "/usr/local/lib/python3.10/dist-packages/mooncake/";
+    });
+
+    return cached_path;
+}
+
+void HipTransport::loadCopyModule() {
+    if (module_loaded_) return;
+
+    int num_devices = 0;
+    if (!checkHip(hipGetDeviceCount(&num_devices),
+                  "HipTransport: hipGetDeviceCount failed")) {
+        return;
+    }
+
+    std::string kernel_path = getCopyKernelPath();
+    if (kernel_path.empty()) {
+        return;
+    }
+
+    int original_device = 0;
+    if (!checkHip(hipGetDevice(&original_device),
+                  "HipTransport: hipGetDevice failed")) {
+        return;
+    }
+
+    for (int device_id = 0; device_id < num_devices; ++device_id) {
+        if (!checkHip(hipSetDevice(device_id),
+                      "HipTransport: hipSetDevice failed")) {
+            return;
+        }
+
+        hipModule_t copy_module;
+        hipFunction_t copy_func;
+        hipError_t err = hipModuleLoad(&copy_module, kernel_path.c_str());
+        if (err != hipSuccess) {
+            LOG(ERROR) << "HipTransport: Failed to load mc_copy_kernel.co: "
+                       << hipGetErrorString(err);
+            return;
+        }
+
+        err = hipModuleGetFunction(&copy_func, copy_module, "MCCopyKernel");
+        if (err != hipSuccess) {
+            LOG(ERROR) << "HipTransport: Failed to get MCCopyKernel function: "
+                       << hipGetErrorString(err);
+            checkHip(hipModuleUnload(copy_module),
+                     "HipTransport: Failed to unload copy module");
+            return;
+        }
+
+        device_copy_modules_[device_id] = copy_module;
+        device_copy_funcs_[device_id] = copy_func;
+    }
+
+    module_loaded_ = true;
+    LOG(INFO) << "HipTransport: MCCopyKernel loaded on "
+              << device_copy_funcs_.size() << " devices.";
+    checkHip(hipSetDevice(original_device),
+             "HipTransport: hipSetDevice failed to restore original device");
+}
+#endif
+
 HipTransport::HipTransport()
     : use_fabric_mem_(supportFabricMem()),
       stream_pool_(getNumStreams()),
       event_pool_(getNumEvents()) {
+    // Probe DTK fabric handle support.
+    initDtkFabricHandle();
     // Enable P2P access for IPC mode
     if (!use_fabric_mem_) {
         int num_devices = 0;
@@ -406,6 +646,16 @@ HipTransport::HipTransport()
 
         setupP2PAccess(num_devices);
     }
+#ifdef USE_HYGON
+    else if (vmmUseKernelCopy()) {
+        LOG(INFO) << "HipTransport: VMM copy path MCCopyKernel "
+                     "(MC_HYLINK_USE_KERNEL_COPY=1)";
+        loadCopyModule();
+    } else {
+        LOG(INFO) << "HipTransport: VMM copy path hipMemcpyAsync "
+                     "(MC_HYLINK_USE_KERNEL_COPY=0)";
+    }
+#endif
 }
 
 HipTransport::~HipTransport() {
@@ -419,6 +669,14 @@ HipTransport::~HipTransport() {
         }
     }
     remap_entries_.clear();
+#ifdef USE_HYGON
+    if (module_loaded_) {
+        for (auto& entry : device_copy_modules_) {
+            checkHip(hipModuleUnload(entry.second),
+                     "HipTransport: Failed to unload copy module");
+        }
+    }
+#endif
 }
 
 int HipTransport::install(std::string& local_server_name,
@@ -501,7 +759,58 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
         return Status::Memory("Failed to get event or stream from pool");
     }
 
-    // Perform async memory copy
+    // IPC always uses hipMemcpyAsync. VMM uses MCCopyKernel when
+    // MC_HYLINK_USE_KERNEL_COPY=1, and hipMemcpyAsync when it is 0.
+#ifdef USE_HYGON
+    if (use_fabric_mem_ && vmmUseKernelCopy()) {
+        uint64_t d_addr, s_addr, length;
+        if (slice->opcode == TransferRequest::READ) {
+            d_addr = (uint64_t)slice->source_addr;
+            s_addr = (uint64_t)slice->local.dest_addr;
+        } else {
+            d_addr = (uint64_t)slice->local.dest_addr;
+            s_addr = (uint64_t)slice->source_addr;
+        }
+        length = (uint64_t)slice->length;
+        void* args[] = {&d_addr, &s_addr, &length};
+
+        int threads_per_block = 1024;
+        uint32_t blocks_per_grid =
+            (length + threads_per_block - 1) / threads_per_block;
+        const char* env_perf = getenv("MC_HIP_COPY_PERF");
+        if (env_perf && strcmp(env_perf, "1") == 0) {
+            if (blocks_per_grid > 4194302u) {
+                blocks_per_grid = 4194302u;
+            }
+        } else {
+            if (blocks_per_grid > 8) {
+                blocks_per_grid = 8;
+            }
+            const char* env_blocks = getenv("MC_HIP_COPY_BLOCKS");
+            if (env_blocks) {
+                try {
+                    int value = std::stoi(env_blocks);
+                    if (value > 0) {
+                        blocks_per_grid = value;
+                    }
+                } catch (...) {
+                }
+            }
+        }
+
+        auto copy_func_it = device_copy_funcs_.find(device_id);
+        if (copy_func_it == device_copy_funcs_.end()) {
+            LOG(ERROR) << "HipTransport: No copy function found for device "
+                       << device_id;
+            slice->markFailed();
+            event_pool_.putEvent(event, device_id);
+            return Status::Memory("No copy function available for device");
+        }
+        err = hipModuleLaunchKernel(copy_func_it->second, blocks_per_grid, 1, 1,
+                                    threads_per_block, 1, 1, 0, stream, args,
+                                    nullptr);
+    } else
+#endif
     if (slice->opcode == TransferRequest::READ) {
         err = hipMemcpyAsync(slice->source_addr, (void*)slice->local.dest_addr,
                              slice->length, hipMemcpyDefault, stream);
@@ -510,7 +819,7 @@ Status HipTransport::startAsyncTransfer(const TransferRequest& request,
                              slice->length, hipMemcpyDefault, stream);
     }
 
-    if (!checkHip(err, "HipTransport: hipMemcpyAsync failed")) {
+    if (!checkHip(err, "HipTransport: copy failed")) {
         slice->markFailed();
         event_pool_.putEvent(event, device_id);
         return Status::Memory("HipTransport: Async memory copy failed");
@@ -729,6 +1038,28 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         }
 
         // Export shareable handle
+        if (useDtkFabricHandle()) {
+            DtkFabricHandle fabric{};
+            if (!checkHip(hipMemExportToShareableHandle(
+                              fabric.data(), handle,
+                              HIPX_MEM_HANDLE_TYPE_DTK_FABRIC, 0),
+                          "HipTransport: hipMemExportToShareableHandle(dtk "
+                          "fabric) failed")) {
+                return -1;
+            }
+            (void)remote_accessible;
+            BufferDesc desc;
+            desc.addr = (uint64_t)real_addr;
+            desc.length = real_size;
+            desc.name = location;
+            desc.shm_name =
+                serializeBinaryData(fabric.data(), fabric.size());
+#ifdef ENABLE_MULTI_PROTOCOL
+            desc.protocol = "hip";
+#endif
+            return metadata_->addLocalMemoryBuffer(desc, true);
+        }
+
         hipxFabricHandle export_handle_raw = {};
         if (!checkHip(
                 hipMemExportToShareableHandle(&export_handle_raw, handle,
@@ -789,6 +1120,10 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                            use_fabric_mem_) {
                     rc = openShareableHandle(output_buffer, entry.length,
                                              &shm_addr);
+                } else if (output_buffer.size() == kDtkFabricHandleBytes &&
+                           use_fabric_mem_) {
+                    rc = openDtkFabricShareableHandle(
+                        output_buffer, entry.length, &shm_addr);
                 } else {
                     LOG(ERROR) << "Mismatched HIP data transfer method";
                     return -1;
@@ -868,7 +1203,9 @@ void* HipTransport::allocatePinnedLocalMemory(size_t size) {
 
     prop.type = hipMemAllocationTypePinned;
     prop.location.type = hipMemLocationTypeDevice;
-    prop.requestedHandleType = HIPX_MEM_HANDLE_TYPE_FABRIC;
+    prop.requestedHandleType = useDtkFabricHandle()
+                                   ? HIPX_MEM_HANDLE_TYPE_DTK_FABRIC
+                                   : HIPX_MEM_HANDLE_TYPE_FABRIC;
     prop.location.id = currentDev;
 
     hipError_t result = hipDeviceGetAttribute(

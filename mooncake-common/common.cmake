@@ -373,6 +373,8 @@ if(USE_MUSA)
 endif()
 
 if(USE_HYGON)
+  # VMM/HIP transport and the bench --protocol=hip path both key off USE_HIP.
+  set(USE_HIP ON)
   if(NOT DEFINED DTK_ROOT OR DTK_ROOT STREQUAL "")
     if(DEFINED ENV{DTK_HOME} AND NOT "$ENV{DTK_HOME}" STREQUAL "")
       set(DTK_ROOT

@@ -47,7 +47,8 @@
     defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
 #include <cassert>
 
-#if defined(USE_MNNVL) || defined(USE_MUSA) || defined(USE_UBSHMEM)
+#if defined(USE_MNNVL) || defined(USE_MUSA) || defined(USE_UBSHMEM) || \
+    defined(USE_HIP)
 #include "gpu_vendor/mnnvl.h"
 #endif
 
@@ -139,14 +140,21 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #endif
-        if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "musa" ||
-            FLAGS_protocol == "hip") {
+        if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "musa") {
 #if defined(USE_MNNVL) || defined(USE_MUSA)
             d_buf = allocateFabricMemory(size);
             LOG(INFO) << "Using GPU fabric/IPC memory allocation";
 #else
-            LOG(ERROR) << "--protocol=nvlink/musa/hip requires USE_MNNVL=ON or "
+            LOG(ERROR) << "--protocol=nvlink/musa requires USE_MNNVL=ON or "
                           "USE_MUSA=ON";
+            return nullptr;
+#endif
+        } else if (FLAGS_protocol == "hip") {
+#ifdef USE_HIP
+            d_buf = allocateFabricMemory(size);
+            LOG(INFO) << "Using HIP fabric memory allocation";
+#else
+            LOG(ERROR) << "--protocol=hip requires USE_HIP=ON";
             return nullptr;
 #endif
         } else if (FLAGS_protocol == "nvlink_intra") {
@@ -197,14 +205,20 @@ static void freeMemoryPool(void* addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
-    if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "musa" ||
-        FLAGS_protocol == "hip") {
+    if (FLAGS_protocol == "nvlink" || FLAGS_protocol == "musa") {
 #if defined(USE_MNNVL) || defined(USE_MUSA)
         if (FLAGS_use_vram) {
             freeFabricMemory(addr);
             return;
         }
 #endif  // USE_MNNVL || USE_MUSA
+    } else if (FLAGS_protocol == "hip") {
+#ifdef USE_HIP
+        if (FLAGS_use_vram) {
+            freeFabricMemory(addr);
+            return;
+        }
+#endif
     } else if (FLAGS_protocol == "nvlink_intra") {
 #ifdef USE_INTRA_NVLINK
         if (FLAGS_use_vram) {
