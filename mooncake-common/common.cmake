@@ -126,6 +126,7 @@ option(
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
+option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -477,6 +478,11 @@ if(USE_COREX)
   endif()
 endif()
 
+# TENT hylink builds on the HIP runtime; enable it automatically.
+if(USE_HYLINK AND NOT USE_HIP)
+  set(USE_HIP ON)
+endif()
+
 if(USE_HIP)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
   find_package(HIP REQUIRED)
@@ -771,4 +777,14 @@ if(USE_SHCA)
   add_compile_definitions(USE_SHCA)
 else()
   add_compile_definitions(YLT_ENABLE_IBV)
+endif()
+
+if(USE_HYLINK)
+  if(NOT USE_TENT)
+    message(
+      FATAL_ERROR
+        "USE_HYLINK=ON requires USE_TENT=ON: hylink is a TENT transport.")
+  endif()
+  add_compile_definitions(USE_HYLINK)
+  message(STATUS "TENT hylink transport is enabled")
 endif()

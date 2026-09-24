@@ -21,6 +21,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
 | **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
 | **flagcx** | RDMA-capable NIC(s) | Unified P2P transfer through FlagOS FlagCX | ⚠️ Advanced |
+| **hylink** | Hygon DCU + DTK | Hygon DCU communication | ⚠️ Advanced (TENT) |
 
 ## Commonly Used Protocols (Python API)
 
@@ -479,6 +480,21 @@ export FLAGCX_SOCKET_IFNAME="eth0"
 See [FlagOS FlagCX Transport](../design/transfer-engine/transport/flagcx_transport.md) for dependency,
 build, benchmark, runtime configuration, and troubleshooting details.
 
+### Hylink Transport (hylink)
+
+**Description:** TENT transport for Hygon DCU / DTK. Peers exchange a Hygon DTK VMM fabric handle (`hipMemAllocationHandleType` `0x8`) by default. Set `MC_HYLINK_USE_VMM=0` on both sides to use HIP IPC (`hipIpcGetMemHandle`) instead. IPC cannot cross machines.
+
+**Status:** TENT only. Select it with `transports.hylink.enable=true` or `transfer_engine_bench --backend=tent --protocol=hylink`. It is off unless that switch is set, so a DTK build keeps using RDMA/TCP by default.
+
+**Use When:**
+- DCU copies should use a DTK fabric handle instead of loopback RDMA/TCP. The exporter must register VMM memory (`hipMemCreate`)
+- Set `MC_HYLINK_USE_VMM=0` only for same-machine `hipMalloc` buffers that expose a HIP IPC handle
+
+**Requirements:**
+- Built with `-DUSE_HYLINK=ON -DUSE_TENT=ON` (implies `USE_HIP`)
+- Hygon DTK runtime
+- For the fabric path, both sides must support DTK fabric handle
+
 ## Configuration Examples
 
 ### Configuration File (JSON)
@@ -540,6 +556,7 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 | Cambricon MLU Clusters | rdma | Build with `-DUSE_MLU=ON`; MLU uses the normal RDMA protocol |
 | Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
 | Multi-vendor or cross-vendor clusters | flagcx | Build with `-DUSE_FLAGCX=ON`; transfers use the FlagCX P2P Engine over RDMA-capable NICs |
+| Hygon DCU Clusters | rdma + hylink | Build with `-DUSE_HYLINK=ON`; use hylink for DCU IPC/fabric communication |
 
 ## Troubleshooting
 
