@@ -135,7 +135,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool enable_dfs_prefetch = true);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -709,7 +710,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool enable_dfs_prefetch = true);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -1131,6 +1133,7 @@ class RealClient : public PyClient {
     // get session's end.
     std::unordered_map<std::string, PrefetchedSessionBuffer>
         get_session_prefetch_cache_;
+    std::atomic<bool> prefetch_arena_available_{false};
     class DfsH2dStreamPool;
     class DfsAsyncScatterContext;
     mutable std::shared_mutex dfs_read_lifecycle_mutex_;
@@ -1154,8 +1157,7 @@ class RealClient : public PyClient {
         std::atomic<bool> unavailable_logged{false};
     };
     // Shared with region deleters so accounting never touches FileStorage.
-    std::shared_ptr<PrefetchArenaStats> prefetch_arena_stats_ =
-        std::make_shared<PrefetchArenaStats>();
+    std::shared_ptr<PrefetchArenaStats> prefetch_arena_stats_;
     std::shared_ptr<BufferHandle> AllocatePrefetchArenaRegion(size_t size,
                                                               size_t alignment);
     std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;

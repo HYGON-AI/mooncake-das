@@ -313,7 +313,8 @@ class RealClientDfsPrefetchTest : public RealClientTest {
     // Starts the in-proc master and a DFS-backed client whose DFS root is a
     // fresh temporary directory, then stores DFS-only objects for keys.
     void StartDfsClientWithObjects(const char* client_address,
-                                   const std::vector<std::string>& keys) {
+                                   const std::vector<std::string>& keys,
+                                   bool enable_dfs_prefetch = true) {
         char path[] = "/tmp/mooncake_dfs_prefetch_XXXXXX";
         const char* created = mkdtemp(path);
         ASSERT_NE(created, nullptr);
@@ -327,7 +328,9 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         ASSERT_EQ(py_client_->setup_real(client_address, "P2PHANDSHAKE",
                                          16 * 1024 * 1024, 16 * 1024 * 1024,
                                          "tcp", "", master_address_, nullptr,
-                                         "", true, ssd_path_),
+                                         "", true, ssd_path_, "default", false,
+                                         DEFAULT_CLIENT_HTTP_PORT,
+                                         enable_dfs_prefetch),
                   0);
 
         ReplicateConfig config;
@@ -407,6 +410,26 @@ TEST_F(RealClientDfsPrefetchTest, FailsWithoutArenaAndOrdinaryReadWorks) {
     EXPECT_EQ(py_client_->batch_get_session_prefetch(keys),
               std::vector<int>{NoAvailableHandle()});
     ExpectRead(keys[0], 0, 512, /*cache_only=*/false);
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+}
+
+TEST_F(RealClientDfsPrefetchTest, DisabledPrefetchKeepsOrdinaryReadWorking) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+                                "4096");
+    const std::vector<std::string> keys = {"dfs_prefetch_disabled_read"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects(
+        "localhost:17830", keys, /*enable_dfs_prefetch=*/false));
+
+    EXPECT_FALSE(py_client_->dfs_prefetch_arena_available());
+    EXPECT_EQ(py_client_->prefetch_arena_stats_, nullptr);
+    EXPECT_EQ(py_client_->dfs_prefetch_arena_status(), "not configured");
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
+    EXPECT_EQ(py_client_->batch_get_session_prefetch(keys),
+              std::vector<int>{NoAvailableHandle()});
+
+    ExpectRead(keys[0], 0, 512, /*cache_only=*/false);
+
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
 }
 
