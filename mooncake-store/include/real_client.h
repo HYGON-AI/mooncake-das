@@ -43,6 +43,7 @@ struct SessionRangeReadRequest {
     std::vector<size_t> sizes;
     std::vector<size_t> src_offsets;
     std::chrono::steady_clock::time_point lease_deadline;
+    std::shared_ptr<GetSessionLifetime> lifetime;
 };
 
 using NonMemReadEntry = SessionRangeReadRequest;
@@ -63,6 +64,7 @@ struct SessionRangeReadContext {
     uint64_t trace_id{0};
     size_t cache_evicted_count{0};
     std::vector<std::string> access_sources;
+    std::vector<std::shared_ptr<GetSessionLifetime>> access_lifetimes;
     std::chrono::steady_clock::time_point timing_start;
     std::chrono::steady_clock::time_point cache_gc_done;
     std::chrono::steady_clock::time_point memory_done;
@@ -297,6 +299,10 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_refresh(
         const std::vector<std::string> &keys) override;
 
+    std::vector<int> prepare_get_session_read(
+        const std::vector<std::string> &keys,
+        GetSessionReadSnapshots &snapshots) override;
+
     GetSessionStartResult
     batch_get_session_start_with_sources(
         const std::vector<std::string> &keys) override;
@@ -325,7 +331,8 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const std::vector<std::vector<size_t>> &all_src_offsets) override;
+        const std::vector<std::vector<size_t>> &all_src_offsets,
+        const GetSessionReadSnapshots *snapshots = nullptr) override;
 
     int batch_get_session_end(const std::vector<std::string> &keys) override;
 
@@ -340,7 +347,8 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::vector<size_t>> &all_src_offsets,
-        std::vector<int> &results, SessionRangeReadContext &context);
+        std::vector<int> &results, SessionRangeReadContext &context,
+        const GetSessionReadSnapshots *snapshots);
 
     SessionRangeReadPlan classify_session_range_read_requests(
         std::vector<SessionRangeReadRequest> requests,
@@ -1091,8 +1099,8 @@ class RealClient : public PyClient {
 
     // KV transfer sessions (process-local; not shared with DummyClient).
     // get_sessions_ stores a FilterQueryResult'd QueryResult (one complete
-    // MEMORY or DFS replica plus its lease). Range reads only compare the
-    // lease locally and do not query the Master again.
+    // MEMORY or DFS replica plus its lease). Expired snapshots are retained
+    // until repair/end so compatible prefetched bytes can survive renewal.
     // Put sessions track writable + inflight so end/revoke can seal the
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
@@ -1104,7 +1112,21 @@ class RealClient : public PyClient {
     };
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
+    // Read once at client creation; shared by every on-demand lease check.
+    std::chrono::milliseconds get_session_min_remaining_{1000};
     std::unordered_map<std::string, QueryResult> get_sessions_;
+    std::unordered_map<std::string, std::shared_ptr<GetSessionLifetime>>
+        get_session_lifetimes_;
+    struct GetSessionRepair {
+        bool done{false};
+        int result{static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))};
+    };
+    std::unordered_map<std::string, std::shared_ptr<GetSessionRepair>>
+        get_session_repairs_;
+    void cancel_get_session_repair(const std::string &key);
+    std::vector<int> ensure_get_sessions(
+        const std::vector<std::string> &keys,
+        GetSessionReadSnapshots &snapshots, bool force_refresh = false);
     struct GetSessionAccessRecord {
         std::string source;
         bool success{true};

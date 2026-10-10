@@ -1378,6 +1378,14 @@ class MasterService {
             return lease_timeout <= now + std::chrono::milliseconds(ttl / 2);
         }
 
+        uint64_t RemainingReadLeaseMs() const {
+            SpinLocker locker(&lock);
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    lease_timeout - std::chrono::system_clock::now()).count();
+            return remaining > 0 ? static_cast<uint64_t>(remaining) : 0;
+        }
+
         // Check if the lease has expired
         bool IsLeaseExpired() const {
             SpinLocker locker(&lock);

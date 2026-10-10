@@ -3760,7 +3760,7 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
 
         resp = GetReplicaListResponse(std::move(replica_list),
-                                      default_kv_lease_ttl_,
+                                      metadata.RemainingReadLeaseMs(),
                                       metadata.object_checksum);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
@@ -3955,7 +3955,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
 
                 results[original_idx] = GetReplicaListResponse(
-                    std::move(replica_list), default_kv_lease_ttl_,
+                    std::move(replica_list), metadata.RemainingReadLeaseMs(),
                     metadata.object_checksum);
             }
         }
@@ -4543,7 +4543,7 @@ auto MasterService::PutStartInternal(
                     return AllocateAndInsertMetadata(
                         shard, client_id, key, slice_length, config,
                         writer_host_id, group_id, object_id.tenant_id, now,
-                        *soft_pin_request, quota_deficit_bytes, std::nullopt, 
+                        *soft_pin_request, quota_deficit_bytes, std::nullopt,
                         preallocated_dfs, &dfs_allocation_failed);
                 }
             }
