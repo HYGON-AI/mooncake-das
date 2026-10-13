@@ -1,5 +1,6 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
+
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
 # Find Python package
@@ -86,6 +87,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    read_layout.cpp
     registered_pinned_memory.cpp
     dummy_client.cpp
     shm_helper.cpp

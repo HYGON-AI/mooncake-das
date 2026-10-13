@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 set(MOONCAKE_STORE_TESTS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 function(add_store_test name)
@@ -328,3 +330,5 @@ foreach(
   ordered_oplog_writer_test)
   target_link_libraries(${target} PRIVATE Mooncake::xxhash)
 endforeach()
+
+add_store_test(read_layout_test read_layout_test.cpp)
