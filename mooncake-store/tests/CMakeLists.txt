@@ -1,3 +1,5 @@
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 set(MOONCAKE_STORE_TESTS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 function(add_store_test name)
@@ -571,6 +573,7 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+add_store_test(read_layout_test read_layout_test.cpp)
 
 # Compile the production resource manager against a USRBIO test double, even
 # when USE_3FS is disabled. Keep it separate from mooncake_store's real client.
