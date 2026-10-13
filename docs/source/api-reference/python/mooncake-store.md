@@ -3338,6 +3338,205 @@ assert store.batch_get_session_end(keys) == 0
 ```
 </details>
 
+### Layout-based batch reads
+
+Use `MooncakeDistributedStore.batch_get_into_layouts()` to read object byte
+ranges into strided destination buffers using active get sessions.
+
+#### Class: ReadComponent
+
+The `ReadComponent` class describes a source byte range and its destination
+address for each selected row.
+
+**Constructor:**
+
+Create a component using destination buffer address `base` and row stride
+`stride` in bytes.
+
+```python
+from mooncake.store import ReadComponent
+
+component = ReadComponent(
+    destination_base=base,
+    destination_stride=stride,
+    byte_count=4,
+    source_offset=0,
+)
+```
+
+**Parameters:**
+
+- `destination_base` (int): Base address of the destination buffer.
+- `destination_stride` (int): Row stride in bytes.
+- `byte_count` (int): Number of bytes to read for each selected row.
+- `source_offset` (int, optional): Byte offset within the source object (default: `0`).
+
+**Properties:**
+
+The four constructor parameters are available as read-only properties.
+
+For selected row `r`, the destination address is:
+
+```text
+destination_base + r * destination_stride
+```
+
+#### Class: ReadLayout
+
+The `ReadLayout` class groups object keys, destination rows and read components.
+
+**Constructor:**
+
+Create a layout using `component` from above.
+
+```python
+from mooncake.store import ReadKeyMapping, ReadLayout
+
+layout = ReadLayout(
+    keys=["a", "b"],
+    rows=[2, 0],
+    key_mapping=ReadKeyMapping.PER_ROW,
+    components=[component],
+)
+```
+
+**Parameters:**
+
+- `keys` (List[str]): Source object identifiers in mapping order.
+- `rows` (List[int]): Destination row indices (>= 0).
+- `key_mapping` (ReadKeyMapping): Mapping between object keys, rows and components.
+- `components` (List[ReadComponent]): Ordered read components for the layout.
+
+**Key mapping:**
+
+For nonempty `components`, let `R = len(rows)` and `C = len(components)`:
+
+| Mapping | Key count | Source object for row position `i`, component `j` |
+|---------|-----------|-------------------------------------------------|
+| `ReadKeyMapping.PER_ROW` | `R` | `keys[i]`; all components read ranges of this object |
+| `ReadKeyMapping.PER_ROW_COMPONENT` | `R * C` | `keys[i * C + j]`; one object per row/component pair |
+
+**Properties:**
+
+`keys`, `rows`, `key_mapping` and `components` are read-only properties.
+`ReadLayout` copies its inputs and can be reused. Neither descriptor class
+owns or registers destination buffers.
+
+#### batch_get_into_layouts()
+
+Ranged get into strided buffers defined by read layouts, using active get
+sessions (no Master RPC).
+
+```python
+def batch_get_into_layouts(self, layouts: List[ReadLayout]) -> List[List[int]]
+```
+
+**Parameters:**
+
+- `layouts` (List[ReadLayout]): Read layouts to execute. All referenced keys must have active get sessions.
+
+**Returns:**
+
+- `List[List[int]]`: Byte counts for each key, grouped by layout (negative = error code).
+
+`results[i][j]` is the result for `layouts[i].keys[j]`. Skipped layouts have
+an empty list at their corresponding result position.
+
+Check each result against the expected byte count before using the data.
+For `PER_ROW`, this is the sum of component sizes. For `PER_ROW_COMPONENT`, it
+is the corresponding component's size. Results may contain both successful
+reads and errors. Zero-byte reads still require a valid session and source range.
+
+An empty `layouts` list returns `[]`. Layouts with no components are skipped,
+including their keys. With nonempty components, an empty `rows` list requires
+empty `keys` and produces an empty result list for that layout.
+
+**Example:**
+
+<details>
+<summary>Click to expand: Layout-based batch reads with NumPy buffers</summary>
+
+The following example reads the first eight bytes of `a` and `b` into rows 2
+and 0 of a NumPy buffer. It assumes an initialized `store` and objects with
+at least eight bytes each. Row 1 is left unchanged.
+
+```python
+import numpy as np
+
+from mooncake.store import ReadComponent, ReadKeyMapping, ReadLayout
+
+keys = ["a", "b"]
+dst = np.zeros((3, 8), dtype=np.uint8)
+base = dst.ctypes.data
+stride = dst.strides[0]  # NumPy strides are already in bytes.
+layout = ReadLayout(
+    keys=keys,
+    rows=[2, 0],
+    key_mapping=ReadKeyMapping.PER_ROW,
+    components=[
+        ReadComponent(
+            destination_base=base, destination_stride=stride,
+            byte_count=4, source_offset=0,
+        ),
+        ReadComponent(
+            destination_base=base + 4, destination_stride=stride,
+            byte_count=4, source_offset=4,
+        ),
+    ],
+)
+expected_sizes = [8] * len(keys)
+rc = store.register_buffer(base, dst.nbytes)
+if rc != 0:
+    raise RuntimeError(f"register_buffer failed: {rc}")
+try:
+    try:
+        statuses = store.batch_get_session_start(keys)
+        if len(statuses) != len(keys) or any(rc != 0 for rc in statuses):
+            raise RuntimeError(f"get session start failed: {statuses}")
+        results = store.batch_get_into_layouts([layout])
+        if results[0] != expected_sizes:
+            raise RuntimeError(f"layout read failed: {results[0]}")
+        print(dst)  # Consume data only after checking the results.
+    finally:
+        # Also drop any successful sessions if another key failed to start.
+        store.batch_get_session_end(keys)
+finally:
+    store.unregister_buffer(base)
+```
+
+To read four separate objects, replace the `keys`, `layout` and
+`expected_sizes` definitions above with the snippet below. Use the same buffer
+allocation, registration and session flow, applying the replacement before
+`register_buffer`. Each object must contain at least four bytes: `a0` and `a1`
+fill the two halves of row 2; `b0` and `b1` fill the two halves of row 0.
+
+```python
+keys = ["a0", "a1", "b0", "b1"]
+layout = ReadLayout(
+    keys=keys,
+    rows=[2, 0],
+    key_mapping=ReadKeyMapping.PER_ROW_COMPONENT,
+    components=[
+        ReadComponent(
+            destination_base=base, destination_stride=stride, byte_count=4,
+        ),
+        ReadComponent(
+            destination_base=base + 4, destination_stride=stride, byte_count=4,
+        ),
+    ],
+)
+expected_sizes = [4] * len(keys)
+```
+
+</details>
+
+The caller manages get-session start and end. Keep destination buffers
+registered and alive until the call finishes, and alive while consuming data.
+All destination ranges must fit within the buffers. Avoid overlapping writes,
+and do not modify sessions or close the Store during a read. Failed or short
+reads may leave partially written data; do not use that key's destination data.
+Writes are not rolled back.
+
 ## MooncakeHostMemAllocator Class
 
 The `MooncakeHostMemAllocator` class provides host memory allocation capabilities for Mooncake Store operations.
