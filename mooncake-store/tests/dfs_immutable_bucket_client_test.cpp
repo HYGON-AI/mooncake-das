@@ -3,18 +3,24 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "client_service.h"
+#include "crc_checksum.h"
+#include "environ.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
@@ -25,17 +31,83 @@ namespace mooncake::test {
 
 namespace {
 
+// CPU-backed device bytes let these tests count/fail only foreground D2H,
+// independently of any memory-replica transfer on a worker thread.
+class ChecksumStagingDevice : public device::AcceleratorDevice {
+   public:
+    void Reset(const void* data = nullptr, size_t size = 0) {
+        start_ = reinterpret_cast<uintptr_t>(data);
+        end_ = start_ + size;
+        thread_ = std::this_thread::get_id();
+        copies = 0;
+        fail_copy = -1;
+        throw_copy = false;
+    }
+    device::AcceleratorVendor Vendor() const override {
+        return device::AcceleratorVendor::kSunrise;
+    }
+    bool Available(bool = false) const override { return true; }
+    device::PointerInfo QueryPointer(const void* ptr) const override {
+        const auto address = reinterpret_cast<uintptr_t>(ptr);
+        return {address >= start_ && address < end_
+                    ? device::MemoryKind::kDevice
+                    : device::MemoryKind::kHost,
+                0};
+    }
+    int32_t CurrentDeviceId() const override { return 0; }
+    void SetContext(int32_t) const override {}
+    bool Copy(void* dst, const void* src, size_t size,
+              device::CopyDirection direction) const override {
+        if (std::this_thread::get_id() == thread_ &&
+            direction == device::CopyDirection::kDeviceToHost) {
+            const int call = ++copies;
+            if (fail_copy == 0 || call == fail_copy) {
+                if (throw_copy)
+                    throw std::runtime_error("injected D2H failure");
+                return false;
+            }
+        }
+        std::memcpy(dst, src, size);
+        return true;
+    }
+    PinnedHostBuffer AllocatePinnedHost(size_t) const override { return {}; }
+
+    mutable int copies = 0;
+    int fail_copy = -1;
+    bool throw_copy = false;
+
+   private:
+    uintptr_t start_ = 0, end_ = 0;
+    std::thread::id thread_;
+};
+
+ChecksumStagingDevice staging_device;
+device::AcceleratorDeviceRegistrar staging_device_registration(staging_device);
+
 // Fails the Nth WriteAt so the asynchronous revoke path can be exercised.
 class FailingBucketFsAdapter : public PosixFsAdapter {
    public:
     int WriteCalls() const { return write_calls_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
     void FailAllWrites(bool fail) { fail_all_writes_.store(fail); }
+    void BlockWrites() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        blocked_ = true;
+    }
+    void ReleaseWrites() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        blocked_ = false;
+        cv_.notify_all();
+    }
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
                                             int64_t offset) override {
         const int call = ++write_calls_;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] { return !blocked_; });
+        }
         if (fail_all_writes_.load() || call == fail_write_call_.load()) {
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
@@ -46,6 +118,9 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     std::atomic<int> write_calls_{0};
     std::atomic<int> fail_write_call_{-1};
     std::atomic<bool> fail_all_writes_{false};
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool blocked_ = false;
 };
 
 }  // namespace
@@ -108,10 +183,12 @@ class DfsBucketClientTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        if (adapter_) adapter_->ReleaseWrites();
         if (provider_ && segment_) {
             (void)provider_->UnmountSegment(segment_, segment_size_);
         }
         writer_.reset();
+        staging_device.Reset();
         provider_.reset();
         backend_.reset();
         master_.Stop();
@@ -306,6 +383,140 @@ TEST_F(DfsBucketClientTest, BatchPutWritesEveryKeyAndKeepsBatchContiguous) {
     }
 }
 
+TEST_F(DfsBucketClientTest, ChecksumReusesDfsD2hBeforeMemoryPublication) {
+    const std::vector<std::string> keys{"checksum_staged_a",
+                                        "checksum_staged_b"};
+    const std::vector<std::string> expected{"123456789", "abcdef"};
+    std::string source = "!" + expected[0] + expected[1];
+    staging_device.Reset(source.data(), source.size());
+    std::vector<std::vector<Slice>> slices{
+        {{source.data() + 1, 3}, {source.data() + 4, 6}},
+        {{source.data() + 10, expected[1].size()}}};
+    adapter_->BlockWrites();
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 2u);
+    ASSERT_TRUE(results[0].has_value());
+    ASSERT_TRUE(results[1].has_value());
+    EXPECT_EQ(staging_device.copies, 3);  // One normal D2H per nonempty slice.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto query = writer_->Query(keys[i]);
+        ASSERT_TRUE(query.has_value());
+        EXPECT_EQ(query->object_checksum,
+                  Environ::Get().GetStoreChecksumEnabled()
+                      ? std::optional<uint64_t>(ComputeCrcChecksum(
+                            expected[i].data(), expected[i].size()))
+                      : std::nullopt);
+        for (const auto& replica : query->replicas) {
+            EXPECT_TRUE(replica.is_memory_replica());
+        }
+    }
+    source.assign(source.size(), 'X');
+    adapter_->ReleaseWrites();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(WaitForDfsReplica(keys[i]));
+        auto query = writer_->Query(keys[i]);
+        ASSERT_TRUE(query.has_value());
+        EXPECT_EQ(query->object_checksum,
+                  Environ::Get().GetStoreChecksumEnabled()
+                      ? std::optional<uint64_t>(ComputeCrcChecksum(
+                            expected[i].data(), expected[i].size()))
+                      : std::nullopt);
+        ExpectDfsValue(keys[i], expected[i]);
+    }
+}
+
+TEST_F(DfsBucketClientTest,
+       ChecksumStagingFailureFallsBackAndReclaimsAllocations) {
+    for (const bool throw_copy : {false, true}) {
+        std::vector<std::string> keys{"checksum_stage_fail"};
+        std::string value(4099, 'F');
+        staging_device.Reset(value.data(), value.size());
+        staging_device.fail_copy = 1;
+        staging_device.throw_copy = throw_copy;
+        std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
+        auto results = writer_->BatchPut(keys, slices, DfsConfig());
+        ASSERT_EQ(results.size(), 1u);
+        ASSERT_FALSE(results[0].has_value());  // BUCKET requires both replicas.
+        EXPECT_EQ(staging_device.copies,
+                  Environ::Get().GetStoreChecksumEnabled() ? 2 : 1);
+        auto query = writer_->Query(keys[0]);
+        ASSERT_FALSE(query.has_value());
+        EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+        staging_device.Reset(value.data(), value.size());
+        results = writer_->BatchPut(keys, slices, DfsConfig());
+        ASSERT_TRUE(results[0].has_value());
+        ASSERT_TRUE(WaitForDfsReplica(keys[0]));
+        ASSERT_TRUE(writer_->Remove(keys[0], true).has_value());
+    }
+}
+
+TEST_F(DfsBucketClientTest, ChecksumFallbackFailureDoesNotPublishAnyReplica) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) GTEST_SKIP();
+    const std::vector<std::string> keys{"checksum_fallback_fail"};
+    std::string value(4099, 'F');
+    staging_device.Reset(value.data(), value.size());
+    staging_device.fail_copy = 0;
+    std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(staging_device.copies, 2);
+    auto query = writer_->Query(keys[0]);
+    ASSERT_FALSE(query.has_value());
+    EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(DfsBucketClientTest, ChecksumMissingBackendKeepsOriginalD2hPath) {
+    writer_->SetDfsStorageBackend(nullptr);
+    const std::vector<std::string> keys{"checksum_no_backend"};
+    std::string value(4099, 'F');
+    staging_device.Reset(value.data(), value.size());
+    std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(staging_device.copies,
+              Environ::Get().GetStoreChecksumEnabled() ? 1 : 0);
+    auto query = writer_->Query(keys[0]);
+    ASSERT_FALSE(query.has_value());
+    EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(DfsBucketClientTest, ChecksumRejectsNullSliceBeforeTransfers) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) GTEST_SKIP();
+    const std::vector<std::string> keys{"checksum_null_slice"};
+    std::vector<std::vector<Slice>> slices{{{nullptr, 4099}}};
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(adapter_->WriteCalls(), 0);
+}
+
+TEST_F(DfsBucketClientTest, ChecksumSurvivesEitherEndOrderAndRetries) {
+    for (const bool dfs_first : {false, true}) {
+        const std::string key =
+            dfs_first ? "checksum_dfs_first" : "checksum_mem_first";
+        auto allocations =
+            writer_->StartBatchPutForSizes({key}, {4096}, DfsConfig());
+        ASSERT_EQ(allocations.size(), 1u);
+        ASSERT_TRUE(allocations[0].has_value());
+        const ObjectMeta meta{key, uint64_t{0}};
+        for (const auto type :
+             {dfs_first ? ReplicaType::DFS : ReplicaType::MEMORY,
+              dfs_first ? ReplicaType::MEMORY : ReplicaType::DFS}) {
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                auto results = writer_->BatchPutEnd({meta}, type);
+                ASSERT_EQ(results.size(), 1u);
+                ASSERT_TRUE(results[0].has_value());
+                auto query = writer_->Query(key);
+                ASSERT_TRUE(query.has_value());
+                EXPECT_EQ(query->object_checksum, std::optional<uint64_t>(0));
+            }
+        }
+    }
+}
+
 TEST_F(DfsBucketClientTest, AsyncWriteSucceedsAfterCallerBufferIsOverwritten) {
     const std::string key = "bucket_buffer_lifetime";
     const std::string expected(8192, 'L');
@@ -350,11 +561,15 @@ TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {
     adapter_->FailAllWrites(false);
 
     auto query = writer_->Query(key);
-    if (query.has_value()) {
-        for (const auto& replica : query->replicas) {
-            EXPECT_FALSE(replica.is_dfs_replica())
-                << "a failed DFS write must not leave a DFS replica behind";
-        }
+    ASSERT_TRUE(query.has_value());
+    EXPECT_EQ(query->object_checksum,
+              Environ::Get().GetStoreChecksumEnabled()
+                  ? std::optional<uint64_t>(
+                        ComputeCrcChecksum(value.data(), value.size()))
+                  : std::nullopt);
+    for (const auto& replica : query->replicas) {
+        EXPECT_FALSE(replica.is_dfs_replica())
+            << "a failed DFS write must not leave a DFS replica behind";
     }
 }
 
@@ -598,6 +813,16 @@ TEST_F(DfsBucketClientTest, ObjectLargerThanBucketCapacityIsRejected) {
     ASSERT_FALSE(result.has_value());
     auto query = writer_->Query("bucket_too_large");
     EXPECT_FALSE(query.has_value());
+
+    staging_device.Reset(value.data(), value.size());
+    const std::vector<std::string> keys{"bucket_batch_too_large"};
+    std::vector<std::vector<Slice>> batch_slices{slices};
+    auto results = writer_->BatchPut(keys, batch_slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(staging_device.copies, 0);
+    auto batch_query = writer_->Query(keys[0]);
+    EXPECT_FALSE(batch_query.has_value());
 }
 
 TEST_F(DfsBucketClientTest, ConcurrentBatchPutsFromMultipleThreads) {

@@ -843,7 +843,7 @@ class Client {
                              std::vector<Slice>& slices);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
-        size_t object_size);
+        size_t object_size, bool staged_for_dfs = false);
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
@@ -916,6 +916,9 @@ class Client {
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
+    void ComputePutObjectChecksum(PutOperation& op,
+                                  const std::vector<Slice>& slices,
+                                  bool staged_for_dfs = false);
     void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
@@ -966,6 +969,8 @@ class Client {
         std::vector<std::string> keys;
         std::vector<DistributedFSDescriptor> descriptors;
         std::vector<std::vector<Slice>> slices;
+        // Ready before enqueue; every End retry uses the foreground checksum.
+        std::vector<std::optional<uint64_t>> object_checksums;
         std::vector<PinnedBufferPool::Buffer> staging;
         std::vector<std::vector<char>> host_staging;
         std::shared_ptr<DistributedStorageBackend> backend;

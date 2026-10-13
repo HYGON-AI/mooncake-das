@@ -153,9 +153,18 @@ add_test(NAME dfs_batch_read_checksum_test
                  --gtest_filter=DfsSyncClientTest.BatchGetVerifiesDfsChecksum)
 set_tests_properties(dfs_batch_read_checksum_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
-add_store_test(dfs_immutable_bucket_allocator_test dfs_immutable_bucket_allocator_test.cpp)
-add_store_test(dfs_immutable_bucket_backend_test dfs_immutable_bucket_backend_test.cpp)
-add_store_test(dfs_immutable_bucket_client_test dfs_immutable_bucket_client_test.cpp)
+add_store_test(dfs_immutable_bucket_allocator_test
+               dfs_immutable_bucket_allocator_test.cpp)
+add_store_test(dfs_immutable_bucket_backend_test
+               dfs_immutable_bucket_backend_test.cpp)
+add_store_test(dfs_immutable_bucket_client_test
+               dfs_immutable_bucket_client_test.cpp)
+add_test(NAME dfs_bucket_write_checksum_test
+         COMMAND dfs_immutable_bucket_client_test)
+set_tests_properties(dfs_bucket_write_checksum_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
+set_tests_properties(dfs_immutable_bucket_client_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=0")
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
 endif()
