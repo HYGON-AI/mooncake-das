@@ -35,8 +35,10 @@ class MasterMetricManager {
 
     void inc_mem_cache_hit_nums(int64_t val = 1);
     void inc_file_cache_hit_nums(int64_t val = 1);
+    void inc_dfs_cache_hit_nums(int64_t val = 1);
     void inc_mem_cache_hit_bytes(int64_t val = 1);
     void inc_file_cache_hit_bytes(int64_t val = 1);
+    void inc_dfs_cache_hit_bytes(int64_t val = 1);
     int64_t get_mem_cache_hit_bytes();
     int64_t get_file_cache_hit_bytes();
     void inc_mem_cache_nums(int64_t val = 1);
@@ -122,6 +124,19 @@ class MasterMetricManager {
     // unlimited DFS capacity instead of relying on the gauge value.
     void set_dfs_capacity_unlimited(bool unlimited);
     bool is_dfs_capacity_unlimited() const;
+    void set_dfs_storage_usage(uint64_t capacity_bytes, uint64_t used_bytes,
+                               bool unlimited);
+    void inc_dfs_replica(const std::string& status, int64_t val = 1);
+    void dec_dfs_replica(const std::string& status, int64_t val = 1);
+    void transition_dfs_replica(const std::string& from, const std::string& to);
+    void set_dfs_bucket_pool_state(uint64_t ready_count,
+                                   uint64_t create_inflight,
+                                   uint64_t ready_reserved_bytes);
+    void observe_dfs_bucket_create_latency_us(int64_t latency_us);
+    void inc_dfs_bucket_create_total(const std::string& result);
+    void inc_dfs_bucket_pool_exhausted_total();
+    void observe_dfs_bucket_pool_wait_latency_us(int64_t latency_us);
+    void observe_dfs_bucket_rollover_latency_us(int64_t latency_us);
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
@@ -283,6 +298,11 @@ class MasterMetricManager {
     // nof eviction metrics
     void inc_nof_eviction_success(int64_t key_count, int64_t size);
     void inc_nof_eviction_fail();  // not a single object is evicted
+    // DFS bucket eviction metrics
+    void inc_dfs_bucket_eviction_attempts(int64_t val = 1);
+    void inc_dfs_bucket_evictions(int64_t val = 1);
+    void inc_dfs_bucket_evicted_replicas(int64_t val = 1);
+    void inc_dfs_bucket_evicted_bytes(int64_t val = 1);
 
     // Eviction Metrics Getters
     // total eviction metrics
@@ -569,6 +589,18 @@ class MasterMetricManager {
     // File Storage Metrics
     ylt::metric::gauge_t file_allocated_size_;
     ylt::metric::gauge_t file_total_capacity_;
+    ylt::metric::gauge_t dfs_capacity_bytes_;
+    ylt::metric::gauge_t dfs_used_bytes_;
+    ylt::metric::gauge_t dfs_capacity_unlimited_metric_;
+    ylt::metric::dynamic_gauge_1t dfs_replicas_;
+    ylt::metric::gauge_t dfs_bucket_ready_count_;
+    ylt::metric::gauge_t dfs_bucket_create_inflight_;
+    ylt::metric::histogram_t dfs_bucket_create_latency_us_;
+    ylt::metric::dynamic_counter_1t dfs_bucket_create_total_;
+    ylt::metric::counter_t dfs_bucket_pool_exhausted_total_;
+    ylt::metric::histogram_t dfs_bucket_pool_wait_latency_us_;
+    ylt::metric::gauge_t dfs_bucket_ready_reserved_bytes_;
+    ylt::metric::histogram_t dfs_bucket_rollover_latency_us_;
     std::atomic<bool> dfs_capacity_unlimited_{false};
 
     // Key/Value Metrics
@@ -661,8 +693,10 @@ class MasterMetricManager {
     // end-to-end request/token-level cache hit ratio.
     ylt::metric::counter_t mem_cache_hit_nums_;
     ylt::metric::counter_t file_cache_hit_nums_;
+    ylt::metric::counter_t dfs_cache_hit_nums_;
     ylt::metric::counter_t mem_cache_hit_bytes_;
     ylt::metric::counter_t file_cache_hit_bytes_;
+    ylt::metric::counter_t dfs_cache_hit_bytes_;
     ylt::metric::gauge_t mem_cache_nums_;
     ylt::metric::gauge_t file_cache_nums_;
 
@@ -695,6 +729,11 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+    // DFS bucket eviction metrics
+    ylt::metric::counter_t dfs_bucket_eviction_attempts_;
+    ylt::metric::counter_t dfs_bucket_evictions_;
+    ylt::metric::counter_t dfs_bucket_evicted_replicas_;
+    ylt::metric::counter_t dfs_bucket_evicted_bytes_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;

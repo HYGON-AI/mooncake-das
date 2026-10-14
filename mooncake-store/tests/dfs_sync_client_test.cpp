@@ -194,6 +194,39 @@ class DfsSyncClientTest : public ::testing::Test {
     std::vector<std::pair<std::string, std::optional<std::string>>> saved_env_;
 };
 
+TEST_F(DfsSyncClientTest, EnableDfsReplicaEnvOverridesConfig) {
+    for (const std::string& value : {"true", "1"}) {
+        SetEnv("MOONCAKE_DFS_FORCE_ONE_REPLICA", value);
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::string key = "env_dfs_replica_" + value;
+        std::string payload(4096, 'Z');
+        std::vector<Slice> slices{{payload.data(), payload.size()}};
+
+        ASSERT_TRUE(writer_->Put(key, slices, config).has_value());
+        EXPECT_EQ(config.dfs_replica_num, 0);
+        ExpectDfsValue(key, payload);
+    }
+}
+
+TEST_F(DfsSyncClientTest, DisableDfsReplicaEnvLeavesConfigUnchanged) {
+    for (const std::string& value : {"false", "0"}) {
+        SetEnv("MOONCAKE_DFS_FORCE_ONE_REPLICA", value);
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::string key = "env_dfs_replica_disabled_" + value;
+        std::string payload(4096, 'Y');
+        std::vector<Slice> slices{{payload.data(), payload.size()}};
+
+        ASSERT_TRUE(writer_->Put(key, slices, config).has_value());
+        auto query = writer_->Query(key);
+        ASSERT_TRUE(query.has_value());
+        EXPECT_FALSE(query->replicas[0].is_dfs_replica());
+    }
+}
+
 TEST_F(DfsSyncClientTest, PutAndUpsertReturnAfterDfsWrite) {
     const std::string key = "sync_put_upsert";
     std::string initial(4096, 'A');

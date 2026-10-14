@@ -4,8 +4,9 @@
 
 file(GLOB HIP_TRANSPORT_SOURCES "*.cpp")
 
-# mc_copy_kernel.co is only needed for Hygon fabric/hylink transfers.
-if (USE_HYGON AND NOT USE_FAKE_HIP_RPC)
+# mc_copy_kernel.co is shared by Hygon fabric transfers and the Store DFS
+# scatter-copy path. The Store path also needs it when fake HIP RPC is used.
+if (USE_HYGON)
     set(COPY_KERNEL ${CMAKE_CURRENT_BINARY_DIR}/mc_copy_kernel.co)
 
     add_custom_command(

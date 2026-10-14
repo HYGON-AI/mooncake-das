@@ -20,6 +20,7 @@
 #include "memory_alloc.h"
 #include "ssd_register_client.h"
 #include "read_layout.h"
+#include "read_plan.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
 
@@ -1951,6 +1952,14 @@ PYBIND11_MODULE(store, m) {
         .def_readonly("rows", &ReadLayoutDescriptor::rows)
         .def_readonly("key_mapping", &ReadLayoutDescriptor::key_mapping)
         .def_readonly("components", &ReadLayoutDescriptor::components);
+    py::class_<mooncake::ReadPlan, std::shared_ptr<mooncake::ReadPlan>>(
+        m, "ReadPlan", py::dynamic_attr())
+        .def("run", &mooncake::ReadPlan::run, py::call_guard<py::gil_scoped_release>())
+        .def("wait", &mooncake::ReadPlan::wait, py::arg("group"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("stats", &mooncake::ReadPlan::stats)
+        .def("reuse_stats", &mooncake::ReadPlan::reuse_stats);
+
     m.def("_serialize_tensor", &serialize_tensor_metadata,
           "Inspect a torch tensor as Mooncake tensor metadata, data pointer, "
           "size, and owner.");
@@ -2273,7 +2282,8 @@ PYBIND11_MODULE(store, m) {
                const std::string &ssd_offload_path = "",
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
-               int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+               int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+               bool enable_dfs_prefetch = true) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2286,7 +2296,7 @@ PYBIND11_MODULE(store, m) {
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine, "", enable_ssd_offload,
                     ssd_offload_path, tenant_id, enable_client_http_server,
-                    client_http_port);
+                    client_http_port, enable_dfs_prefetch);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -2295,7 +2305,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_ssd_offload") = false,
             py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
             py::arg("enable_client_http_server") = false,
-            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT)
+            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
+            py::arg("enable_dfs_prefetch") = true)
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2327,6 +2338,8 @@ PYBIND11_MODULE(store, m) {
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
             "  ssd_offload_path: SSD storage directory path (overrides env "
             "var).\n"
+            "  enable_dfs_prefetch: Honor the DFS prefetch arena size from "
+            "environment (default true).\n"
             "  tenant_id: Tenant identifier (default 'default').\n"
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
@@ -3103,6 +3116,32 @@ PYBIND11_MODULE(store, m) {
             "Ranged get into strided buffers defined by read layouts, using "
             "active get sessions (no Master RPC).")
         .def(
+            "create_read_plan",
+            [](MooncakeStorePyWrapper &self,
+               std::vector<mooncake::ReadLayout> layouts, int num_groups,
+               bool reuse_ranges, py::object buffer_owners, bool page_wise,
+               bool borrowed_sessions) {
+                if (!self.is_client_initialized())
+                    throw std::runtime_error("Client is not initialized");
+                std::shared_ptr<mooncake::ReadPlan> plan;
+                {
+                    py::gil_scoped_release release;
+                    plan = std::make_shared<mooncake::ReadPlan>(
+                        self.store_, std::move(layouts), num_groups, reuse_ranges,
+                        page_wise, borrowed_sessions);
+                }
+                auto object = py::cast(plan);
+                object.attr("_buffer_owners") = std::move(buffer_owners);
+                return object;
+            }, py::arg("layouts"), py::arg("num_groups"),
+            py::arg("reuse_ranges") = false, py::arg("buffer_owners") = py::none(),
+            py::arg("page_wise") = false, py::arg("borrowed_sessions") = false,
+            py::keep_alive<0, 1>(),
+            "Create ordered range reads; retain registered destination memory "
+            "until run completes. By default the plan starts and ends get "
+            "sessions; borrowed_sessions=True requires the caller to keep "
+            "sessions for all keys active until run completes.")
+        .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
@@ -3115,6 +3154,83 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"),
             "Start a get session: query replicas once and cache them")
+        .def(
+            "batch_get_session_refresh",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_refresh(keys);
+            },
+            py::arg("keys"),
+            "Refresh leases for active get sessions while preserving cached "
+            "session objects; incompatible refreshed replicas fail. "
+            "Reads also repair leases on demand while the session is active.")
+        .def(
+            "batch_get_session_start_with_sources",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::pair<std::vector<int>,
+                                     std::vector<std::string>>{};
+                }
+                py::gil_scoped_release release;
+                auto result =
+                    self.store_->batch_get_session_start_with_sources(keys);
+                return std::make_pair(std::move(result.codes),
+                                      std::move(result.sources));
+            },
+            py::arg("keys"),
+            "Start get sessions and return each result with its selected "
+            "source")
+        .def(
+            "batch_get_session_prefetch",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                if (!self.is_client_initialized()) {
+                    LOG(ERROR) << "Client is not initialized";
+                    return std::vector<int>{};
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_session_prefetch(keys);
+            },
+            py::arg("keys"),
+            "Synchronously read DFS objects in active get sessions into "
+            "Mooncake's dedicated prefetch arena without copying to caller "
+            "buffers. A successful DFS status means the complete object bytes "
+            "remain owned by a compatible active session; non-DFS entries use "
+            "the ordinary range-get path. Returns per-key status.")
+        .def(
+            "dfs_prefetch_arena_available",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.is_client_initialized()) return false;
+                return self.store_->dfs_prefetch_arena_available();
+            },
+            "Whether batch_get_session_prefetch has a DFS staging arena "
+            "(MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES). When false every DFS "
+            "prefetch read fails, so callers should not submit prefetches.")
+        .def(
+            "dfs_prefetch_arena_status",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.is_client_initialized()) {
+                    return std::string("client not initialized");
+                }
+                return self.store_->dfs_prefetch_arena_status();
+            },
+            "\"ready\" or the reason the DFS prefetch arena is unavailable.")
+        .def(
+            "record_prefetched_tokens",
+            [](MooncakeStorePyWrapper &self, uint64_t tokens) {
+                if (!self.is_client_initialized()) return;
+                py::gil_scoped_release release;
+                self.store_->record_prefetched_tokens(tokens);
+            },
+            py::arg("tokens"),
+            "Record prompt tokens successfully prefetched by the direct linker")
         .def(
             "batch_get_into_multi_buffer_ranges",
             [](MooncakeStorePyWrapper &self,
@@ -3133,7 +3249,11 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("all_src_offsets"),
-            "Ranged get into multiple buffers using a get session")
+            "Ranged get into multiple buffers using an active get session, "
+            "repairing missing or expiring leases on demand. "
+            "MC_STORE_GET_SESSION_MIN_REMAINING_MS controls the safety margin "
+            "in milliseconds (default 1000, range 0..3600000), read once when "
+            "the client is created. Zero still rejects expired leases.")
         .def(
             "batch_get_session_end",
             [](MooncakeStorePyWrapper &self,

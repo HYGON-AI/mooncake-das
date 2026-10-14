@@ -341,6 +341,12 @@ struct FileStorageConfig {
 
     int64_t pinned_restore_arena_size = 0;
 
+    // Dedicated arena for waiting-queue DFS prefetch staging. Prefetched
+    // buffers stay pinned until their session ends, so they get their own
+    // fixed arena instead of the request-scoped restore arena. 0 disables
+    // DFS prefetch staging.
+    int64_t pinned_prefetch_arena_size = 0;
+
     // Limits for scanning and iteration operations
     int64_t scanmeta_iterator_keys_limit =
         20000;  // Max number of keys returned per Scan call, required by bucket

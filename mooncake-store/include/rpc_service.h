@@ -40,6 +40,8 @@ class WrappedMasterService {
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
 
+    void RefreshDfsMetrics() const;
+
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
@@ -199,6 +201,15 @@ class WrappedMasterService {
     DeleteTenantQuotaPolicy(const std::string& tenant_id);
     tl::expected<uint64_t, ErrorCode> GetTenantQuotaAllocatableCapacityBytes();
 
+    /**
+     * @brief Dynamically set the max_bucket_count of the DFS bucket allocator.
+     *
+     * Only valid in BUCKET mode; returns UNAVAILABLE_IN_CURRENT_MODE otherwise.
+     * @return the previous max_bucket_count on success.
+     */
+    tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
+        int64_t new_max_bucket_count);
+
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();
@@ -329,6 +340,11 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchInvalidateDfsBuckets(
+        const UUID& client_id,
+        const std::vector<DfsMissingBucketReport>& reports,
+        const std::string& tenant_id);
 
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;

@@ -209,6 +209,13 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;
 }
 
+TEST_F(ClientMetricsTest, DirectStorageMetricSourceClassification) {
+    EXPECT_STREQ(DirectStorageMetricSource(ReplicaType::DISK), "dfs");
+    EXPECT_STREQ(DirectStorageMetricSource(ReplicaType::DFS), "dfs");
+    EXPECT_STREQ(DirectStorageMetricSource(ReplicaType::LOCAL_DISK),
+                 "local_disk");
+}
+
 TEST_F(ClientMetricsTest, ByteFormattingTest) {
     TransferMetric metrics;
 

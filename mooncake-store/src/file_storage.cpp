@@ -20,6 +20,14 @@ namespace mooncake {
 
 namespace {
 
+bool UseMappedPinnedRestoreArena() {
+#if defined(USE_HYGON)
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -64,20 +72,31 @@ FileStorage::FileStorage(const FileStorageConfig& config,
             LOG(WARNING)
                 << "Pinned SSD restore is disabled: local memcpy unavailable";
         } else {
-            auto buffer = PinnedBufferPool::AllocatePinned(
-                static_cast<size_t>(config.pinned_restore_arena_size));
+            const size_t arena_size =
+                static_cast<size_t>(config.pinned_restore_arena_size);
+            const bool mapped_requested = UseMappedPinnedRestoreArena();
+            auto buffer =
+                PinnedBufferPool::AllocatePinned(arena_size, mapped_requested);
+            if (!buffer.data && mapped_requested) {
+                LOG(WARNING) << "Mapped pinned restore arena is unavailable; "
+                                "falling back to ordinary pinned memory";
+                buffer = PinnedBufferPool::AllocatePinned(arena_size);
+            }
             if (buffer.pinned_host.addr) {
                 pinned_restore_arena_ = std::move(buffer);
                 pinned_restore_arena_allocator_ = ClientBufferAllocator::create(
                     pinned_restore_arena_.data, pinned_restore_arena_.capacity,
-                    client->GetProtocol());
+                    client->GetProtocol(), pinned_restore_arena_.device_data);
                 LOG(INFO) << "Initialized pinned SSD restore arena, size="
-                          << pinned_restore_arena_.capacity;
+                          << pinned_restore_arena_.capacity
+                          << ", mapped=" << pinned_restore_arena_.mapped;
             } else {
                 LOG(WARNING) << "Failed to allocate pinned SSD restore arena";
             }
         }
     }
+
+    InitPinnedPrefetchArena(config, client);
 
     auto create_storage_backend_result = CreateStorageBackend(config_);
     if (!create_storage_backend_result) {
@@ -126,6 +145,84 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+}
+
+std::optional<BufferHandle> FileStorage::AllocatePinnedStagingBuffer(
+    size_t size, size_t alignment) const {
+    if (!pinned_restore_arena_allocator_) return std::nullopt;
+    return pinned_restore_arena_allocator_->allocate_aligned(size, alignment);
+}
+
+void FileStorage::InitPinnedPrefetchArena(
+    const FileStorageConfig& config, const std::shared_ptr<Client>& client) {
+    if (config.pinned_prefetch_arena_size <= 0) {
+        pinned_prefetch_arena_status_ = "not configured";
+        return;
+    }
+    // Allocated once on the constructing (setup) thread, like the restore
+    // arena (whose pages were observed on the rank GPU's NUMA node), instead
+    // of from prefetch worker threads at runtime. Unlike the restore
+    // arena, a mapped allocation failure is not downgraded to ordinary pinned
+    // memory: without a device alias the HYGON H2D kernel falls back to DMA
+    // and the arena would no longer match the restore arena's behaviour.
+    if (config.use_uring) {
+        pinned_prefetch_arena_status_ = "disabled: io_uring";
+    } else if (!client ||
+               !client->CanUseLocalMemcpy(client->GetSegmentEndpoint())) {
+        pinned_prefetch_arena_status_ = "disabled: local memcpy unavailable";
+    } else {
+        const size_t arena_size =
+            static_cast<size_t>(config.pinned_prefetch_arena_size);
+        const bool mapped_required = UseMappedPinnedRestoreArena();
+        auto buffer =
+            PinnedBufferPool::AllocatePinned(arena_size, mapped_required);
+        if (!buffer.pinned_host.addr) {
+            pinned_prefetch_arena_status_ = "pinned allocation failed";
+        } else if (mapped_required &&
+                   (!buffer.mapped || buffer.device_data == nullptr)) {
+            pinned_prefetch_arena_status_ = "mapped device alias unavailable";
+        } else {
+            pinned_prefetch_arena_ = std::move(buffer);
+            pinned_prefetch_arena_allocator_ = ClientBufferAllocator::create(
+                pinned_prefetch_arena_.data, pinned_prefetch_arena_.capacity,
+                client->GetProtocol(), pinned_prefetch_arena_.device_data);
+            pinned_prefetch_arena_status_ = "ready";
+        }
+    }
+
+    int32_t device_id = -1;
+    const auto accelerators =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!accelerators.Devices().empty()) {
+        device_id = accelerators.Devices().front()->CurrentDeviceId();
+    }
+    if (HasPinnedPrefetchArena()) {
+        LOG(INFO) << "Initialized pinned DFS prefetch arena, size="
+                  << pinned_prefetch_arena_.capacity
+                  << ", mapped=" << pinned_prefetch_arena_.mapped
+                  << ", device_alias="
+                  << (pinned_prefetch_arena_.device_data != nullptr)
+                  << ", device_id=" << device_id << ", addr="
+                  << static_cast<void*>(pinned_prefetch_arena_.data);
+    } else {
+        LOG(ERROR) << "Pinned DFS prefetch arena unavailable ("
+                   << pinned_prefetch_arena_status_
+                   << "), requested size=" << config.pinned_prefetch_arena_size
+                   << ", device_id=" << device_id
+                   << "; waiting-queue DFS prefetch reads will fail";
+    }
+}
+
+std::optional<BufferHandle> FileStorage::AllocatePinnedPrefetchBuffer(
+    size_t size, size_t alignment) const {
+    if (!pinned_prefetch_arena_allocator_) return std::nullopt;
+    return pinned_prefetch_arena_allocator_->allocate_aligned(size, alignment);
+}
+
+offset_allocator::OffsetAllocStorageReport
+FileStorage::PinnedPrefetchArenaReport() const {
+    if (!pinned_prefetch_arena_allocator_) return {0, 0};
+    return pinned_prefetch_arena_allocator_->storageReport();
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {

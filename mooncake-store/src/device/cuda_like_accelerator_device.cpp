@@ -72,6 +72,32 @@ class CudaLikeAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         return cudaMemcpy(dst, src, size, kind) == cudaSuccess;
     }
 
+    bool CopyFromHostAsync(void* dst, const void* src, size_t size,
+                           void* stream) const override {
+        return cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice,
+                               static_cast<cudaStream_t>(stream)) ==
+               cudaSuccess;
+    }
+
+    bool CreateStream(void** stream) const override {
+        cudaStream_t cuda_stream = nullptr;
+        if (cudaStreamCreate(&cuda_stream) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        *stream = static_cast<void*>(cuda_stream);
+        return true;
+    }
+
+    bool SynchronizeStream(void* stream) const override {
+        return cudaStreamSynchronize(static_cast<cudaStream_t>(stream)) ==
+               cudaSuccess;
+    }
+
+    void DestroyStream(void* stream) const override {
+        cudaStreamDestroy(static_cast<cudaStream_t>(stream));
+    }
+
     PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
         void* addr = nullptr;
         if (cudaMallocHost(&addr, size) != cudaSuccess) {

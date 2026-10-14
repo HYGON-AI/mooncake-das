@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <string_view>
@@ -220,6 +221,18 @@ struct HttpTenantQuotaPolicyRequest {
 };
 YLT_REFL(HttpTenantQuotaPolicyRequest, requested_quota_bytes);
 
+struct HttpDfsMaxBucketCountRequest {
+    int64_t max_bucket_count{0};
+};
+YLT_REFL(HttpDfsMaxBucketCountRequest, max_bucket_count);
+
+struct HttpDfsMaxBucketCountResponse {
+    bool success{true};
+    int64_t old_value{0};
+    int64_t new_value{0};
+};
+YLT_REFL(HttpDfsMaxBucketCountResponse, success, old_value, new_value);
+
 tl::expected<std::string, ErrorCode> ParseAdminTenantId(
     coro_http::coro_http_request& req) {
     auto tenant_id_view = req.get_decode_query_value("tenant_id");
@@ -241,6 +254,33 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
     } catch (const std::exception& e) {
         return tl::make_unexpected(std::string("Invalid JSON body: ") +
                                    e.what());
+    }
+    return request;
+}
+
+// Buckets are addressed through DistributedFSDescriptor::shard_idx, an int
+// serialized as int32, so the count must stay within int32 range. Keep in
+// sync with kMaxBucketId in storage/distributed/bucket_entry_layout.h.
+constexpr int64_t kDfsMaxBucketCountLimit =
+    static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+
+tl::expected<HttpDfsMaxBucketCountRequest, std::string>
+ParseDfsMaxBucketCountBody(coro_http::coro_http_request& req) {
+    HttpDfsMaxBucketCountRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(std::string("Invalid JSON body: ") +
+                                   e.what());
+    }
+    if (request.max_bucket_count <= 0) {
+        return tl::make_unexpected(
+            "max_bucket_count must be positive (>0)");
+    }
+    if (request.max_bucket_count > kDfsMaxBucketCountLimit) {
+        return tl::make_unexpected(
+            "max_bucket_count exceeds maximum addressable bucket id (" +
+            std::to_string(kDfsMaxBucketCountLimit) + ")");
     }
     return request;
 }
@@ -375,6 +415,10 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
 
 std::string MasterAdminServer::BuildMetricsText() const {
     RefreshStorageMetrics();
+    auto snapshot = SnapshotState();
+    if (snapshot.service) {
+        snapshot.service->RefreshDfsMetrics();
+    }
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
@@ -975,6 +1019,16 @@ struct HttpLocalDiskReplicaInfo {
              transport_endpoint);
 };
 
+struct HttpDfsReplicaInfo {
+    std::string file_path;
+    uint64_t offset = 0;
+    uint64_t object_size = 0;
+    uint64_t aligned_size = 0;
+    int shard_idx = 0;
+    YLT_REFL(HttpDfsReplicaInfo, file_path, offset, object_size, aligned_size,
+             shard_idx);
+};
+
 struct HttpBatchQueryKeyResult {
     bool ok{false};
     std::optional<std::string> error;
@@ -982,9 +1036,10 @@ struct HttpBatchQueryKeyResult {
     std::optional<std::vector<HttpDiskReplicaInfo>> disk_values;
     std::optional<std::vector<HttpLocalDiskReplicaInfo>> local_disk_values;
     std::optional<std::vector<AllocatedBuffer::Descriptor>> nof_values;
+    std::optional<std::vector<HttpDfsReplicaInfo>> dfs_values;
 };
 YLT_REFL(HttpBatchQueryKeyResult, ok, error, values, disk_values,
-         local_disk_values, nof_values);
+         local_disk_values, nof_values, dfs_values);
 
 struct HttpBatchQueryKeysResponse {
     bool success{false};
@@ -1058,6 +1113,17 @@ void MasterAdminServer::HandleBatchQueryKeys(
                     }
                     item.nof_values->emplace_back(
                         replica.get_nof_descriptor().buffer_descriptor);
+                } else if (replica.is_dfs_replica()) {
+                    if (!item.dfs_values.has_value()) {
+                        item.dfs_values = std::vector<HttpDfsReplicaInfo>{};
+                    }
+                    auto& d = replica.get_dfs_descriptor();
+                    item.dfs_values->emplace_back(
+                        HttpDfsReplicaInfo{d.file_path,
+                                           d.offset,
+                                           d.object_size,
+                                           d.aligned_size,
+                                           d.shard_idx});
                 }
             }
             payload.data.emplace(keys[i], std::move(item));
@@ -1202,6 +1268,31 @@ void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
     });
 }
 
+void MasterAdminServer::HandleSetDfsMaxBucketCount(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto body_result = ParseDfsMaxBucketCountBody(req);
+    if (!body_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, body_result.error());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result =
+            service->SetDfsMaxBucketCount(body_result->max_bucket_count);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        HttpDfsMaxBucketCountResponse response;
+        response.success = true;
+        response.old_value = result.value();
+        response.new_value = body_result->max_bucket_count;
+        WriteJsonResponse(resp, coro_http::status_type::ok, response);
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1304,6 +1395,11 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/remove_all",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleRemoveAll(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/dfs/max_bucket_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetDfsMaxBucketCount(req, resp);
         });
 }
 }  // namespace mooncake
