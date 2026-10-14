@@ -2,8 +2,8 @@
 
 #include <functional>
 #include <optional>
-#include <vector>
 #include <string>
+#include <vector>
 
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
@@ -34,7 +34,8 @@ class ClientBufferAllocator
 
     // Create for shared memory
     static std::shared_ptr<ClientBufferAllocator> create(
-        void* addr, size_t size, const std::string& protocol = "");
+        void* addr, size_t size, const std::string& protocol = "",
+        void* device_addr = nullptr);
 
     ~ClientBufferAllocator();
 
@@ -48,16 +49,32 @@ class ClientBufferAllocator
 
     [[nodiscard]] void* getBase() const { return buffer_; }
 
+    [[nodiscard]] void* getDeviceBase() const { return device_buffer_; }
+
     [[nodiscard]] size_t size() const { return buffer_size_; }
 
     [[nodiscard]] std::optional<BufferHandle> allocate(size_t size);
 
+    // Allocate a host view with the requested address alignment. If this
+    // allocator also has a device-visible base, the returned handle exposes
+    // the device alias at the same sub-allocation offset.
+    [[nodiscard]] std::optional<BufferHandle> allocate_aligned(
+        size_t size, size_t alignment);
+
+    // Free space and a conservative lower bound of the largest free region
+    // (taken from the largest non-empty bin). All zero when the allocator has
+    // no backing buffer.
+    [[nodiscard]] offset_allocator::OffsetAllocStorageReport storageReport()
+        const;
+
    protected:
     // Constructors accessible to derived classes
-    ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
+    ClientBufferAllocator(void* addr, size_t size, const std::string& protocol,
+                          void* device_addr = nullptr);
 
     void* buffer_;
     size_t buffer_size_;
+    void* device_buffer_ = nullptr;
     bool use_hugepage_ = false;
 
    private:
@@ -86,7 +103,8 @@ class BufferHandle {
                  offset_allocator::OffsetAllocationHandle handle);
 
     // View mode: non-owning, calls release_fn on destruction
-    BufferHandle(void* ptr, size_t size, std::function<void()> release_fn);
+    BufferHandle(void* ptr, size_t size, std::function<void()> release_fn,
+                 void* device_ptr = nullptr);
 
     ~BufferHandle();
 
@@ -99,6 +117,8 @@ class BufferHandle {
 
     [[nodiscard]] void* ptr() const;
     [[nodiscard]] size_t size() const;
+    // Device-visible alias for a mapped host view, when one is available.
+    [[nodiscard]] void* device_ptr() const;
 
    private:
     // Owning mode members
@@ -109,6 +129,7 @@ class BufferHandle {
     void* view_ptr_ = nullptr;
     size_t view_size_ = 0;
     std::function<void()> release_fn_;
+    void* view_device_ptr_ = nullptr;
 };
 
 // Utility functions for buffer and slice management

@@ -2,9 +2,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace mooncake {
 
@@ -27,6 +29,29 @@ TEST(CrcChecksumTest, StreamingMatchesContiguousForArbitraryLengths) {
     EXPECT_EQ(streaming.Finalize(),
               ComputeCrcChecksum(value.data(), value.size()));
     EXPECT_EQ(ComputeCrcChecksum(nullptr, 0), 0);
+}
+
+TEST(CrcChecksumTest, StagedSlicesMatchChunkedUnalignedInput) {
+    std::vector<uint8_t> source(4099);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<uint8_t>(i * 37);
+    }
+    const auto* data = source.data() + 1;
+    constexpr size_t lengths[] = {3, 0, 1025, 3070};
+    CrcChecksum original;
+    CrcChecksum staged;
+    size_t offset = 0;
+    for (const auto length : lengths) {
+        const std::vector<uint8_t> host(data + offset, data + offset + length);
+        staged.Update(host.data(), host.size());
+        for (size_t chunk = 0; chunk < length; chunk += 17) {
+            original.Update(data + offset + chunk,
+                            std::min(size_t{17}, length - chunk));
+        }
+        offset += length;
+    }
+    EXPECT_EQ(original.Finalize(), staged.Finalize());
+    EXPECT_EQ(staged.Finalize(), ComputeCrcChecksum(data, offset));
 }
 
 }  // namespace mooncake

@@ -1,6 +1,7 @@
 #include "master_metric_manager.h"
 
 #include <glog/logging.h>
+#include <algorithm>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <limits>   // For std::numeric_limits
 #include <sstream>  // For string building during serialization
@@ -50,6 +51,40 @@ MasterMetricManager::MasterMetricManager()
           "Total bytes currently allocated for file storage in 3fs/nfs"),
       file_total_capacity_("master_total_file_capacity_bytes",
                            "Total capacity for file storage in 3fs/nfs"),
+      dfs_capacity_bytes_("master_dfs_capacity_bytes",
+                          "Total capacity exposed by the DFS allocator"),
+      dfs_used_bytes_("master_dfs_used_bytes",
+                      "Bytes currently used by the DFS allocator"),
+      dfs_capacity_unlimited_metric_(
+          "master_dfs_capacity_unlimited",
+          "Whether DFS capacity is configured as unlimited"),
+      dfs_replicas_("master_dfs_replicas",
+                    "Current DFS replicas by lifecycle status", {"status"}),
+      dfs_bucket_ready_count_("dfs_bucket_ready_count",
+                              "Current number of ready DFS buckets"),
+      dfs_bucket_create_inflight_(
+          "dfs_bucket_create_inflight",
+          "Current number of DFS bucket creations in flight"),
+      dfs_bucket_create_latency_us_(
+          "dfs_bucket_create_latency_us",
+          "DFS bucket data-file preallocation latency in microseconds",
+          {10, 100, 1000, 10000, 100000, 1000000, 10000000, 60000000}),
+      dfs_bucket_create_total_("dfs_bucket_create_total",
+                               "DFS bucket creation outcomes", {"result"}),
+      dfs_bucket_pool_exhausted_total_(
+          "dfs_bucket_pool_exhausted_total",
+          "Total allocations that found the DFS ready bucket pool empty"),
+      dfs_bucket_pool_wait_latency_us_(
+          "dfs_bucket_pool_wait_latency_us",
+          "Allocation wait latency caused by an empty DFS ready bucket pool",
+          {10, 100, 1000, 10000, 100000, 1000000, 10000000, 60000000}),
+      dfs_bucket_ready_reserved_bytes_(
+          "dfs_bucket_ready_reserved_bytes",
+          "Estimated bytes reserved by ready DFS bucket data files"),
+      dfs_bucket_rollover_latency_us_(
+          "dfs_bucket_rollover_latency_us",
+          "End-to-end DFS active bucket rollover latency in microseconds",
+          {10, 100, 1000, 10000, 100000, 1000000, 10000000, 60000000}),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
       soft_pin_key_count_(
@@ -496,6 +531,18 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     mem_total_capacity_.update(0);
     file_allocated_size_.update(0);
     file_total_capacity_.update(0);
+    dfs_capacity_bytes_.update(0);
+    dfs_used_bytes_.update(0);
+    dfs_capacity_unlimited_metric_.update(0);
+    dfs_replicas_.update({"processing"}, 0);
+    dfs_replicas_.update({"complete"}, 0);
+    dfs_bucket_ready_count_.update(0);
+    dfs_bucket_create_inflight_.update(0);
+    dfs_bucket_create_total_.inc({"success"}, 0);
+    dfs_bucket_create_total_.inc({"failure"}, 0);
+    dfs_bucket_create_total_.inc({"discarded"}, 0);
+    dfs_bucket_pool_exhausted_total_.inc(0);
+    dfs_bucket_ready_reserved_bytes_.update(0);
     key_count_.update(0);
     soft_pin_key_count_.update(0);
     active_clients_.update(0);
@@ -826,6 +873,70 @@ void MasterMetricManager::set_dfs_capacity_unlimited(bool unlimited) {
 
 bool MasterMetricManager::is_dfs_capacity_unlimited() const {
     return dfs_capacity_unlimited_;
+}
+
+void MasterMetricManager::set_dfs_storage_usage(uint64_t capacity_bytes,
+                                                uint64_t used_bytes,
+                                                bool unlimited) {
+    const auto clamp = [](uint64_t value) {
+        return static_cast<int64_t>(std::min<uint64_t>(
+            value, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+    };
+    dfs_capacity_bytes_.update(clamp(capacity_bytes));
+    dfs_used_bytes_.update(clamp(used_bytes));
+    dfs_capacity_unlimited_metric_.update(unlimited ? 1 : 0);
+}
+
+void MasterMetricManager::inc_dfs_replica(const std::string& status,
+                                          int64_t val) {
+    dfs_replicas_.inc({status}, val);
+}
+
+void MasterMetricManager::dec_dfs_replica(const std::string& status,
+                                          int64_t val) {
+    dfs_replicas_.dec({status}, val);
+}
+
+void MasterMetricManager::transition_dfs_replica(const std::string& from,
+                                                 const std::string& to) {
+    dfs_replicas_.dec({from});
+    dfs_replicas_.inc({to});
+}
+
+void MasterMetricManager::set_dfs_bucket_pool_state(
+    uint64_t ready_count, uint64_t create_inflight,
+    uint64_t ready_reserved_bytes) {
+    const auto clamp = [](uint64_t value) {
+        return static_cast<int64_t>(std::min<uint64_t>(
+            value, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+    };
+    dfs_bucket_ready_count_.update(clamp(ready_count));
+    dfs_bucket_create_inflight_.update(clamp(create_inflight));
+    dfs_bucket_ready_reserved_bytes_.update(clamp(ready_reserved_bytes));
+}
+
+void MasterMetricManager::observe_dfs_bucket_create_latency_us(
+    int64_t latency_us) {
+    dfs_bucket_create_latency_us_.observe(latency_us);
+}
+
+void MasterMetricManager::inc_dfs_bucket_create_total(
+    const std::string& result) {
+    dfs_bucket_create_total_.inc({result});
+}
+
+void MasterMetricManager::inc_dfs_bucket_pool_exhausted_total() {
+    dfs_bucket_pool_exhausted_total_.inc();
+}
+
+void MasterMetricManager::observe_dfs_bucket_pool_wait_latency_us(
+    int64_t latency_us) {
+    dfs_bucket_pool_wait_latency_us_.observe(latency_us);
+}
+
+void MasterMetricManager::observe_dfs_bucket_rollover_latency_us(
+    int64_t latency_us) {
+    dfs_bucket_rollover_latency_us_.observe(latency_us);
 }
 
 int64_t MasterMetricManager::get_allocated_file_size() {
@@ -1824,6 +1935,18 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
+    serialize_metric(dfs_capacity_bytes_);
+    serialize_metric(dfs_used_bytes_);
+    serialize_metric(dfs_capacity_unlimited_metric_);
+    serialize_metric(dfs_replicas_);
+    serialize_metric(dfs_bucket_ready_count_);
+    serialize_metric(dfs_bucket_create_inflight_);
+    serialize_metric(dfs_bucket_create_latency_us_);
+    serialize_metric(dfs_bucket_create_total_);
+    serialize_metric(dfs_bucket_pool_exhausted_total_);
+    serialize_metric(dfs_bucket_pool_wait_latency_us_);
+    serialize_metric(dfs_bucket_ready_reserved_bytes_);
+    serialize_metric(dfs_bucket_rollover_latency_us_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);

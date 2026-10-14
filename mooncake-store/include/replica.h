@@ -27,6 +27,22 @@ namespace mooncake {
  */
 using ReplicaID = uint64_t;
 
+inline constexpr const char* DirectStorageMetricSource(
+    ReplicaType replica_type) noexcept {
+    switch (replica_type) {
+        case ReplicaType::MEMORY:
+        case ReplicaType::NOF_SSD:
+            return "memory";
+        case ReplicaType::LOCAL_DISK:
+            return "local_disk";
+        case ReplicaType::DISK:
+        case ReplicaType::DFS:
+            return "dfs";
+        default:
+            return "unknown";
+    }
+}
+
 /**
  * @brief Stream operator for ReplicaType
  */
@@ -57,6 +73,12 @@ enum class ReplicaStatus {
     REMOVED,        // Replica has been removed
     FAILED,         // Failed state (can be used for reassignment)
 };
+
+inline const char* DfsReplicaMetricStatus(ReplicaStatus status) {
+    if (status == ReplicaStatus::PROCESSING) return "processing";
+    if (status == ReplicaStatus::COMPLETE) return "complete";
+    return nullptr;
+}
 
 /**
  * @brief Requested soft-pin transition for a Put or Upsert operation.
@@ -306,7 +328,14 @@ class Replica {
         : id_(next_id_.fetch_add(1)),
           data_(DfsReplicaData{std::move(descriptor)}),
           status_(status),
-          refcnt_(0) {}
+          refcnt_(0) {
+        if (is_dfs_replica()) {
+            const char* metric_status = DfsReplicaMetricStatus(status_);
+            if (metric_status != nullptr) {
+                MasterMetricManager::instance().inc_dfs_replica(metric_status);
+            }
+        }
+    }
 
     ~Replica() {
         if (status_ == ReplicaStatus::UNDEFINED) return;
@@ -316,6 +345,10 @@ class Replica {
         } else if (is_local_disk_replica()) {
             MasterMetricManager::instance().dec_allocated_file_size(
                 std::get<LocalDiskReplicaData>(data_).object_size);
+        } else if (is_dfs_replica()) {
+            if (const char* metric_status = DfsReplicaMetricStatus(status_)) {
+                MasterMetricManager::instance().dec_dfs_replica(metric_status);
+            }
         }
     }
 
@@ -348,6 +381,12 @@ class Replica {
             } else if (is_local_disk_replica()) {
                 MasterMetricManager::instance().dec_allocated_file_size(
                     std::get<LocalDiskReplicaData>(data_).object_size);
+            } else if (is_dfs_replica()) {
+                if (const char* metric_status =
+                        DfsReplicaMetricStatus(status_)) {
+                    MasterMetricManager::instance().dec_dfs_replica(
+                        metric_status);
+                }
             }
         }
 
@@ -510,6 +549,10 @@ class Replica {
 
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
+            if (is_dfs_replica()) {
+                MasterMetricManager::instance().transition_dfs_replica(
+                    "processing", "complete");
+            }
             status_ = ReplicaStatus::COMPLETE;
         } else if (status_ == ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "Replica already marked as complete";
@@ -520,6 +563,10 @@ class Replica {
 
     void mark_processing() {
         if (status_ == ReplicaStatus::COMPLETE) {
+            if (is_dfs_replica()) {
+                MasterMetricManager::instance().transition_dfs_replica(
+                    "complete", "processing");
+            }
             status_ = ReplicaStatus::PROCESSING;
         } else {
             LOG(ERROR) << "Cannot mark_processing from status: " << status_;

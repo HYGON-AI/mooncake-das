@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -596,6 +597,26 @@ int64_t time_gen() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+bool dfs_read_trace_enabled() {
+    static const bool enabled = [] {
+        const char *val = std::getenv("MC_STORE_DFS_READ_TRACE");
+        if (!val || val[0] == '\0') {
+            return false;  // unset: disabled
+        }
+        std::string s(val);
+        for (auto &c : s) {
+            c = std::tolower(c);
+        }
+        return s != "0" && s != "false" && s != "off";
+    }();
+    return enabled;
+}
+
+std::string GetEnvStringOr(const char *name, const std::string &default_value) {
+    const char *env_val = std::getenv(name);
+    return env_val ? std::string(env_val) : default_value;
 }
 
 std::string ResolveMooncakeHostId(const std::string &local_hostname) {

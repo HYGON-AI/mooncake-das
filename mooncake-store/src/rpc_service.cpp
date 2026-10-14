@@ -98,6 +98,10 @@ WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
 }
 
+void WrappedMasterService::RefreshDfsMetrics() const {
+    master_service_.RefreshDfsMetrics();
+}
+
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key, const std::string& tenant_id) {
     return execute_rpc(
@@ -487,6 +491,13 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                 }
             }
         }
+    } else if (config.dfs_replica_num > 0 &&
+               master_service_.UsesDfsBucketAllocator()) {
+        // Go through MasterService::BatchPutStart so DFS space for the whole
+        // batch is reserved in one allocator call, keeping the batch's entries
+        // contiguous instead of interleaved with other clients' batches.
+        results = master_service_.BatchPutStart(
+            client_id, keys, resolved_tenant_id.value(), slice_lengths, config);
     } else {
         for (size_t i = 0; i < keys.size(); ++i) {
             auto key_config = config.ForSingleKey(i);
@@ -1307,6 +1318,31 @@ tl::expected<void, ErrorCode> WrappedMasterService::EvictDiskReplica(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchInvalidateDfsBuckets(
+    const UUID& client_id,
+    const std::vector<DfsMissingBucketReport>& reports,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "BatchInvalidateDfsBuckets");
+    timer.LogRequest("client_id=", client_id,
+                     ", report_count=", reports.size());
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        reports.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchInvalidateDfsBuckets(
+                client_id, reports, resolved_tenant_id);
+        });
+    size_t failure_count = 0;
+    for (const auto& result : results) {
+        if (!result.has_value()) ++failure_count;
+    }
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
 WrappedMasterService::BatchEvictDiskReplica(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::string& tenant_id, ReplicaType replica_type) {
@@ -1531,6 +1567,11 @@ WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     return master_service_.GetTenantQuotaAllocatableCapacityBytes();
+}
+
+tl::expected<int64_t, ErrorCode>
+WrappedMasterService::SetDfsMaxBucketCount(int64_t new_max_bucket_count) {
+    return master_service_.SetDfsMaxBucketCount(new_max_bucket_count);
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
@@ -1865,6 +1906,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::BatchEvictDiskReplica>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchInvalidateDfsBuckets>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
         &wrapped_master_service);

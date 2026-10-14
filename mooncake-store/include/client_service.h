@@ -623,6 +623,42 @@ class Client {
         }
     }
 
+    void ObserveDirectAccess(const std::string& source, bool success,
+                             uint64_t bytes) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectAccess(source, success, bytes);
+        }
+    }
+
+    [[nodiscard]] bool MetricsEnabled() const { return metrics_ != nullptr; }
+
+    void ObservePrefetchedTokens(uint64_t tokens) {
+        if (metrics_ != nullptr) {
+            metrics_->ObservePrefetchedTokens(tokens);
+        }
+    }
+
+    void ObserveDirectSessionCache(bool hit) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectSessionCache(hit);
+        }
+    }
+
+    void ObserveDirectSessionCacheEviction() {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectSessionCacheEviction();
+        }
+    }
+
+    void ObserveDirectIo(const std::string& operation,
+                         const std::string& source, bool success,
+                         uint64_t bytes, double duration_seconds) {
+        if (metrics_ != nullptr) {
+            metrics_->ObserveDirectIo(operation, source, success, bytes,
+                                      duration_seconds);
+        }
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {
@@ -807,7 +843,7 @@ class Client {
                              std::vector<Slice>& slices);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
-        size_t object_size);
+        size_t object_size, bool staged_for_dfs = false);
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
@@ -880,11 +916,31 @@ class Client {
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
+    void ComputePutObjectChecksum(PutOperation& op,
+                                  const std::vector<Slice>& slices,
+                                  bool staged_for_dfs = false);
     void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
-    void SubmitDfsWrites(std::vector<PutOperation>& ops);
+
+    /**
+     * @brief Perform the DFS writes for a batch.
+     *
+     * In BUCKET mode this stages every slice into task-owned memory and hands
+     * the work to `write_thread_pool_`, so BatchPut does not wait for DFS I/O;
+     * the background task sends PutEnd/PutRevoke itself. In SHARD mode the
+     * write stays synchronous, preserving the upstream contract that a
+     * successful Put means the DFS copy is already durable.
+     *
+     * @param is_upsert Selects UpsertEnd/UpsertRevoke instead of
+     *        PutEnd/PutRevoke for the asynchronous completion.
+     * @param allow_async Set to false to force the synchronous path even in
+     *        BUCKET mode. Used by the upsert paths, whose finalize RPCs act on
+     *        ReplicaType::ALL and would collide with a deferred completion.
+     */
+    void SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert = false,
+                         bool allow_async = true);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -897,13 +953,61 @@ class Client {
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors);
 
+    /**
+     * @brief Everything one asynchronous DFS write batch needs, owned outright.
+     *
+     * The background task must not reference the caller's CPU or GPU buffers,
+     * which may be freed or overwritten as soon as BatchPut returns. All slice
+     * bytes are therefore copied into owned storage (pinned host memory when a
+     * GPU is involved, plain host memory otherwise) before the task is queued,
+     * and `slices` points into that storage.
+     *
+     * `backend` and `pinned_pool` are held by shared_ptr so the task keeps them
+     * alive even if the Client is torn down while the write is in flight.
+     */
+    struct AsyncDfsWriteContext {
+        std::vector<std::string> keys;
+        std::vector<DistributedFSDescriptor> descriptors;
+        std::vector<std::vector<Slice>> slices;
+        // Ready before enqueue; every End retry uses the foreground checksum.
+        std::vector<std::optional<uint64_t>> object_checksums;
+        std::vector<PinnedBufferPool::Buffer> staging;
+        std::vector<std::vector<char>> host_staging;
+        std::shared_ptr<DistributedStorageBackend> backend;
+        std::shared_ptr<PinnedBufferPool> pinned_pool;
+        bool is_upsert = false;
+
+        ~AsyncDfsWriteContext();
+    };
+
+    /**
+     * @brief Copy a batch's slices into context-owned storage.
+     * GPU pointers go through a D2H copy into pinned host memory; host pointers
+     * are memcpy'd. Returns false if any staging step fails.
+     */
+    bool StageDfsWriteData(
+        AsyncDfsWriteContext& context,
+        const std::vector<const std::vector<Slice>*>& slice_lists);
+
+    /**
+     * @brief Run one staged DFS write batch and report the outcome to master.
+     * Executed on `write_thread_pool_`; must only touch context-owned state.
+     */
+    void RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context);
+
+    /**
+     * @brief Wait until every queued asynchronous DFS write has finished.
+     * Called from the destructor before the master client goes away.
+     */
+    void DrainAsyncDfsWrites();
+
     std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
         std::vector<PutOperation>& ops, bool is_upsert);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
-    ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
+    ReplicateConfig AttachConfig(const ReplicateConfig& config) const;
 
     // Client identification
     const UUID client_id_;
@@ -951,12 +1055,21 @@ class Client {
     const bool object_checksum_enabled_;
 
     // Client persistent thread pool for async operations
-    // Pinned host memory pool for GPU D2H staging (must outlive
-    // write_thread_pool_)
-    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    // Pinned host memory pool for GPU D2H staging. Held by shared_ptr so an
+    // in-flight async DFS write keeps it alive even while the Client is being
+    // destroyed.
+    std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+
+    // Tracks asynchronous DFS writes so the destructor can drain them before
+    // tearing down the RPC client they report their result through.
+    std::mutex dfs_inflight_mutex_;
+    std::condition_variable dfs_inflight_cv_;
+    size_t dfs_inflight_writes_{0};
+    // Set during destruction: no new async DFS writes are accepted afterwards.
+    std::atomic<bool> dfs_writes_shutting_down_{false};
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;

@@ -122,6 +122,19 @@ class MasterMetricManager {
     // unlimited DFS capacity instead of relying on the gauge value.
     void set_dfs_capacity_unlimited(bool unlimited);
     bool is_dfs_capacity_unlimited() const;
+    void set_dfs_storage_usage(uint64_t capacity_bytes, uint64_t used_bytes,
+                               bool unlimited);
+    void inc_dfs_replica(const std::string& status, int64_t val = 1);
+    void dec_dfs_replica(const std::string& status, int64_t val = 1);
+    void transition_dfs_replica(const std::string& from, const std::string& to);
+    void set_dfs_bucket_pool_state(uint64_t ready_count,
+                                   uint64_t create_inflight,
+                                   uint64_t ready_reserved_bytes);
+    void observe_dfs_bucket_create_latency_us(int64_t latency_us);
+    void inc_dfs_bucket_create_total(const std::string& result);
+    void inc_dfs_bucket_pool_exhausted_total();
+    void observe_dfs_bucket_pool_wait_latency_us(int64_t latency_us);
+    void observe_dfs_bucket_rollover_latency_us(int64_t latency_us);
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
@@ -569,6 +582,18 @@ class MasterMetricManager {
     // File Storage Metrics
     ylt::metric::gauge_t file_allocated_size_;
     ylt::metric::gauge_t file_total_capacity_;
+    ylt::metric::gauge_t dfs_capacity_bytes_;
+    ylt::metric::gauge_t dfs_used_bytes_;
+    ylt::metric::gauge_t dfs_capacity_unlimited_metric_;
+    ylt::metric::dynamic_gauge_1t dfs_replicas_;
+    ylt::metric::gauge_t dfs_bucket_ready_count_;
+    ylt::metric::gauge_t dfs_bucket_create_inflight_;
+    ylt::metric::histogram_t dfs_bucket_create_latency_us_;
+    ylt::metric::dynamic_counter_1t dfs_bucket_create_total_;
+    ylt::metric::counter_t dfs_bucket_pool_exhausted_total_;
+    ylt::metric::histogram_t dfs_bucket_pool_wait_latency_us_;
+    ylt::metric::gauge_t dfs_bucket_ready_reserved_bytes_;
+    ylt::metric::histogram_t dfs_bucket_rollover_latency_us_;
     std::atomic<bool> dfs_capacity_unlimited_{false};
 
     // Key/Value Metrics

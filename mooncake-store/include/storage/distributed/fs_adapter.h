@@ -1,8 +1,11 @@
 #pragma once
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
+#include <cerrno>
 #include <span>
 #include <string>
 #include <vector>
@@ -123,6 +126,91 @@ class FileSystemAdapter {
                                                    int /*iovcnt*/,
                                                    int64_t /*offset*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    /**
+     * @brief Open a file for direct (page-cache-bypassing) reads.
+     *
+     * Returns a read-only handle whose reads avoid polluting the kernel page
+     * cache (e.g. O_DIRECT on POSIX). Adapters whose I/O path already bypasses
+     * the page cache (e.g. 3FS USRBIO) may simply open a read-only handle.
+     * The default returns NOT_SUPPORTED, in which case callers fall back to
+     * OpenFile handles.
+     */
+    virtual tl::expected<int, ErrorCode> OpenFileDirect(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    /**
+     * @brief Scatter-read into `iov` from a handle opened by OpenFileDirect.
+     *
+     * Direct handles may impose alignment rules (offset, buffer, length), so
+     * implementations absorb unaligned requests internally (e.g. through an
+     * aligned bounce buffer) and always keep the zero-copy semantics of the
+     * caller's iovec. The default just forwards to ReadAt.
+     */
+    virtual tl::expected<size_t, ErrorCode> DirectReadAt(
+        int fd, iovec* iov, int iovcnt, int64_t offset) {
+        return ReadAt(fd, iov, iovcnt, offset);
+    }
+
+    // === Durability primitives ===
+    //
+    // Used to publish metadata sidecars atomically: write a temp file, fsync
+    // it, rename it over the live name, then fsync the directory so the rename
+    // itself is durable. Defaults are POSIX implementations, which also hold
+    // for FUSE-mounted distributed filesystems; adapters with a native
+    // metadata path may override them.
+
+    virtual tl::expected<void, ErrorCode> SyncFile(const std::string& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return tl::make_unexpected(errno == ENOENT
+                                           ? ErrorCode::FILE_NOT_FOUND
+                                           : ErrorCode::FILE_OPEN_FAIL);
+        }
+        const int rc = ::fsync(fd);
+        const int saved_errno = errno;
+        ::close(fd);
+        if (rc != 0) {
+            errno = saved_errno;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return {};
+    }
+
+    virtual tl::expected<void, ErrorCode> SyncDirectory(
+        const std::string& dir) {
+        const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0) {
+            // Some filesystems refuse to open directories for fsync. Treat
+            // that as "nothing further to flush" rather than a hard failure.
+            if (errno == EACCES || errno == EPERM || errno == EINVAL) {
+                return {};
+            }
+            return tl::make_unexpected(errno == ENOENT
+                                           ? ErrorCode::FILE_NOT_FOUND
+                                           : ErrorCode::FILE_OPEN_FAIL);
+        }
+        const int rc = ::fsync(fd);
+        const int saved_errno = errno;
+        ::close(fd);
+        if (rc != 0 && saved_errno != EINVAL) {
+            errno = saved_errno;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return {};
+    }
+
+    virtual tl::expected<void, ErrorCode> RenameFile(const std::string& from,
+                                                     const std::string& to) {
+        if (::rename(from.c_str(), to.c_str()) != 0) {
+            return tl::make_unexpected(errno == ENOENT
+                                           ? ErrorCode::FILE_NOT_FOUND
+                                           : ErrorCode::FILE_WRITE_FAIL);
+        }
+        return {};
     }
 
     // === Lifecycle ===
