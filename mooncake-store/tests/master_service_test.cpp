@@ -1331,7 +1331,191 @@ const Replica::Descriptor* FindDfsDescriptor(
     return nullptr;
 }
 
+std::optional<int64_t> ReadPrometheusCounter(const std::string& serialized,
+                                             const std::string& name) {
+    const std::string line_prefix = name + " ";
+    size_t line_begin = 0;
+    while (line_begin < serialized.size()) {
+        const size_t line_end = serialized.find('\n', line_begin);
+        if (serialized.compare(line_begin, line_prefix.size(), line_prefix) ==
+            0) {
+            const size_t value_begin = line_begin + line_prefix.size();
+            const size_t value_end = line_end == std::string::npos
+                                         ? serialized.size()
+                                         : line_end;
+            return std::stoll(
+                serialized.substr(value_begin, value_end - value_begin));
+        }
+        if (line_end == std::string::npos) break;
+        line_begin = line_end + 1;
+    }
+    return std::nullopt;
+}
+
 }  // namespace
+
+TEST_F(MasterServiceTest, DfsGetMetricsFollowFirstReadableReplica) {
+    const auto root = MakeDfsTestRoot("query_metrics");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        auto& metrics = MasterMetricManager::instance();
+
+        struct GetMetrics {
+            int64_t dfs_hits;
+            int64_t dfs_bytes;
+            int64_t mem_hits;
+            int64_t file_hits;
+            int64_t mem_bytes;
+            int64_t file_bytes;
+            int64_t valid_gets;
+            int64_t total_gets;
+        };
+        const auto capture_metrics = [&]() {
+            const auto serialized = metrics.serialize_metrics();
+            const auto read_counter = [&](const std::string& name) {
+                const auto value = ReadPrometheusCounter(serialized, name);
+                EXPECT_TRUE(value.has_value()) << "missing metric " << name;
+                return value.value_or(-1);
+            };
+            return GetMetrics{
+                .dfs_hits = read_counter("dfs_cache_hit_nums_"),
+                .dfs_bytes = read_counter("dfs_cache_hit_bytes_total"),
+                .mem_hits = read_counter("mem_cache_hit_nums_"),
+                .file_hits = read_counter("file_cache_hit_nums_"),
+                .mem_bytes = read_counter("mem_cache_hit_bytes_total"),
+                .file_bytes = read_counter("file_cache_hit_bytes_total"),
+                .valid_gets = read_counter("valid_get_nums_"),
+                .total_gets = read_counter("total_get_nums_"),
+            };
+        };
+        const GetMetrics baseline = capture_metrics();
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        auto missing =
+            service.GetReplicaList("dfs_metrics_missing", TenantId::Default());
+        ASSERT_FALSE(missing.has_value());
+        EXPECT_EQ(missing.error(), ErrorCode::OBJECT_NOT_FOUND);
+        auto after_missing = capture_metrics();
+        EXPECT_EQ(after_missing.dfs_hits, baseline.dfs_hits);
+        EXPECT_EQ(after_missing.dfs_bytes, baseline.dfs_bytes);
+        EXPECT_EQ(after_missing.valid_gets, baseline.valid_gets);
+        EXPECT_EQ(after_missing.total_gets, baseline.total_gets + 1);
+
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "dfs_metrics_not_ready",
+                                  TenantId::Default(), 111, config)
+                        .has_value());
+        auto not_ready = service.GetReplicaList("dfs_metrics_not_ready",
+                                                TenantId::Default());
+        ASSERT_FALSE(not_ready.has_value());
+        EXPECT_EQ(not_ready.error(), ErrorCode::REPLICA_IS_NOT_READY);
+        auto after_not_ready = capture_metrics();
+        EXPECT_EQ(after_not_ready.dfs_hits, baseline.dfs_hits);
+        EXPECT_EQ(after_not_ready.dfs_bytes, baseline.dfs_bytes);
+        EXPECT_EQ(after_not_ready.valid_gets, baseline.valid_gets);
+        EXPECT_EQ(after_not_ready.total_gets, baseline.total_gets + 2);
+
+        constexpr uint64_t kSingleDfsSize = 123;
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "dfs_metrics_single",
+                                  TenantId::Default(), kSingleDfsSize, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "dfs_metrics_single",
+                                TenantId::Default(), ReplicaType::DFS)
+                        .has_value());
+        auto single = service.GetReplicaList("dfs_metrics_single",
+                                             TenantId::Default());
+        ASSERT_TRUE(single.has_value());
+        ASSERT_EQ(single->replicas.size(), 1u);
+        EXPECT_TRUE(single->replicas.front().is_dfs_replica());
+
+        auto after_single = capture_metrics();
+        EXPECT_EQ(after_single.dfs_hits, baseline.dfs_hits + 1);
+        EXPECT_EQ(after_single.dfs_bytes,
+                  baseline.dfs_bytes + kSingleDfsSize);
+        EXPECT_EQ(after_single.valid_gets, baseline.valid_gets + 1);
+        EXPECT_EQ(after_single.total_gets, baseline.total_gets + 3);
+        EXPECT_EQ(after_single.mem_hits, baseline.mem_hits);
+        EXPECT_EQ(after_single.file_hits, baseline.file_hits);
+        EXPECT_EQ(after_single.mem_bytes, baseline.mem_bytes);
+        EXPECT_EQ(after_single.file_bytes, baseline.file_bytes);
+
+        constexpr uint64_t kBatchDfsSize = 456;
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "dfs_metrics_batch",
+                                  TenantId::Default(), kBatchDfsSize, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "dfs_metrics_batch",
+                                TenantId::Default(), ReplicaType::DFS)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id,
+                                  "dfs_metrics_batch_not_ready",
+                                  TenantId::Default(), 222, config)
+                        .has_value());
+
+        auto batch = service.BatchGetReplicaList(
+            {"dfs_metrics_batch", "dfs_metrics_batch_missing",
+             "dfs_metrics_batch_not_ready"},
+            TenantId::Default());
+        ASSERT_EQ(batch.size(), 3u);
+        ASSERT_TRUE(batch[0].has_value());
+        ASSERT_EQ(batch[0]->replicas.size(), 1u);
+        EXPECT_TRUE(batch[0]->replicas.front().is_dfs_replica());
+        ASSERT_FALSE(batch[1].has_value());
+        EXPECT_EQ(batch[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+        ASSERT_FALSE(batch[2].has_value());
+        EXPECT_EQ(batch[2].error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+        auto after_batch = capture_metrics();
+        EXPECT_EQ(after_batch.dfs_hits, baseline.dfs_hits + 2);
+        EXPECT_EQ(after_batch.dfs_bytes,
+                  baseline.dfs_bytes + kSingleDfsSize + kBatchDfsSize);
+        EXPECT_EQ(after_batch.valid_gets, baseline.valid_gets + 2);
+        EXPECT_EQ(after_batch.total_gets, baseline.total_gets + 6);
+        EXPECT_EQ(after_batch.mem_hits, baseline.mem_hits);
+        EXPECT_EQ(after_batch.file_hits, baseline.file_hits);
+        EXPECT_EQ(after_batch.mem_bytes, baseline.mem_bytes);
+        EXPECT_EQ(after_batch.file_bytes, baseline.file_bytes);
+
+        constexpr uint64_t kMixedSize = 789;
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "dfs_metrics_mixed",
+                                  TenantId::Default(), kMixedSize, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "dfs_metrics_mixed",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+        auto mixed = service.GetReplicaList("dfs_metrics_mixed",
+                                            TenantId::Default());
+        ASSERT_TRUE(mixed.has_value());
+        ASSERT_EQ(mixed->replicas.size(), 2u);
+        EXPECT_TRUE(mixed->replicas.front().is_memory_replica());
+        EXPECT_NE(FindDfsDescriptor(mixed->replicas), nullptr);
+
+        const auto after_mixed = capture_metrics();
+        EXPECT_EQ(after_mixed.dfs_hits, after_batch.dfs_hits);
+        EXPECT_EQ(after_mixed.dfs_bytes, after_batch.dfs_bytes);
+        EXPECT_EQ(after_mixed.mem_hits, baseline.mem_hits + 1);
+        EXPECT_EQ(after_mixed.mem_bytes, baseline.mem_bytes + kMixedSize);
+        EXPECT_EQ(after_mixed.file_hits, baseline.file_hits);
+        EXPECT_EQ(after_mixed.file_bytes, baseline.file_bytes);
+        EXPECT_EQ(after_mixed.valid_gets, baseline.valid_gets + 3);
+        EXPECT_EQ(after_mixed.total_gets, baseline.total_gets + 7);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
 
 TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
     const auto root = MakeDfsTestRoot("memory_failure");

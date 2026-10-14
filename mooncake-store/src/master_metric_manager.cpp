@@ -317,12 +317,18 @@ MasterMetricManager::MasterMetricManager()
       file_cache_hit_nums_("file_cache_hit_nums_",
                            "Total number of GetReplicaList results served from "
                            "the SSD cache"),
+      dfs_cache_hit_nums_("dfs_cache_hit_nums_",
+                          "Total number of GetReplicaList results served from "
+                          "the DFS cache"),
       mem_cache_hit_bytes_("mem_cache_hit_bytes_total",
                            "Total bytes of GetReplicaList results served from "
                            "the memory pool"),
       file_cache_hit_bytes_("file_cache_hit_bytes_total",
                             "Total bytes of GetReplicaList results served from "
                             "the SSD cache"),
+      dfs_cache_hit_bytes_("dfs_cache_hit_bytes_total",
+                           "Total bytes of GetReplicaList results served from "
+                           "the DFS cache"),
       mem_cache_nums_("mem_cache_nums_",
                       "Current number of cached values in the memory pool"),
       file_cache_nums_("file_cache_nums_",
@@ -664,8 +670,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Store-observed cache reuse metrics
     mem_cache_hit_nums_.inc(0);
     file_cache_hit_nums_.inc(0);
+    dfs_cache_hit_nums_.inc(0);
     mem_cache_hit_bytes_.inc(0);
     file_cache_hit_bytes_.inc(0);
+    dfs_cache_hit_bytes_.inc(0);
     valid_get_nums_.inc(0);
     total_get_nums_.inc(0);
 
@@ -1003,11 +1011,17 @@ void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
 void MasterMetricManager::inc_file_cache_hit_nums(int64_t val) {
     file_cache_hit_nums_.inc(val);
 }
+void MasterMetricManager::inc_dfs_cache_hit_nums(int64_t val) {
+    dfs_cache_hit_nums_.inc(val);
+}
 void MasterMetricManager::inc_mem_cache_hit_bytes(int64_t val) {
     mem_cache_hit_bytes_.inc(val);
 }
 void MasterMetricManager::inc_file_cache_hit_bytes(int64_t val) {
     file_cache_hit_bytes_.inc(val);
+}
+void MasterMetricManager::inc_dfs_cache_hit_bytes(int64_t val) {
+    dfs_cache_hit_bytes_.inc(val);
 }
 int64_t MasterMetricManager::get_mem_cache_hit_bytes() {
     return mem_cache_hit_bytes_.value();
@@ -2065,8 +2079,10 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Store-observed cache reuse metrics
     serialize_metric(mem_cache_hit_nums_);
     serialize_metric(file_cache_hit_nums_);
+    serialize_metric(dfs_cache_hit_nums_);
     serialize_metric(mem_cache_hit_bytes_);
     serialize_metric(file_cache_hit_bytes_);
+    serialize_metric(dfs_cache_hit_bytes_);
     serialize_metric(mem_cache_nums_);
     serialize_metric(file_cache_nums_);
     serialize_metric(valid_get_nums_);
