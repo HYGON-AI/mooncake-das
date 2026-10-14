@@ -81,6 +81,33 @@ class FileStorage {
         return pinned_restore_arena_allocator_ != nullptr;
     }
 
+    // Allocate request-scoped staging from the fixed-capacity pinned restore
+    // arena. The handle returns its sub-allocation to the arena on destruction.
+    [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
+        size_t size, size_t alignment = 1) const;
+
+    // Dedicated arena for waiting-queue DFS prefetch staging, allocated once
+    // at construction. It is the only staging source for prefetch reads;
+    // there is no runtime pinned allocation fallback.
+    [[nodiscard]] bool HasPinnedPrefetchArena() const {
+        return pinned_prefetch_arena_allocator_ != nullptr;
+    }
+
+    // "ready" or the reason the prefetch arena is unavailable.
+    [[nodiscard]] const std::string& PinnedPrefetchArenaStatus() const {
+        return pinned_prefetch_arena_status_;
+    }
+
+    [[nodiscard]] size_t PinnedPrefetchArenaCapacity() const {
+        return pinned_prefetch_arena_.capacity;
+    }
+
+    [[nodiscard]] std::optional<BufferHandle> AllocatePinnedPrefetchBuffer(
+        size_t size, size_t alignment = 1) const;
+
+    [[nodiscard]] offset_allocator::OffsetAllocStorageReport
+    PinnedPrefetchArenaReport() const;
+
     FileStorageConfig config_;
 
     /**
@@ -198,13 +225,20 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
 
+    // Allocates the dedicated prefetch arena once and records its status.
+    void InitPinnedPrefetchArena(const FileStorageConfig& config,
+                                 const std::shared_ptr<Client>& client);
+
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
-    // Pinned memory for GPU staging and SSD-to-GPU restores.
+    // Pinned memory for GPU staging and SSD/DFS-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     PinnedBufferPool::Buffer pinned_restore_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
+    PinnedBufferPool::Buffer pinned_prefetch_arena_;
+    std::shared_ptr<ClientBufferAllocator> pinned_prefetch_arena_allocator_;
+    std::string pinned_prefetch_arena_status_ = "not configured";
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;

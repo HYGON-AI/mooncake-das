@@ -5,13 +5,16 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <vector>
 
 #include "pyclient.h"
@@ -30,6 +33,43 @@
 #include <async_simple/coro/Lazy.h>
 
 namespace mooncake {
+
+struct SessionRangeReadRequest {
+    std::string key;
+    size_t original_idx;
+    Replica::Descriptor replica;
+    QueryResult query_result;
+    std::vector<void *> buffers;
+    std::vector<size_t> sizes;
+    std::vector<size_t> src_offsets;
+    std::chrono::steady_clock::time_point lease_deadline;
+    std::shared_ptr<GetSessionLifetime> lifetime;
+};
+
+using NonMemReadEntry = SessionRangeReadRequest;
+
+// Full-object pinned buffer populated only by waiting-queue prefetch.
+struct PrefetchedSessionBuffer {
+    std::shared_ptr<BufferHandle> buffer_handle;
+    uint64_t total_size;  // object size in bytes
+};
+
+struct SessionRangeReadPlan {
+    std::vector<SessionRangeReadRequest> memory_requests;
+    std::vector<SessionRangeReadRequest> dfs_requests;
+};
+
+struct SessionRangeReadContext {
+    bool record_access{false};
+    uint64_t trace_id{0};
+    size_t cache_evicted_count{0};
+    std::vector<std::string> access_sources;
+    std::vector<std::shared_ptr<GetSessionLifetime>> access_lifetimes;
+    std::chrono::steady_clock::time_point timing_start;
+    std::chrono::steady_clock::time_point cache_gc_done;
+    std::chrono::steady_clock::time_point memory_done;
+    std::chrono::steady_clock::time_point access_done;
+};
 
 class RealClient;
 class RegisteredPinnedRegion;
@@ -76,6 +116,7 @@ class ResourceTracker {
 
 class RealClient : public PyClient {
    public:
+   public:
     RealClient();
     ~RealClient();
 
@@ -95,7 +136,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool enable_dfs_prefetch = true);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -254,13 +296,91 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) override;
 
+    std::vector<int> batch_get_session_refresh(
+        const std::vector<std::string> &keys) override;
+
+    std::vector<int> prepare_get_session_read(
+        const std::vector<std::string> &keys,
+        GetSessionReadSnapshots &snapshots) override;
+
+    GetSessionStartResult
+    batch_get_session_start_with_sources(
+        const std::vector<std::string> &keys) override;
+
+    bool all_get_sessions_memory(
+        const std::vector<std::string> &keys) const override;
+
+    // Synchronously populate the prefetch buffer for DFS-backed active get
+    // sessions. A successful DFS status means the complete buffered bytes
+    // still belong to a live session with a compatible selected replica when
+    // this call returns. Non-DFS entries remain for the ordinary range-get.
+    std::vector<int> batch_get_session_prefetch(
+        const std::vector<std::string> &keys) override;
+
+    // Whether waiting-queue DFS prefetch has a staging arena. Callers should
+    // not submit prefetches when this is false: every DFS staging allocation
+    // would fail.
+    bool dfs_prefetch_arena_available() const override;
+
+    // "ready" or the reason the prefetch arena is unavailable.
+    std::string dfs_prefetch_arena_status() const override;
+
+    void record_prefetched_tokens(uint64_t tokens) override;
+
     std::vector<int> batch_get_into_multi_buffer_ranges(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const std::vector<std::vector<size_t>> &all_src_offsets) override;
+        const std::vector<std::vector<size_t>> &all_src_offsets,
+        const GetSessionReadSnapshots *snapshots = nullptr) override;
 
     int batch_get_session_end(const std::vector<std::string> &keys) override;
+
+    bool validate_session_range_batch_arguments(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets) const;
+
+    std::vector<SessionRangeReadRequest> prepare_session_range_read_requests(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets,
+        std::vector<int> &results, SessionRangeReadContext &context,
+        const GetSessionReadSnapshots *snapshots);
+
+    SessionRangeReadPlan classify_session_range_read_requests(
+        std::vector<SessionRangeReadRequest> requests,
+        std::vector<int> &results) const;
+
+    void execute_session_memory_range_reads(
+        const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
+    void process_session_disk_dfs_reads(std::vector<NonMemReadEntry *> &entries,
+                                        std::vector<int> &results,
+                                        uint64_t trace_id,
+                                        bool prefetch_only = false);
+
+    void execute_session_dfs_range_reads(
+        std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results, uint64_t trace_id,
+        bool prefetch_only = false);
+
+    void record_session_range_accesses(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets,
+        const std::vector<int> &results,
+        const SessionRangeReadContext &context);
+
+    void trace_session_range_reads(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        size_t memory_read_count, size_t dfs_read_count,
+        const SessionRangeReadContext &context) const;
 
     std::vector<int> batch_put_session_start(
         const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
@@ -587,7 +707,8 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool enable_dfs_prefetch = true);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -977,8 +1098,9 @@ class RealClient : public PyClient {
     std::optional<WritableBufferRegion> local_buffer_region_;
 
     // KV transfer sessions (process-local; not shared with DummyClient).
-    // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
-    // memory replica + lease); ranges only compare lease locally (no Master).
+    // get_sessions_ stores a FilterQueryResult'd QueryResult (one complete
+    // MEMORY or DFS replica plus its lease). Expired snapshots are retained
+    // until repair/end so compatible prefetched bytes can survive renewal.
     // Put sessions track writable + inflight so end/revoke can seal the
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
@@ -990,8 +1112,66 @@ class RealClient : public PyClient {
     };
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
+    // Read once at client creation; shared by every on-demand lease check.
+    std::chrono::milliseconds get_session_min_remaining_{1000};
     std::unordered_map<std::string, QueryResult> get_sessions_;
+    std::unordered_map<std::string, std::shared_ptr<GetSessionLifetime>>
+        get_session_lifetimes_;
+    struct GetSessionRepair {
+        bool done{false};
+        int result{static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))};
+    };
+    std::unordered_map<std::string, std::shared_ptr<GetSessionRepair>>
+        get_session_repairs_;
+    void cancel_get_session_repair(const std::string &key);
+    std::vector<int> ensure_get_sessions(
+        const std::vector<std::string> &keys,
+        GetSessionReadSnapshots &snapshots, bool force_refresh = false);
+    struct GetSessionAccessRecord {
+        std::string source;
+        bool success{true};
+        uint64_t bytes{0};
+        std::set<std::pair<uint64_t, uint64_t>> ranges;
+    };
+    // One record per key/session. Bytes are accumulated across all range
+    // calls (including every layer) and emitted when the session ends.
+    std::unordered_map<std::string, GetSessionAccessRecord>
+        get_session_access_records_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
+
+    // Per-key full-object buffers populated only by waiting-queue prefetch.
+    // Consumed by the admitted request's DFS range-get and released at the
+    // get session's end.
+    std::unordered_map<std::string, PrefetchedSessionBuffer>
+        get_session_prefetch_cache_;
+    std::atomic<bool> prefetch_arena_available_{false};
+    class DfsH2dStreamPool;
+    class DfsAsyncScatterContext;
+    mutable std::shared_mutex dfs_read_lifecycle_mutex_;
+    bool dfs_read_shutting_down_ = false;
+    // Waiting-queue prefetch buffers outlive the read that populated them.
+    // They come only from FileStorage's dedicated prefetch arena, never from
+    // the request-scoped restore arena or a runtime pinned allocation.
+    struct PrefetchArenaStats {
+        std::atomic<uint64_t> alloc_ok{0};
+        std::atomic<uint64_t> alloc_fail{0};
+        // Requested bytes of live root regions; released after the region
+        // has been returned to the arena.
+        std::atomic<uint64_t> requested_bytes_in_use{0};
+        // Arena occupancy (capacity - free, including alignment and bin
+        // rounding) observed right after allocations; not an exact peak.
+        std::atomic<uint64_t> occupied_bytes_observed_peak{0};
+        // Minimum observed conservative lower bound of the largest free
+        // region.
+        std::atomic<uint64_t> largest_free_region_min{UINT64_MAX};
+        std::atomic<int64_t> last_summary_ns{0};
+        std::atomic<bool> unavailable_logged{false};
+    };
+    // Shared with region deleters so accounting never touches FileStorage.
+    std::shared_ptr<PrefetchArenaStats> prefetch_arena_stats_;
+    std::shared_ptr<BufferHandle> AllocatePrefetchArenaRegion(size_t size,
+                                                              size_t alignment);
+    std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,

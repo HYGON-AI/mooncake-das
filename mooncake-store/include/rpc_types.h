@@ -14,6 +14,11 @@ struct ObjectMeta {
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
 
+struct DfsMissingBucketReport {
+    int64_t bucket_id = -1;
+};
+YLT_REFL(DfsMissingBucketReport, bucket_id);
+
 enum class ReplicaActionType {
     ADD = 0,
 };

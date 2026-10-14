@@ -16,6 +16,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     uds_transport.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
+    storage/distributed/immutable_bucket_allocator.cpp
     utils/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
@@ -88,6 +89,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     aligned_client_buffer.cpp
     real_client.cpp
     read_layout.cpp
+    read_plan.cpp
     registered_pinned_memory.cpp
     dummy_client.cpp
     shm_helper.cpp

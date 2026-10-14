@@ -2996,9 +2996,18 @@ Typical flow:
 - Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
-Get sessions cache a filtered `QueryResult` (single complete memory replica + lease).
-Range calls only check the cached lease locally (zero Master RPCs). Put sessions
-reserve object space via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+Get sessions cache a filtered `QueryResult` (one selected complete memory or DFS
+replica plus its lease). Range calls only check the cached lease locally (zero
+Master RPCs). Put sessions reserve object space via Master `BatchPutStart` and
+finalize with `BatchPutEnd`.
+
+For `create_read_plan(..., page_wise=True)`, set
+`MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE=1` to read layer by layer when every key in
+the plan selects a memory replica. If any key selects DFS, or its source is
+unknown, the plan keeps the single page-wise range call. The setting is off by
+default and does not change plans created with `page_wise=False`. With
+`borrowed_sessions=True`, the plan inspects the caller's active sessions without
+re-querying Master or releasing prefetched DFS data.
 
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where

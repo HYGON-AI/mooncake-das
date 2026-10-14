@@ -677,6 +677,10 @@ class MasterClient {
                           const std::string& tenant_id,
                           ReplicaType replica_type);
 
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchInvalidateDfsBuckets(
+        const std::vector<DfsMissingBucketReport>& reports);
+
    private:
     /**
      * @brief Generic RPC invocation helper for single-result operations

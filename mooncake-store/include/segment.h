@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "allocation_strategy.h"
@@ -399,6 +400,8 @@ class SegmentManager {
         bool enable_cxl = false)
         : memory_allocator_(memory_allocator), enable_cxl_(enable_cxl) {}
 
+    ~SegmentManager();
+
     /**
      * @brief Releases the capacity metric contribution of segments that
      *        are still mounted. Intended to be called when the owning
@@ -460,6 +463,8 @@ class SegmentManager {
 
    private:
     void AttachMountedUsageTrackers();
+    void RefreshActiveClientMetric(const UUID& client_id);
+    void ReleaseActiveClientMetrics();
 
     std::shared_ptr<StorageUsageTracker> usage_tracker_ =
         std::make_shared<StorageUsageTracker>();
@@ -477,6 +482,9 @@ class SegmentManager {
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;  // client_id -> segment_ids
+    // Runtime metric contributions only; deserialized snapshot clients are
+    // counted when they mount/remount, not while reading a snapshot.
+    std::unordered_set<UUID, boost::hash<UUID>> metric_memory_clients_;
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
     std::unordered_map<std::string, UUID>

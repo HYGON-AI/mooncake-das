@@ -194,6 +194,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
             segment_manager_->client_by_name_[segment.name] = client_id;
             segment_manager_->segment_id_by_name_[segment.name] = segment.id;
             AddHostSegment(segment_manager_->segments_by_host_, segment);
+            segment_manager_->RefreshActiveClientMetric(client_id);
 
             LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
                       << segment.name
@@ -225,6 +226,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     if (exist_segment_it != segment_manager_->mounted_segments_.end()) {
         auto& exist_segment = exist_segment_it->second;
         if (exist_segment.status == SegmentStatus::OK) {
+            segment_manager_->RefreshActiveClientMetric(client_id);
             LOG(WARNING) << "segment_name=" << segment.name
                          << ", warn=segment_already_exists";
             return ErrorCode::SEGMENT_ALREADY_EXISTS;
@@ -278,6 +280,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     segment_manager_->segment_id_by_name_[segment.name] = segment.id;
     AddHostSegment(segment_manager_->segments_by_host_, segment);
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
+    segment_manager_->RefreshActiveClientMetric(client_id);
 
     return ErrorCode::OK;
 }
@@ -512,6 +515,9 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     }
     // Remove from mounted_segments_
     segment_manager_->mounted_segments_.erase(segment_id);
+    if (segment_manager_->metric_memory_clients_.contains(client_id)) {
+        segment_manager_->RefreshActiveClientMetric(client_id);
+    }
 
     // Decrease the total capacity
     if (!is_cxl) {
@@ -843,6 +849,7 @@ SegmentSerializer::Deserialize(const std::vector<uint8_t>& data) {
 
     // Do not mutate SegmentManager until the independent LocalSSD payload has
     // been fully validated.
+    segment_manager_->ReleaseActiveClientMetrics();
     segment_manager_->mounted_segments_.clear();
     segment_manager_->client_segments_.clear();
     segment_manager_->segments_by_host_.clear();
@@ -1063,6 +1070,7 @@ SegmentSerializer::Deserialize(const std::vector<uint8_t>& data) {
 }
 
 void SegmentSerializer::Reset() {
+    segment_manager_->ReleaseActiveClientMetrics();
     segment_manager_->mounted_segments_.clear();
     segment_manager_->client_segments_.clear();
     segment_manager_->client_by_name_.clear();
@@ -1448,6 +1456,35 @@ StorageUsageSnapshot NoFSegmentManager::GetUsageSnapshot() const {
                           counted_allocators);
     }
     return snapshot;
+}
+
+SegmentManager::~SegmentManager() { ReleaseActiveClientMetrics(); }
+
+void SegmentManager::RefreshActiveClientMetric(const UUID& client_id) {
+    const auto client = client_segments_.find(client_id);
+    const bool has_memory =
+        client != client_segments_.end() &&
+        std::any_of(client->second.begin(), client->second.end(),
+                    [this](const UUID& segment_id) {
+                        const auto segment = mounted_segments_.find(segment_id);
+                        return segment != mounted_segments_.end() &&
+                               segment->second.segment.size > 0;
+                    });
+    if (has_memory) {
+        if (metric_memory_clients_.insert(client_id).second) {
+            MasterMetricManager::instance().inc_active_clients();
+        }
+    } else if (metric_memory_clients_.erase(client_id) > 0) {
+        MasterMetricManager::instance().dec_active_clients();
+    }
+}
+
+void SegmentManager::ReleaseActiveClientMetrics() {
+    if (!metric_memory_clients_.empty()) {
+        MasterMetricManager::instance().dec_active_clients(
+            metric_memory_clients_.size());
+    }
+    metric_memory_clients_.clear();
 }
 
 void SegmentManager::releaseCapacityMetrics() {

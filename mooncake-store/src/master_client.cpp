@@ -335,6 +335,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchInvalidateDfsBuckets> {
+    static constexpr const char* value = "BatchInvalidateDfsBuckets";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
@@ -1354,6 +1359,18 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
             keys.size(), client_id_, keys, tenant_id, replica_type);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchInvalidateDfsBuckets(
+    const std::vector<DfsMissingBucketReport>& reports) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchInvalidateDfsBuckets");
+    timer.LogRequest("report_count=", reports.size());
+    auto results = invoke_batch_rpc<
+        &WrappedMasterService::BatchInvalidateDfsBuckets, void>(
+        reports.size(), client_id_, reports, tenant_id_.value());
+    timer.LogResponse("result=", results.size(), " operations");
+    return results;
 }
 
 }  // namespace mooncake

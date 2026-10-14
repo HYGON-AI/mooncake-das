@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -18,6 +19,19 @@
 #include "file_storage.h"
 
 namespace mooncake {
+
+// Identity survives lease expiry, but never an explicit end/start.
+struct GetSessionLifetime {
+    bool ready{false};  // Protected by RealClient::session_mutex_.
+    // Ordinary layer-wise range calls also must not mix content after reading.
+    std::optional<QueryResult> read_snapshot;
+};
+struct GetSessionReadSnapshot {
+    std::shared_ptr<GetSessionLifetime> lifetime;
+    QueryResult query;
+};
+using GetSessionReadSnapshots =
+    std::unordered_map<std::string, GetSessionReadSnapshot>;
 
 #define MOONCAKE_SHM_NAME "mooncake_shm"
 
@@ -209,6 +223,13 @@ class ClientRequester {
 };
 
 // Python-specific wrapper class for client interface
+struct GetSessionStartResult {
+    std::vector<int> codes;
+    std::vector<std::string> sources;
+    // True only when every key successfully selected a MEMORY replica.
+    bool all_memory = false;
+};
+
 class PyClient {
    public:
     // Request-scoped cache of fresh batch_query() results that can be reused by
@@ -228,7 +249,8 @@ class PyClient {
         const std::string &ssd_offload_path = "",
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT) = 0;
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        bool enable_dfs_prefetch = true) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,
@@ -302,11 +324,61 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
+    // Refresh leases for already-active get sessions without starting a new
+    // session or discarding its session-local object cache.
+    virtual std::vector<int> batch_get_session_refresh(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    // Internal read preparation: renew only when necessary and bind the read
+    // to a caller-owned lifetime and a compatible content snapshot.
+    virtual std::vector<int> prepare_get_session_read(
+        const std::vector<std::string> &keys,
+        GetSessionReadSnapshots & /*snapshots*/) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual GetSessionStartResult
+    batch_get_session_start_with_sources(const std::vector<std::string> &keys) {
+        return {batch_get_session_start(keys),
+                std::vector<std::string>(keys.size(), "unknown"), false};
+    }
+
+    // Inspect caller-owned get sessions without querying Master or changing
+    // their selected replicas and prefetched buffers.
+    virtual bool all_get_sessions_memory(
+        const std::vector<std::string> & /*keys*/) const {
+        return false;
+    }
+
+    // Read DFS session objects into Mooncake's dedicated prefetch arena
+    // without copying them to caller buffers. Non-DFS keys succeed without
+    // preloading; a later batch_get_into_multi_buffer_ranges() call remains
+    // authoritative.
+    virtual std::vector<int> batch_get_session_prefetch(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    // Whether batch_get_session_prefetch() has a staging arena for DFS reads.
+    virtual bool dfs_prefetch_arena_available() const { return false; }
+
+    virtual std::string dfs_prefetch_arena_status() const {
+        return "unsupported";
+    }
+
+    virtual void record_prefetched_tokens(uint64_t /*tokens*/) {}
+
     virtual std::vector<int> batch_get_into_multi_buffer_ranges(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> & /*all_buffers*/,
         const std::vector<std::vector<size_t>> & /*all_sizes*/,
-        const std::vector<std::vector<size_t>> & /*all_src_offsets*/) {
+        const std::vector<std::vector<size_t>> & /*all_src_offsets*/,
+        const GetSessionReadSnapshots * /*snapshots*/ = nullptr) {
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }

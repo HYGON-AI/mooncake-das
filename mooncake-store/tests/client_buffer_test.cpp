@@ -165,6 +165,78 @@ TEST_F(ClientBufferTest, SmallAllocation) {
     EXPECT_EQ(*ptr, 0xFF);
 }
 
+TEST_F(ClientBufferTest, ExternalDeviceAliasTracksSuballocationOffset) {
+    constexpr size_t kBufferSize = 4096;
+    std::vector<char> host(kBufferSize);
+    std::vector<char> device_alias(kBufferSize);
+    auto allocator = ClientBufferAllocator::create(host.data(), host.size(), "",
+                                                   device_alias.data());
+
+    auto first = allocator->allocate(127);
+    auto second = allocator->allocate(257);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+
+    const auto expect_matching_alias = [&](const BufferHandle& handle) {
+        const auto offset = static_cast<char*>(handle.ptr()) - host.data();
+        EXPECT_EQ(handle.device_ptr(), device_alias.data() + offset);
+    };
+    expect_matching_alias(*first);
+    expect_matching_alias(*second);
+}
+
+TEST_F(ClientBufferTest, AlignedExternalAllocationPreservesDeviceAlias) {
+    constexpr size_t kAlignment = 4096;
+    constexpr size_t kAllocationSize = 1024;
+    std::vector<char> host(3 * kAlignment);
+    std::vector<char> device_alias(host.size());
+    void* host_base = host.data() + 1;
+    void* device_base = device_alias.data() + 1;
+    auto allocator = ClientBufferAllocator::create(host_base, host.size() - 1,
+                                                   "", device_base);
+
+    auto allocation = allocator->allocate_aligned(kAllocationSize, kAlignment);
+    ASSERT_TRUE(allocation.has_value());
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(allocation->ptr()) % kAlignment, 0);
+    EXPECT_EQ(allocation->size(), kAllocationSize);
+
+    const auto offset =
+        static_cast<char*>(allocation->ptr()) - static_cast<char*>(host_base);
+    EXPECT_EQ(allocation->device_ptr(),
+              static_cast<char*>(device_base) + offset);
+
+    allocation.reset();
+    EXPECT_TRUE(allocator->allocate(host.size() - 1).has_value());
+}
+
+TEST_F(ClientBufferTest, StorageReportOfZeroSizeAllocatorIsEmpty) {
+    auto allocator = ClientBufferAllocator::create(0);
+    const auto report = allocator->storageReport();
+    EXPECT_EQ(report.totalFreeSpace, 0);
+    EXPECT_EQ(report.largestFreeRegion, 0);
+}
+
+TEST_F(ClientBufferTest, StorageReportTracksExternalAllocations) {
+    constexpr size_t kBufferSize = 64 * 1024;
+    std::vector<char> host(kBufferSize);
+    auto allocator =
+        ClientBufferAllocator::create(host.data(), host.size(), "", nullptr);
+
+    auto report = allocator->storageReport();
+    EXPECT_EQ(report.totalFreeSpace, kBufferSize);
+    EXPECT_GT(report.largestFreeRegion, 0);
+    EXPECT_LE(report.largestFreeRegion, kBufferSize);
+
+    auto allocation = allocator->allocate(16 * 1024);
+    ASSERT_TRUE(allocation.has_value());
+    report = allocator->storageReport();
+    EXPECT_LE(report.totalFreeSpace, kBufferSize - 16 * 1024);
+    EXPECT_LE(report.largestFreeRegion, report.totalFreeSpace);
+
+    allocation.reset();
+    EXPECT_EQ(allocator->storageReport().totalFreeSpace, kBufferSize);
+}
+
 // Test BufferHandle move constructor
 TEST_F(ClientBufferTest, BufferHandleMoveConstructor) {
     const size_t buffer_size = 1024 * 1024;  // 1MB

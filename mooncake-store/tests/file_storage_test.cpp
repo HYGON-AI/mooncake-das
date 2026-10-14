@@ -34,6 +34,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
         UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
         UnsetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES");
+        UnsetEnv("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
@@ -81,9 +82,17 @@ class FileStorageTest : public ::testing::Test {
     }
 
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
-                               size_t size) {
+                               size_t size, void* device_address = nullptr) {
         fileStorage.pinned_restore_arena_allocator_ =
-            ClientBufferAllocator::create(address, size);
+            ClientBufferAllocator::create(address, size, "", device_address);
+    }
+
+    void SetPinnedPrefetchArena(FileStorage& fileStorage, void* address,
+                                size_t size, void* device_address = nullptr) {
+        fileStorage.pinned_prefetch_arena_.capacity = size;
+        fileStorage.pinned_prefetch_arena_allocator_ =
+            ClientBufferAllocator::create(address, size, "", device_address);
+        fileStorage.pinned_prefetch_arena_status_ = "ready";
     }
 
     tl::expected<void, ErrorCode> FileStorageBatchLoad(
@@ -323,6 +332,112 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
                         sizes[i]),
             batch_data.at(keys[i]));
     }
+}
+
+TEST_F(FileStorageTest, PinnedStagingAllocationIsAlignedWithMappedAlias) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    constexpr size_t kAlignment = 4096;
+    std::vector<char> host(3 * kAlignment);
+    std::vector<char> device_alias(host.size());
+    void* host_base = host.data() + 1;
+    void* device_base = device_alias.data() + 1;
+    SetPinnedRestoreArena(fileStorage, host_base, host.size() - 1, device_base);
+
+    auto allocation = fileStorage.AllocatePinnedStagingBuffer(1024, kAlignment);
+    ASSERT_TRUE(allocation.has_value());
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(allocation->ptr()) % kAlignment, 0);
+    const auto offset =
+        static_cast<char*>(allocation->ptr()) - static_cast<char*>(host_base);
+    EXPECT_EQ(allocation->device_ptr(),
+              static_cast<char*>(device_base) + offset);
+}
+
+TEST_F(FileStorageTest, PinnedPrefetchArenaIsUnavailableWhenNotConfigured) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    EXPECT_FALSE(fileStorage.HasPinnedPrefetchArena());
+    EXPECT_EQ(fileStorage.PinnedPrefetchArenaStatus(), "not configured");
+    EXPECT_EQ(fileStorage.PinnedPrefetchArenaCapacity(), 0);
+    EXPECT_FALSE(fileStorage.AllocatePinnedPrefetchBuffer(4096).has_value());
+    const auto report = fileStorage.PinnedPrefetchArenaReport();
+    EXPECT_EQ(report.totalFreeSpace, 0);
+    EXPECT_EQ(report.largestFreeRegion, 0);
+}
+
+TEST_F(FileStorageTest, PinnedPrefetchArenaRequiresLocalMemcpy) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.use_uring = false;
+    file_storage_config.pinned_prefetch_arena_size = 1024 * 1024;
+    // Without a client, local memcpy cannot be established; the arena is
+    // reported unavailable instead of being allocated or downgraded.
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    EXPECT_FALSE(fileStorage.HasPinnedPrefetchArena());
+    EXPECT_EQ(fileStorage.PinnedPrefetchArenaStatus(),
+              "disabled: local memcpy unavailable");
+    EXPECT_FALSE(fileStorage.AllocatePinnedPrefetchBuffer(4096).has_value());
+}
+
+TEST_F(FileStorageTest, PinnedPrefetchArenaIsAlignedAndSeparateFromRestore) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    constexpr size_t kAlignment = 4096;
+    constexpr size_t kArenaSize = 4 * kAlignment;
+    std::vector<char> prefetch_host(kArenaSize + 1);
+    std::vector<char> prefetch_device_alias(prefetch_host.size());
+    void* prefetch_base = prefetch_host.data() + 1;
+    void* prefetch_device_base = prefetch_device_alias.data() + 1;
+    SetPinnedPrefetchArena(fileStorage, prefetch_base, kArenaSize,
+                           prefetch_device_base);
+    std::vector<char> restore_host(kArenaSize);
+    SetPinnedRestoreArena(fileStorage, restore_host.data(), kArenaSize);
+
+    ASSERT_TRUE(fileStorage.HasPinnedPrefetchArena());
+    EXPECT_EQ(fileStorage.PinnedPrefetchArenaCapacity(), kArenaSize);
+    EXPECT_EQ(fileStorage.PinnedPrefetchArenaReport().totalFreeSpace,
+              kArenaSize);
+
+    {
+        auto allocation =
+            fileStorage.AllocatePinnedPrefetchBuffer(1024, kAlignment);
+        ASSERT_TRUE(allocation.has_value());
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(allocation->ptr()) % kAlignment,
+                  0);
+        const auto offset = static_cast<char*>(allocation->ptr()) -
+                            static_cast<char*>(prefetch_base);
+        EXPECT_GE(offset, 0);
+        EXPECT_LT(static_cast<size_t>(offset), kArenaSize);
+        EXPECT_EQ(allocation->device_ptr(),
+                  static_cast<char*>(prefetch_device_base) + offset);
+        EXPECT_LT(fileStorage.PinnedPrefetchArenaReport().totalFreeSpace,
+                  kArenaSize);
+    }
+    EXPECT_EQ(fileStorage.PinnedPrefetchArenaReport().totalFreeSpace,
+              kArenaSize);
+
+    // Exhausting the prefetch arena must not affect the restore arena, and
+    // an oversized request fails instead of falling back elsewhere.
+    auto whole = fileStorage.AllocatePinnedPrefetchBuffer(kArenaSize);
+    ASSERT_TRUE(whole.has_value());
+    EXPECT_FALSE(fileStorage.AllocatePinnedPrefetchBuffer(1024).has_value());
+    EXPECT_FALSE(
+        fileStorage.AllocatePinnedPrefetchBuffer(2 * kArenaSize).has_value());
+    auto restore = fileStorage.AllocatePinnedStagingBuffer(1024);
+    ASSERT_TRUE(restore.has_value());
+    EXPECT_GE(static_cast<char*>(restore->ptr()), restore_host.data());
+    EXPECT_LT(static_cast<char*>(restore->ptr()),
+              restore_host.data() + kArenaSize);
+
+    whole.reset();
+    EXPECT_TRUE(fileStorage.AllocatePinnedPrefetchBuffer(1024).has_value());
 }
 
 TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
