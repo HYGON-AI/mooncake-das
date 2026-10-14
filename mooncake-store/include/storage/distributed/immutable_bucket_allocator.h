@@ -274,8 +274,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     /**
      * @brief Accept the eviction: drop the bucket and delete its files.
      * Must only be called once the master has removed every candidate replica.
+     * @return True when the allocator removed the logical bucket. Physical file
+     * deletion is still best-effort.
      */
-    void CommitEviction(PendingEviction&& pending);
+    bool CommitEviction(PendingEviction&& pending);
 
     /**
      * @brief Reject the eviction and return the bucket to service unchanged.

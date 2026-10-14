@@ -35,8 +35,10 @@ class MasterMetricManager {
 
     void inc_mem_cache_hit_nums(int64_t val = 1);
     void inc_file_cache_hit_nums(int64_t val = 1);
+    void inc_dfs_cache_hit_nums(int64_t val = 1);
     void inc_mem_cache_hit_bytes(int64_t val = 1);
     void inc_file_cache_hit_bytes(int64_t val = 1);
+    void inc_dfs_cache_hit_bytes(int64_t val = 1);
     int64_t get_mem_cache_hit_bytes();
     int64_t get_file_cache_hit_bytes();
     void inc_mem_cache_nums(int64_t val = 1);
@@ -296,6 +298,11 @@ class MasterMetricManager {
     // nof eviction metrics
     void inc_nof_eviction_success(int64_t key_count, int64_t size);
     void inc_nof_eviction_fail();  // not a single object is evicted
+    // DFS bucket eviction metrics
+    void inc_dfs_bucket_eviction_attempts(int64_t val = 1);
+    void inc_dfs_bucket_evictions(int64_t val = 1);
+    void inc_dfs_bucket_evicted_replicas(int64_t val = 1);
+    void inc_dfs_bucket_evicted_bytes(int64_t val = 1);
 
     // Eviction Metrics Getters
     // total eviction metrics
@@ -686,8 +693,10 @@ class MasterMetricManager {
     // end-to-end request/token-level cache hit ratio.
     ylt::metric::counter_t mem_cache_hit_nums_;
     ylt::metric::counter_t file_cache_hit_nums_;
+    ylt::metric::counter_t dfs_cache_hit_nums_;
     ylt::metric::counter_t mem_cache_hit_bytes_;
     ylt::metric::counter_t file_cache_hit_bytes_;
+    ylt::metric::counter_t dfs_cache_hit_bytes_;
     ylt::metric::gauge_t mem_cache_nums_;
     ylt::metric::gauge_t file_cache_nums_;
 
@@ -720,6 +729,11 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+    // DFS bucket eviction metrics
+    ylt::metric::counter_t dfs_bucket_eviction_attempts_;
+    ylt::metric::counter_t dfs_bucket_evictions_;
+    ylt::metric::counter_t dfs_bucket_evicted_replicas_;
+    ylt::metric::counter_t dfs_bucket_evicted_bytes_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;

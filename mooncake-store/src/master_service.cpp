@@ -1301,7 +1301,6 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
         // Change the client status to OK
         ok_client_.insert(client_id);
-        MasterMetricManager::instance().inc_active_clients();
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -3722,6 +3721,10 @@ auto MasterService::GetReplicaList(const std::string& key,
             MasterMetricManager::instance().inc_file_cache_hit_nums();
             MasterMetricManager::instance().inc_file_cache_hit_bytes(
                 static_cast<int64_t>(metadata.size));
+        } else if (replica_list[0].is_dfs_replica()) {
+            MasterMetricManager::instance().inc_dfs_cache_hit_nums();
+            MasterMetricManager::instance().inc_dfs_cache_hit_bytes(
+                static_cast<int64_t>(metadata.size));
         }
         MasterMetricManager::instance().inc_valid_get_nums();
         // Grant a lease to the object so it will not be removed
@@ -3912,6 +3915,10 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                            replica_list[0].is_disk_replica()) {
                     MasterMetricManager::instance().inc_file_cache_hit_nums();
                     MasterMetricManager::instance().inc_file_cache_hit_bytes(
+                        static_cast<int64_t>(metadata.size));
+                } else if (replica_list[0].is_dfs_replica()) {
+                    MasterMetricManager::instance().inc_dfs_cache_hit_nums();
+                    MasterMetricManager::instance().inc_dfs_cache_hit_bytes(
                         static_cast<int64_t>(metadata.size));
                 }
                 MasterMetricManager::instance().inc_valid_get_nums();
@@ -7413,12 +7420,20 @@ bool MasterService::RunBucketDfsEvictionInternal(
             bucket_allocator_->AbortEviction(std::move(pending));
             return evicted;
         }
+        if (!invalidating_missing_bucket) {
+            MasterMetricManager::instance()
+                .inc_dfs_bucket_eviction_attempts();
+        }
 
         const auto& candidates = pending.Candidates();
         if (candidates.empty()) {
             // A bucket whose entries are all tombstoned has no replicas for the
             // master to validate, so it can be reclaimed immediately.
-            bucket_allocator_->CommitEviction(std::move(pending));
+            const bool committed =
+                bucket_allocator_->CommitEviction(std::move(pending));
+            if (committed && !invalidating_missing_bucket) {
+                MasterMetricManager::instance().inc_dfs_bucket_evictions();
+            }
             evicted = true;
             if (invalidating_missing_bucket || force_one) return true;
             continue;
@@ -7592,6 +7607,14 @@ bool MasterService::RunBucketDfsEvictionInternal(
                         return matches_candidate(replica, candidate) &&
                                !replica.is_processing();
                     });
+                if (erased > 0 && !invalidating_missing_bucket) {
+                    MasterMetricManager::instance()
+                        .inc_dfs_bucket_evicted_replicas(
+                            static_cast<int64_t>(erased));
+                    MasterMetricManager::instance()
+                        .inc_dfs_bucket_evicted_bytes(static_cast<int64_t>(
+                            metadata.size * erased));
+                }
                 if (erased > 0 && !metadata.IsValid()) {
                     PublishKvRemovedAfterEvict(candidate.key,
                                                metadata.size * erased, "disk",
@@ -7611,7 +7634,11 @@ bool MasterService::RunBucketDfsEvictionInternal(
 
         // Phase 3 (commit storage): the master no longer returns any descriptor
         // into this bucket, so it is now safe to drop the files.
-        bucket_allocator_->CommitEviction(std::move(pending));
+        const bool committed =
+            bucket_allocator_->CommitEviction(std::move(pending));
+        if (committed && !invalidating_missing_bucket) {
+            MasterMetricManager::instance().inc_dfs_bucket_evictions();
+        }
         evicted = true;
         if (force_one) return true;
     }
@@ -11696,7 +11723,6 @@ void MasterService::ClientMonitorFunc() {
                     auto it = ok_client_.find(client_id);
                     if (it != ok_client_.end()) {
                         ok_client_.erase(it);
-                        MasterMetricManager::instance().dec_active_clients();
                     }
                     client_host_id_.erase(client_id);
                 }
