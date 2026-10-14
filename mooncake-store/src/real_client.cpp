@@ -108,9 +108,6 @@ std::string DirectSourceForReplica(const Replica::Descriptor &replica) {
     if (replica.is_memory_replica() || replica.is_nof_replica()) {
         return DirectStorageMetricSource(ReplicaType::MEMORY);
     }
-    if (replica.is_local_disk_replica()) {
-        return DirectStorageMetricSource(ReplicaType::LOCAL_DISK);
-    }
     if (replica.is_disk_replica() || replica.is_dfs_replica()) {
         // Legacy DISK and descriptor-based DFS both represent the shared
         // distributed filesystem tier for direct-storage metrics.
@@ -411,26 +408,6 @@ size_t sum_buffer_handle_sizes(
     return total;
 }
 
-void scatter_non_mem_result(const NonMemReadEntry &entry, const void *tmp_base,
-                            std::vector<int> &results) {
-    for (size_t j = 0; j < entry.buffers.size(); ++j) {
-        const void *src =
-            static_cast<const char *>(tmp_base) + entry.src_offsets[j];
-        if (auto r = scatter_host_to_maybe_device(
-                entry.buffers[j], src, entry.sizes[j],
-                "session non-mem range read, key: " + entry.key);
-            !r) {
-            results[entry.original_idx] = static_cast<int>(toInt(r.error()));
-            return;
-        }
-    }
-    size_t transferred = 0;
-    for (size_t size : entry.sizes) {
-        transferred += size;
-    }
-    results[entry.original_idx] = static_cast<int>(transferred);
-}
-
 ErrorCode scatter_transfer_error(const Status &status) {
     return status.IsInvalidArgument() ? ErrorCode::INVALID_PARAMS
                                       : ErrorCode::TRANSFER_FAIL;
@@ -481,13 +458,6 @@ inline bool SameReplicaForSessionCache(const Replica::Descriptor &lhs,
         const auto &right = rhs.get_disk_descriptor();
         return left.file_path == right.file_path &&
                left.object_size == right.object_size;
-    }
-    if (lhs.is_local_disk_replica() && rhs.is_local_disk_replica()) {
-        const auto &left = lhs.get_local_disk_descriptor();
-        const auto &right = rhs.get_local_disk_descriptor();
-        return left.client_id == right.client_id &&
-               left.object_size == right.object_size &&
-               left.transport_endpoint == right.transport_endpoint;
     }
     if (lhs.is_dfs_replica() && rhs.is_dfs_replica()) {
         const auto &left = lhs.get_dfs_descriptor();
@@ -6715,8 +6685,7 @@ std::vector<int> RealClient::batch_get_session_prefetch(
 
             const auto &replica = session_it->second.replicas.front();
             if (!replica.is_dfs_replica()) {
-                // The ordinary session range-get path remains authoritative
-                // for memory, local-disk, and legacy disk replicas.
+                // The ordinary session range-get path handles memory replicas.
                 results[i] = 0;
                 continue;
             }
@@ -6910,12 +6879,10 @@ RealClient::prepare_session_range_read_requests(
         if (replica.is_memory_replica()) {
             replica_limit =
                 replica.get_memory_descriptor().buffer_descriptor.size_;
-        } else if (replica.is_local_disk_replica() ||
-                   replica.is_dfs_replica()) {
+        } else if (replica.is_dfs_replica()) {
             replica_limit = calculate_total_size(replica);
         }
-        if (replica.is_memory_replica() || replica.is_local_disk_replica() ||
-            replica.is_dfs_replica()) {
+        if (replica.is_memory_replica() || replica.is_dfs_replica()) {
             bool overflow = false;
             for (size_t j = 0; j < buffers.size(); ++j) {
                 if (is_object_range_overflow(offsets[j], sizes[j],
@@ -6946,13 +6913,10 @@ SessionRangeReadPlan RealClient::classify_session_range_read_requests(
     std::vector<int> &results) const {
     SessionRangeReadPlan plan;
     plan.memory_requests.reserve(requests.size());
-    plan.local_disk_requests.reserve(requests.size());
     plan.dfs_requests.reserve(requests.size());
     for (auto &request : requests) {
         if (request.replica.is_memory_replica()) {
             plan.memory_requests.push_back(std::move(request));
-        } else if (request.replica.is_local_disk_replica()) {
-            plan.local_disk_requests.push_back(std::move(request));
         } else if (request.replica.is_dfs_replica()) {
             plan.dfs_requests.push_back(std::move(request));
         } else {
@@ -7153,14 +7117,6 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         classify_session_range_read_requests(std::move(requests), results);
     execute_session_memory_range_reads(plan.memory_requests, results);
     context.memory_done = std::chrono::steady_clock::now();
-    std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
-        local_disk_by_endpoint;
-    for (auto &request : plan.local_disk_requests) {
-        const auto &endpoint =
-            request.replica.get_local_disk_descriptor().transport_endpoint;
-        local_disk_by_endpoint[endpoint].push_back(&request);
-    }
-    process_session_local_disk_reads(local_disk_by_endpoint, results);
     execute_session_dfs_range_reads(plan.dfs_requests, results,
                                     context.trace_id);
     record_session_range_accesses(keys, all_buffers, all_sizes, all_src_offsets,
@@ -7218,70 +7174,6 @@ int RealClient::batch_get_session_end(const std::vector<std::string> &keys) {
                                      observation.bytes);
     }
     return 0;
-}
-
-void RealClient::scatter_read_result(
-    NonMemReadEntry &entry, std::shared_ptr<BufferHandle> shared_handle,
-    std::vector<int> &results) {
-    scatter_non_mem_result(entry, shared_handle->ptr(), results);
-}
-void RealClient::process_session_local_disk_reads(
-    std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
-        &local_disk_by_endpoint,
-    std::vector<int> &results) {
-    for (auto &[endpoint, ep_entries] : local_disk_by_endpoint) {
-        // Local-disk range reads use a request-local buffer; only the DFS
-        // waiting-queue prefetch path retains a full object across calls.
-        std::unordered_map<std::string, std::vector<Slice>> miss_objects;
-        std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
-            miss_handles;
-
-        for (auto *entry_ptr : ep_entries) {
-            auto &entry = *entry_ptr;
-            const uint64_t total_size = calculate_total_size(entry.replica);
-            if (!client_buffer_allocator_) {
-                results[entry.original_idx] =
-                    static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
-                continue;
-            }
-            auto alloc_result = client_buffer_allocator_->allocate(total_size);
-            if (!alloc_result) {
-                LOG(WARNING) << "Buffer allocation failed for key: "
-                             << entry.key;
-                results[entry.original_idx] =
-                    static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
-                continue;
-            }
-            auto handle =
-                std::make_unique<BufferHandle>(std::move(*alloc_result));
-            miss_objects.emplace(
-                entry.key, std::vector<Slice>{Slice{handle->ptr(), total_size}});
-            miss_handles.emplace(entry.key, std::move(handle));
-        }
-
-        if (miss_objects.empty()) continue;
-        auto read_result =
-            batch_get_into_offload_object_internal(endpoint, miss_objects);
-        client_->ObserveDirectIo(
-            "read", DirectStorageMetricSource(ReplicaType::LOCAL_DISK),
-            read_result.has_value(),
-            read_result ? SumSliceBytes(miss_objects) : 0, 0.0);
-
-        for (auto *entry_ptr : ep_entries) {
-            auto &entry = *entry_ptr;
-            if (results[entry.original_idx] != 0) continue;
-            auto handle_it = miss_handles.find(entry.key);
-            if (handle_it == miss_handles.end()) continue;
-            if (!read_result) {
-                results[entry.original_idx] =
-                    static_cast<int>(toInt(read_result.error()));
-                continue;
-            }
-            auto shared_handle =
-                std::shared_ptr<BufferHandle>(std::move(handle_it->second));
-            scatter_non_mem_result(entry, shared_handle->ptr(), results);
-        }
-    }
 }
 
 void RealClient::process_session_disk_dfs_reads(

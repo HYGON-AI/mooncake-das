@@ -55,7 +55,6 @@ struct PrefetchedSessionBuffer {
 
 struct SessionRangeReadPlan {
     std::vector<SessionRangeReadRequest> memory_requests;
-    std::vector<SessionRangeReadRequest> local_disk_requests;
     std::vector<SessionRangeReadRequest> dfs_requests;
 };
 
@@ -351,11 +350,6 @@ class RealClient : public PyClient {
         const std::vector<SessionRangeReadRequest> &requests,
         std::vector<int> &results);
 
-    void process_session_local_disk_reads(
-        std::unordered_map<std::string, std::vector<NonMemReadEntry *>>
-            &local_disk_by_endpoint,
-        std::vector<int> &results);
-
     void process_session_disk_dfs_reads(std::vector<NonMemReadEntry *> &entries,
                                         std::vector<int> &results,
                                         uint64_t trace_id,
@@ -379,11 +373,6 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         size_t memory_read_count, size_t dfs_read_count,
         const SessionRangeReadContext &context) const;
-
-    // Scatter a local-disk read buffer without retaining it across requests.
-    void scatter_read_result(NonMemReadEntry &entry,
-                             std::shared_ptr<BufferHandle> handle,
-                             std::vector<int> &results);
 
     std::vector<int> batch_put_session_start(
         const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
