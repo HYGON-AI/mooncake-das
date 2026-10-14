@@ -576,6 +576,13 @@ class Replica {
     void mark_removed() {
         if (status_ == ReplicaStatus::COMPLETE ||
             status_ == ReplicaStatus::PROCESSING) {
+            if (is_dfs_replica()) {
+                if (const char* metric_status =
+                        DfsReplicaMetricStatus(status_)) {
+                    MasterMetricManager::instance().dec_dfs_replica(
+                        metric_status);
+                }
+            }
             status_ = ReplicaStatus::REMOVED;
         } else if (status_ == ReplicaStatus::REMOVED) {
             LOG(WARNING) << "Replica already marked as removed";

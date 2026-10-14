@@ -1352,6 +1352,12 @@ std::optional<int64_t> ReadPrometheusCounter(const std::string& serialized,
     return std::nullopt;
 }
 
+std::optional<int64_t> ReadDfsReplicaGauge(const std::string& serialized,
+                                           const std::string& status) {
+    return ReadPrometheusCounter(
+        serialized, "master_dfs_replicas{status=\"" + status + "\"}");
+}
+
 }  // namespace
 
 TEST_F(MasterServiceTest, DfsGetMetricsFollowFirstReadableReplica) {
@@ -1515,6 +1521,73 @@ TEST_F(MasterServiceTest, DfsGetMetricsFollowFirstReadableReplica) {
 
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsReplicaRemovalDecrementsStatusGaugeOnce) {
+    auto& metrics = MasterMetricManager::instance();
+    struct ReplicaGauges {
+        int64_t processing;
+        int64_t complete;
+    };
+    const auto capture_gauges = [&]() {
+        const auto serialized = metrics.serialize_metrics();
+        const auto read_gauge = [&](const std::string& status) {
+            const auto value = ReadDfsReplicaGauge(serialized, status);
+            EXPECT_TRUE(value.has_value())
+                << "missing DFS replica gauge for status=" << status;
+            return value.value_or(-1);
+        };
+        return ReplicaGauges{.processing = read_gauge("processing"),
+                             .complete = read_gauge("complete")};
+    };
+    const ReplicaGauges baseline = capture_gauges();
+    const auto make_descriptor = [] {
+        DistributedFSDescriptor descriptor;
+        descriptor.file_path = "replica_metric_test";
+        return descriptor;
+    };
+
+    {
+        Replica processing(make_descriptor(), ReplicaStatus::PROCESSING);
+        EXPECT_EQ(capture_gauges().processing, baseline.processing + 1);
+
+        processing.mark_removed();
+        EXPECT_EQ(capture_gauges().processing, baseline.processing);
+        processing.mark_removed();
+        EXPECT_EQ(capture_gauges().processing, baseline.processing);
+    }
+    EXPECT_EQ(capture_gauges().processing, baseline.processing);
+
+    {
+        Replica complete(make_descriptor(), ReplicaStatus::COMPLETE);
+        EXPECT_EQ(capture_gauges().complete, baseline.complete + 1);
+
+        complete.mark_removed();
+        EXPECT_EQ(capture_gauges().complete, baseline.complete);
+        complete.mark_removed();
+        EXPECT_EQ(capture_gauges().complete, baseline.complete);
+
+        Replica moved(std::move(complete));
+        EXPECT_TRUE(moved.is_dfs_replica());
+        EXPECT_EQ(moved.status(), ReplicaStatus::REMOVED);
+        EXPECT_EQ(capture_gauges().complete, baseline.complete);
+    }
+    EXPECT_EQ(capture_gauges().complete, baseline.complete);
+
+    {
+        Replica removed_source(make_descriptor(), ReplicaStatus::COMPLETE);
+        removed_source.mark_removed();
+        Replica destination(make_descriptor(), ReplicaStatus::PROCESSING);
+        EXPECT_EQ(capture_gauges().processing, baseline.processing + 1);
+
+        destination = std::move(removed_source);
+        EXPECT_EQ(destination.status(), ReplicaStatus::REMOVED);
+        EXPECT_EQ(capture_gauges().processing, baseline.processing);
+        EXPECT_EQ(capture_gauges().complete, baseline.complete);
+    }
+    const auto after_destruction = capture_gauges();
+    EXPECT_EQ(after_destruction.processing, baseline.processing);
+    EXPECT_EQ(after_destruction.complete, baseline.complete);
 }
 
 TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
