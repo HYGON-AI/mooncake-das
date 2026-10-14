@@ -2220,7 +2220,8 @@ PYBIND11_MODULE(store, m) {
                const std::string &ssd_offload_path = "",
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
-               int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+               int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+               bool enable_dfs_prefetch = true) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2233,7 +2234,7 @@ PYBIND11_MODULE(store, m) {
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine, "", enable_ssd_offload,
                     ssd_offload_path, tenant_id, enable_client_http_server,
-                    client_http_port);
+                    client_http_port, enable_dfs_prefetch);
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -2242,7 +2243,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_ssd_offload") = false,
             py::arg("ssd_offload_path") = "", py::arg("tenant_id") = "default",
             py::arg("enable_client_http_server") = false,
-            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT)
+            py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
+            py::arg("enable_dfs_prefetch") = true)
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
@@ -2274,6 +2276,8 @@ PYBIND11_MODULE(store, m) {
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
             "  ssd_offload_path: SSD storage directory path (overrides env "
             "var).\n"
+            "  enable_dfs_prefetch: Honor the DFS prefetch arena size from "
+            "environment (default true).\n"
             "  tenant_id: Tenant identifier (default 'default').\n"
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
