@@ -1352,6 +1352,59 @@ std::optional<int64_t> ReadPrometheusCounter(const std::string& serialized,
     return std::nullopt;
 }
 
+const std::vector<std::string>& DfsBucketEvictionMetricNames() {
+    static const std::vector<std::string> names = {
+        "master_dfs_bucket_eviction_attempts_total",
+        "master_dfs_bucket_evictions_total",
+        "master_dfs_bucket_evicted_replicas_total",
+        "master_dfs_bucket_evicted_bytes_total",
+        "master_attempted_evictions_total",
+        "master_successful_evictions_total",
+        "master_evicted_key_count",
+        "master_evicted_size_bytes",
+        "master_attempted_evictions_mem",
+        "master_successful_evictions_mem",
+        "master_evicted_key_count_mem",
+        "master_evicted_size_bytes_mem",
+        "master_attempted_evictions_nof",
+        "master_successful_evictions_nof",
+        "master_evicted_key_count_nof",
+        "master_evicted_size_bytes_nof",
+    };
+    return names;
+}
+
+using DfsBucketEvictionMetrics = std::map<std::string, int64_t>;
+
+DfsBucketEvictionMetrics CaptureDfsBucketEvictionMetrics() {
+    const auto serialized = MasterMetricManager::instance().serialize_metrics();
+    DfsBucketEvictionMetrics metrics;
+    const auto& names = DfsBucketEvictionMetricNames();
+    for (size_t i = 0; i < 4; ++i) {
+        const auto& name = names[i];
+        const auto value = ReadPrometheusCounter(serialized, name);
+        EXPECT_TRUE(value.has_value()) << "missing metric " << name;
+        metrics.emplace(name, value.value_or(-1));
+    }
+
+    // Read legacy counters through getters because not all of their series are
+    // exported. Keep checking their values without changing their export.
+    auto& manager = MasterMetricManager::instance();
+    metrics.emplace(names[4], manager.get_eviction_attempts());
+    metrics.emplace(names[5], manager.get_eviction_success());
+    metrics.emplace(names[6], manager.get_evicted_key_count());
+    metrics.emplace(names[7], manager.get_evicted_size());
+    metrics.emplace(names[8], manager.get_mem_eviction_attempts());
+    metrics.emplace(names[9], manager.get_mem_eviction_success());
+    metrics.emplace(names[10], manager.get_mem_evicted_key_count());
+    metrics.emplace(names[11], manager.get_mem_evicted_size());
+    metrics.emplace(names[12], manager.get_nof_eviction_attempts());
+    metrics.emplace(names[13], manager.get_nof_eviction_success());
+    metrics.emplace(names[14], manager.get_nof_evicted_key_count());
+    metrics.emplace(names[15], manager.get_nof_evicted_size());
+    return metrics;
+}
+
 std::optional<int64_t> ReadDfsReplicaGauge(const std::string& serialized,
                                            const std::string& status) {
     return ReadPrometheusCounter(
@@ -1915,7 +1968,25 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRemovesWholeBucket) {
                             .has_value());
         }
 
+        const auto metrics_before = CaptureDfsBucketEvictionMetrics();
         service.RunDfsEvictionForTesting();
+        const auto metrics_after = CaptureDfsBucketEvictionMetrics();
+
+        EXPECT_EQ(metrics_after.at("master_dfs_bucket_eviction_attempts_total"),
+                  metrics_before.at("master_dfs_bucket_eviction_attempts_total") +
+                      2);
+        EXPECT_EQ(metrics_after.at("master_dfs_bucket_evictions_total"),
+                  metrics_before.at("master_dfs_bucket_evictions_total") + 2);
+        EXPECT_EQ(
+            metrics_after.at("master_dfs_bucket_evicted_replicas_total"),
+            metrics_before.at("master_dfs_bucket_evicted_replicas_total") + 2);
+        EXPECT_EQ(metrics_after.at("master_dfs_bucket_evicted_bytes_total"),
+                  metrics_before.at("master_dfs_bucket_evicted_bytes_total") +
+                      200);
+        for (size_t i = 4; i < DfsBucketEvictionMetricNames().size(); ++i) {
+            const auto& name = DfsBucketEvictionMetricNames()[i];
+            EXPECT_EQ(metrics_after.at(name), metrics_before.at(name)) << name;
+        }
 
         // The coldest bucket's key lost its DFS replica; its MEMORY replica
         // survives, so the object is still queryable.
@@ -1964,7 +2035,24 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRejectsLeasedBucketWithoutChanges) {
                 service.GetReplicaList(key, TenantId::Default()).has_value());
         }
 
+        const auto metrics_before = CaptureDfsBucketEvictionMetrics();
         service.RunDfsEvictionForTesting();
+        const auto metrics_after = CaptureDfsBucketEvictionMetrics();
+
+        EXPECT_EQ(metrics_after.at("master_dfs_bucket_eviction_attempts_total"),
+                  metrics_before.at("master_dfs_bucket_eviction_attempts_total") +
+                      2);
+        EXPECT_EQ(metrics_after.at("master_dfs_bucket_evictions_total"),
+                  metrics_before.at("master_dfs_bucket_evictions_total"));
+        EXPECT_EQ(
+            metrics_after.at("master_dfs_bucket_evicted_replicas_total"),
+            metrics_before.at("master_dfs_bucket_evicted_replicas_total"));
+        EXPECT_EQ(metrics_after.at("master_dfs_bucket_evicted_bytes_total"),
+                  metrics_before.at("master_dfs_bucket_evicted_bytes_total"));
+        for (size_t i = 4; i < DfsBucketEvictionMetricNames().size(); ++i) {
+            const auto& name = DfsBucketEvictionMetricNames()[i];
+            EXPECT_EQ(metrics_after.at(name), metrics_before.at(name)) << name;
+        }
 
         // A rejected eviction must leave metadata completely unchanged: zero
         // partial commits.
@@ -1975,6 +2063,107 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRejectsLeasedBucketWithoutChanges) {
             EXPECT_NE(FindDfsDescriptor(query->replicas), nullptr)
                 << "key " << key;
         }
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketEvictionCountsEmptyTombstonedBucket) {
+    const auto root = MakeDfsTestRoot("evict_empty_tombstone");
+    ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.25", "0.1");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        for (int i = 0; i < 2; ++i) {
+            const std::string key = "tombstone_" + std::to_string(i);
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, key,
+                                      TenantId::Default(), 100, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key,
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        }
+        ASSERT_TRUE(service
+                        .Remove("tombstone_0", TenantId::Default(),
+                                /*force=*/true)
+                        .has_value());
+
+        const auto metrics_before = CaptureDfsBucketEvictionMetrics();
+        service.RunDfsEvictionForTesting();
+        const auto metrics_after = CaptureDfsBucketEvictionMetrics();
+
+        EXPECT_EQ(metrics_after.at("master_dfs_bucket_eviction_attempts_total"),
+                  metrics_before.at("master_dfs_bucket_eviction_attempts_total") +
+                      1);
+        EXPECT_EQ(metrics_after.at("master_dfs_bucket_evictions_total"),
+                  metrics_before.at("master_dfs_bucket_evictions_total") + 1);
+        EXPECT_EQ(
+            metrics_after.at("master_dfs_bucket_evicted_replicas_total"),
+            metrics_before.at("master_dfs_bucket_evicted_replicas_total"));
+        EXPECT_EQ(metrics_after.at("master_dfs_bucket_evicted_bytes_total"),
+                  metrics_before.at("master_dfs_bucket_evicted_bytes_total"));
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
+    const auto root = MakeDfsTestRoot("missing_file_invalidation");
+    ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.25");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "missing_file_key",
+                                  TenantId::Default(), 100, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "missing_file_key",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+        const auto before =
+            service.GetReplicaList("missing_file_key", TenantId::Default());
+        ASSERT_TRUE(before.has_value());
+        const auto* dfs = FindDfsDescriptor(before->replicas);
+        ASSERT_NE(dfs, nullptr);
+        const auto descriptor = dfs->get_dfs_descriptor();
+        ASSERT_TRUE(std::filesystem::remove(descriptor.file_path));
+
+        const auto metrics_before = CaptureDfsBucketEvictionMetrics();
+        const auto queued = service.BatchInvalidateDfsBuckets(
+            context.client_id, {{descriptor.shard_idx}}, TenantId::Default());
+        ASSERT_EQ(queued.size(), 1u);
+        ASSERT_TRUE(queued.front().has_value());
+
+        WaitUntil([&] {
+            const auto after =
+                service.GetReplicaList("missing_file_key", TenantId::Default());
+            return after.has_value() &&
+                   FindDfsDescriptor(after->replicas) == nullptr;
+        });
+        const auto metrics_after = CaptureDfsBucketEvictionMetrics();
+
+        for (size_t i = 0; i < 4; ++i) {
+            const auto& name = DfsBucketEvictionMetricNames()[i];
+            EXPECT_EQ(metrics_after.at(name), metrics_before.at(name)) << name;
+        }
+        const auto after =
+            service.GetReplicaList("missing_file_key", TenantId::Default());
+        ASSERT_TRUE(after.has_value());
+        EXPECT_EQ(FindDfsDescriptor(after->replicas), nullptr);
     }
 
     std::error_code ec;

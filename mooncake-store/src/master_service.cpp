@@ -7423,12 +7423,20 @@ bool MasterService::RunBucketDfsEvictionInternal(
             bucket_allocator_->AbortEviction(std::move(pending));
             return evicted;
         }
+        if (!invalidating_missing_bucket) {
+            MasterMetricManager::instance()
+                .inc_dfs_bucket_eviction_attempts();
+        }
 
         const auto& candidates = pending.Candidates();
         if (candidates.empty()) {
             // A bucket whose entries are all tombstoned has no replicas for the
             // master to validate, so it can be reclaimed immediately.
-            bucket_allocator_->CommitEviction(std::move(pending));
+            const bool committed =
+                bucket_allocator_->CommitEviction(std::move(pending));
+            if (committed && !invalidating_missing_bucket) {
+                MasterMetricManager::instance().inc_dfs_bucket_evictions();
+            }
             evicted = true;
             if (invalidating_missing_bucket || force_one) return true;
             continue;
@@ -7602,6 +7610,14 @@ bool MasterService::RunBucketDfsEvictionInternal(
                         return matches_candidate(replica, candidate) &&
                                !replica.is_processing();
                     });
+                if (erased > 0 && !invalidating_missing_bucket) {
+                    MasterMetricManager::instance()
+                        .inc_dfs_bucket_evicted_replicas(
+                            static_cast<int64_t>(erased));
+                    MasterMetricManager::instance()
+                        .inc_dfs_bucket_evicted_bytes(static_cast<int64_t>(
+                            metadata.size * erased));
+                }
                 if (erased > 0 && !metadata.IsValid()) {
                     PublishKvRemovedAfterEvict(candidate.key,
                                                metadata.size * erased, "disk",
@@ -7621,7 +7637,11 @@ bool MasterService::RunBucketDfsEvictionInternal(
 
         // Phase 3 (commit storage): the master no longer returns any descriptor
         // into this bucket, so it is now safe to drop the files.
-        bucket_allocator_->CommitEviction(std::move(pending));
+        const bool committed =
+            bucket_allocator_->CommitEviction(std::move(pending));
+        if (committed && !invalidating_missing_bucket) {
+            MasterMetricManager::instance().inc_dfs_bucket_evictions();
+        }
         evicted = true;
         if (force_one) return true;
     }

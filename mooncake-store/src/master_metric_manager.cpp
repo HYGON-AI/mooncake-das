@@ -371,6 +371,18 @@ MasterMetricManager::MasterMetricManager()
                              "Total number of keys evicted in nof"),
       nof_evicted_size_("master_evicted_size_bytes_nof",
                         "Total bytes of evicted objects in nof"),
+      // DFS bucket eviction
+      dfs_bucket_eviction_attempts_(
+          "master_dfs_bucket_eviction_attempts_total",
+          "Total number of DFS bucket eviction attempts"),
+      dfs_bucket_evictions_("master_dfs_bucket_evictions_total",
+                            "Total number of DFS buckets evicted"),
+      dfs_bucket_evicted_replicas_(
+          "master_dfs_bucket_evicted_replicas_total",
+          "Total number of DFS replicas removed by bucket eviction"),
+      dfs_bucket_evicted_bytes_("master_dfs_bucket_evicted_bytes_total",
+                                "Total bytes of DFS replicas removed by "
+                                "bucket eviction"),
 
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
@@ -682,6 +694,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     eviction_attempts_.inc(0);
     evicted_key_count_.inc(0);
     evicted_size_.inc(0);
+    dfs_bucket_eviction_attempts_.inc(0);
+    dfs_bucket_evictions_.inc(0);
+    dfs_bucket_evicted_replicas_.inc(0);
+    dfs_bucket_evicted_bytes_.inc(0);
 
     // Update PutStart Discard Metrics
     put_start_discard_cnt_.inc(0);
@@ -1657,6 +1673,22 @@ void MasterMetricManager::inc_nof_eviction_fail() {
     nof_eviction_attempts_.inc();
 }
 
+void MasterMetricManager::inc_dfs_bucket_eviction_attempts(int64_t val) {
+    dfs_bucket_eviction_attempts_.inc(val);
+}
+
+void MasterMetricManager::inc_dfs_bucket_evictions(int64_t val) {
+    dfs_bucket_evictions_.inc(val);
+}
+
+void MasterMetricManager::inc_dfs_bucket_evicted_replicas(int64_t val) {
+    dfs_bucket_evicted_replicas_.inc(val);
+}
+
+void MasterMetricManager::inc_dfs_bucket_evicted_bytes(int64_t val) {
+    dfs_bucket_evicted_bytes_.inc(val);
+}
+
 int64_t MasterMetricManager::get_eviction_success() {
     return eviction_success_.value();
 }
@@ -2101,6 +2133,10 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_eviction_attempts_);
     serialize_metric(nof_evicted_key_count_);
     serialize_metric(nof_evicted_size_);
+    serialize_metric(dfs_bucket_eviction_attempts_);
+    serialize_metric(dfs_bucket_evictions_);
+    serialize_metric(dfs_bucket_evicted_replicas_);
+    serialize_metric(dfs_bucket_evicted_bytes_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);

@@ -1140,7 +1140,9 @@ TEST(ImmutableBucketAllocatorTest, CommitEvictionDeletesBucketAndFrees) {
     TempDir tmp("bucket_evict_commit");
     const uint64_t capacity = kAlignment;
     ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
+    auto config = MakeEvictionConfig(tmp.path(), capacity, 4);
+    config.ready_bucket_target = 0;
+    ASSERT_TRUE(alloc.Init(config));
 
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 3; ++i) {
@@ -1169,7 +1171,7 @@ TEST(ImmutableBucketAllocatorTest, CommitEvictionDeletesBucketAndFrees) {
     const std::string data_path = descs[0].file_path;
     ASSERT_TRUE(std::filesystem::exists(data_path));
 
-    alloc.CommitEviction(std::move(pending));
+    EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
     EXPECT_FALSE(std::filesystem::exists(data_path));
     EXPECT_EQ(alloc.GetBucketCount(), 2u);
     EXPECT_FALSE(alloc.GetBucketIdForKey("k0").has_value());
@@ -1237,7 +1239,9 @@ TEST(ImmutableBucketAllocatorTest, CommitAndAbortEvictionAreIdempotent) {
     TempDir tmp("bucket_evict_idempotent");
     const uint64_t capacity = kAlignment;
     ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 4)));
+    auto config = MakeEvictionConfig(tmp.path(), capacity, 4);
+    config.ready_bucket_target = 0;
+    ASSERT_TRUE(alloc.Init(config));
 
     for (int i = 0; i < 3; ++i) {
         auto desc = alloc.Allocate("k" + std::to_string(i), 100);
@@ -1247,10 +1251,10 @@ TEST(ImmutableBucketAllocatorTest, CommitAndAbortEvictionAreIdempotent) {
 
     auto pending = alloc.PrepareEviction();
     ASSERT_FALSE(pending.Empty());
-    alloc.CommitEviction(std::move(pending));
+    EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
     EXPECT_EQ(alloc.GetBucketCount(), 2u);
     // Committing (or aborting) the already-resolved transaction is a no-op.
-    alloc.CommitEviction(std::move(pending));
+    EXPECT_FALSE(alloc.CommitEviction(std::move(pending)));
     alloc.AbortEviction(std::move(pending));
     EXPECT_EQ(alloc.GetBucketCount(), 2u);
 }

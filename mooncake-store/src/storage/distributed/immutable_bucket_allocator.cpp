@@ -1745,15 +1745,15 @@ ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
     return pending;
 }
 
-void ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
+bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
     // Detach first so the destructor of `pending` cannot abort what we commit.
     auto* owner = std::exchange(pending.owner_, nullptr);
-    if (owner != this) return;
+    if (owner != this) return false;
 
     const int64_t bucket_id = pending.bucket_id_;
     auto bucket_identity = std::move(pending.bucket_identity_);
     pending.candidates_.clear();
-    if (bucket_id < 0 || !bucket_identity) return;
+    if (bucket_id < 0 || !bucket_identity) return false;
 
     std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
     PersistedBucketMetadata marker;
@@ -1761,7 +1761,7 @@ void ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(bucket_id);
         if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
-            return;
+            return false;
         }
         const bool has_pending = std::any_of(
             it->second->entries.begin(), it->second->entries.end(),
@@ -1778,7 +1778,7 @@ void ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
             }
             LOG(WARNING) << "Aborted DFS bucket eviction at commit: bucket "
                         << bucket_id << " has a PENDING entry";
-            return;
+            return false;
         }
         marker = SnapshotLocked(*it->second, /*evicting=*/true);
     }
@@ -1799,7 +1799,7 @@ void ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(bucket_id);
         if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
-            return;
+            return false;
         }
         for (const auto& [key, entry] : it->second->entries) {
             if (!IsLive(entry.state)) continue;
@@ -1821,6 +1821,7 @@ void ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
     // longer present. Wake both refill workers and allocation waiters now.
     bucket_pool_cv_.notify_all();
     LOG(INFO) << "Evicted DFS bucket " << bucket_id;
+    return true;
 }
 
 void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending) {
