@@ -2395,6 +2395,30 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
                     .has_value());
 }
 
+TEST_F(MasterServiceTest, GroupedQueryReportsRemainingLease) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(10000).build();
+    MasterService service(config);
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const std::string key = "group_remaining_lease";
+    ReplicateConfig replication;
+    replication.replica_num = 1;
+    replication.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(key)};
+    PutCompletedObject(service, generate_uuid(), key, replication);
+    ASSERT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // The group is not near expiry, so these queries do not grant a full TTL.
+    auto single = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(single.has_value());
+    EXPECT_LT(single->lease_ttl_ms, 9950u);
+    auto batch = service.BatchGetReplicaList({key}, TenantId::Default());
+    ASSERT_EQ(batch.size(), 1u);
+    ASSERT_TRUE(batch[0].has_value());
+    EXPECT_LE(batch[0]->lease_ttl_ms, single->lease_ttl_ms);
+    EXPECT_GT(batch[0]->lease_ttl_ms, 0u);
+}
+
 TEST_F(MasterServiceTest,
        GroupedLeaseRefreshAfterMembershipChangeDoesNotWaitForTriggerExpiry) {
     auto service_config =
