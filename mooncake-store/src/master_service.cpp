@@ -561,12 +561,10 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
     if (!enable_dfs_) return;
 
-    if (config.enable_snapshot || config.enable_snapshot_restore ||
-        enable_oplog_) {
-        LOG(ERROR) << "DFS cannot be enabled with snapshot or oplog recovery "
-                      "until DFS allocator state restoration is supported";
-        throw std::invalid_argument(
-            "DFS is incompatible with snapshot/oplog recovery");
+    if (enable_oplog_) {
+        LOG(ERROR) << "DFS cannot be enabled with oplog recovery until DFS "
+                      "allocator state restoration is supported";
+        throw std::invalid_argument("DFS is incompatible with oplog recovery");
     }
 
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
@@ -604,10 +602,10 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         return;
     }
 
-    // Recovered bucket entries must become queryable COMPLETE replicas before
-    // the master starts serving; otherwise restart recovery would only restore
-    // allocator bookkeeping and the data would stay unreachable.
-    if (bucket_allocator_ != nullptr) {
+    // Snapshot is the metadata recovery source when enabled. Do not rebuild
+    // DFS replicas from bucket state in that mode.
+    if (bucket_allocator_ != nullptr && !config.enable_snapshot &&
+        !config.enable_snapshot_restore) {
         RestoreRecoveredDfsReplicas();
     }
 
