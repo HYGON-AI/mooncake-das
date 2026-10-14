@@ -1303,7 +1303,6 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
         // Change the client status to OK
         ok_client_.insert(client_id);
-        MasterMetricManager::instance().inc_active_clients();
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -11726,7 +11725,6 @@ void MasterService::ClientMonitorFunc() {
                     auto it = ok_client_.find(client_id);
                     if (it != ok_client_.end()) {
                         ok_client_.erase(it);
-                        MasterMetricManager::instance().dec_active_clients();
                     }
                     client_host_id_.erase(client_id);
                 }

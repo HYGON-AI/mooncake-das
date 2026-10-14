@@ -96,7 +96,8 @@ MasterMetricManager::MasterMetricManager()
           {4096, 65536, 262144, 1048576, 4194304, 16777216, 67108864}),
       // Initialize cluster metrics
       active_clients_("master_active_clients",
-                      "Total number of active clients"),
+                      "Number of clients with mounted positive-capacity memory "
+                      "segments, deduplicated by client UUID"),
 
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",

@@ -708,6 +708,112 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
     EXPECT_TRUE(unmount_result4.has_value());
 }
 
+TEST_F(MasterServiceTest, ActiveClientsExcludeSegmentlessDfsClients) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_active_clients();
+    {
+        MasterService service;
+        const auto provider = generate_uuid();
+        const auto segment = MakeSegment();
+        ASSERT_TRUE(service.MountSegment(segment, provider).has_value());
+        ASSERT_TRUE(service.ReMountSegment({segment}, provider).has_value());
+        ASSERT_EQ(baseline + 1, metrics.get_active_clients());
+
+        // DFS consumers register through an empty remount and still need
+        // heartbeat/liveness management, even though they provide no memory.
+        for (int i = 0; i < 5; ++i) {
+            const auto consumer = generate_uuid();
+            ASSERT_TRUE(service.ReMountSegment({}, consumer).has_value());
+            ASSERT_TRUE(service.ReMountSegment({}, consumer).has_value());
+            const auto ping = service.Ping(consumer);
+            ASSERT_TRUE(ping.has_value());
+            EXPECT_EQ(ClientStatus::OK, ping->client_status);
+            EXPECT_EQ(baseline + 1, metrics.get_active_clients());
+        }
+    }
+    EXPECT_EQ(baseline, metrics.get_active_clients());
+}
+
+TEST_F(MasterServiceTest, ActiveClientsFollowMemorySegmentLifetime) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_active_clients();
+    MasterService service;
+    const auto client = generate_uuid();
+    const auto first = MakeSegment("first");
+    const auto second = MakeSegment("second", 0x400000000);
+    ASSERT_TRUE(service.ReMountSegment({}, client).has_value());
+    ASSERT_EQ(baseline, metrics.get_active_clients());
+
+    ASSERT_TRUE(service.MountSegment(first, client).has_value());
+    ASSERT_TRUE(service.MountSegment(first, client).has_value());
+    ASSERT_TRUE(service.MountSegment(second, client).has_value());
+    ASSERT_TRUE(service.ReMountSegment({first, second}, client).has_value());
+    EXPECT_EQ(baseline + 1, metrics.get_active_clients());
+
+    ASSERT_TRUE(service.UnmountSegment(first.id, client).has_value());
+    EXPECT_EQ(baseline + 1, metrics.get_active_clients());
+    ASSERT_TRUE(service.UnmountSegment(second.id, client).has_value());
+    ASSERT_TRUE(service.UnmountSegment(second.id, client).has_value());
+    ASSERT_TRUE(service.ReMountSegment({}, client).has_value());
+    EXPECT_EQ(baseline, metrics.get_active_clients());
+
+    ASSERT_TRUE(service.MountSegment(first, client).has_value());
+    EXPECT_EQ(baseline + 1, metrics.get_active_clients());
+}
+
+TEST_F(MasterServiceTest, ActiveClientsExpireWithoutCountingDfsConsumers) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_active_clients();
+    auto config = MasterServiceConfig::builder()
+                      .set_client_live_ttl_sec(1)
+                      .build();
+    MasterService service(config);
+    const auto provider = generate_uuid();
+    const auto consumer = generate_uuid();
+    const auto segment = MakeSegment();
+    ASSERT_TRUE(service.ReMountSegment({segment}, provider).has_value());
+    ASSERT_TRUE(service.ReMountSegment({}, consumer).has_value());
+    ASSERT_EQ(baseline + 1, metrics.get_active_clients());
+
+    WaitUntil([&] { return metrics.get_active_clients() == baseline; });
+    for (const auto& client : {provider, consumer}) {
+        const auto ping = service.Ping(client);
+        ASSERT_TRUE(ping.has_value());
+        EXPECT_EQ(ClientStatus::NEED_REMOUNT, ping->client_status);
+    }
+    ASSERT_TRUE(service.ReMountSegment({}, consumer).has_value());
+    EXPECT_EQ(baseline, metrics.get_active_clients());
+    ASSERT_TRUE(service.ReMountSegment({segment}, provider).has_value());
+    EXPECT_EQ(baseline + 1, metrics.get_active_clients());
+}
+
+TEST_F(MasterServiceTest, ActiveClientsSnapshotReadersDoNotChangeGauge) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_active_clients();
+    const auto client = generate_uuid();
+    const auto segment = MakeSegment();
+    SegmentManager manager(BufferAllocatorType::OFFSET);
+    ASSERT_EQ(ErrorCode::OK,
+              manager.getSegmentAccess().MountSegment(segment, client));
+    SegmentSerializer serializer(&manager);
+    auto snapshot = serializer.Serialize(LocalSsdPersistedState{});
+    ASSERT_TRUE(snapshot.has_value());
+    {
+        SegmentManager reader(BufferAllocatorType::OFFSET);
+        SegmentSerializer reader_serializer(&reader);
+        ASSERT_TRUE(reader_serializer.Deserialize(*snapshot).has_value());
+        EXPECT_EQ(baseline + 1, metrics.get_active_clients());
+    }
+    EXPECT_EQ(baseline + 1, metrics.get_active_clients());
+    serializer.Reset();
+    EXPECT_EQ(baseline, metrics.get_active_clients());
+    ASSERT_TRUE(serializer.Deserialize(*snapshot).has_value());
+    EXPECT_EQ(baseline, metrics.get_active_clients());
+    ASSERT_EQ(ErrorCode::OK,
+              manager.getSegmentAccess().ReMountSegment({segment}, client));
+    EXPECT_EQ(baseline + 1, metrics.get_active_clients());
+}
+
 TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
     // Create a MasterService instance for testing.
     std::unique_ptr<MasterService> service_(new MasterService());
