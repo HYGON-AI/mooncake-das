@@ -5365,7 +5365,8 @@ void Client::StorageHeartbeatThreadMain() {
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
                        << " times (non-HA); reconnecting to "
                        << current_master_address;
-            auto err = master_client_.Connect(current_master_address);
+            auto err = master_client_.Connect(current_master_address,
+                                              /*force_recreate=*/true);
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Reconnect failed to " << current_master_address
                            << ": " << toString(err);

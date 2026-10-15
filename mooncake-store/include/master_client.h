@@ -72,6 +72,25 @@ inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
 
 inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
     RpcClientPool::PoolConfig config;
+    // Keep one retry for transient connection failures while avoiding the
+    // long default reconnect delay. The heartbeat thread still owns retries
+    // after the pool's bounded attempts are exhausted.
+    config.connect_retry_count = 1;
+    config.reconnect_wait_time = std::chrono::milliseconds(0);
+    config.client_config.connect_timeout_duration = std::chrono::seconds(1);
+    config.client_config.request_timeout_duration = std::chrono::seconds(5);
+    if (const char* retry_count = std::getenv("MC_RPC_CONNECT_RETRY_COUNT")) {
+        const auto parsed = std::atoll(retry_count);
+        config.connect_retry_count =
+            parsed > 0 ? static_cast<decltype(config.connect_retry_count)>(
+                            parsed)
+                       : 0;
+    }
+    if (const char* wait_ms = std::getenv("MC_RPC_RECONNECT_WAIT_MS")) {
+        const auto parsed = std::atoll(wait_ms);
+        config.reconnect_wait_time =
+            std::chrono::milliseconds(parsed > 0 ? parsed : 0);
+    }
     const char* value = std::getenv("MC_RPC_PROTOCOL");
     if (value && std::string_view(value) == "rdma") {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
@@ -108,7 +127,8 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] ErrorCode Connect(
-        const std::string& master_addr = kDefaultMasterAddress);
+        const std::string& master_addr = kDefaultMasterAddress,
+        bool force_recreate = false);
 
     /**
      * @brief Checks if an object exists

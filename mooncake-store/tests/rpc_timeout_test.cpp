@@ -134,11 +134,30 @@ TEST(RpcTimeoutTest, TimeoutEnvOverridesAreOptIn) {
 
     ::unsetenv("MC_RPC_TIMEOUT_MS");
     ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+    ::unsetenv("MC_RPC_CONNECT_RETRY_COUNT");
+    ::unsetenv("MC_RPC_RECONNECT_WAIT_MS");
 
     StubClientConfig defaults;
     detail::ApplyRpcTimeoutEnvOverrides(defaults);
     EXPECT_EQ(defaults.request_timeout_duration, std::chrono::seconds(30));
     EXPECT_EQ(defaults.connect_timeout_duration, std::chrono::seconds(30));
+
+    // The master pool uses a bounded connection attempt and request deadline.
+    auto master_config = detail::MakeMasterRpcClientPoolConfig();
+    EXPECT_EQ(master_config.connect_retry_count, 1u);
+    EXPECT_EQ(master_config.reconnect_wait_time,
+              std::chrono::milliseconds(0));
+    EXPECT_EQ(master_config.client_config.connect_timeout_duration,
+              std::chrono::seconds(1));
+    EXPECT_EQ(master_config.client_config.request_timeout_duration,
+              std::chrono::seconds(5));
+
+    ASSERT_EQ(::setenv("MC_RPC_CONNECT_RETRY_COUNT", "3", 1), 0);
+    ASSERT_EQ(::setenv("MC_RPC_RECONNECT_WAIT_MS", "250", 1), 0);
+    master_config = detail::MakeMasterRpcClientPoolConfig();
+    EXPECT_EQ(master_config.connect_retry_count, 3u);
+    EXPECT_EQ(master_config.reconnect_wait_time,
+              std::chrono::milliseconds(250));
 
     ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS", "1500", /*overwrite=*/1), 0);
     ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "1000", /*overwrite=*/1),
@@ -152,12 +171,16 @@ TEST(RpcTimeoutTest, TimeoutEnvOverridesAreOptIn) {
               std::chrono::milliseconds(1000));
 
     // The master pool is built from the same helper, so it sees them too.
-    auto master_config = detail::MakeMasterRpcClientPoolConfig();
+    master_config = detail::MakeMasterRpcClientPoolConfig();
+    EXPECT_EQ(master_config.client_config.request_timeout_duration,
+              std::chrono::milliseconds(1500));
     EXPECT_EQ(master_config.client_config.connect_timeout_duration,
               std::chrono::milliseconds(1000));
 
     ::unsetenv("MC_RPC_TIMEOUT_MS");
     ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
+    ::unsetenv("MC_RPC_CONNECT_RETRY_COUNT");
+    ::unsetenv("MC_RPC_RECONNECT_WAIT_MS");
 }
 
 }  // namespace mooncake

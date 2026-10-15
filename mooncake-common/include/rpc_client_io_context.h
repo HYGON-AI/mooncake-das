@@ -53,6 +53,13 @@ class RpcClientPool {
         return client_pool_;
     }
 
+    std::shared_ptr<ClientPool> RecreateClientPool(std::string_view address) {
+        std::lock_guard<std::shared_mutex> lock(mutex_);
+        client_pool_ = ClientPool::create(address, config_, io_context_pool_);
+        address_ = address;
+        return client_pool_;
+    }
+
     std::shared_ptr<ClientPool> GetClientPool() const {
         std::shared_lock<std::shared_mutex> lock(mutex_);
         return client_pool_;

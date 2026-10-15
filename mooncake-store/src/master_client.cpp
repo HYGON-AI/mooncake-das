@@ -440,13 +440,15 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
 
 MasterClient::~MasterClient() = default;
 
-ErrorCode MasterClient::Connect(const std::string& master_addr) {
+ErrorCode MasterClient::Connect(const std::string& master_addr,
+                                bool force_recreate) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
-    timer.LogRequest("master_addr=", master_addr);
+    timer.LogRequest("master_addr=", master_addr,
+                     ", force_recreate=", force_recreate);
 
     MutexLocker lock(&connect_mutex_);
-    if (client_addr_param_ != master_addr) {
-        client_accessor_.GetOrCreateClientPool(master_addr);
+    if (force_recreate || client_addr_param_ != master_addr) {
+        client_accessor_.RecreateClientPool(master_addr);
         client_addr_param_ = master_addr;
     }
     // The client pool does not have native connection check method, so we need
