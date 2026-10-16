@@ -1,7 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <msgpack.hpp>
@@ -10,6 +15,7 @@
 #include "master_config.h"
 #include "master_service.h"
 #include "segment.h"
+#include "snapshot_test_utils.h"
 #include "task_manager.h"
 #include "tenant_id.h"
 #include "utils/zstd_util.h"
@@ -36,6 +42,35 @@ class MasterSnapshotCodecTest : public ::testing::Test {
         return MasterSnapshotStateView(
             service, service.segment_manager_, service.local_ssd_manager_,
             service.nof_segment_manager_, service.task_manager_);
+    }
+
+    static void AddSnapshotReplicas(MasterService& service,
+                                   const std::string& key,
+                                   std::vector<Replica> replicas) {
+        const auto tenant_id = TenantId::Default();
+        MasterService::MetadataShardAccessorRW shard(
+            &service, service.getMetadataShardIndex(tenant_id, key));
+        auto& tenant = service.GetOrCreateTenantState(shard.get(), tenant_id);
+        auto [it, inserted] = tenant.metadata.try_emplace(
+            key, UUID{}, std::chrono::system_clock::now(), 1024,
+            std::vector<Replica>{}, std::nullopt, false,
+            ObjectDataType::UNKNOWN, std::string(), tenant_id, key);
+        it->second.AddReplicas(std::move(replicas));
+        shard.OnDiskReplicaAdded(it->second);
+        it->second.lease_timeout =
+            std::chrono::system_clock::now() + std::chrono::hours(1);
+    }
+
+    static void AddDiscardedReplicas(MasterService& service,
+                                    std::vector<Replica> replicas) {
+        std::lock_guard lock(service.discarded_replicas_mutex_);
+        service.discarded_replicas_.emplace_back(
+            std::move(replicas),
+            std::chrono::system_clock::now() + std::chrono::hours(1));
+    }
+
+    static auto ApplySnapshotState(MasterService& service) {
+        return service.ApplySnapshotState(std::chrono::system_clock::now());
     }
 
     std::unique_ptr<MasterService> master_service_;
@@ -124,6 +159,87 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
     ASSERT_TRUE(get_result.has_value())
         << "GetReplicaList failed: " << static_cast<int>(get_result.error());
     EXPECT_EQ(get_result.value().replicas.size(), 1u);
+}
+
+TEST_F(MasterSnapshotCodecTest, DfsRecoverySwitchPreservesOtherSnapshotReplicas) {
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "dfs_filter_segment";
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+    const auto client_id = generate_uuid();
+    ASSERT_TRUE(master_service_->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(master_service_
+                    ->PutStart(client_id, "mixed", TenantId::Default(), 1024,
+                               ReplicateConfig{.replica_num = 1})
+                    .has_value());
+    ASSERT_TRUE(master_service_
+                    ->PutEnd(client_id, "mixed", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    const DistributedFSDescriptor dfs{"/unused/bucket_000042.data", 0, 1024,
+                                      4096, 42};
+    for (const auto& key : {"mixed", "dfs_only"}) {
+        std::vector<Replica> replicas;
+        replicas.emplace_back(dfs, ReplicaStatus::COMPLETE);
+        AddSnapshotReplicas(*master_service_, key, std::move(replicas));
+    }
+    std::vector<Replica> local;
+    local.emplace_back(client_id, 1024, segment.name, ReplicaStatus::COMPLETE);
+    local.emplace_back(dfs, ReplicaStatus::COMPLETE);
+    AddSnapshotReplicas(*master_service_, "local", std::move(local));
+    for (const bool with_local : {false, true}) {
+        std::vector<Replica> discarded;
+        discarded.emplace_back(dfs, ReplicaStatus::COMPLETE);
+        if (with_local) {
+            discarded.emplace_back(client_id, 1024, segment.name,
+                                   ReplicaStatus::COMPLETE);
+        }
+        AddDiscardedReplicas(*master_service_, std::move(discarded));
+    }
+
+    MasterSnapshotCodec codec;
+    auto state = MakeStateView(*master_service_);
+    auto payloads = codec.Encode(state);
+    ASSERT_TRUE(payloads.has_value());
+    for (const bool recovery_enabled : {true, false}) {
+        SCOPED_TRACE(recovery_enabled);
+        test::ScopedEnvVar env("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED",
+                              recovery_enabled ? "true" : "false");
+        auto target = MakeMasterService();
+        ASSERT_TRUE(codec.Decode(target.get(), *payloads).has_value());
+        ASSERT_TRUE(ApplySnapshotState(*target).has_value());
+
+        auto mixed = target->GetReplicaList("mixed", TenantId::Default());
+        ASSERT_TRUE(mixed.has_value());
+        EXPECT_EQ(mixed->replicas.size(), recovery_enabled ? 2u : 1u);
+        EXPECT_TRUE(mixed->replicas.front().is_memory_replica());
+        auto local_result = target->GetReplicaList("local", TenantId::Default());
+        ASSERT_TRUE(local_result.has_value());
+        EXPECT_EQ(local_result->replicas.size(), recovery_enabled ? 2u : 1u);
+        EXPECT_TRUE(local_result->replicas.front().is_local_disk_replica());
+        auto dfs_only = target->GetReplicaList("dfs_only", TenantId::Default());
+        EXPECT_EQ(dfs_only.has_value(), recovery_enabled);
+
+        auto target_state = MakeStateView(*target);
+        auto restored = codec.Encode(target_state);
+        ASSERT_TRUE(restored.has_value());
+        auto metadata = msgpack::unpack(
+            reinterpret_cast<const char*>(restored->metadata.data()),
+            restored->metadata.size());
+        std::map<std::string, msgpack::object> fields;
+        metadata.get().convert(fields);
+        const auto& discarded = fields.at("discarded_replicas");
+        ASSERT_EQ(discarded.via.array.size, recovery_enabled ? 2u : 1u);
+        if (!recovery_enabled) {
+            const auto& item = discarded.via.array.ptr[0];
+            EXPECT_EQ(item.via.array.ptr[2].as<uint32_t>(), 1u);
+            EXPECT_EQ(item.via.array.ptr[3].via.array.ptr[2].as<int8_t>(),
+                      static_cast<int8_t>(ReplicaType::LOCAL_DISK));
+        }
+    }
 }
 
 TEST_F(MasterSnapshotCodecTest, DecodeWithCorruptPayloadFails) {
