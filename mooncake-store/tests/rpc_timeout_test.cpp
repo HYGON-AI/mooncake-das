@@ -142,21 +142,36 @@ TEST(RpcTimeoutTest, TimeoutEnvOverridesAreOptIn) {
     EXPECT_EQ(defaults.request_timeout_duration, std::chrono::seconds(30));
     EXPECT_EQ(defaults.connect_timeout_duration, std::chrono::seconds(30));
 
-    // The master pool uses a bounded connection attempt and request deadline.
+    // Both modes use the bounded Master connection policy.
     auto master_config = detail::MakeMasterRpcClientPoolConfig();
-    EXPECT_EQ(master_config.connect_retry_count, 1u);
+    EXPECT_EQ(master_config.connect_retry_count, 0u);
     EXPECT_EQ(master_config.reconnect_wait_time,
               std::chrono::milliseconds(0));
     EXPECT_EQ(master_config.client_config.connect_timeout_duration,
               std::chrono::seconds(1));
     EXPECT_EQ(master_config.client_config.request_timeout_duration,
-              std::chrono::seconds(5));
+              std::chrono::seconds(30));
+
+    auto ha_config = detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true);
+    EXPECT_EQ(ha_config.connect_retry_count, 0u);
+    EXPECT_EQ(ha_config.reconnect_wait_time,
+              std::chrono::milliseconds(0));
+    EXPECT_EQ(ha_config.client_config.connect_timeout_duration,
+              std::chrono::seconds(1));
+    EXPECT_EQ(ha_config.client_config.request_timeout_duration,
+              std::chrono::seconds(30));
 
     ASSERT_EQ(::setenv("MC_RPC_CONNECT_RETRY_COUNT", "3", 1), 0);
     ASSERT_EQ(::setenv("MC_RPC_RECONNECT_WAIT_MS", "250", 1), 0);
     master_config = detail::MakeMasterRpcClientPoolConfig();
     EXPECT_EQ(master_config.connect_retry_count, 3u);
     EXPECT_EQ(master_config.reconnect_wait_time,
+              std::chrono::milliseconds(250));
+
+    auto ha_overridden_config =
+        detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true);
+    EXPECT_EQ(ha_overridden_config.connect_retry_count, 3u);
+    EXPECT_EQ(ha_overridden_config.reconnect_wait_time,
               std::chrono::milliseconds(250));
 
     ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS", "1500", /*overwrite=*/1), 0);
@@ -170,11 +185,17 @@ TEST(RpcTimeoutTest, TimeoutEnvOverridesAreOptIn) {
     EXPECT_EQ(overridden.connect_timeout_duration,
               std::chrono::milliseconds(1000));
 
-    // The master pool is built from the same helper, so it sees them too.
+    // The helper applies timeout overrides to the selected Master pool.
     master_config = detail::MakeMasterRpcClientPoolConfig();
     EXPECT_EQ(master_config.client_config.request_timeout_duration,
               std::chrono::milliseconds(1500));
     EXPECT_EQ(master_config.client_config.connect_timeout_duration,
+              std::chrono::milliseconds(1000));
+    ha_overridden_config =
+        detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true);
+    EXPECT_EQ(ha_overridden_config.client_config.request_timeout_duration,
+              std::chrono::milliseconds(1500));
+    EXPECT_EQ(ha_overridden_config.client_config.connect_timeout_duration,
               std::chrono::milliseconds(1000));
 
     ::unsetenv("MC_RPC_TIMEOUT_MS");

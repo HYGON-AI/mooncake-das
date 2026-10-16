@@ -23,6 +23,16 @@ namespace etcd {
 namespace {
 
 constexpr int kKeepAliveReadyTimeoutMs = 1000;
+constexpr std::string_view kServiceWarmingPrefix =
+    "__mooncake_service_warming__:";
+
+std::string MakeServiceWarmingValue(const OwnerToken& owner_token) {
+    return std::string(kServiceWarmingPrefix) + owner_token;
+}
+
+bool IsServiceWarmingValue(const std::string& value) {
+    return value.rfind(kServiceWarmingPrefix, 0) == 0;
+}
 // Fallback poll interval used only when a watch cannot be armed (e.g. the watch
 // RPC fails, or the remaining timeout is too small to be worth a watch). The
 // steady-state path blocks on an etcd watch and does not poll.
@@ -185,6 +195,10 @@ EtcdLeaderCoordinator::ReadCurrentView() {
         return tl::make_unexpected(err);
     }
 
+    if (IsServiceWarmingValue(leader_address)) {
+        return std::optional<MasterView>{std::nullopt};
+    }
+
     return std::optional<MasterView>{
         MasterView{.leader_address = std::move(leader_address),
                    .view_version = view_version}};
@@ -205,9 +219,11 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
     }
 
     ViewVersionId view_version = 0;
+    const auto owner_token = MakeOwnerToken(lease_id);
+    const auto warming_value = MakeServiceWarmingValue(owner_token);
     err = EtcdHelper::CreateWithLease(
         master_view_key_.c_str(), master_view_key_.size(),
-        leader_address.c_str(), leader_address.size(), lease_id, view_version);
+        warming_value.c_str(), warming_value.size(), lease_id, view_version);
     if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
         auto revoke_err = EtcdHelper::RevokeLease(lease_id);
         if (revoke_err != ErrorCode::OK) {
@@ -257,6 +273,27 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         .session = std::move(session),
         .observed_view = std::nullopt,
     };
+}
+
+ErrorCode EtcdLeaderCoordinator::PublishServiceReady(
+    const LeadershipSession& session) {
+    auto err = EnsureConnected();
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    const auto owner_token = session.owner_token;
+    const auto warming_value = MakeServiceWarmingValue(owner_token);
+    auto lease_id = ParseLeaseId(session.owner_token);
+    if (!lease_id) {
+        return lease_id.error();
+    }
+    return EtcdHelper::TxnCompareAndPutWithLease(
+        {{.key = master_view_key_,
+          .kind = EtcdHelper::TxnCompareKind::kValueEquals,
+          .expected_value = warming_value}},
+        {{.key = master_view_key_,
+          .value = session.view.leader_address}},
+        lease_id.value());
 }
 
 tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(

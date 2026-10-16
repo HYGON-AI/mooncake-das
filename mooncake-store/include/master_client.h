@@ -74,21 +74,17 @@ inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
 inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
     bool ha_enabled = false) {
     RpcClientPool::PoolConfig config;
-    if (ha_enabled) {
-        config.connect_retry_count = 0;
-        config.reconnect_wait_time = std::chrono::milliseconds(0);
-        config.client_config.connect_timeout_duration =
-            std::chrono::seconds(1);
-    } else {
-        // Keep one retry for transient connection failures while avoiding the
-        // long default reconnect delay. The heartbeat thread still owns
-        // retries after the pool's bounded attempts are exhausted.
-        config.connect_retry_count = 1;
-        config.reconnect_wait_time = std::chrono::milliseconds(0);
-        config.client_config.connect_timeout_duration =
-            std::chrono::seconds(1);
-    }
-    config.client_config.request_timeout_duration = std::chrono::seconds(5);
+    // The outer heartbeat/reconnect loops own recovery in both HA and
+    // non-HA modes. Avoid pool-level retries and waits so every Master RPC
+    // returns connection failures to its caller promptly.
+    config.connect_retry_count = 0;
+    config.reconnect_wait_time = std::chrono::milliseconds(0);
+    config.client_config.connect_timeout_duration =
+        std::chrono::seconds(1);
+    // Keep the parameter to preserve the HA/non-HA policy construction API;
+    // both modes currently use the same bounded connection policy.
+    (void)ha_enabled;
+    const char* value = std::getenv("MC_RPC_PROTOCOL");
     if (const char* retry_count = std::getenv("MC_RPC_CONNECT_RETRY_COUNT")) {
         const auto parsed = std::atoll(retry_count);
         config.connect_retry_count =
@@ -101,11 +97,12 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
         config.reconnect_wait_time =
             std::chrono::milliseconds(parsed > 0 ? parsed : 0);
     }
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
     if (value && std::string_view(value) == "rdma") {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
+    // Unset MC_RPC_* variables keep the configured pool defaults; explicit
+    // values override those defaults for both HA and non-HA pools.
     ApplyRpcTimeoutEnvOverrides(config.client_config);
     return config;
 }
