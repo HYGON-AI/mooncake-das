@@ -710,10 +710,6 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
 
-        leader_monitor_running_ = true;
-        leader_monitor_thread_ =
-            std::thread([this]() { this->LeaderMonitorThreadMain(); });
-
         return ErrorCode::OK;
     } else {
         auto err = master_client_.Connect(master_server_entry);
@@ -727,6 +723,18 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         }
         last_ping_success_.store(true);
         return ErrorCode::OK;
+    }
+}
+
+void Client::EnterHaRuntimeMode() {
+    if (!leader_coordinator_) {
+        return;
+    }
+
+    master_client_.EnableHaConnectionPolicy();
+    if (!leader_monitor_running_.exchange(true)) {
+        leader_monitor_thread_ =
+            std::thread([this]() { this->LeaderMonitorThreadMain(); });
     }
 }
 
@@ -1144,6 +1152,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
             }
         }
     }
+
+    client->EnterHaRuntimeMode();
 
     // this only performs RPC calls
     if (protocol == "rpc_only") {
