@@ -79,7 +79,6 @@ struct ReadPlan::Impl {
     bool reuse;
     bool page_wise;
     bool borrowed_sessions;
-    GetSessionReadSnapshots session_snapshots;
     uint64_t built_count = 0, refreshed_count = 0;
     std::mutex mutex;
     std::condition_variable cv;
@@ -356,8 +355,7 @@ struct ReadPlan::Impl {
                     auto &r = slot.ranges;
                     if (!r.keys.empty())
                         slot.result = client->batch_get_into_multi_buffer_ranges(
-                            r.keys, r.addresses, r.sizes, r.offsets,
-                            &session_snapshots);
+                            r.keys, r.addresses, r.sizes, r.offsets);
                 } catch (...) {
                     slot.error = std::current_exception();
                 }
@@ -449,17 +447,9 @@ struct ReadPlan::Impl {
                                 [](int x) { return x != 0; }))
                     throw std::runtime_error(
                         "Mooncake read plan session start failed");
-            }
-            // Prepare the entire deduplicated plan at execution time. Every
-            // layer (including pipeline workers) stays on this content/lifetime.
-            const auto prepared =
-                client->prepare_get_session_read(session, session_snapshots);
-            if (prepared.size() != session.size() ||
-                std::any_of(prepared.begin(), prepared.end(),
-                            [](int x) { return x != 0; }))
-                throw std::runtime_error(
-                    "Mooncake read plan session preparation failed");
-            if (adaptive) {
+            } else if (adaptive) {
+                // SGLang owns these sessions and any DFS prefetch buffers.
+                // Inspect their selected replicas without a second Master query.
                 effective_page_wise =
                     !client->all_get_sessions_memory(session);
             }
@@ -485,8 +475,7 @@ struct ReadPlan::Impl {
                 ++built_count;
                 if (!r.keys.empty()) {
                     auto result = client->batch_get_into_multi_buffer_ranges(
-                        r.keys, r.addresses, r.sizes, r.offsets,
-                        &session_snapshots);
+                        r.keys, r.addresses, r.sizes, r.offsets);
                     check(r, result, -1);
                 }
             } else if (pipeline) {
@@ -515,8 +504,7 @@ struct ReadPlan::Impl {
                     auto &r = *selected;
                     if (!r.keys.empty()) {
                         auto result = client->batch_get_into_multi_buffer_ranges(
-                            r.keys, r.addresses, r.sizes, r.offsets,
-                            &session_snapshots);
+                            r.keys, r.addresses, r.sizes, r.offsets);
                         check(r, result, group);
                     }
                     if (group < groups - 1)
@@ -536,7 +524,6 @@ struct ReadPlan::Impl {
             }
         }
         reservation.reset();
-        session_snapshots.clear();
         finish(error);
         if (error) std::rethrow_exception(error);
     }
