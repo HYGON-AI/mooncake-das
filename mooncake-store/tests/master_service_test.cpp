@@ -1832,6 +1832,44 @@ TEST_F(MasterServiceTest, DfsBucketModeSupportsPutEndAndQuery) {
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_F(MasterServiceTest, DfsBucketAllocationFailureEvictsBeforeRetryingPut) {
+    const auto root = MakeDfsTestRoot("forced_eviction");
+    // Keep the background eviction thread asleep so the second PutStart must
+    // use the allocation-failure recovery path.
+    ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+                                   "3600");
+    ScopedBucketDfsEnv env(root, "4096", "1", "1", "0.99", "0.8");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "forced_eviction_old",
+                                  TenantId::Default(), 4096, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "forced_eviction_old",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        auto replacement = service.PutStart(
+            context.client_id, "forced_eviction_new", TenantId::Default(),
+            4096, config);
+        ASSERT_TRUE(replacement.has_value()) << toString(replacement.error());
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "forced_eviction_new",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 TEST_F(MasterServiceTest, DfsBucketPutRevokeReleasesSpaceAndMetadata) {
     const auto root = MakeDfsTestRoot("revoke");
     ScopedBucketDfsEnv env(root, "1048576", "16");
