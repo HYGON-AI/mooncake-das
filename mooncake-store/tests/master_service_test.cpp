@@ -1225,8 +1225,13 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
         auto failed = service.PutStart(context.client_id, "dfs_quota_failure",
                                        TenantId::Default(),
                                        kStrictTenantQuotaBytes, dfs_config);
-        ASSERT_FALSE(failed.has_value());
-        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        ASSERT_TRUE(failed.has_value()) << toString(failed.error());
+        ASSERT_EQ(failed->size(), 1u);
+        EXPECT_TRUE(failed->front().is_memory_replica());
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "dfs_quota_failure",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
 
         ReplicateConfig memory_config;
         memory_config.replica_num = 1;
@@ -1830,6 +1835,157 @@ TEST_F(MasterServiceTest, DfsBucketModeSupportsPutEndAndQuery) {
 
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest,
+       DfsBucketCapacityFailureFallsBackToMemoryForSingleAndBatch) {
+    const auto root = MakeDfsTestRoot("capacity_fallback");
+    ScopedBucketDfsEnv env(root, "4096", "1");
+    ScopedEnvVar ready_bucket_count("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "capacity_fill",
+                                  TenantId::Default(), 100, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "capacity_fill",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        const auto skipped_metric = [](const std::string& reason) {
+            return ReadPrometheusCounter(
+                MasterMetricManager::instance().serialize_metrics(),
+                "master_dfs_replica_skipped_total{reason=\"" + reason + "\"}");
+        };
+        const auto before = skipped_metric("NO_AVAILABLE_HANDLE");
+        ASSERT_TRUE(before.has_value());
+
+        auto single = service.PutStart(context.client_id, "capacity_single",
+                                       TenantId::Default(), 100, config);
+        ASSERT_TRUE(single.has_value()) << toString(single.error());
+        ASSERT_EQ(single->size(), 1u);
+        EXPECT_TRUE(single->front().is_memory_replica());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "capacity_single",
+                                TenantId::Default(), ReplicaType::MEMORY)
+                        .has_value());
+
+        const std::vector<std::string> keys{"capacity_batch_a",
+                                            "capacity_batch_b"};
+        const std::vector<uint64_t> lengths(keys.size(), 100);
+        auto batch = service.BatchPutStart(
+            context.client_id, keys, TenantId::Default(), lengths, config);
+        ASSERT_EQ(batch.size(), keys.size());
+        for (size_t i = 0; i < batch.size(); ++i) {
+            ASSERT_TRUE(batch[i].has_value())
+                << keys[i] << ": " << toString(batch[i].error());
+            ASSERT_EQ(batch[i]->size(), 1u);
+            EXPECT_TRUE(batch[i]->front().is_memory_replica());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, keys[i],
+                                    TenantId::Default(), ReplicaType::MEMORY)
+                            .has_value());
+        }
+
+        for (const auto& key :
+             {"capacity_single", "capacity_batch_a", "capacity_batch_b"}) {
+            auto query = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(query.has_value());
+            ASSERT_EQ(query->replicas.size(), 1u);
+            EXPECT_TRUE(query->replicas.front().is_memory_replica());
+            EXPECT_EQ(query->replicas.front().status, ReplicaStatus::COMPLETE);
+        }
+        const auto after = skipped_metric("NO_AVAILABLE_HANDLE");
+        ASSERT_TRUE(after.has_value());
+        EXPECT_EQ(*after, *before + 3);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest,
+       DfsBucketOpenFailureFallsBackToMemoryForSingleAndBatch) {
+    const auto root = MakeDfsTestRoot("open_failure_fallback");
+    const auto moved_root = root + "_moved";
+    ScopedBucketDfsEnv env(root, "4096", "2");
+    ScopedEnvVar ready_bucket_count("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        ASSERT_TRUE(service
+                        .PutStart(context.client_id, "open_failure_fill",
+                                  TenantId::Default(), 100, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "open_failure_fill",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        std::filesystem::rename(root, moved_root);
+        std::ofstream blocker(root, std::ios::binary);
+        ASSERT_TRUE(blocker.good());
+        blocker.close();
+
+        const auto skipped_metric = [] {
+            return ReadPrometheusCounter(
+                MasterMetricManager::instance().serialize_metrics(),
+                "master_dfs_replica_skipped_total{reason=\"FILE_OPEN_FAIL\"}");
+        };
+        const auto before = skipped_metric();
+        ASSERT_TRUE(before.has_value());
+
+        auto single = service.PutStart(context.client_id, "open_failure_single",
+                                       TenantId::Default(), 100, config);
+        ASSERT_TRUE(single.has_value()) << toString(single.error());
+        ASSERT_EQ(single->size(), 1u);
+        EXPECT_TRUE(single->front().is_memory_replica());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "open_failure_single",
+                                TenantId::Default(), ReplicaType::MEMORY)
+                        .has_value());
+
+        const std::vector<std::string> keys{"open_failure_batch"};
+        const std::vector<uint64_t> lengths{100};
+        auto batch = service.BatchPutStart(
+            context.client_id, keys, TenantId::Default(), lengths, config);
+        ASSERT_EQ(batch.size(), keys.size());
+        ASSERT_TRUE(batch.front().has_value())
+            << toString(batch.front().error());
+        ASSERT_EQ(batch.front()->size(), 1u);
+        EXPECT_TRUE(batch.front()->front().is_memory_replica());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, keys.front(),
+                                TenantId::Default(), ReplicaType::MEMORY)
+                        .has_value());
+
+        for (const auto& key : {"open_failure_single", "open_failure_batch"}) {
+            auto query = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(query.has_value());
+            ASSERT_EQ(query->replicas.size(), 1u);
+            EXPECT_TRUE(query->replicas.front().is_memory_replica());
+            EXPECT_EQ(query->replicas.front().status, ReplicaStatus::COMPLETE);
+        }
+        const auto after = skipped_metric();
+        ASSERT_TRUE(after.has_value());
+        EXPECT_EQ(*after, *before + 2);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::remove_all(moved_root, ec);
 }
 
 TEST_F(MasterServiceTest, DfsBucketPutRevokeReleasesSpaceAndMetadata) {
