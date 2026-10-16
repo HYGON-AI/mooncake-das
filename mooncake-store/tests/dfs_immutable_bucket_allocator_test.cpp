@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1101,6 +1103,75 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     auto desc = recovered.Allocate("after", 100);
     ASSERT_TRUE(desc.has_value());
     EXPECT_EQ(desc->shard_idx, 3);
+}
+
+TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudget) {
+    TempDir tmp("bucket_no_recovery");
+    auto config = MakeBucketConfig(tmp.path(), kAlignment, 8);
+    config.ready_bucket_target = 0;
+    {
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(config));
+        auto old = alloc.Allocate("same_key", 100);
+        ASSERT_TRUE(old.has_value());
+        ASSERT_TRUE(alloc.MarkCommitted("same_key", *old));
+        ASSERT_TRUE(alloc.Allocate("unsealed", 100).has_value());
+    }
+    // Include corrupt metadata, a metadata-only ID and an orphan data file.
+    std::ofstream(tmp.file("bucket_000041.meta")) << "corrupt metadata";
+    std::ofstream(tmp.file("bucket_000042.data")) << "orphan data";
+    auto read_file = [](const std::string& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input),
+                           std::istreambuf_iterator<char>());
+    };
+    std::unordered_map<std::string, std::string> old_files;
+    for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
+        old_files.emplace(entry.path().string(), read_file(entry.path().string()));
+    }
+
+    config.bucket_recovery_enabled = false;
+    config.max_bucket_count = 2;
+    {
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(config));
+        EXPECT_TRUE(alloc.TakeRecoveredReplicas().empty());
+        EXPECT_FALSE(alloc.GetBucketIdForKey("same_key").has_value());
+        EXPECT_EQ(alloc.GetBucketCount(), 0u);
+        EXPECT_EQ(alloc.GetUsedBytes(), 0u);
+        EXPECT_EQ(alloc.GetTotalCapacity(), 2 * kAlignment);
+
+        auto first = alloc.Allocate("same_key", 100);
+        ASSERT_TRUE(first.has_value());
+        EXPECT_EQ(first->shard_idx, 43);
+        ASSERT_TRUE(alloc.MarkCommitted("same_key", *first));
+        auto second = alloc.Allocate("new_key", 100);
+        ASSERT_TRUE(second.has_value());
+        EXPECT_EQ(second->shard_idx, 44);
+        ASSERT_TRUE(alloc.MarkCommitted("new_key", *second));
+        EXPECT_EQ(alloc.GetBucketCount(), 2u);
+        EXPECT_EQ(alloc.GetUsedBytes(), 2 * kAlignment);
+        EXPECT_FALSE(alloc.Allocate("over_budget", 100).has_value());
+
+        auto pending = alloc.PrepareEvictionForAllocationFailure();
+        ASSERT_FALSE(pending.Empty());
+        EXPECT_EQ(pending.bucket_id(), first->shard_idx);
+        EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
+        EXPECT_FALSE(std::filesystem::exists(first->file_path));
+    }
+    for (const auto& [path, contents] : old_files) {
+        ASSERT_TRUE(std::filesystem::exists(path)) << path;
+        EXPECT_EQ(read_file(path), contents) << path;
+    }
+
+    // A metadata-only ID also reserves its name without loading its payload.
+    std::ofstream(tmp.file("bucket_000050.meta")) << "still not metadata";
+    ImmutableBucketAllocator next;
+    ASSERT_TRUE(next.Init(config));
+    auto descriptor = next.Allocate("same_key", 100);
+    ASSERT_TRUE(descriptor.has_value());
+    EXPECT_EQ(descriptor->shard_idx, 51);
+    EXPECT_TRUE(next.TakeRecoveredReplicas().empty());
 }
 
 // ---------------------------------------------------------------------------

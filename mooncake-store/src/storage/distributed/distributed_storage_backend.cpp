@@ -308,6 +308,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     }
     config.bucket_capacity = Environ::GetUInt64("MOONCAKE_DFS_BUCKET_CAPACITY",
                                                 config.bucket_capacity);
+    config.bucket_recovery_enabled = Environ::GetBool(
+        "MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", config.bucket_recovery_enabled);
     config.max_bucket_count = static_cast<int64_t>(
         Environ::GetInt("MOONCAKE_DFS_MAX_BUCKET_COUNT",
                         static_cast<int>(config.max_bucket_count)));
@@ -342,6 +344,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << eviction_check_interval.count()
         << ", allocator_type=" << ToString(allocator_type)
         << ", bucket_capacity=" << bucket_capacity
+        << ", bucket_recovery_enabled=" << bucket_recovery_enabled
         << ", max_bucket_count=" << max_bucket_count
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
