@@ -6549,9 +6549,7 @@ bool RealClient::disable_dfs_prefetch() {
     }
     {
         std::lock_guard<std::mutex> session_lock(session_mutex_);
-        if (!get_sessions_.empty() || !get_session_lifetimes_.empty() ||
-            !get_session_repairs_.empty() ||
-            !get_session_access_records_.empty() ||
+        if (!get_sessions_.empty() || !get_session_access_records_.empty() ||
             !get_session_prefetch_cache_.empty() || !put_sessions_.empty()) {
             return false;
         }
