@@ -758,6 +758,7 @@ class MasterClient {
     RpcClientPool client_accessor_;
     RpcClientPool ha_control_client_accessor_;
     RpcClientPool ha_probe_client_accessor_;
+    RpcDrainGuard rpc_drain_;
 
     // The client identification.
     const UUID client_id_;
