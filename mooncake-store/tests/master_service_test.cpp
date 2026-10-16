@@ -2284,6 +2284,19 @@ TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
         const auto* dfs = FindDfsDescriptor(before->replicas);
         ASSERT_NE(dfs, nullptr);
         const auto descriptor = dfs->get_dfs_descriptor();
+
+        // A report must not invalidate a bucket whose data file is still
+        // present on the master's DFS.
+        const auto present_report = service.BatchInvalidateDfsBuckets(
+            context.client_id, {{descriptor.shard_idx}}, TenantId::Default());
+        ASSERT_EQ(present_report.size(), 1u);
+        ASSERT_TRUE(present_report.front().has_value());
+        service.ProcessInvalidatedDfsBucketsForTesting();
+        const auto still_present =
+            service.GetReplicaList("missing_file_key", TenantId::Default());
+        ASSERT_TRUE(still_present.has_value());
+        EXPECT_NE(FindDfsDescriptor(still_present->replicas), nullptr);
+
         ASSERT_TRUE(std::filesystem::remove(descriptor.file_path));
 
         const auto metrics_before = CaptureDfsBucketEvictionMetrics();
@@ -2292,12 +2305,7 @@ TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
         ASSERT_EQ(queued.size(), 1u);
         ASSERT_TRUE(queued.front().has_value());
 
-        WaitUntil([&] {
-            const auto after =
-                service.GetReplicaList("missing_file_key", TenantId::Default());
-            return after.has_value() &&
-                   FindDfsDescriptor(after->replicas) == nullptr;
-        });
+        service.ProcessInvalidatedDfsBucketsForTesting();
         const auto metrics_after = CaptureDfsBucketEvictionMetrics();
 
         for (size_t i = 0; i < 4; ++i) {

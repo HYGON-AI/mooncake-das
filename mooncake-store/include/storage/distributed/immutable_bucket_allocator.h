@@ -272,6 +272,15 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     bool HasBucket(int64_t bucket_id) const;
 
     /**
+     * @brief Check whether the bucket data file exists on the master's DFS.
+     *
+     * The error result is preserved so callers can ask the client to retry
+     * instead of treating an inconclusive check as a missing file.
+     */
+    tl::expected<bool, ErrorCode> IsBucketDataFilePresent(
+        int64_t bucket_id) const;
+
+    /**
      * @brief Accept the eviction: drop the bucket and delete its files.
      * Must only be called once the master has removed every candidate replica.
      * @return True when the allocator removed the logical bucket. Physical file
