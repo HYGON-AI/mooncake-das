@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -416,6 +417,71 @@ TEST_F(DfsSyncClientTest, BatchGetUsesExplicitDfsDescriptors) {
     ASSERT_TRUE(get_results[1].has_value());
     EXPECT_EQ(output[0], values[0]);
     EXPECT_EQ(output[1], values[1]);
+}
+
+TEST_F(DfsSyncClientTest, BatchGetReturnsLeaseExpiredAfterSuccessfulDfsRead) {
+    const std::string key = "dfs_batch_expired_lease";
+    std::string value(4096, 'L');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    auto replicas = query->replicas;
+    std::vector<QueryResult> queries;
+    queries.emplace_back(
+        std::move(replicas),
+        std::chrono::steady_clock::now() - std::chrono::seconds(1),
+        query->object_checksum);
+
+    std::string output(value.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> read_slices;
+    read_slices[key] = {{output.data(), output.size()}};
+    auto results = writer_->BatchGet({key}, queries, read_slices);
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::LEASE_EXPIRED);
+    EXPECT_EQ(output, value);
+}
+
+TEST_F(DfsSyncClientTest,
+       BatchGetReturnsLeaseExpiredAfterSuccessfulMemoryRead) {
+    SetEnv("MOONCAKE_DFS_FORCE_ONE_REPLICA", "false");
+    const std::string key = "memory_batch_expired_lease";
+    std::string value(4096, 'Q');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(writer_->Put(key, write_slices, config).has_value());
+
+    auto query = writer_->Query(key);
+    ASSERT_TRUE(query.has_value());
+    std::vector<Replica::Descriptor> replicas;
+    for (const auto& replica : query->replicas) {
+        if (replica.is_memory_replica()) {
+            replicas.push_back(replica);
+        }
+    }
+    ASSERT_EQ(replicas.size(), 1);
+
+    std::vector<QueryResult> queries;
+    queries.emplace_back(
+        std::move(replicas),
+        std::chrono::steady_clock::now() - std::chrono::seconds(1),
+        query->object_checksum);
+    std::string output(value.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> read_slices;
+    read_slices[key] = {{output.data(), output.size()}};
+
+    for (const bool prefer_same_node : {false, true}) {
+        std::memset(output.data(), 0, output.size());
+        auto results =
+            writer_->BatchGet({key}, queries, read_slices, prefer_same_node);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::LEASE_EXPIRED);
+        EXPECT_EQ(output, value);
+    }
 }
 
 TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
