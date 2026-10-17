@@ -696,19 +696,20 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return coordinator.error();
         }
 
-        auto current_view = coordinator.value()->ReadCurrentView();
-        if (!current_view) {
-            LOG(ERROR) << "Failed to read current master view: "
-                       << toString(current_view.error());
-            return current_view.error();
+        auto master_view = ha::ReadCurrentViewOrWaitForReady(
+            *coordinator.value(), std::chrono::seconds(30));
+        if (!master_view) {
+            LOG(ERROR) << "Failed to discover a ready master view: "
+                       << toString(master_view.error());
+            return master_view.error();
         }
-        if (!current_view.value().has_value()) {
-            LOG(ERROR) << "No master is available in HA backend";
+        if (!master_view->has_value()) {
+            LOG(ERROR) << "No master became ready within 30 seconds";
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
 
-        const auto& master_view = current_view.value().value();
-        auto err = SwitchLeader(master_view);
+        const auto& current_master_view = master_view->value();
+        auto err = SwitchLeader(current_master_view);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to master";
             return err;
@@ -716,10 +717,6 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
-
-        leader_monitor_running_ = true;
-        leader_monitor_thread_ =
-            std::thread([this]() { this->LeaderMonitorThreadMain(); });
 
         return ErrorCode::OK;
     } else {
@@ -734,6 +731,18 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         }
         last_ping_success_.store(true);
         return ErrorCode::OK;
+    }
+}
+
+void Client::EnterHaRuntimeMode() {
+    if (!leader_coordinator_) {
+        return;
+    }
+
+    master_client_.EnableHaConnectionPolicy();
+    if (!leader_monitor_running_.exchange(true)) {
+        leader_monitor_thread_ =
+            std::thread([this]() { this->LeaderMonitorThreadMain(); });
     }
 }
 
@@ -1151,6 +1160,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
             }
         }
     }
+
+    client->EnterHaRuntimeMode();
 
     // this only performs RPC calls
     if (protocol == "rpc_only") {
@@ -5375,7 +5386,8 @@ void Client::StorageHeartbeatThreadMain() {
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
                        << " times (non-HA); reconnecting to "
                        << current_master_address;
-            auto err = master_client_.Connect(current_master_address);
+            auto err = master_client_.Connect(current_master_address,
+                                              /*force_recreate=*/true);
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Reconnect failed to " << current_master_address
                            << ": " << toString(err);
