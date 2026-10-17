@@ -149,17 +149,6 @@ class RealClientTest : public ::testing::Test {
     std::string master_address_;
     std::string ssd_path_;
 
-    void ExpireGetSession(const std::string& key) {
-        std::lock_guard<std::mutex> lock(py_client_->session_mutex_);
-        const auto old = py_client_->get_sessions_.at(key);
-        py_client_->get_sessions_.erase(key);
-        py_client_->get_sessions_.emplace(
-            key, QueryResult(std::vector<Replica::Descriptor>(old.replicas),
-                             std::chrono::steady_clock::now() -
-                                 std::chrono::seconds(1),
-                             old.object_checksum));
-    }
-
     void StartMasterAndSetupClient() {
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
             << "Failed to start in-proc master";
@@ -333,7 +322,7 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         dfs_root_.emplace("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
 
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
-                                      .set_default_kv_lease_ttl(10000)
+                                      .set_default_kv_lease_ttl(1000)
                                       .build()));
         master_address_ = master_.master_address();
         ASSERT_EQ(py_client_->setup_real(client_address, "P2PHANDSHAKE",
@@ -581,49 +570,6 @@ TEST_F(RealClientDfsPrefetchTest, SharedRootRegionIsReleasedAfterLastKey) {
               std::vector<int>{0});
     ExpectRead(keys[2], 2, 0, /*cache_only=*/true);
     EXPECT_EQ(py_client_->batch_get_session_end({keys[2]}), 0);
-}
-
-TEST_F(RealClientDfsPrefetchTest, SessionRepairReusesOnlyCompatiblePrefetch) {
-    DfsPrefetchTestEnv dfs_env;
-    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "4096");
-    const std::vector<std::string> keys = {"dfs_prefetch_expired"};
-    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17827", keys));
-    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
-    if (IsSkipped()) return;
-    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
-    ASSERT_EQ(py_client_->batch_get_session_prefetch(keys), std::vector<int>{0});
-    auto handle = py_client_->get_session_prefetch_cache_.at(keys[0]).buffer_handle;
-    ExpireGetSession(keys[0]);
-    // No fallback allocator: a successful range read must reuse the old bytes.
-    ExpectRead(keys[0], 0, 123, /*cache_only=*/true);
-    EXPECT_EQ(py_client_->get_session_prefetch_cache_.at(keys[0]).buffer_handle,
-              handle);
-    ExpireGetSession(keys[0]);
-    ASSERT_EQ(py_client_->batch_get_session_prefetch(keys), std::vector<int>{0});
-    EXPECT_EQ(py_client_->get_session_prefetch_cache_.at(keys[0]).buffer_handle,
-              handle);
-    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
-    EXPECT_EQ(py_client_->get_session_prefetch_cache_.count(keys[0]), 0u);
-    handle.reset();
-
-    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
-    ASSERT_EQ(py_client_->batch_get_session_prefetch(keys), std::vector<int>{0});
-    const auto old = py_client_->get_sessions_.at(keys[0]);
-    auto replicas = old.replicas;
-    auto dfs = replicas.front().get_dfs_descriptor();
-    dfs.offset += 4096;
-    replicas.front().descriptor_variant = std::move(dfs);
-    py_client_->get_sessions_.erase(keys[0]);
-    py_client_->get_sessions_.emplace(
-        keys[0], QueryResult(std::move(replicas),
-                            std::chrono::steady_clock::now(),
-                            old.object_checksum));
-    GetSessionReadSnapshots repaired;
-    ASSERT_EQ(py_client_->prepare_get_session_read(keys, repaired),
-              std::vector<int>{0});
-    EXPECT_EQ(py_client_->get_session_prefetch_cache_.count(keys[0]), 0u);
-    ExpectRead(keys[0], 0, 123, /*cache_only=*/false);
-    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
 }
 
 TEST_F(RealClientDfsPrefetchTest, TearDownWithLivePrefetchedBuffers) {
@@ -1795,7 +1741,6 @@ TEST_F(RealClientTest, ReadPlanBorrowsGetSession) {
             reinterpret_cast<size_t>(destination.data()), 0,
             destination.size(), 0}}});
     ReadPlan plan(py_client_, std::move(layouts), 1, false, false, true);
-    ExpireGetSession(key);  // The wait happens after plan creation, before run.
     EXPECT_NO_THROW(plan.run());
     EXPECT_EQ(destination, source);
 
@@ -1806,75 +1751,6 @@ TEST_F(RealClientTest, ReadPlanBorrowsGetSession) {
     ASSERT_EQ(result.size(), 1);
     EXPECT_EQ(result[0], static_cast<int>(destination.size()));
     EXPECT_EQ(destination, source);
-    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
-    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
-}
-
-TEST_F(RealClientTest, GetSessionSafetyMarginEnvironment) {
-    constexpr const char* env = "MC_STORE_GET_SESSION_MIN_REMAINING_MS";
-    const struct {
-        const char* value;
-        int64_t expected;
-    } cases[] = {{nullptr, 1000}, {"0", 0}, {"250", 250}, {"2000", 2000},
-                 {"3600000", 3600000}, {"-1", 1000}, {"3600001", 1000},
-                 {"100junk", 1000}, {"999999999999999999999", 1000}};
-    ScopedEnv restore(env);
-    for (const auto& item : cases) {
-        if (item.value) setenv(env, item.value, 1);
-        else unsetenv(env);
-        auto client = RealClient::create();
-        EXPECT_EQ(client->get_session_min_remaining_.count(), item.expected);
-        setenv(env, "500", 1);
-        EXPECT_EQ(client->get_session_min_remaining_.count(), item.expected)
-            << "configuration must stay fixed for this client";
-    }
-}
-
-TEST_F(RealClientTest, SessionReadRepairsMissingLeaseButRejectsNewLifetime) {
-    StartMasterAndSetupClient();
-    const std::string key = "session_demand_repair";
-    const std::string source = "session-data";
-    std::string destination(source.size(), '?');
-    ASSERT_EQ(py_client_->put(key, source), 0);
-    ASSERT_EQ(py_client_->register_buffer(destination.data(), destination.size()), 0);
-    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
-    GetSessionReadSnapshots snapshots;
-    ASSERT_EQ(py_client_->prepare_get_session_read({key, key}, snapshots),
-              (std::vector<int>{0, 0}));
-    ASSERT_EQ(snapshots.size(), 1u);
-    const auto deadline = snapshots.at(key).query.lease_timeout;
-    // Healthy preparation keeps the lease untouched; it does not query again.
-    GetSessionReadSnapshots healthy;
-    ASSERT_EQ(py_client_->prepare_get_session_read({key}, healthy),
-              std::vector<int>{0});
-    EXPECT_EQ(healthy.at(key).query.lease_timeout, deadline);
-    py_client_->get_sessions_.erase(key);
-    auto read = [&] {
-        return py_client_->batch_get_into_multi_buffer_ranges(
-            {key}, {{destination.data()}}, {{destination.size()}}, {{0}},
-            &snapshots)[0];
-    };
-    EXPECT_EQ(read(), static_cast<int>(source.size()));
-    EXPECT_EQ(destination, source);
-    EXPECT_EQ(py_client_->get_session_lifetimes_.at(key),
-              snapshots.at(key).lifetime);
-    // Once a layer was published, a different checksum cannot be accepted.
-    const auto current = py_client_->get_sessions_.at(key);
-    py_client_->get_sessions_.erase(key);
-    py_client_->get_sessions_.emplace(
-        key, QueryResult(std::vector<Replica::Descriptor>(current.replicas),
-                         current.lease_timeout,
-                         current.object_checksum.value_or(0) ^ uint64_t{1}));
-    EXPECT_EQ(read(), static_cast<int>(toInt(ErrorCode::INVALID_REPLICA)));
-    auto pending = std::make_shared<RealClient::GetSessionRepair>();
-    py_client_->get_session_repairs_.emplace(key, pending);
-    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
-    EXPECT_TRUE(pending->done);
-    EXPECT_EQ(pending->result, static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
-    EXPECT_EQ(py_client_->get_session_repairs_.count(key), 0u);
-    EXPECT_EQ(read(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
-    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
-    EXPECT_EQ(read(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
     EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
 }
@@ -2035,9 +1911,6 @@ TEST_F(RealClientTest, TestPutGetSessionAbnormal) {
         replica.status = ReplicaStatus::COMPLETE;
         std::vector<Replica::Descriptor> replicas;
         replicas.push_back(std::move(replica));
-        py_client_->get_session_lifetimes_.emplace(
-            key, std::make_shared<GetSessionLifetime>(
-                     GetSessionLifetime{true, std::nullopt}));
         py_client_->get_sessions_.emplace(
             key,
             QueryResult(std::move(replicas), std::chrono::steady_clock::now() +
@@ -2214,8 +2087,8 @@ TEST_F(RealClientTest, TestPutSessionEndCompletesMemoryReplica) {
     ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
 }
 
-// A lease too short for the safety margin fails without ending ownership.
-TEST_F(RealClientTest, TestGetSessionShortLeaseKeepsOwnership) {
+// Lease expire on get ranges must drop the cached get session.
+TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
     ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
     setenv("MC_STORE_CLIENT_METRIC", "1", 1);
     constexpr uint64_t kLeaseTtlMs = 50;
@@ -2253,7 +2126,7 @@ TEST_F(RealClientTest, TestGetSessionShortLeaseKeepsOwnership) {
 
     ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
 
-    // Wait past the cached lease; repair cannot obtain the 1s safety margin.
+    // Wait past cached lease_deadline (client-local check; no Master query).
     std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseTtlMs + 50));
 
     auto expired = py_client_->batch_get_into_multi_buffer_ranges(
@@ -2262,16 +2135,15 @@ TEST_F(RealClientTest, TestGetSessionShortLeaseKeepsOwnership) {
     EXPECT_EQ(expired[0], kLeaseExpired)
         << "get ranges after lease ttl should return LEASE_EXPIRED";
 
-    // Another read can repair again; expiry must not implicitly end the session.
+    // Session must have been erased: next ranges sees no session.
     auto again = py_client_->batch_get_into_multi_buffer_ranges(
         keys, {{dst.data()}}, {{kSize}}, {{0}});
     ASSERT_EQ(again.size(), 1);
-    EXPECT_EQ(again[0], kLeaseExpired);
-    EXPECT_EQ(py_client_->get_session_lifetimes_.count(keys[0]), 1u);
+    EXPECT_EQ(again[0], kInvalidParams)
+        << "get session should be dropped after LEASE_EXPIRED";
 
+    // get_end is still safe (idempotent erase).
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
-    EXPECT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
-                  keys, {{dst.data()}}, {{kSize}}, {{0}})[0], kInvalidParams);
 
     auto metrics = py_client_->client_->SerializeMetrics();
     ASSERT_TRUE(metrics.has_value());
@@ -2286,7 +2158,7 @@ TEST_F(RealClientTest, TestGetSessionShortLeaseKeepsOwnership) {
 }
 
 TEST_F(RealClientTest, TestGetSessionRefreshRenewsLease) {
-    constexpr uint64_t kLeaseTtlMs = 3000;
+    constexpr uint64_t kLeaseTtlMs = 300;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
                                   .set_default_kv_lease_ttl(kLeaseTtlMs)
                                   .build()));
@@ -2319,7 +2191,7 @@ TEST_F(RealClientTest, TestGetSessionRefreshRenewsLease) {
     const auto original_session_start_returned =
         std::chrono::steady_clock::now();
     std::this_thread::sleep_until(
-        original_session_start_returned + std::chrono::milliseconds(2000));
+        original_session_start_returned + std::chrono::milliseconds(200));
     auto refresh_rcs = py_client_->batch_get_session_refresh(keys);
     ASSERT_EQ(refresh_rcs.size(), 1u);
     ASSERT_EQ(refresh_rcs[0], 0);

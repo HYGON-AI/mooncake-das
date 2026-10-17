@@ -3167,8 +3167,8 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"),
             "Refresh leases for active get sessions while preserving cached "
-            "session objects; incompatible refreshed replicas fail. "
-            "Reads also repair leases on demand while the session is active.")
+            "session objects; incompatible refreshed replicas fail and "
+            "invalidate that session")
         .def(
             "batch_get_session_start_with_sources",
             [](MooncakeStorePyWrapper &self,
@@ -3258,11 +3258,7 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("all_src_offsets"),
-            "Ranged get into multiple buffers using an active get session, "
-            "repairing missing or expiring leases on demand. "
-            "MC_STORE_GET_SESSION_MIN_REMAINING_MS controls the safety margin "
-            "in milliseconds (default 1000, range 0..3600000), read once when "
-            "the client is created. Zero still rejects expired leases.")
+            "Ranged get into multiple buffers using a get session")
         .def(
             "batch_get_session_end",
             [](MooncakeStorePyWrapper &self,
