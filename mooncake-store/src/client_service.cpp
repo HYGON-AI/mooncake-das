@@ -1730,7 +1730,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         return results;
     }
     if (prefer_alloc_in_same_node) {
-        return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        auto results =
+            BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        auto now = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            if (results[i].has_value() &&
+                query_results[i].IsLeaseExpired(now)) {
+                LOG(WARNING)
+                    << "lease_expired_before_data_transfer_completed key="
+                    << object_keys[i];
+                results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+            }
+        }
+        return results;
     }
 
     // Collect all transfer operations for parallel execution
@@ -1937,6 +1949,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     ProcessSlicesAsync(key, slices_it->second, stored_replica);
                 }
             }
+        }
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
+            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                         << object_keys[i];
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
     }
 
