@@ -186,6 +186,8 @@ void FileStorage::InitPinnedPrefetchArena(
             pinned_prefetch_arena_allocator_ = ClientBufferAllocator::create(
                 pinned_prefetch_arena_.data, pinned_prefetch_arena_.capacity,
                 client->GetProtocol(), pinned_prefetch_arena_.device_data);
+            pinned_prefetch_arena_full_free_bytes_ =
+                pinned_prefetch_arena_allocator_->storageReport().totalFreeSpace;
             pinned_prefetch_arena_status_ = "ready";
         }
     }
@@ -223,6 +225,26 @@ offset_allocator::OffsetAllocStorageReport
 FileStorage::PinnedPrefetchArenaReport() const {
     if (!pinned_prefetch_arena_allocator_) return {0, 0};
     return pinned_prefetch_arena_allocator_->storageReport();
+}
+
+bool FileStorage::ReleasePinnedPrefetchArena() {
+    if (pinned_prefetch_arena_allocator_) {
+        const auto report = PinnedPrefetchArenaReport();
+        if (report.totalFreeSpace != pinned_prefetch_arena_full_free_bytes_) {
+            return false;
+        }
+    } else if (pinned_prefetch_arena_.capacity != 0 ||
+               pinned_prefetch_arena_full_free_bytes_ != 0) {
+        return false;
+    }
+
+    // The allocator uses external memory; drop it before its pinned backing
+    // buffer so no allocator can outlive the memory it manages.
+    pinned_prefetch_arena_allocator_.reset();
+    pinned_prefetch_arena_ = PinnedBufferPool::Buffer{};
+    pinned_prefetch_arena_full_free_bytes_ = 0;
+    pinned_prefetch_arena_status_ = "disabled";
+    return true;
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {

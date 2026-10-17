@@ -6536,6 +6536,33 @@ bool RealClient::dfs_prefetch_arena_available() const {
     return prefetch_arena_available_.load(std::memory_order_acquire);
 }
 
+bool RealClient::disable_dfs_prefetch() {
+    // This is a startup-only operation. The exclusive lifecycle lock drains
+    // any DFS range read that could be allocating from the arena. Callers
+    // must also serialize against session creation, which uses session_mutex_
+    // but does not take this lifecycle lock.
+    std::unique_lock<std::shared_mutex> dfs_read_lock(
+        dfs_read_lifecycle_mutex_);
+    if (!prefetch_arena_available_.load(std::memory_order_acquire) &&
+        (!file_storage_ || !file_storage_->HasPinnedPrefetchArena())) {
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> session_lock(session_mutex_);
+        if (!get_sessions_.empty() || !get_session_access_records_.empty() ||
+            !get_session_prefetch_cache_.empty() || !put_sessions_.empty()) {
+            return false;
+        }
+    }
+
+    if (file_storage_ && !file_storage_->ReleasePinnedPrefetchArena()) {
+        return false;
+    }
+    prefetch_arena_available_.store(false, std::memory_order_release);
+    prefetch_arena_stats_.reset();
+    return true;
+}
+
 std::string RealClient::dfs_prefetch_arena_status() const {
     if (!file_storage_) {
         return "unavailable: no FileStorage (SSD offload disabled)";

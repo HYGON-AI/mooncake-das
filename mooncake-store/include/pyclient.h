@@ -345,6 +345,11 @@ class PyClient {
     // Whether batch_get_session_prefetch() has a staging arena for DFS reads.
     virtual bool dfs_prefetch_arena_available() const { return false; }
 
+    // Startup-only: disable DFS prefetch and release its unused arena. The
+    // caller must serialize this with session creation before request traffic.
+    // Unsupported clients must return false.
+    virtual bool disable_dfs_prefetch() { return false; }
+
     virtual std::string dfs_prefetch_arena_status() const {
         return "unsupported";
     }
