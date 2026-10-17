@@ -377,7 +377,7 @@ struct FileStorageConfig {
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
-    bool ValidatePath(std::string path) const;
+    bool ValidatePath(std::string path, bool require_available = true) const;
 
     /**
      * @brief Creates a config instance by reading values from environment

@@ -35,6 +35,13 @@ class FileSystemAdapter {
     virtual tl::expected<size_t, ErrorCode> WriteFile(
         const std::string& path, std::span<const char> data) = 0;
 
+    // Overwrite a stable file in place. Unlike WriteFile, implementations
+    // should not unlink the previous contents when a write fails.
+    virtual tl::expected<size_t, ErrorCode> OverwriteFile(
+        const std::string& path, std::span<const char> data) {
+        return WriteFile(path, data);
+    }
+
     // Read file into a pre-allocated buffer (zero-copy into Slice.ptr)
     virtual tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
                                                      void* buf, size_t len) = 0;
@@ -103,6 +110,11 @@ class FileSystemAdapter {
     // === fd-based I/O for shard-offset DFS mode ===
 
     virtual tl::expected<int, ErrorCode> OpenFile(const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    virtual tl::expected<int, ErrorCode> OpenFileReadOnly(
+        const std::string& /*path*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 

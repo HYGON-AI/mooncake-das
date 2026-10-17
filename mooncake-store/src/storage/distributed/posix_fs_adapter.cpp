@@ -94,6 +94,36 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::WriteFile(
     return total_written;
 }
 
+tl::expected<size_t, ErrorCode> PosixFsAdapter::OverwriteFile(
+    const std::string& path, std::span<const char> data) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+
+    size_t total_written = 0;
+    while (total_written < data.size()) {
+        const ssize_t ret =
+            ::pwrite(fd, data.data() + total_written,
+                     data.size() - total_written,
+                     static_cast<off_t>(total_written));
+        if (ret < 0) {
+            const int saved_errno = errno;
+            ::close(fd);
+            errno = saved_errno;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (ret == 0) break;
+        total_written += static_cast<size_t>(ret);
+    }
+    if (total_written == data.size() &&
+        ::ftruncate(fd, static_cast<off_t>(data.size())) != 0) {
+        total_written = 0;
+    }
+    if (::close(fd) != 0 || total_written != data.size()) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return total_written;
+}
+
 tl::expected<size_t, ErrorCode> PosixFsAdapter::ReadFile(
     const std::string& path, void* buf, size_t len) {
     if (!buf && len > 0) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -199,6 +229,13 @@ tl::expected<std::vector<std::string>, ErrorCode> PosixFsAdapter::ListFiles(
 tl::expected<int, ErrorCode> PosixFsAdapter::OpenFile(const std::string& path) {
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    return fd;
+}
+
+tl::expected<int, ErrorCode> PosixFsAdapter::OpenFileReadOnly(
+    const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return tl::make_unexpected(ReadOpenError());
     return fd;
 }
 

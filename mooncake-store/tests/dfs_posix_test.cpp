@@ -821,6 +821,40 @@ class DfsBackendTest : public ::testing::Test {
     std::unique_ptr<DistributedStorageBackend> backend_;
 };
 
+TEST_F(DfsBackendTest, HealthProbeUsesOnePersistentFile) {
+    const std::string probe_path =
+        tmp_->file(".mooncake_dfs_health_probe");
+    EXPECT_FALSE(std::filesystem::exists(probe_path));
+
+    auto read_before_write = backend_->ProbeRead();
+    ASSERT_FALSE(read_before_write.has_value());
+    EXPECT_EQ(read_before_write.error(), ErrorCode::FILE_NOT_FOUND);
+
+    ASSERT_TRUE(backend_->ProbeWrite().has_value());
+    EXPECT_TRUE(std::filesystem::exists(probe_path));
+    EXPECT_TRUE(backend_->ProbeRead().has_value());
+
+    const int fd = ::open(probe_path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    constexpr char kCorruptPayload[] = "bad";
+    ASSERT_EQ(::write(fd, kCorruptPayload, sizeof(kCorruptPayload) - 1),
+              static_cast<ssize_t>(sizeof(kCorruptPayload) - 1));
+    ASSERT_EQ(::close(fd), 0);
+    EXPECT_FALSE(backend_->ProbeRead().has_value());
+
+    ASSERT_TRUE(backend_->ProbeWrite().has_value());
+    EXPECT_TRUE(backend_->ProbeRead().has_value());
+
+    size_t probe_file_count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
+        if (entry.path().filename().string().starts_with(
+                ".mooncake_dfs_health_probe")) {
+            ++probe_file_count;
+        }
+    }
+    EXPECT_EQ(probe_file_count, 1u);
+}
+
 class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
     void FailWriteCall(int call) { fail_write_call_ = call; }

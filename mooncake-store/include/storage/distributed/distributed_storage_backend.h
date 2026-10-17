@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -122,6 +123,21 @@ class DistributedStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> Init() override;
 
+    // Retry a previously failed initialization. EnsureInitialized waits for
+    // the initializer; TryEnsureInitialized returns unavailable immediately
+    // when another read/write probe is initializing the shared backend.
+    tl::expected<void, ErrorCode> EnsureInitialized();
+    tl::expected<void, ErrorCode> TryEnsureInitialized();
+
+    // Minimal adapter-level probes used by SGLang's health state machine.
+    // These methods never touch business keys.
+    tl::expected<void, ErrorCode> ProbeRead();
+    tl::expected<void, ErrorCode> ProbeWrite();
+
+    [[nodiscard]] bool IsInitialized() const {
+        return initialized_.load(std::memory_order_acquire);
+    }
+
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -162,7 +178,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
    private:
     struct ShardFile {
         std::string path;
-        int fd = -1;
+        int read_fd = -1;
+        std::atomic<int> write_fd{-1};
         std::mutex mutex;
     };
 
@@ -299,7 +316,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
         bucket_id_direct_cache_;
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
-    bool initialized_ = false;
+    tl::expected<void, ErrorCode> InitLocked();
+    void ResetFailedInitializationLocked();
+
+    mutable std::mutex init_mutex_;
+    std::atomic<bool> initialized_{false};
 };
 
 }  // namespace mooncake

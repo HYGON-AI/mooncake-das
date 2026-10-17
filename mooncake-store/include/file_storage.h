@@ -8,6 +8,7 @@
 namespace mooncake {
 
 struct SsdMetric;
+class DistributedStorageBackend;
 
 class FileStorage {
    public:
@@ -17,6 +18,10 @@ class FileStorage {
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
+
+    tl::expected<void, ErrorCode> ProbeDfsRead();
+    tl::expected<void, ErrorCode> ProbeDfsWrite();
+    [[nodiscard]] bool IsDfsBackendReady() const;
 
     void RemoveAll();
 
@@ -245,6 +250,7 @@ class FileStorage {
     uint64_t pinned_prefetch_arena_full_free_bytes_{0};
     std::string pinned_prefetch_arena_status_ = "not configured";
     std::shared_ptr<StorageBackendInterface> storage_backend_;
+    std::shared_ptr<DistributedStorageBackend> distributed_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(

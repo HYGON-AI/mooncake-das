@@ -582,7 +582,9 @@ ReplicateConfig Client::AttachConfig(const ReplicateConfig& config) const {
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
     }
-    if (DistributedStorageConfig::IsReplicaEnabledFromEnvironment()) {
+    if (!DfsWriteAllowed()) {
+        client_cfg.dfs_replica_num = 0;
+    } else if (DistributedStorageConfig::IsReplicaEnabledFromEnvironment()) {
         client_cfg.dfs_replica_num = 1;
     }
     return client_cfg;
@@ -1813,6 +1815,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
         if (replica.is_dfs_replica()) {
+            if (!DfsReadAllowed()) {
+                results[i] =
+                    tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+                continue;
+            }
             if (!dfs_storage_backend_) {
                 LOG(ERROR) << "DFS backend is not initialized";
                 results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -5090,6 +5097,9 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
                                  std::vector<Slice>& slices) {
     if (!replica_descriptor.is_dfs_replica()) {
         return ErrorCode::INVALID_REPLICA;
+    }
+    if (!DfsReadAllowed()) {
+        return ErrorCode::DFS_SERVICE_UNAVAILABLE;
     }
     if (!dfs_storage_backend_) {
         LOG(ERROR) << "DFS backend is not initialized";

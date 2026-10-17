@@ -472,6 +472,25 @@ class PyClient {
 
     virtual int health_check() = 0;
 
+    // DFS health/policy control. The probe result is
+    // [read_error_code, write_error_code, backend_ready].
+    virtual int probe_dfs_read() {
+        return toInt(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual int probe_dfs_write() {
+        return toInt(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual std::vector<int> probe_dfs_health() {
+        const int read_error = probe_dfs_read();
+        const int write_error = probe_dfs_write();
+        return {read_error, write_error,
+                read_error == 0 || write_error == 0 ? 1 : 0};
+    }
+    virtual int set_dfs_access_policy(bool /*allow_read*/,
+                                      bool /*allow_write*/) {
+        return toInt(ErrorCode::NOT_SUPPORTED);
+    }
+
     virtual tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets) = 0;
 
