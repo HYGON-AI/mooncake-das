@@ -386,7 +386,9 @@ void MasterAdminServer::SetServiceDelegate(
         clear_storage_metrics = !service_available_;
     }
     if (clear_storage_metrics) {
-        MasterMetricManager::instance().project_storage_usage({});
+        auto& metrics = MasterMetricManager::instance();
+        metrics.project_storage_usage({});
+        metrics.set_dfs_storage_usage(0, 0, false);
     }
 }
 
@@ -399,7 +401,9 @@ void MasterAdminServer::SetServiceAvailable(bool available) {
         service_available = service_available_;
     }
     if (!service_available) {
-        MasterMetricManager::instance().project_storage_usage({});
+        auto& metrics = MasterMetricManager::instance();
+        metrics.project_storage_usage({});
+        metrics.set_dfs_storage_usage(0, 0, false);
     }
 }
 
@@ -415,10 +419,6 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
 
 std::string MasterAdminServer::BuildMetricsText() const {
     RefreshStorageMetrics();
-    auto snapshot = SnapshotState();
-    if (snapshot.service) {
-        snapshot.service->RefreshDfsMetrics();
-    }
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
@@ -579,7 +579,13 @@ void MasterAdminServer::RefreshStorageMetrics() const {
     const auto storage = runtime.service_available && runtime.service
                              ? runtime.service->GetStorageUsageSnapshot()
                              : TieredStorageUsageSnapshot{};
-    MasterMetricManager::instance().project_storage_usage(storage);
+    auto& metrics = MasterMetricManager::instance();
+    metrics.project_storage_usage(storage);
+    if (runtime.service_available && runtime.service) {
+        runtime.service->RefreshDfsMetrics();
+    } else {
+        metrics.set_dfs_storage_usage(0, 0, false);
+    }
 }
 
 template <typename Handler>

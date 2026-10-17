@@ -3,10 +3,13 @@
 
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 
@@ -98,6 +101,48 @@ std::string WriteTenantQuotaPolicyForTest(
     return path.string();
 }
 
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const std::string& value) : name_(name) {
+        const char* previous = std::getenv(name_.c_str());
+        if (previous != nullptr) {
+            previous_value_ = previous;
+        }
+        Set(value);
+    }
+
+    ~ScopedEnvVar() {
+        if (previous_value_.has_value()) {
+            ::setenv(name_.c_str(), previous_value_->c_str(), 1);
+        } else {
+            ::unsetenv(name_.c_str());
+        }
+    }
+
+    void Set(const std::string& value) {
+        ::setenv(name_.c_str(), value.c_str(), 1);
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> previous_value_;
+};
+
+std::optional<double> ReadMetricValue(const std::string& metrics,
+                                      const std::string& name) {
+    std::istringstream input(metrics);
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream metric_line(line);
+        std::string metric_name;
+        double value = 0;
+        if (metric_line >> metric_name >> value && metric_name == name) {
+            return value;
+        }
+    }
+    return std::nullopt;
+}
+
 }  // namespace
 
 // =========================================================================
@@ -165,6 +210,133 @@ TEST_F(MasterAdminServerTest, MetricsEndpointReturns200) {
     EXPECT_NE(resp.body.find("master_"), std::string::npos);
 
     admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest,
+       DfsMetricsFollowServiceAvailabilityAndDelegateLifecycle) {
+    const auto first_root =
+        (std::filesystem::temp_directory_path() /
+         ("mooncake_admin_dfs_metrics_" + UuidToString(generate_uuid())))
+            .string();
+    const auto replacement_root =
+        (std::filesystem::temp_directory_path() /
+         ("mooncake_admin_dfs_metrics_" + UuidToString(generate_uuid())))
+            .string();
+    std::filesystem::create_directories(first_root);
+
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar allocator_type("MOONCAKE_DFS_ALLOCATOR_TYPE", "shard");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", first_root);
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "2");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    const auto make_service = [] {
+        WrappedMasterServiceConfig config;
+        config.default_kv_lease_ttl = 5000;
+        config.enable_metric_reporting = false;
+        return std::make_shared<WrappedMasterService>(config);
+    };
+    const auto add_dfs_object = [](const auto& service, const std::string& key,
+                                   size_t segment_base, uint64_t object_size) {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = key + "_segment";
+        segment.base = segment_base;
+        segment.size = 16 * 1024 * 1024;
+        const UUID client_id = generate_uuid();
+        if (!service->MountSegment(segment, client_id).has_value()) {
+            return false;
+        }
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        const auto put_start =
+            service->PutStart(client_id, key, object_size, config);
+        if (!put_start.has_value()) {
+            return false;
+        }
+        return service
+            ->PutEnd(client_id, ObjectMeta{key, std::nullopt}, ReplicaType::DFS)
+            .has_value();
+    };
+    const auto expect_dfs_metrics = [](const std::string& metrics,
+                                       double expected_capacity,
+                                       bool expect_used) {
+        const auto capacity =
+            ReadMetricValue(metrics, "master_dfs_capacity_bytes");
+        const auto used = ReadMetricValue(metrics, "master_dfs_used_bytes");
+        const auto unlimited =
+            ReadMetricValue(metrics, "master_dfs_capacity_unlimited");
+        ASSERT_TRUE(capacity.has_value());
+        ASSERT_TRUE(used.has_value());
+        ASSERT_TRUE(unlimited.has_value());
+        EXPECT_DOUBLE_EQ(*capacity, expected_capacity);
+        EXPECT_EQ(*unlimited, 0);
+        if (expect_used) {
+            EXPECT_GT(*used, 0);
+        } else {
+            EXPECT_DOUBLE_EQ(*used, 0);
+        }
+    };
+
+    auto service = make_service();
+    ASSERT_TRUE(add_dfs_object(service, "dfs_metrics_lifecycle_first",
+                               0x600000000, 4096));
+    std::weak_ptr<WrappedMasterService> service_lifetime = service;
+
+    const int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto metrics = HttpGet(port, "/metrics");
+    ASSERT_EQ(metrics.http_status, 200);
+    expect_dfs_metrics(metrics.body, 2 * 16 * 1024 * 1024, true);
+
+    admin.SetServiceAvailable(false);
+    metrics = HttpGet(port, "/metrics");
+    ASSERT_EQ(metrics.http_status, 200);
+    expect_dfs_metrics(metrics.body, 0, false);
+
+    admin.SetServiceAvailable(true);
+    metrics = HttpGet(port, "/metrics");
+    ASSERT_EQ(metrics.http_status, 200);
+    expect_dfs_metrics(metrics.body, 2 * 16 * 1024 * 1024, true);
+
+    service.reset();
+    admin.SetServiceDelegate(nullptr);
+    EXPECT_TRUE(service_lifetime.expired());
+    metrics = HttpGet(port, "/metrics");
+    ASSERT_EQ(metrics.http_status, 200);
+    expect_dfs_metrics(metrics.body, 0, false);
+
+    std::filesystem::create_directories(replacement_root);
+    root_dir.Set(replacement_root);
+    shard_count.Set("1");
+    shard_capacity.Set("8388608");
+    auto replacement = make_service();
+    ASSERT_TRUE(add_dfs_object(replacement, "dfs_metrics_lifecycle_replacement",
+                               0x700000000, 8192));
+    admin.SetServiceDelegate(replacement);
+    admin.SetServiceAvailable(true);
+    metrics = HttpGet(port, "/metrics");
+    ASSERT_EQ(metrics.http_status, 200);
+    expect_dfs_metrics(metrics.body, 8 * 1024 * 1024, true);
+
+    admin.Stop();
+    admin.SetServiceDelegate(nullptr);
+    replacement.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(first_root, ec);
+    std::filesystem::remove_all(replacement_root, ec);
 }
 
 TEST_F(MasterAdminServerTest, MetricsSummaryEndpointReturns200) {
