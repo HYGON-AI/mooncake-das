@@ -225,7 +225,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return tl::make_unexpected(adapter_init.error());
     }
 
-    auto recovered = RecoverFromDisk();
+    auto recovered = RecoverFromDisk(config.bucket_recovery_enabled);
     if (!recovered) {
         fs_adapter_->Shutdown();
         fs_adapter_.reset();
@@ -1878,10 +1878,13 @@ void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending,
 
 // === recovery ===
 
-tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
+tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
+    bool recover_metadata) {
     auto files = fs_adapter_->ListFiles(fsdir_);
     if (!files) {
-        if (files.error() == ErrorCode::FILE_NOT_FOUND) return {};
+        if (recover_metadata && files.error() == ErrorCode::FILE_NOT_FOUND) {
+            return {};
+        }
         LOG(ERROR) << "Failed to list DFS bucket directory " << fsdir_
                    << ", error=" << files.error();
         return tl::make_unexpected(files.error());
@@ -1889,20 +1892,29 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
 
     std::vector<int64_t> meta_ids;
     std::vector<int64_t> data_ids;
+    int64_t max_seen_id = -1;
     for (const auto& name : *files) {
         if (auto id = ParseBucketFileName(name, kBucketMetaSuffix)) {
             meta_ids.push_back(*id);
+            max_seen_id = std::max(max_seen_id, *id);
         } else if (auto data_id =
                        ParseBucketFileName(name, kBucketDataSuffix)) {
             data_ids.push_back(*data_id);
+            max_seen_id = std::max(max_seen_id, *data_id);
         }
         // Anything else - including `.meta.0`/`.meta.1` snapshot slots,
         // `.meta.log` and `.meta.tmp.*` leftovers from older layouts - is
         // deliberately ignored.
     }
+    if (!recover_metadata) {
+        // Old files stay outside this process's allocation and eviction state.
+        next_bucket_id_ = max_seen_id + 1;
+        LOG(INFO) << "DFS bucket recovery disabled; retaining existing files, "
+                  << "next_bucket_id=" << next_bucket_id_;
+        return {};
+    }
     std::sort(meta_ids.begin(), meta_ids.end());
 
-    int64_t max_seen_id = -1;
     uint64_t max_generation = 0;
     // Buckets already reclaimed by this pass: their metadata could not be
     // trusted, so both files were deleted. A cache entry that cannot be proven
@@ -1922,8 +1934,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
     std::unordered_map<std::string, RecoveryWinner> winners;
 
     for (const int64_t bucket_id : meta_ids) {
-        max_seen_id = std::max(max_seen_id, bucket_id);
-
         const std::string meta_path = BucketMetaPath(bucket_id);
         PersistedBucketMetadata snapshot;
         bool valid = false;
@@ -2166,7 +2176,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
     // can ever address the data again. Reclaim it. Buckets rejected above were
     // already deleted, so they are skipped here to avoid a duplicate log line.
     for (const int64_t data_id : data_ids) {
-        max_seen_id = std::max(max_seen_id, data_id);
         if (buckets_.count(data_id) > 0) continue;
         if (discarded_ids.count(data_id) > 0) continue;
         LOG(WARNING) << "Removing orphaned DFS bucket data file for bucket_id="

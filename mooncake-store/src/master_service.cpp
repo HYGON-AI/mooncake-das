@@ -258,6 +258,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
 
+    enable_dfs_bucket_recovery_ =
+        Environ::GetBool("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", true);
+
     const bool use_snapshot_backup_dir = !config.snapshot_backup_dir.empty();
     if (config.enable_snapshot || config.enable_snapshot_restore) {
         try {
@@ -12469,6 +12472,10 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
         }
 
         auto metadata_ptr = std::move(metadata_result.value());
+        if (!service_->enable_dfs_bucket_recovery_ &&
+            metadata_ptr->CountReplicas() == 0) {
+            continue;
+        }
         auto& tenant_state = service_->GetOrCreateTenantState(shard, tenant_id);
         const std::string user_key = key;
         auto [it, inserted] = tenant_state.metadata.emplace(
@@ -12665,7 +12672,10 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         if (!result) {
             return tl::unexpected(result.error());
         }
-        replicas.emplace_back(std::move(*result.value()));
+        if (service_->enable_dfs_bucket_recovery_ ||
+            !result.value()->is_dfs_replica()) {
+            replicas.emplace_back(std::move(*result.value()));
+        }
     }
 
     // Deserialize hard_pinned (if present, otherwise default to false)
@@ -13524,9 +13534,15 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
                                 "discarded_replicas item {}: {}",
                                 j, i, replica_result.error().message)));
             }
-            replicas.emplace_back(std::move(*replica_result.value()));
+            if (service_->enable_dfs_bucket_recovery_ ||
+                !replica_result.value()->is_dfs_replica()) {
+                replicas.emplace_back(std::move(*replica_result.value()));
+            }
         }
 
+        if (!service_->enable_dfs_bucket_recovery_ && replicas.empty()) {
+            continue;
+        }
         // Create DiscardedReplicas and manually set mem_size_
         temp_list.emplace_back(std::move(replicas), ttl);
         // Set the deserialized mem_size

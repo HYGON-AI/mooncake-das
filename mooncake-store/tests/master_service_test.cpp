@@ -2208,6 +2208,58 @@ TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_F(MasterServiceTest, DfsBucketRestartCanSkipRecoveryAndRewriteOldKey) {
+    const auto root = MakeDfsTestRoot("restart_no_recovery");
+    ScopedBucketDfsEnv env(root, "4096", "8");
+    ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "false");
+    ScopedEnvVar ready("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+    std::string old_path;
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        for (const auto& key : {"same_key", "rollover"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start.has_value());
+            ASSERT_TRUE(service.PutEnd(context.client_id, key,
+                                       TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+            if (std::string(key) == "same_key") {
+                const auto* dfs = FindDfsDescriptor(*start);
+                ASSERT_NE(dfs, nullptr);
+                old_path = dfs->get_dfs_descriptor().file_path;
+            }
+        }
+    }
+    {
+        ScopedEnvVar budget("MOONCAKE_DFS_MAX_BUCKET_COUNT", "1");
+        MasterService service;
+        EXPECT_FALSE(service.GetReplicaList("same_key", TenantId::Default())
+                         .has_value());
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        auto start = service.PutStart(context.client_id, "same_key",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start.has_value());
+        const auto* dfs = FindDfsDescriptor(*start);
+        ASSERT_NE(dfs, nullptr);
+        EXPECT_NE(dfs->get_dfs_descriptor().file_path, old_path);
+        ASSERT_TRUE(service.PutEnd(context.client_id, "same_key",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+        EXPECT_TRUE(service.GetReplicaList("same_key", TenantId::Default())
+                        .has_value());
+        EXPECT_TRUE(std::filesystem::exists(old_path));
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 TEST_F(MasterServiceTest, DfsBucketRestartDoesNotRestoreRemovedKeys) {
     const auto root = MakeDfsTestRoot("restart_revoked");
     ScopedBucketDfsEnv env(root, "1048576", "16");

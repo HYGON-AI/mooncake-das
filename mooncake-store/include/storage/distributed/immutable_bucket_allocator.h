@@ -447,7 +447,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
                                          const DistributedFSDescriptor& desc,
                                          BucketPtr* out_bucket);
 
-    tl::expected<void, ErrorCode> RecoverFromDisk();
+    tl::expected<void, ErrorCode> RecoverFromDisk(bool recover_metadata);
 
     void DeleteBucketFiles(int64_t bucket_id);
 

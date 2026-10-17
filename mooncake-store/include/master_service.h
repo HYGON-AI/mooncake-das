@@ -2771,6 +2771,7 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
+    bool enable_dfs_bucket_recovery_{true};
     // Chosen by configuration at startup: DfsGlobalAllocator (SHARD, the
     // default) or ImmutableBucketAllocator (BUCKET). The master only ever talks
     // to it through DfsAllocatorInterface.
