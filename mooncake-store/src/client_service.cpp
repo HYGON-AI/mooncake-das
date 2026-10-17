@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <limits>
 #ifdef USE_NOF
@@ -48,6 +49,7 @@
 #include "crc_checksum.h"
 #include "environ.h"
 #include "storage/distributed/distributed_storage_backend.h"
+
 
 namespace mooncake {
 
@@ -584,6 +586,31 @@ ReplicateConfig Client::AttachConfig(const ReplicateConfig& config) const {
         client_cfg.dfs_replica_num = 1;
     }
     return client_cfg;
+}
+
+static std::string NormalizeDfsPath(const std::string& path) {
+    if (path.empty()) return {};
+    std::error_code ec;
+    auto normalized = std::filesystem::absolute(path, ec);
+    if (ec) return path;
+    return normalized.lexically_normal().string();
+}
+
+static void WarnOnClientDfsPathMismatch(const std::string& master_fsdir) {
+    const auto storage_config = FileStorageConfig::FromEnvironment();
+    if (storage_config.storage_backend_type != StorageBackendType::kDistributed) {
+        return;
+    }
+    const auto client_fsdir = DistributedStorageConfig::FromEnvironment().fsdir;
+    if (client_fsdir.empty() || master_fsdir.empty()) return;
+
+    const auto normalized_client = NormalizeDfsPath(client_fsdir);
+    const auto normalized_master = NormalizeDfsPath(master_fsdir);
+    if (normalized_client == normalized_master) return;
+
+    LOG(WARNING) << "DFS fsdir differs from master: client='"
+                 << normalized_client << "', master='" << normalized_master
+                 << ". Verify that both paths refer to the same DFS storage.";
 }
 
 static std::optional<bool> get_auto_discover() {
@@ -1129,6 +1156,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         }
     } else {
         auto config = config_response.value();
+        WarnOnClientDfsPathMismatch(config.dfs_fsdir);
         if (config.fsdir.empty()) {
             LOG(INFO)
                 << "Storage root directory is not set. persisting data is "

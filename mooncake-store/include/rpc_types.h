@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <utility>
 
 #include "types.h"
 #include "replica.h"
@@ -116,15 +117,20 @@ struct GetStorageConfigResponse {
     std::string fsdir;
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+    std::string dfs_fsdir;
 
-    GetStorageConfigResponse() : enable_disk_eviction(true), quota_bytes(0) {}
+    GetStorageConfigResponse()
+        : enable_disk_eviction(true), quota_bytes(0) {}
     GetStorageConfigResponse(const std::string& fsdir_param,
-                             bool enable_eviction, uint64_t quota)
+                             bool enable_eviction, uint64_t quota,
+                             std::string dfs_fsdir_param = {})
         : fsdir(fsdir_param),
           enable_disk_eviction(enable_eviction),
-          quota_bytes(quota) {}
+          quota_bytes(quota),
+          dfs_fsdir(std::move(dfs_fsdir_param)) {}
 };
-YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes,
+         dfs_fsdir);
 
 struct NoFSegmentOwnerInfo {
     UUID segment_id;
