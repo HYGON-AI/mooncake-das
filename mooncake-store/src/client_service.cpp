@@ -830,6 +830,25 @@ void Client::LeaderMonitorThreadMain() {
         }
 
         if (!view_change->changed || !view_change->current_view.has_value()) {
+            // A warming leader owns master_view without exposing a routable
+            // endpoint. Acknowledge the empty observation so the next wait
+            // blocks on the ready-value update instead of spinning on the old
+            // view version.
+            if (view_change->changed &&
+                !view_change->current_view.has_value()) {
+                std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                // Do not let a stale empty watch result erase a newer view
+                // installed concurrently by the heartbeat recovery path.
+                const bool still_on_observed_view =
+                    known_version.has_value()
+                        ? current_master_view_.has_value() &&
+                              current_master_view_->view_version ==
+                                  known_version.value()
+                        : !current_master_view_.has_value();
+                if (still_on_observed_view) {
+                    current_master_view_.reset();
+                }
+            }
             continue;
         }
 
