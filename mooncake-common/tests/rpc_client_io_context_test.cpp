@@ -51,7 +51,8 @@ TEST(RpcClientIoContextPoolTest, ReplacesPoolWhenTargetChanges) {
     auto second = pools.GetOrCreateClientPool("127.0.0.1:10002");
     EXPECT_NE(first, second);
     first.reset();
-    EXPECT_TRUE(old_pool.expired());
+    // The registry retains retired pools for background reconnect coroutines.
+    EXPECT_FALSE(old_pool.expired());
     EXPECT_EQ(pools.GetClientPool(), second);
 }
 

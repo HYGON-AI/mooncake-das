@@ -316,6 +316,11 @@ class RealClient : public PyClient {
     // would fail.
     bool dfs_prefetch_arena_available() const override;
 
+    // Startup-only. The caller must serialize this with request/session
+    // creation and call it before request traffic begins. Returns false if a
+    // session or a borrowed arena region is still active.
+    bool disable_dfs_prefetch() override;
+
     // "ready" or the reason the prefetch arena is unavailable.
     std::string dfs_prefetch_arena_status() const override;
 

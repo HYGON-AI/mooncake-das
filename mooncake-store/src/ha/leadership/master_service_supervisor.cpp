@@ -487,6 +487,20 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             return -1;
         }
 
+        if (leader_coordinator.PublishServiceReady(*leadership_session) !=
+            ErrorCode::OK) {
+            LOG(ERROR) << "Failed to publish master service readiness";
+            StopLeadershipMonitor(leadership_monitor_handle);
+            server.stop();
+            std::move(ec).get();
+            DeactivateServingState(admin_server, label_reconciler);
+            EnterStandbyMode(admin_server, *standby_controller,
+                             accept_standby_runtime_updates,
+                             leadership_session->view);
+            leader_coordinator.ReleaseLeadership(*leadership_session);
+            continue;
+        }
+
         if (!serve_shutdown_requested.load(std::memory_order_acquire)) {
             ActivateServingState(admin_server, wrapped_master_service,
                                  label_reconciler);
