@@ -1227,6 +1227,12 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    void execute_session_dfs_range_reads_batch(
+        std::vector<SessionRangeReadRequest *> &entries,
+        std::vector<int> &results, uint64_t trace_id, bool prefetch_only,
+        size_t chunk_index, size_t chunk_count, size_t chunk_limit_bytes,
+        size_t request_planned_bytes);
+
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;

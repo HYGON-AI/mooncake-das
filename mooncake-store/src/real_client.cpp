@@ -40,6 +40,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
+#include "environment_variables.h"
 #include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "uds_transport.h"
@@ -7217,15 +7218,12 @@ void RealClient::process_session_disk_dfs_reads(
 void RealClient::execute_session_dfs_range_reads(
     std::vector<SessionRangeReadRequest> &requests, std::vector<int> &results,
     uint64_t trace_id, bool prefetch_only) {
-    if (requests.empty()) {
-        return;
-    }
+    if (requests.empty()) return;
 
     std::vector<SessionRangeReadRequest *> entries;
     entries.reserve(requests.size());
-    for (auto &request : requests) {
-        entries.push_back(&request);
-    }
+    for (auto &request : requests) entries.push_back(&request);
+
     std::shared_lock<std::shared_mutex> dfs_read_lock(
         dfs_read_lifecycle_mutex_);
     if (closed_.load(std::memory_order_acquire) || dfs_read_shutting_down_ ||
@@ -7237,6 +7235,119 @@ void RealClient::execute_session_dfs_range_reads(
         return;
     }
 
+    if (prefetch_only) {
+        execute_session_dfs_range_reads_batch(
+            entries, results, trace_id, true, 1, 1, 0, 0);
+        return;
+    }
+
+    constexpr size_t kDefaultRestoreChunkSize = size_t{1} << 30;
+    using Variables = FileStorageEnvironmentVariables;
+    const int64_t configured_chunk_size = Environ::ReadOr(
+        Variables::MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES,
+        static_cast<int64_t>(kDefaultRestoreChunkSize));
+    const size_t chunk_limit_bytes =
+        configured_chunk_size > 0
+            ? static_cast<size_t>(configured_chunk_size)
+            : kDefaultRestoreChunkSize;
+    if (configured_chunk_size <= 0) {
+        LOG(WARNING) << Variables::MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES.name
+                     << " must be positive; using default "
+                     << kDefaultRestoreChunkSize;
+    }
+
+    // Match the full-object layout used below: DFS objects read aligned_size
+    // (including padding), with an alignment gap between staging slots.
+    const size_t dfs_alignment =
+        GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
+    auto get_staging_size = [&](SessionRangeReadRequest *entry,
+                                size_t *staging_size) {
+        const uint64_t total_size = calculate_total_size(entry->replica);
+        uint64_t source_size = total_size;
+        if (entry->replica.is_dfs_replica()) {
+            const auto &descriptor = entry->replica.get_dfs_descriptor();
+            source_size = descriptor.aligned_size > 0
+                              ? descriptor.aligned_size
+                              : descriptor.object_size;
+        }
+        if (source_size < total_size ||
+            source_size > std::numeric_limits<size_t>::max() ||
+            dfs_alignment == 0) {
+            return false;
+        }
+        size_t aligned_size = static_cast<size_t>(source_size);
+        if (!entry->replica.is_dfs_replica() &&
+            !AlignUp(aligned_size, dfs_alignment, &aligned_size)) {
+            return false;
+        }
+        *staging_size = aligned_size;
+        return true;
+    };
+
+    std::vector<std::vector<SessionRangeReadRequest *>> chunks;
+    chunks.reserve(entries.size());
+    std::vector<SessionRangeReadRequest *> chunk;
+    chunk.reserve(entries.size());
+    size_t chunk_arena_size = 0;
+    size_t request_planned_bytes = 0;
+    auto add_planned_bytes = [&](size_t bytes) {
+        if (bytes > std::numeric_limits<size_t>::max() -
+                        request_planned_bytes) {
+            request_planned_bytes = std::numeric_limits<size_t>::max();
+        } else {
+            request_planned_bytes += bytes;
+        }
+    };
+    auto flush_chunk = [&]() {
+        if (chunk.empty()) return;
+        add_planned_bytes(chunk_arena_size);
+        chunks.push_back(chunk);
+        chunk.clear();
+        chunk_arena_size = 0;
+    };
+    for (auto *entry : entries) {
+        size_t staging_size = 0;
+        if (!get_staging_size(entry, &staging_size)) {
+            flush_chunk();
+            chunks.push_back({entry});
+            continue;
+        }
+        size_t aligned_offset = 0;
+        if (!AlignUp(chunk_arena_size, dfs_alignment, &aligned_offset) ||
+            staging_size > std::numeric_limits<size_t>::max() -
+                               aligned_offset) {
+            flush_chunk();
+            chunks.push_back({entry});
+            continue;
+        }
+        size_t next_size = aligned_offset + staging_size;
+        if (!chunk.empty() && next_size > chunk_limit_bytes) {
+            flush_chunk();
+            next_size = staging_size;
+        }
+        if (staging_size > chunk_limit_bytes) {
+            flush_chunk();
+            chunks.push_back({entry});
+            add_planned_bytes(staging_size);
+            continue;
+        }
+        chunk.push_back(entry);
+        chunk_arena_size = next_size;
+    }
+    flush_chunk();
+
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        execute_session_dfs_range_reads_batch(
+            chunks[i], results, trace_id, false, i + 1, chunks.size(),
+            chunk_limit_bytes, request_planned_bytes);
+    }
+}
+
+void RealClient::execute_session_dfs_range_reads_batch(
+    std::vector<SessionRangeReadRequest *> &entries,
+    std::vector<int> &results, uint64_t trace_id, bool prefetch_only,
+    size_t chunk_index, size_t chunk_count, size_t chunk_limit_bytes,
+    size_t request_planned_bytes) {
     const auto timing_start = std::chrono::steady_clock::now();
     const bool trace_enabled = trace_id != 0;
     const size_t input_entries = entries.size();
@@ -7457,6 +7568,16 @@ void RealClient::execute_session_dfs_range_reads(
             LOG(ERROR) << "DFS pinned arena size overflow, key: " << entry.key;
             results[entry.original_idx] =
                 static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        if (!prefetch_only &&
+            (aligned_offset > chunk_limit_bytes ||
+             aligned_object_size > chunk_limit_bytes - aligned_offset)) {
+            LOG(ERROR) << "DFS restore entry exceeds staging chunk limit, key: "
+                       << entry.key << ", entry_bytes=" << aligned_object_size
+                       << ", chunk_limit_bytes=" << chunk_limit_bytes;
+            results[entry.original_idx] =
+                static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
             continue;
         }
         arena_views.push_back(
@@ -7697,6 +7818,10 @@ void RealClient::execute_session_dfs_range_reads(
         }
         LOG(INFO)
             << "execute_session_dfs_range_reads: trace_id=" << trace_id
+            << ", restore_chunk=" << chunk_index << "/" << chunk_count
+            << ", restore_chunk_limit_bytes=" << chunk_limit_bytes
+            << ", restore_chunk_plan_total_bytes=" << request_planned_bytes
+            << ", arena_peak_requested_bytes=" << arena_size
             << ", entries=" << entries.size()
             << ", input_entries=" << input_entries
             << ", prefetch_cache_hits=" << prefetch_cache_hits
