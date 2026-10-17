@@ -108,6 +108,10 @@ class FileStorage {
     [[nodiscard]] offset_allocator::OffsetAllocStorageReport
     PinnedPrefetchArenaReport() const;
 
+    // Release the startup-allocated arena only when no suballocations remain.
+    // The caller must serialize this with DFS prefetch allocations.
+    [[nodiscard]] bool ReleasePinnedPrefetchArena();
+
     FileStorageConfig config_;
 
     /**
@@ -238,6 +242,7 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     PinnedBufferPool::Buffer pinned_prefetch_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_prefetch_arena_allocator_;
+    uint64_t pinned_prefetch_arena_full_free_bytes_{0};
     std::string pinned_prefetch_arena_status_ = "not configured";
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;

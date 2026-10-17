@@ -999,12 +999,17 @@ class MasterService {
      * @brief PutStart implementation shared by the single-key and batch paths.
      * `preallocated_dfs` carries a DFS reservation already made by the caller
      * (BatchPutStart); when nullopt the DFS replica is allocated inline.
+     * `skip_dfs_replica` retries after an eligible DFS allocation failure;
+     * `dfs_fallback_reason` records the original error for successful
+     * fallback metrics and logging.
      */
     auto PutStartInternal(
         const UUID& client_id, const std::string& key,
         const TenantId& tenant_id, const uint64_t slice_length,
         const ReplicateConfig& config,
-        const std::optional<DistributedFSDescriptor>& preallocated_dfs)
+        const std::optional<DistributedFSDescriptor>& preallocated_dfs,
+        bool skip_dfs_replica = false,
+        std::optional<ErrorCode> dfs_fallback_reason = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // Restore master state
@@ -1378,14 +1383,6 @@ class MasterService {
             SpinLocker locker(&lock);
             const auto now = std::chrono::system_clock::now();
             return lease_timeout <= now + std::chrono::milliseconds(ttl / 2);
-        }
-
-        uint64_t RemainingReadLeaseMs() const {
-            SpinLocker locker(&lock);
-            const auto remaining =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    lease_timeout - std::chrono::system_clock::now()).count();
-            return remaining > 0 ? static_cast<uint64_t>(remaining) : 0;
         }
 
         // Check if the lease has expired
@@ -2056,7 +2053,8 @@ class MasterService {
             committed_soft_pin_timeout = std::nullopt,
         const std::optional<DistributedFSDescriptor>& preallocated_dfs =
             std::nullopt,
-        bool* dfs_allocation_failed = nullptr)
+        bool skip_dfs_replica = false,
+        std::optional<ErrorCode>* dfs_allocation_error = nullptr)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**

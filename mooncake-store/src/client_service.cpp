@@ -294,7 +294,8 @@ bool AllAllocatedTransfersSucceeded(const ReplicaTransferSummary& summary) {
 }
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
-                                  const ReplicaTransferSummary& summary) {
+                                  const ReplicaTransferSummary& summary,
+                                  bool allow_missing_dfs = false) {
     if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
         return summary.allocated_memory_replicas > 0;
     }
@@ -303,6 +304,11 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
         return summary.allocated_memory_replicas +
                    summary.allocated_nof_replicas >
                0;
+    }
+    if (allow_missing_dfs && config.dfs_replica_num == 1 &&
+        summary.allocated_dfs_replicas == 0) {
+        return summary.allocated_memory_replicas == config.replica_num &&
+               summary.allocated_nof_replicas == config.nof_replica_num;
     }
     return summary.allocated_memory_replicas == config.replica_num &&
            summary.allocated_nof_replicas == config.nof_replica_num &&
@@ -337,10 +343,11 @@ struct FinalizeDecision {
 };
 
 FinalizeDecision DetermineFinalizeDecision(
-    const ReplicateConfig& config, const ReplicaTransferSummary& summary) {
+    const ReplicateConfig& config, const ReplicaTransferSummary& summary,
+    bool allow_missing_dfs = false) {
     const auto write_mode = DetermineReplicaWriteMode(config);
     const bool allocation_satisfied =
-        HasExpectedReplicaAllocation(config, summary);
+        HasExpectedReplicaAllocation(config, summary, allow_missing_dfs);
 
     // When the DFS replica's completion has been handed to the background write
     // task, this batch must not send ReplicaType::ALL: that would also complete
@@ -716,19 +723,20 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return coordinator.error();
         }
 
-        auto current_view = coordinator.value()->ReadCurrentView();
-        if (!current_view) {
-            LOG(ERROR) << "Failed to read current master view: "
-                       << toString(current_view.error());
-            return current_view.error();
+        auto master_view = ha::ReadCurrentViewOrWaitForReady(
+            *coordinator.value(), std::chrono::seconds(30));
+        if (!master_view) {
+            LOG(ERROR) << "Failed to discover a ready master view: "
+                       << toString(master_view.error());
+            return master_view.error();
         }
-        if (!current_view.value().has_value()) {
-            LOG(ERROR) << "No master is available in HA backend";
+        if (!master_view->has_value()) {
+            LOG(ERROR) << "No master became ready within 30 seconds";
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
 
-        const auto& master_view = current_view.value().value();
-        auto err = SwitchLeader(master_view);
+        const auto& current_master_view = master_view->value();
+        auto err = SwitchLeader(current_master_view);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to master";
             return err;
@@ -736,10 +744,6 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
-
-        leader_monitor_running_ = true;
-        leader_monitor_thread_ =
-            std::thread([this]() { this->LeaderMonitorThreadMain(); });
 
         return ErrorCode::OK;
     } else {
@@ -754,6 +758,18 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         }
         last_ping_success_.store(true);
         return ErrorCode::OK;
+    }
+}
+
+void Client::EnterHaRuntimeMode() {
+    if (!leader_coordinator_) {
+        return;
+    }
+
+    master_client_.EnableHaConnectionPolicy();
+    if (!leader_monitor_running_.exchange(true)) {
+        leader_monitor_thread_ =
+            std::thread([this]() { this->LeaderMonitorThreadMain(); });
     }
 }
 
@@ -1172,6 +1188,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
             }
         }
     }
+
+    client->EnterHaRuntimeMode();
 
     // this only performs RPC calls
     if (protocol == "rpc_only") {
@@ -2079,7 +2097,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary,
+                                  /*allow_missing_dfs=*/true);
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
@@ -2524,7 +2543,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         } else {
             op.replicas = start_responses[i].value();
             op.RecordAllocatedReplicas();
-            if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+            if (!HasExpectedReplicaAllocation(config, op.transfer_summary,
+                                              /*allow_missing_dfs=*/true)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
                                     PutOperationState::MASTER_FAILED,
                                     "Allocated replicas do not satisfy "
@@ -3280,7 +3300,8 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         }
 
         const auto finalize_decision = DetermineFinalizeDecision(
-            op.ToReplicateConfig(), op.transfer_summary);
+            op.ToReplicateConfig(), op.transfer_summary,
+            /*allow_missing_dfs=*/true);
         should_succeed[i] = finalize_decision.success;
         terminal_errors[i] = finalize_decision.error;
         add_finalize_action(finalize_decision.end_type, true, op.key, i);
@@ -5393,7 +5414,8 @@ void Client::StorageHeartbeatThreadMain() {
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
                        << " times (non-HA); reconnecting to "
                        << current_master_address;
-            auto err = master_client_.Connect(current_master_address);
+            auto err = master_client_.Connect(current_master_address,
+                                              /*force_recreate=*/true);
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Reconnect failed to " << current_master_address
                            << ": " << toString(err);
