@@ -491,6 +491,83 @@ TEST_F(RealClientDfsPrefetchTest, StartupDisableRefusesActiveSession) {
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
 }
 
+TEST_F(RealClientDfsPrefetchTest,
+       RestoreReadsAreChunkedAndOversizedEntryFailsIndividually) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar restore_arena("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",
+                               "8192");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
+    ScopedEnvVar restore_chunk("MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES",
+                               "4096");
+    if (!PinnedPrefetchMemorySupported()) {
+        GTEST_SKIP() << "pinned host memory is unavailable on this machine";
+    }
+
+    const std::vector<std::string> keys = {
+        "dfs_restore_chunk_first", "dfs_restore_chunk_oversized",
+        "dfs_restore_chunk_third", "dfs_restore_chunk_fourth"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects(
+        "localhost:17834", {keys[0], keys[2], keys[3]}));
+    ASSERT_TRUE(py_client_->file_storage_);
+    ASSERT_TRUE(py_client_->file_storage_->HasPinnedRestoreArena());
+
+    std::string oversized_source(2 * kDfsPrefetchObjectSize, 'x');
+    for (size_t i = 0; i < oversized_source.size(); ++i) {
+        oversized_source[i] = static_cast<char>((i * 11 + 9) % 251);
+    }
+    sources_.insert(sources_.begin() + 1, oversized_source);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(keys[1], oversized_source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({keys[1]}, "localhost:17834")
+                  .size(),
+              1);
+    const auto oversized_replicas = py_client_->get_replica_desc(keys[1]);
+    ASSERT_EQ(oversized_replicas.size(), 1);
+    ASSERT_TRUE(oversized_replicas.front().is_dfs_replica());
+
+    std::vector<std::string> destinations;
+    std::vector<std::vector<void *>> buffers;
+    std::vector<std::vector<size_t>> sizes;
+    std::vector<std::vector<size_t>> offsets;
+    destinations.reserve(keys.size());
+    buffers.reserve(keys.size());
+    sizes.reserve(keys.size());
+    offsets.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        destinations.emplace_back(sources_[i].size(), '\0');
+        ASSERT_EQ(py_client_->register_buffer(destinations.back().data(),
+                                              destinations.back().size()),
+                  0);
+        buffers.push_back({destinations.back().data()});
+        sizes.push_back({destinations.back().size()});
+        offsets.push_back({0});
+    }
+
+    ASSERT_EQ(py_client_->batch_get_session_start(keys),
+              std::vector<int>(keys.size(), 0));
+    auto fallback_allocator = std::move(py_client_->client_buffer_allocator_);
+    const auto results = py_client_->batch_get_into_multi_buffer_ranges(
+        keys, buffers, sizes, offsets);
+    py_client_->client_buffer_allocator_ = std::move(fallback_allocator);
+
+    EXPECT_EQ(results,
+              (std::vector<int>{static_cast<int>(kDfsPrefetchObjectSize),
+                                NoAvailableHandle(),
+                                static_cast<int>(kDfsPrefetchObjectSize),
+                                static_cast<int>(kDfsPrefetchObjectSize)}));
+    EXPECT_EQ(destinations[0], sources_[0]);
+    EXPECT_EQ(destinations[2], sources_[2]);
+    EXPECT_EQ(destinations[3], sources_[3]);
+    EXPECT_EQ(destinations[1], std::string(oversized_source.size(), '\0'));
+
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    for (auto &destination : destinations) {
+        EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+    }
+}
+
 TEST_F(RealClientTest, DfsPrefetchArenaUnavailableWithoutFileStorage) {
     StartMasterAndSetupClient();
     EXPECT_FALSE(py_client_->dfs_prefetch_arena_available());
