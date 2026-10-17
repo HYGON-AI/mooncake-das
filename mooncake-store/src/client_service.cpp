@@ -292,7 +292,8 @@ bool AllAllocatedTransfersSucceeded(const ReplicaTransferSummary& summary) {
 }
 
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
-                                  const ReplicaTransferSummary& summary) {
+                                  const ReplicaTransferSummary& summary,
+                                  bool allow_missing_dfs = false) {
     if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
         return summary.allocated_memory_replicas > 0;
     }
@@ -301,6 +302,11 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
         return summary.allocated_memory_replicas +
                    summary.allocated_nof_replicas >
                0;
+    }
+    if (allow_missing_dfs && config.dfs_replica_num == 1 &&
+        summary.allocated_dfs_replicas == 0) {
+        return summary.allocated_memory_replicas == config.replica_num &&
+               summary.allocated_nof_replicas == config.nof_replica_num;
     }
     return summary.allocated_memory_replicas == config.replica_num &&
            summary.allocated_nof_replicas == config.nof_replica_num &&
@@ -335,10 +341,11 @@ struct FinalizeDecision {
 };
 
 FinalizeDecision DetermineFinalizeDecision(
-    const ReplicateConfig& config, const ReplicaTransferSummary& summary) {
+    const ReplicateConfig& config, const ReplicaTransferSummary& summary,
+    bool allow_missing_dfs = false) {
     const auto write_mode = DetermineReplicaWriteMode(config);
     const bool allocation_satisfied =
-        HasExpectedReplicaAllocation(config, summary);
+        HasExpectedReplicaAllocation(config, summary, allow_missing_dfs);
 
     // When the DFS replica's completion has been handed to the background write
     // task, this batch must not send ReplicaType::ALL: that would also complete
@@ -2051,7 +2058,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary,
+                                  /*allow_missing_dfs=*/true);
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
@@ -2496,7 +2504,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         } else {
             op.replicas = start_responses[i].value();
             op.RecordAllocatedReplicas();
-            if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+            if (!HasExpectedReplicaAllocation(config, op.transfer_summary,
+                                              /*allow_missing_dfs=*/true)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
                                     PutOperationState::MASTER_FAILED,
                                     "Allocated replicas do not satisfy "
@@ -3252,7 +3261,8 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         }
 
         const auto finalize_decision = DetermineFinalizeDecision(
-            op.ToReplicateConfig(), op.transfer_summary);
+            op.ToReplicateConfig(), op.transfer_summary,
+            /*allow_missing_dfs=*/true);
         should_succeed[i] = finalize_decision.success;
         terminal_errors[i] = finalize_decision.error;
         add_finalize_action(finalize_decision.end_type, true, op.key, i);

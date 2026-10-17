@@ -44,6 +44,8 @@ class FailingPosixFsAdapter : public PosixFsAdapter {
 
 class DfsSyncClientTest : public ::testing::Test {
    protected:
+    virtual uint64_t DfsShardCapacity() const { return 16 * 1024 * 1024; }
+
     void SetUp() override {
         root_ = (std::filesystem::temp_directory_path() /
                  ("dfs_sync_client_" + std::to_string(::getpid()) + "_" +
@@ -55,7 +57,8 @@ class DfsSyncClientTest : public ::testing::Test {
         SetEnv("MOONCAKE_DFS_FS_ADAPTER", "posix");
         SetEnv("MOONCAKE_DFS_ROOT_DIR", root_);
         SetEnv("MOONCAKE_DFS_SHARD_COUNT", "2");
-        SetEnv("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+        SetEnv("MOONCAKE_DFS_SHARD_CAPACITY",
+               std::to_string(DfsShardCapacity()));
         SetEnv("MOONCAKE_DFS_ALIGNMENT", "4096");
         SetEnv("MOONCAKE_DFS_EVICTION_ENABLED", "0");
         SetEnv("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
@@ -81,7 +84,7 @@ class DfsSyncClientTest : public ::testing::Test {
         distributed_config.fsdir = root_;
         distributed_config.fs_adapter_type = "posix";
         distributed_config.shard_count = 2;
-        distributed_config.shard_capacity = 16 * 1024 * 1024;
+        distributed_config.shard_capacity = DfsShardCapacity();
         distributed_config.alignment = 4096;
 
         auto adapter = std::make_unique<FailingPosixFsAdapter>();
@@ -194,6 +197,11 @@ class DfsSyncClientTest : public ::testing::Test {
     std::vector<std::pair<std::string, std::optional<std::string>>> saved_env_;
 };
 
+class DfsSyncClientSmallDfsCapacityTest : public DfsSyncClientTest {
+   protected:
+    uint64_t DfsShardCapacity() const override { return 8192; }
+};
+
 TEST_F(DfsSyncClientTest, EnableDfsReplicaEnvOverridesConfig) {
     for (const std::string& value : {"true", "1"}) {
         SetEnv("MOONCAKE_DFS_FORCE_ONE_REPLICA", value);
@@ -208,6 +216,52 @@ TEST_F(DfsSyncClientTest, EnableDfsReplicaEnvOverridesConfig) {
         EXPECT_EQ(config.dfs_replica_num, 0);
         ExpectDfsValue(key, payload);
     }
+}
+
+TEST_F(DfsSyncClientSmallDfsCapacityTest,
+       BatchPutCompletesWhenForcedDfsAllocationIsExhausted) {
+    SetEnv("MOONCAKE_DFS_FORCE_ONE_REPLICA", "1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    std::vector<int> full_shards;
+    for (int i = 0; i < 32 && full_shards.size() < 2; ++i) {
+        const std::string key = "dfs_fallback_fill_" + std::to_string(i);
+        std::string payload(4096, static_cast<char>('a' + i % 26));
+        std::vector<Slice> slices{{payload.data(), payload.size()}};
+        ASSERT_TRUE(writer_->Put(key, slices, config).has_value());
+
+        auto query = writer_->Query(key);
+        ASSERT_TRUE(query.has_value());
+        for (const auto& replica : query->replicas) {
+            if (!replica.is_dfs_replica()) continue;
+            const int shard_idx = replica.get_dfs_descriptor().shard_idx;
+            bool already_full = false;
+            for (const int filled_shard : full_shards) {
+                if (filled_shard == shard_idx) {
+                    already_full = true;
+                    break;
+                }
+            }
+            if (!already_full) full_shards.push_back(shard_idx);
+        }
+    }
+    ASSERT_EQ(full_shards.size(), 2u);
+
+    const std::string key = "dfs_fallback_batch";
+    std::string payload(4096, 'Z');
+    std::vector<std::string> keys{key};
+    std::vector<std::string> values{payload};
+    auto batched_slices = MakeSlices(values);
+    auto results = writer_->BatchPut(keys, batched_slices, config);
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results.front().has_value())
+        << toString(results.front().error());
+
+    auto query = writer_->Query(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_TRUE(query->replicas.front().is_memory_replica());
 }
 
 TEST_F(DfsSyncClientTest, DisableDfsReplicaEnvLeavesConfigUnchanged) {
