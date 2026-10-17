@@ -20,8 +20,7 @@ struct LayoutBackend : DummyClient {
         const std::vector<std::string>& keys,
         const std::vector<std::vector<void*>>& buffers,
         const std::vector<std::vector<size_t>>& sizes,
-        const std::vector<std::vector<size_t>>& offsets,
-        const GetSessionReadSnapshots* /*snapshots*/) override {
+        const std::vector<std::vector<size_t>>& offsets) override {
         ++calls;
         seen = keys;
         std::vector<int> result;

@@ -3767,7 +3767,7 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
 
         resp = GetReplicaListResponse(std::move(replica_list),
-                                      metadata.RemainingReadLeaseMs(),
+                                      default_kv_lease_ttl_,
                                       metadata.object_checksum);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
@@ -3966,7 +3966,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
 
                 results[original_idx] = GetReplicaListResponse(
-                    std::move(replica_list), metadata.RemainingReadLeaseMs(),
+                    std::move(replica_list), default_kv_lease_ttl_,
                     metadata.object_checksum);
             }
         }
