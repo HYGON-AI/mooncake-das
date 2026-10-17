@@ -60,6 +60,10 @@ MasterMetricManager::MasterMetricManager()
           "Whether DFS capacity is configured as unlimited"),
       dfs_replicas_("master_dfs_replicas",
                     "Current DFS replicas by lifecycle status", {"status"}),
+      dfs_replica_skipped_total_(
+          "master_dfs_replica_skipped_total",
+          "DFS replicas skipped after allocation failure with memory fallback",
+          {"reason"}),
       dfs_bucket_ready_count_("dfs_bucket_ready_count",
                               "Current number of ready DFS buckets"),
       dfs_bucket_create_inflight_(
@@ -555,6 +559,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     dfs_capacity_unlimited_metric_.update(0);
     dfs_replicas_.update({"processing"}, 0);
     dfs_replicas_.update({"complete"}, 0);
+    dfs_replica_skipped_total_.inc({"FILE_OPEN_FAIL"}, 0);
+    dfs_replica_skipped_total_.inc({"FILE_WRITE_FAIL"}, 0);
+    dfs_replica_skipped_total_.inc({"NO_AVAILABLE_HANDLE"}, 0);
     dfs_bucket_ready_count_.update(0);
     dfs_bucket_create_inflight_.update(0);
     dfs_bucket_create_total_.inc({"success"}, 0);
@@ -926,6 +933,11 @@ void MasterMetricManager::transition_dfs_replica(const std::string& from,
                                                  const std::string& to) {
     dfs_replicas_.dec({from});
     dfs_replicas_.inc({to});
+}
+
+void MasterMetricManager::inc_dfs_replica_skipped_total(
+    const std::string& reason) {
+    dfs_replica_skipped_total_.inc({reason});
 }
 
 void MasterMetricManager::set_dfs_bucket_pool_state(
@@ -1986,6 +1998,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(dfs_used_bytes_);
     serialize_metric(dfs_capacity_unlimited_metric_);
     serialize_metric(dfs_replicas_);
+    serialize_metric(dfs_replica_skipped_total_);
     serialize_metric(dfs_bucket_ready_count_);
     serialize_metric(dfs_bucket_create_inflight_);
     serialize_metric(dfs_bucket_create_latency_us_);
