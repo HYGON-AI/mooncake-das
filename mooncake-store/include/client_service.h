@@ -584,6 +584,17 @@ class Client {
     void SetDfsStorageBackend(
         std::shared_ptr<DistributedStorageBackend> backend);
 
+    void SetDfsAccessPolicy(bool allow_read, bool allow_write) {
+        dfs_read_allowed_.store(allow_read, std::memory_order_release);
+        dfs_write_allowed_.store(allow_write, std::memory_order_release);
+    }
+    [[nodiscard]] bool DfsReadAllowed() const {
+        return dfs_read_allowed_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool DfsWriteAllowed() const {
+        return dfs_write_allowed_.load(std::memory_order_acquire);
+    }
+
     /**
      * @brief Fetch tasks assigned to a client
      * @param batch_size Number of tasks to fetch
@@ -1063,6 +1074,10 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+    // Preserve existing behavior for non-SGLang callers. SGLang explicitly
+    // installs memory-only immediately after setup and before warmup.
+    std::atomic<bool> dfs_read_allowed_{true};
+    std::atomic<bool> dfs_write_allowed_{true};
 
     // Tracks asynchronous DFS writes so the destructor can drain them before
     // tearing down the RPC client they report their result through.

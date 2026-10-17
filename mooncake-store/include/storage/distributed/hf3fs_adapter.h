@@ -18,6 +18,8 @@ class Hf3fsAdapter : public FileSystemAdapter {
 
     tl::expected<size_t, ErrorCode> WriteFile(
         const std::string& path, std::span<const char> data) override;
+    tl::expected<size_t, ErrorCode> OverwriteFile(
+        const std::string& path, std::span<const char> data) override;
 
     tl::expected<size_t, ErrorCode> ReadFile(const std::string& path, void* buf,
                                              size_t len) override;
@@ -39,6 +41,8 @@ class Hf3fsAdapter : public FileSystemAdapter {
         const std::string& dir) override;
 
     tl::expected<int, ErrorCode> OpenFile(const std::string& path) override;
+    tl::expected<int, ErrorCode> OpenFileReadOnly(
+        const std::string& path) override;
 
     tl::expected<void, ErrorCode> CloseFile(int fd) override;
 

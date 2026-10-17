@@ -463,6 +463,12 @@ class RealClient : public PyClient {
     int tearDownAll();
 
     int health_check() override;
+    int probe_dfs_read() override;
+    int probe_dfs_write() override;
+    async_simple::coro::Lazy<int> probe_dfs_read_rpc();
+    async_simple::coro::Lazy<int> probe_dfs_write_rpc();
+    std::vector<int> probe_dfs_health() override;
+    int set_dfs_access_policy(bool allow_read, bool allow_write) override;
 
     /**
      * @brief Check if an object exists

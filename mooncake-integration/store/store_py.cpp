@@ -434,6 +434,32 @@ class MooncakeStorePyWrapper {
         return store_->health_check();
     }
 
+    std::vector<int> probe_dfs_health() {
+        if (!store_) {
+            const int error = toInt(ErrorCode::INVALID_PARAMS);
+            return {error, error, 0};
+        }
+        py::gil_scoped_release release;
+        return store_->probe_dfs_health();
+    }
+
+    int probe_dfs_read() {
+        if (!store_) return toInt(ErrorCode::INVALID_PARAMS);
+        py::gil_scoped_release release;
+        return store_->probe_dfs_read();
+    }
+
+    int probe_dfs_write() {
+        if (!store_) return toInt(ErrorCode::INVALID_PARAMS);
+        py::gil_scoped_release release;
+        return store_->probe_dfs_write();
+    }
+
+    int set_dfs_access_policy(bool allow_read, bool allow_write) {
+        if (!store_) return toInt(ErrorCode::INVALID_PARAMS);
+        return store_->set_dfs_access_policy(allow_read, allow_write);
+    }
+
     py::dict mount_segment(const std::string &path, size_t size, size_t offset,
                            const std::string &protocol,
                            const std::string &location) {
@@ -2478,6 +2504,17 @@ PYBIND11_MODULE(store, m) {
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
              "2 if master unreachable.")
+        .def("probe_dfs_health", &MooncakeStorePyWrapper::probe_dfs_health,
+             "Probe DFS read/write health. Returns "
+             "[read_error_code, write_error_code, backend_ready].")
+        .def("probe_dfs_read", &MooncakeStorePyWrapper::probe_dfs_read,
+             "Probe DFS read capability and return an error code.")
+        .def("probe_dfs_write", &MooncakeStorePyWrapper::probe_dfs_write,
+             "Probe DFS write capability and return an error code.")
+        .def("set_dfs_access_policy",
+             &MooncakeStorePyWrapper::set_dfs_access_policy,
+             py::arg("allow_read"), py::arg("allow_write"),
+             "Atomically update DFS read/write access policy.")
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;

@@ -526,12 +526,13 @@ inline const Replica::Descriptor *SelectCompleteMemoryReplica(
 
 inline const Replica::Descriptor *SelectSessionReplica(
     const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
+    const std::unordered_set<std::string> &local_endpoints, bool allow_dfs) {
     if (const auto *memory =
             SelectCompleteMemoryReplica(replicas, local_endpoints)) {
         return memory;
     }
 
+    if (!allow_dfs) return nullptr;
     for (const auto &replica : replicas) {
         if (replica.status == ReplicaStatus::COMPLETE &&
             replica.is_dfs_replica()) {
@@ -539,6 +540,28 @@ inline const Replica::Descriptor *SelectSessionReplica(
         }
     }
     return nullptr;
+}
+
+tl::expected<QueryResult, ErrorCode> ApplyDfsReadVisibility(
+    const tl::expected<QueryResult, ErrorCode> &query_result,
+    bool allow_dfs) {
+    if (!query_result) {
+        return tl::make_unexpected(query_result.error());
+    }
+    if (allow_dfs) return query_result.value();
+
+    std::vector<Replica::Descriptor> memory_replicas;
+    for (const auto &replica : query_result->replicas) {
+        if (replica.status == ReplicaStatus::COMPLETE &&
+            replica.is_memory_replica()) {
+            memory_replicas.push_back(replica);
+        }
+    }
+    if (memory_replicas.empty()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return QueryResult(std::move(memory_replicas), query_result->lease_timeout,
+                       query_result->object_checksum);
 }
 
 inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
@@ -2681,6 +2704,47 @@ int RealClient::health_check() {
     return HC_HEALTHY;
 }
 
+std::vector<int> RealClient::probe_dfs_health() {
+    const int read_error = probe_dfs_read();
+    const int write_error = probe_dfs_write();
+    return {read_error, write_error,
+            file_storage_ && file_storage_->IsDfsBackendReady() ? 1 : 0};
+}
+
+int RealClient::probe_dfs_read() {
+    if (!file_storage_) return toInt(ErrorCode::NOT_SUPPORTED);
+    const auto result = file_storage_->ProbeDfsRead();
+    return result ? 0 : toInt(result.error());
+}
+
+int RealClient::probe_dfs_write() {
+    if (!file_storage_) return toInt(ErrorCode::NOT_SUPPORTED);
+    const auto result = file_storage_->ProbeDfsWrite();
+    return result ? 0 : toInt(result.error());
+}
+
+async_simple::coro::Lazy<int> RealClient::probe_dfs_read_rpc() {
+    // DFS calls may block indefinitely in the kernel. Keep them off the
+    // coro_rpc I/O thread so a stuck read cannot prevent a write RPC from
+    // being accepted and dispatched.
+    auto result = co_await coro_io::post([this]() { return probe_dfs_read(); });
+    co_return result.value();
+}
+
+async_simple::coro::Lazy<int> RealClient::probe_dfs_write_rpc() {
+    // Use a separate worker task from read. The backend itself has no shared
+    // probe lock, and failed initialization uses a non-blocking try-lock.
+    auto result =
+        co_await coro_io::post([this]() { return probe_dfs_write(); });
+    co_return result.value();
+}
+
+int RealClient::set_dfs_access_policy(bool allow_read, bool allow_write) {
+    if (!client_) return toInt(ErrorCode::INVALID_PARAMS);
+    client_->SetDfsAccessPolicy(allow_read, allow_write);
+    return 0;
+}
+
 int RealClient::start_http_server(int port) {
     using namespace coro_http;
 
@@ -3114,7 +3178,12 @@ tl::expected<bool, ErrorCode> RealClient::isExist_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->IsExist(key);
+    if (client_->DfsReadAllowed()) return client_->IsExist(key);
+    auto results = batchIsExist_internal({key});
+    if (results.size() != 1) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return std::move(results.front());
 }
 
 int RealClient::isExist(const std::string &key) {
@@ -4864,7 +4933,16 @@ std::vector<tl::expected<QueryResult, ErrorCode>> RealClient::batch_query(
         return std::vector<tl::expected<QueryResult, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
-    return client_->BatchQuery(keys);
+    const bool allow_dfs = client_->DfsReadAllowed();
+    auto query_results = client_->BatchQuery(keys);
+    if (allow_dfs) return query_results;
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> filtered;
+    filtered.reserve(query_results.size());
+    for (const auto &query_result : query_results) {
+        filtered.push_back(ApplyDfsReadVisibility(query_result, false));
+    }
+    return filtered;
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
@@ -6199,8 +6277,33 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
         return std::vector<tl::expected<bool, ErrorCode>>();
     }
 
-    // Call client BatchIsExist and return the vector<expected> directly
-    return client_->BatchIsExist(keys);
+    if (client_->DfsReadAllowed()) {
+        return client_->BatchIsExist(keys);
+    }
+
+    // A memory-only lookup must not expose a DFS-only hit. Query replicas and
+    // report success only when a COMPLETE memory replica exists.
+    const auto query_results = client_->BatchQuery(keys);
+    const auto local_endpoints = client_->GetLocalEndpoints();
+    std::vector<tl::expected<bool, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (const auto &query_result : query_results) {
+        if (!query_result) {
+            if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                results.emplace_back(false);
+            } else {
+                results.emplace_back(tl::make_unexpected(query_result.error()));
+            }
+            continue;
+        }
+        results.emplace_back(SelectCompleteMemoryReplica(
+                                 query_result->replicas, local_endpoints) !=
+                             nullptr);
+    }
+    while (results.size() < keys.size()) {
+        results.emplace_back(tl::make_unexpected(ErrorCode::RPC_FAIL));
+    }
+    return results;
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
@@ -6341,8 +6444,9 @@ RealClient::batch_get_session_start_with_sources(
             continue;
         }
 
-        const auto *replica =
-            SelectSessionReplica(query_result.replicas, local_endpoints);
+        const auto *replica = SelectSessionReplica(
+            query_result.replicas, local_endpoints,
+            client_->DfsReadAllowed());
         if (!replica) {
             result.all_memory = false;
             LOG(ERROR) << "No supported complete session replica for key: "
@@ -6454,9 +6558,9 @@ std::vector<int> RealClient::batch_get_session_refresh(
                 if (fresh_query.IsLeaseExpired()) {
                     refresh_error = ErrorCode::LEASE_EXPIRED;
                 } else {
-                    const auto *replica =
-                        SelectSessionReplica(fresh_query.replicas,
-                                             local_endpoints);
+                    const auto *replica = SelectSessionReplica(
+                        fresh_query.replicas, local_endpoints,
+                        client_->DfsReadAllowed());
                     if (!replica) {
                         refresh_error = ErrorCode::INVALID_REPLICA;
                     } else {
@@ -8913,7 +9017,9 @@ void RealClient::handle_ipc_shm_fd_request(UdsConnection &connection) {
 
 std::vector<Replica::Descriptor> RealClient::get_replica_desc(
     const std::string &key) {
-    auto query_result = client_->Query(key);
+    const bool allow_dfs = client_->DfsReadAllowed();
+    auto query_result =
+        ApplyDfsReadVisibility(client_->Query(key), allow_dfs);
     if (!query_result) {
         std::vector<Replica::Descriptor> replica_list = {};
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -8935,7 +9041,7 @@ std::vector<Replica::Descriptor> RealClient::get_replica_desc(
 
 std::map<std::string, std::vector<Replica::Descriptor>>
 RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
-    auto query_results = client_->BatchQuery(keys);
+    auto query_results = batch_query(keys);
     std::map<std::string, std::vector<Replica::Descriptor>> replica_map;
     if (query_results.size() != keys.size()) {
         LOG(ERROR) << "Batch query response size mismatch in "
@@ -8962,7 +9068,7 @@ std::vector<CachedQueryResultResponse> RealClient::batch_get_query_results(
         return std::vector<CachedQueryResultResponse>(
             keys.size(), CachedQueryResultResponse(ErrorCode::INVALID_PARAMS));
     }
-    auto query_results = client_->BatchQuery(keys);
+    auto query_results = batch_query(keys);
     std::vector<CachedQueryResultResponse> cached_results;
     cached_results.reserve(keys.size());
     if (query_results.size() != keys.size()) {

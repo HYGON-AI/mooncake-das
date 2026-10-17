@@ -31,6 +31,8 @@ constexpr int kMaxBucketCreateConcurrency = 8;
 // BatchAllocate output to one read. Larger batches become a few contiguous
 // reads rather than one read per object.
 constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
+constexpr char kDfsHealthProbeFileName[] = ".mooncake_dfs_health_probe";
+constexpr char kDfsHealthProbePayload[] = "mooncake-dfs-health-v1\n";
 
 struct MergedReadScratch {
     std::vector<char> sink;
@@ -122,6 +124,10 @@ const char* ToString(DfsAllocatorType type) {
 }
 
 bool DistributedStorageConfig::Validate() const {
+    if (!allocator_type_valid) {
+        LOG(ERROR) << "DistributedStorageConfig: invalid allocator_type";
+        return false;
+    }
     if (fsdir.empty()) {
         LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
         return false;
@@ -156,6 +162,10 @@ bool DistributedStorageConfig::Validate() const {
     if (!single_tenant) {
         LOG(ERROR) << "DistributedStorageConfig: Currently, DFS requires "
                       "single_tenant=true";
+        return false;
+    }
+    if (allocator_type == DfsAllocatorType::BUCKET &&
+        !ValidateForBucketAllocator()) {
         return false;
     }
     return true;
@@ -381,10 +391,15 @@ DistributedStorageBackend::DistributedStorageBackend(
 DistributedStorageBackend::~DistributedStorageBackend() {
     for (auto& shard : shard_files_) {
         if (shard && fs_adapter_) {
-            if (shard->fd >= 0) {
-                fs_adapter_->CloseFile(shard->fd);
-                shard->fd = -1;
+            const int write_fd = shard->write_fd.load();
+            if (write_fd >= 0) {
+                fs_adapter_->CloseFile(write_fd);
             }
+            if (shard->read_fd >= 0 && shard->read_fd != write_fd) {
+                fs_adapter_->CloseFile(shard->read_fd);
+            }
+            shard->read_fd = -1;
+            shard->write_fd.store(-1);
         }
     }
     // Drop cached bucket handles before the adapter goes away; each handle
@@ -399,7 +414,53 @@ DistributedStorageBackend::~DistributedStorageBackend() {
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
-    if (initialized_) {
+    std::lock_guard<std::mutex> lock(init_mutex_);
+    return InitLocked();
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::EnsureInitialized() {
+    if (initialized_.load(std::memory_order_acquire)) return {};
+    return Init();
+}
+
+tl::expected<void, ErrorCode>
+DistributedStorageBackend::TryEnsureInitialized() {
+    if (initialized_.load(std::memory_order_acquire)) return {};
+    std::unique_lock<std::mutex> lock(init_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    return InitLocked();
+}
+
+void DistributedStorageBackend::ResetFailedInitializationLocked() {
+    for (auto& shard : shard_files_) {
+        if (shard && fs_adapter_) {
+            const int write_fd = shard->write_fd.load();
+            if (write_fd >= 0) {
+                (void)fs_adapter_->CloseFile(write_fd);
+            }
+            if (shard->read_fd >= 0 && shard->read_fd != write_fd) {
+                (void)fs_adapter_->CloseFile(shard->read_fd);
+            }
+            shard->read_fd = -1;
+            shard->write_fd.store(-1);
+        }
+    }
+    shard_files_.clear();
+    {
+        std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
+        bucket_id_cache_.clear();
+        bucket_id_direct_cache_.clear();
+    }
+    batch_read_pool_.reset();
+    canonical_root_dir_.clear();
+    if (fs_adapter_) (void)fs_adapter_->Shutdown();
+    initialized_.store(false, std::memory_order_release);
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
+    if (initialized_.load(std::memory_order_acquire)) {
         LOG(WARNING) << "DistributedStorageBackend is already initialized";
         return {};
     }
@@ -407,7 +468,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     if (UsesObjectStorage()) {
         auto init_result = object_storage_adapter_->Init();
         if (!init_result) return init_result;
-        initialized_ = true;
+        initialized_.store(true, std::memory_order_release);
         LOG(INFO) << "DistributedStorageBackend initialized, object adapter="
                   << object_storage_adapter_->GetName();
         return {};
@@ -422,25 +483,31 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     }
 
     auto init_result = fs_adapter_->Init(root_dir_);
-    if (!init_result) return init_result;
+    if (!init_result) {
+        const auto error = init_result.error();
+        ResetFailedInitializationLocked();
+        return tl::make_unexpected(error);
+    }
 
     if (IsBucketMode()) {
         canonical_root_dir_ = CanonicalizePath(root_dir_);
         if (canonical_root_dir_.empty()) {
             LOG(ERROR) << "Failed to canonicalize DFS root directory "
                        << root_dir_;
+            ResetFailedInitializationLocked();
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
         // Bucket data files are created by the master's allocator and opened
         // on demand here, so there is no fixed shard table to preopen.
         if (!distributed_config_.ValidateForBucketAllocator()) {
+            ResetFailedInitializationLocked();
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (distributed_config_.batch_read_threads > 1) {
             batch_read_pool_ = std::make_unique<ThreadPool>(
                 static_cast<size_t>(distributed_config_.batch_read_threads));
         }
-        initialized_ = true;
+        initialized_.store(true, std::memory_order_release);
         LOG(INFO) << "DistributedStorageBackend initialized in bucket mode, "
                      "fsdir="
                   << root_dir_ << ", bucket_capacity="
@@ -454,19 +521,89 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
                            DfsGlobalAllocator::FormatShardIdx(
                                i, distributed_config_.shard_count) +
                            ".data";
-        auto fd_result = fs_adapter_->OpenFile(path);
-        if (!fd_result) {
+        auto write_fd_result = fs_adapter_->OpenFile(path);
+        auto read_fd_result = write_fd_result;
+        if (!write_fd_result) {
+            read_fd_result = fs_adapter_->OpenFileReadOnly(path);
+        }
+        if (!read_fd_result) {
             LOG(ERROR) << "Failed to open DFS shard " << path << ": "
-                       << fd_result.error();
-            return tl::make_unexpected(fd_result.error());
+                       << read_fd_result.error();
+            const auto error = read_fd_result.error();
+            ResetFailedInitializationLocked();
+            return tl::make_unexpected(error);
         }
         auto shard = std::make_unique<ShardFile>();
         shard->path = std::move(path);
-        shard->fd = *fd_result;
+        shard->read_fd = *read_fd_result;
+        shard->write_fd.store(write_fd_result ? *write_fd_result : -1);
         shard_files_.push_back(std::move(shard));
     }
 
-    initialized_ = true;
+    initialized_.store(true, std::memory_order_release);
+    return {};
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
+    auto initialized = TryEnsureInitialized();
+    if (!initialized) return initialized;
+    if (UsesObjectStorage()) return {};
+    const std::string probe_path =
+        root_dir_ + "/" + kDfsHealthProbeFileName;
+    constexpr size_t kExpectedSize = sizeof(kDfsHealthProbePayload) - 1;
+    char payload[sizeof(kDfsHealthProbePayload)] = {};
+    auto read_result =
+        fs_adapter_->ReadFile(probe_path, payload, sizeof(payload));
+    if (!read_result) return tl::make_unexpected(read_result.error());
+    if (*read_result != kExpectedSize ||
+        std::memcmp(payload, kDfsHealthProbePayload, kExpectedSize) != 0) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
+    auto initialized = TryEnsureInitialized();
+    if (!initialized) return initialized;
+    if (UsesObjectStorage()) return {};
+
+    const std::string probe_path =
+        root_dir_ + "/" + kDfsHealthProbeFileName;
+    auto write_result = fs_adapter_->OverwriteFile(
+        probe_path,
+        std::span<const char>(kDfsHealthProbePayload,
+                              sizeof(kDfsHealthProbePayload) - 1));
+    if (!write_result) return tl::make_unexpected(write_result.error());
+    if (*write_result != sizeof(kDfsHealthProbePayload) - 1) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    auto sync_result = fs_adapter_->SyncFile(probe_path);
+    if (!sync_result) return sync_result;
+
+    if (!IsBucketMode()) {
+        std::vector<int> new_write_fds;
+        new_write_fds.reserve(shard_files_.size());
+        for (const auto& shard : shard_files_) {
+            if (shard->write_fd.load(std::memory_order_acquire) >= 0) {
+                new_write_fds.push_back(-1);
+                continue;
+            }
+            auto fd = fs_adapter_->OpenFile(shard->path);
+            if (!fd) {
+                for (int opened_fd : new_write_fds) {
+                    if (opened_fd >= 0) (void)fs_adapter_->CloseFile(opened_fd);
+                }
+                return tl::make_unexpected(fd.error());
+            }
+            new_write_fds.push_back(*fd);
+        }
+        for (size_t i = 0; i < shard_files_.size(); ++i) {
+            if (new_write_fds[i] >= 0) {
+                shard_files_[i]->write_fd.store(new_write_fds[i],
+                                                std::memory_order_release);
+            }
+        }
+    }
     return {};
 }
 
@@ -564,7 +701,13 @@ DistributedStorageBackend::ResolveTarget(
                        << distributed_config_.shard_capacity;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        return ResolvedTarget{shard.fd, &shard.mutex, false, nullptr};
+        const int fd = read_only
+                           ? shard.read_fd
+                           : shard.write_fd.load(std::memory_order_acquire);
+        if (fd < 0) {
+            return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+        }
+        return ResolvedTarget{fd, &shard.mutex, false, nullptr};
     }
 
     // BUCKET mode: the descriptor carries an allocator-chosen path, so it must
@@ -610,7 +753,7 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     if (!UsesObjectStorage()) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    if (!initialized_) {
+    if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -680,7 +823,7 @@ DistributedStorageBackend::BatchWrite(
                        tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
         return results;
     }
-    if (!initialized_) {
+    if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         results.assign(requests.size(),
                        tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
@@ -743,7 +886,7 @@ DistributedStorageBackend::BatchReadShard(
         requests.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
-        auto target = ResolveTarget(request.descriptor, request.key, false);
+        auto target = ResolveTarget(request.descriptor, request.key, true);
         if (!target) {
             results[i] = tl::make_unexpected(target.error());
             continue;
@@ -940,8 +1083,9 @@ DistributedStorageBackend::PrepareReadTasks(
     oversized_tasks.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
-        auto target = ResolveTarget(request.descriptor, request.key,
-                                    distributed_config_.direct_read_enabled);
+        auto target = ResolveTarget(
+            request.descriptor, request.key,
+            !IsBucketMode() || distributed_config_.direct_read_enabled);
         if (!target) {
             results[i] = tl::make_unexpected(target.error());
             continue;
@@ -1295,7 +1439,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
                        tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
         return results;
     }
-    if (!initialized_) {
+    if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         std::fill(results.begin(), results.end(),
                   tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
@@ -1339,7 +1483,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
     if (!UsesObjectStorage()) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    if (!initialized_) {
+    if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -1361,7 +1505,7 @@ tl::expected<bool, ErrorCode> DistributedStorageBackend::IsExist(
     if (!UsesObjectStorage()) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    if (!initialized_) {
+    if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -1379,7 +1523,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
     if (!UsesObjectStorage()) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    if (!initialized_) {
+    if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }

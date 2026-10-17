@@ -335,6 +335,33 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidStoragePath) {
     EXPECT_TRUE(config.Validate());
 }
 
+TEST_F(FileStorageConfigTest,
+       DistributedDefersUnavailableStoragePathValidation) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = (data_path / "unavailable").string();
+    EXPECT_TRUE(config.Validate());
+
+    config.storage_filepath = "relative/path";
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest,
+       DistributedDoesNotRejectNonWritableStoragePathAtStartup) {
+    std::filesystem::permissions(
+        data_path, std::filesystem::perms::owner_read |
+                       std::filesystem::perms::owner_exec,
+        std::filesystem::perm_options::replace);
+
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = data_path.string();
+    EXPECT_TRUE(config.Validate());
+
+    std::filesystem::permissions(data_path, std::filesystem::perms::owner_all,
+                                 std::filesystem::perm_options::replace);
+}
+
 TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
     FileStorageConfig config;
     config.storage_filepath = "/tmp";

@@ -108,6 +108,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
+        distributed_backend_ = distributed_backend;
         if (client_) {
             client_->SetDfsStorageBackend(distributed_backend);
         }
@@ -256,9 +257,14 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     }
     auto init_storage_backend_result = storage_backend_->Init();
     if (!init_storage_backend_result) {
-        LOG(ERROR) << "Failed to init storage backend: "
-                   << init_storage_backend_result.error();
-        return init_storage_backend_result;
+        if (!distributed_backend_) {
+            LOG(ERROR) << "Failed to init storage backend: "
+                       << init_storage_backend_result.error();
+            return init_storage_backend_result;
+        }
+        LOG(WARNING) << "DFS backend init failed; continuing in degraded "
+                        "memory-only mode, error="
+                     << init_storage_backend_result.error();
     }
     if (config_.enable_dfs) {
         client_buffer_gc_running_.store(true);
@@ -346,6 +352,24 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     client_buffer_gc_thread_ =
         std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
     return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProbeDfsRead() {
+    if (!distributed_backend_) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    return distributed_backend_->ProbeRead();
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProbeDfsWrite() {
+    if (!distributed_backend_) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    return distributed_backend_->ProbeWrite();
+}
+
+bool FileStorage::IsDfsBackendReady() const {
+    return distributed_backend_ && distributed_backend_->IsInitialized();
 }
 
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
