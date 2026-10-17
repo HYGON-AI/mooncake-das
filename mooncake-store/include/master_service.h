@@ -220,6 +220,7 @@ class MasterService {
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
     void RunDfsEvictionForTesting();
+    void ProcessInvalidatedDfsBucketsForTesting();
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -758,9 +759,10 @@ class MasterService {
     tl::expected<std::string, ErrorCode> GetFsdir() const;
 
     /**
-     * @brief Get storage backend configuration including eviction settings
+     * @brief Get storage backend configuration including eviction settings and
+     * DFS path.
      * @return GetStorageConfigResponse containing fsdir, enable_disk_eviction,
-     * and quota_bytes
+     * quota_bytes, and dfs_fsdir
      */
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig() const;
 
@@ -2089,6 +2091,8 @@ class MasterService {
         bool force_one,
         std::optional<int64_t> invalidated_bucket_id = std::nullopt);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
+    tl::expected<bool, ErrorCode> IsDfsBucketDataFilePresent(
+        int64_t bucket_id) const;
     // Shard-mode per-key eviction (unchanged behaviour).
     void RunShardDfsEviction();
     // Re-registers DFS replicas recovered from bucket metadata as COMPLETE so

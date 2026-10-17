@@ -768,6 +768,10 @@ void MasterService::RunNoFBatchEvictForTesting(double evict_ratio_target,
 
 void MasterService::RunDfsEvictionForTesting() { RunDfsEviction(); }
 
+void MasterService::ProcessInvalidatedDfsBucketsForTesting() {
+    ProcessInvalidatedDfsBuckets();
+}
+
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
 #ifdef USE_NOF
     std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
@@ -4587,7 +4591,14 @@ auto MasterService::PutStartInternal(
             if (*dfs_allocation_error == ErrorCode::NO_AVAILABLE_HANDLE &&
                 bucket_allocator_ != nullptr && !retried_dfs_allocation) {
                 retried_dfs_allocation = true;
-                if (TryRecoverDfsSpaceAfterAllocationFailure()) {
+                // Eviction validates metadata and then acquires object-operation
+                // locks for all candidates. Do not hold the request lock here:
+                // the write key may be one of those candidates, and the opposite
+                // metadata/object lock order would otherwise deadlock.
+                object_operation_lock.lock.unlock();
+                const bool recovered = TryRecoverDfsSpaceAfterAllocationFailure();
+                object_operation_lock.lock.lock();
+                if (recovered) {
                     --attempt;
                     continue;
                 }
@@ -5893,6 +5904,14 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchEvictDiskReplica(
     return results;
 }
 
+tl::expected<bool, ErrorCode> MasterService::IsDfsBucketDataFilePresent(
+    int64_t bucket_id) const {
+    if (bucket_allocator_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return bucket_allocator_->IsBucketDataFilePresent(bucket_id);
+}
+
 std::vector<tl::expected<void, ErrorCode>>
 MasterService::BatchInvalidateDfsBuckets(
     const UUID& client_id, const std::vector<DfsMissingBucketReport>& reports,
@@ -5914,6 +5933,20 @@ MasterService::BatchInvalidateDfsBuckets(
             results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
+        const auto file_present = IsDfsBucketDataFilePresent(report.bucket_id);
+        if (!file_present) {
+            LOG(WARNING) << "Cannot verify DFS bucket " << report.bucket_id
+                         << " data file: " << file_present.error();
+            results.emplace_back(tl::make_unexpected(file_present.error()));
+            continue;
+        }
+        if (*file_present) {
+            LOG(INFO) << "Ignoring DFS bucket invalidation report for bucket "
+                      << report.bucket_id
+                      << ": master data file is present";
+            results.emplace_back();
+            continue;
+        }
         bucket_ids.insert(report.bucket_id);
         results.emplace_back();
     }
@@ -5932,6 +5965,19 @@ void MasterService::ProcessInvalidatedDfsBuckets() {
         pending.swap(invalidated_dfs_buckets_);
     }
     for (const int64_t bucket_id : pending) {
+        const auto file_present = IsDfsBucketDataFilePresent(bucket_id);
+        if (!file_present) {
+            LOG(WARNING) << "Deferring DFS bucket invalidation for bucket "
+                         << bucket_id << ": " << file_present.error();
+            std::lock_guard<std::mutex> lock(invalidated_dfs_buckets_mutex_);
+            invalidated_dfs_buckets_.insert(bucket_id);
+            continue;
+        }
+        if (*file_present) {
+            LOG(INFO) << "Ignoring DFS bucket invalidation for bucket "
+                      << bucket_id << ": master data file is present";
+            continue;
+        }
         if (!RunBucketDfsEvictionInternal(/*force_one=*/false, bucket_id)) {
             if (bucket_allocator_ != nullptr &&
                 bucket_allocator_->HasBucket(bucket_id)) {
@@ -7863,15 +7909,18 @@ tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
 
 tl::expected<GetStorageConfigResponse, ErrorCode>
 MasterService::GetStorageConfig() const {
+    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    const std::string dfs_fsdir = enable_dfs_ ? dfs_config.fsdir : std::string();
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
         LOG(INFO)
             << "Storage root directory or cluster ID is not set. persisting "
                "data is disabled.";
         return GetStorageConfigResponse("", enable_disk_eviction_,
-                                        quota_bytes_);
+                                        quota_bytes_, dfs_fsdir);
     }
     std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
-    return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
+    return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_,
+                                    dfs_fsdir);
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,

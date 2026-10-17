@@ -1837,6 +1837,51 @@ TEST_F(MasterServiceTest, DfsBucketModeSupportsPutEndAndQuery) {
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_F(MasterServiceTest, DfsBucketAllocationFailureEvictsBeforeRetryingPut) {
+    const auto root = MakeDfsTestRoot("forced_eviction");
+    // Keep the background eviction thread asleep so the second PutStart must
+    // use the allocation-failure recovery path.
+    ScopedEnvVar eviction_interval("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+                                   "3600");
+    ScopedBucketDfsEnv env(root, "4096", "2", "1", "0.99", "0.8");
+
+    {
+        auto service_config =
+            MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+        MasterService service(service_config);
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        // Fill two buckets so the first is sealed and evictable, while the
+        // second remains active. Active buckets cannot be eviction candidates.
+        for (const auto* key : {"forced_eviction_old", "forced_eviction_active"}) {
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, key,
+                                      TenantId::Default(), 4096, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+
+        auto replacement = service.PutStart(
+            context.client_id, "forced_eviction_new", TenantId::Default(),
+            4096, config);
+        ASSERT_TRUE(replacement.has_value()) << toString(replacement.error());
+        ASSERT_NE(FindDfsDescriptor(*replacement), nullptr);
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "forced_eviction_new",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
 TEST_F(MasterServiceTest,
        DfsBucketCapacityFailureFallsBackToMemoryForSingleAndBatch) {
     const auto root = MakeDfsTestRoot("capacity_fallback");
@@ -2402,6 +2447,19 @@ TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
         const auto* dfs = FindDfsDescriptor(before->replicas);
         ASSERT_NE(dfs, nullptr);
         const auto descriptor = dfs->get_dfs_descriptor();
+
+        // A report must not invalidate a bucket whose data file is still
+        // present on the master's DFS.
+        const auto present_report = service.BatchInvalidateDfsBuckets(
+            context.client_id, {{descriptor.shard_idx}}, TenantId::Default());
+        ASSERT_EQ(present_report.size(), 1u);
+        ASSERT_TRUE(present_report.front().has_value());
+        service.ProcessInvalidatedDfsBucketsForTesting();
+        const auto still_present =
+            service.GetReplicaList("missing_file_key", TenantId::Default());
+        ASSERT_TRUE(still_present.has_value());
+        EXPECT_NE(FindDfsDescriptor(still_present->replicas), nullptr);
+
         ASSERT_TRUE(std::filesystem::remove(descriptor.file_path));
 
         const auto metrics_before = CaptureDfsBucketEvictionMetrics();
@@ -2410,12 +2468,7 @@ TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
         ASSERT_EQ(queued.size(), 1u);
         ASSERT_TRUE(queued.front().has_value());
 
-        WaitUntil([&] {
-            const auto after =
-                service.GetReplicaList("missing_file_key", TenantId::Default());
-            return after.has_value() &&
-                   FindDfsDescriptor(after->replicas) == nullptr;
-        });
+        service.ProcessInvalidatedDfsBucketsForTesting();
         const auto metrics_after = CaptureDfsBucketEvictionMetrics();
 
         for (size_t i = 0; i < 4; ++i) {

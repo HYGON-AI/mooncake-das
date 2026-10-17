@@ -1581,6 +1581,20 @@ bool ImmutableBucketAllocator::HasBucket(int64_t bucket_id) const {
     return buckets_.contains(bucket_id);
 }
 
+tl::expected<bool, ErrorCode>
+ImmutableBucketAllocator::IsBucketDataFilePresent(int64_t bucket_id) const {
+    if (bucket_id < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto root_present = fs_adapter_->FileExists(fsdir_);
+    if (!root_present || !*root_present) {
+        LOG(WARNING) << "Cannot verify DFS bucket directory " << fsdir_
+                     << ": filesystem is unavailable";
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    return fs_adapter_->FileExists(BucketDataPath(bucket_id));
+}
+
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
     PendingEviction pending;
