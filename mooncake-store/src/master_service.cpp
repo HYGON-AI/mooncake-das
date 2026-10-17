@@ -140,6 +140,12 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
            allocated_nof_replicas == config.nof_replica_num;
 }
 
+bool IsDfsReplicaFallbackError(ErrorCode error) {
+    return error == ErrorCode::FILE_OPEN_FAIL ||
+           error == ErrorCode::FILE_WRITE_FAIL ||
+           error == ErrorCode::NO_AVAILABLE_HANDLE;
+}
+
 void LogTenantQuotaLedgerError(const TenantQuotaResult& result,
                                std::string_view operation,
                                const TenantId& tenant_id,
@@ -4081,10 +4087,10 @@ auto MasterService::AllocateAndInsertMetadata(
     std::optional<std::chrono::system_clock::time_point>
         committed_soft_pin_timeout,
     const std::optional<DistributedFSDescriptor>& preallocated_dfs,
-    bool* dfs_allocation_failed)
+    bool skip_dfs_replica, std::optional<ErrorCode>* dfs_allocation_error)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    if (dfs_allocation_failed != nullptr) {
-        *dfs_allocation_failed = false;
+    if (dfs_allocation_error != nullptr) {
+        dfs_allocation_error->reset();
     }
     const auto deadline_to_index = committed_soft_pin_timeout;
     auto& tenant_state = GetOrCreateTenantState(shard.get(), tenant_id);
@@ -4261,7 +4267,7 @@ auto MasterService::AllocateAndInsertMetadata(
                               ReplicaStatus::PROCESSING);
     }
 
-    if (config.dfs_replica_num > 0) {
+    if (config.dfs_replica_num > 0 && !skip_dfs_replica) {
         if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
             LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                        << ", error=dfs_allocator_not_initialized";
@@ -4278,9 +4284,8 @@ auto MasterService::AllocateAndInsertMetadata(
             if (!alloc) {
                 LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                            << ", error=" << alloc.error();
-                if (dfs_allocation_failed != nullptr) {
-                    *dfs_allocation_failed =
-                        alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE;
+                if (dfs_allocation_error != nullptr) {
+                    *dfs_allocation_error = alloc.error();
                 }
                 refund_pending_quota();
                 return tl::make_unexpected(alloc.error());
@@ -4370,7 +4375,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutStartInternal(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const uint64_t slice_length, const ReplicateConfig& config,
-    const std::optional<DistributedFSDescriptor>& preallocated_dfs)
+    const std::optional<DistributedFSDescriptor>& preallocated_dfs,
+    bool skip_dfs_replica, std::optional<ErrorCode> dfs_fallback_reason)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
@@ -4453,9 +4459,10 @@ auto MasterService::PutStartInternal(
     uint64_t quota_deficit_bytes = 0;
 
     bool retried_dfs_allocation = false;
-    bool dfs_allocation_failed = false;
+    std::optional<ErrorCode> dfs_allocation_error;
     auto attempt_once =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+        dfs_allocation_error.reset();
         quota_deficit_bytes = 0;
         auto now = std::chrono::system_clock::now();
         std::optional<size_t> retry_shard_idx;
@@ -4548,8 +4555,9 @@ auto MasterService::PutStartInternal(
                     return AllocateAndInsertMetadata(
                         shard, client_id, key, slice_length, config,
                         writer_host_id, group_id, object_id.tenant_id, now,
-                        *soft_pin_request, quota_deficit_bytes, std::nullopt, 
-                        preallocated_dfs, &dfs_allocation_failed);
+                        *soft_pin_request, quota_deficit_bytes, std::nullopt,
+                        preallocated_dfs, skip_dfs_replica,
+                        &dfs_allocation_error);
                 }
             }
         }
@@ -4567,23 +4575,39 @@ auto MasterService::PutStartInternal(
         return AllocateAndInsertMetadata(
             shard, client_id, key, slice_length, config, writer_host_id,
             group_id, object_id.tenant_id, now, *soft_pin_request,
-            quota_deficit_bytes, std::nullopt, preallocated_dfs, &dfs_allocation_failed);
+            quota_deficit_bytes, std::nullopt, preallocated_dfs,
+            skip_dfs_replica, &dfs_allocation_error);
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
          ++attempt) {
         auto result = attempt_once();
-        if (!result && dfs_allocation_failed &&
-            config.dfs_replica_num > 0 && bucket_allocator_ != nullptr &&
-            !retried_dfs_allocation) {
-            retried_dfs_allocation = true;
-            if (TryRecoverDfsSpaceAfterAllocationFailure()) {
-                --attempt;
-                continue;
+        if (!result && !skip_dfs_replica && dfs_allocation_error.has_value() &&
+            IsDfsReplicaFallbackError(*dfs_allocation_error)) {
+            if (*dfs_allocation_error == ErrorCode::NO_AVAILABLE_HANDLE &&
+                bucket_allocator_ != nullptr && !retried_dfs_allocation) {
+                retried_dfs_allocation = true;
+                if (TryRecoverDfsSpaceAfterAllocationFailure()) {
+                    --attempt;
+                    continue;
+                }
             }
+            skip_dfs_replica = true;
+            dfs_fallback_reason = dfs_allocation_error;
+            --attempt;
+            continue;
         }
-        if (result.has_value() ||
-            result.error() != ErrorCode::TENANT_QUOTA_EXCEEDED) {
+        if (result.has_value()) {
+            if (dfs_fallback_reason.has_value()) {
+                MasterMetricManager::instance().inc_dfs_replica_skipped_total(
+                    toString(*dfs_fallback_reason));
+                LOG(WARNING) << "key=" << key
+                             << ", action=dfs_replica_skipped_memory_fallback"
+                             << ", error=" << toString(*dfs_fallback_reason);
+            }
+            return result;
+        }
+        if (result.error() != ErrorCode::TENANT_QUOTA_EXCEEDED) {
             return result;
         }
         if (attempt == kMaxTenantQuotaEvictionRetries) {
@@ -4704,10 +4728,18 @@ MasterService::BatchPutStart(const UUID& client_id,
                 preallocated = it->second;
             } else {
                 auto error_it = reservation_errors.find(keys[i]);
-                results.emplace_back(tl::make_unexpected(
-                    error_it != reservation_errors.end()
-                        ? error_it->second
-                        : ErrorCode::NO_AVAILABLE_HANDLE));
+                const ErrorCode error = error_it != reservation_errors.end()
+                                            ? error_it->second
+                                            : ErrorCode::NO_AVAILABLE_HANDLE;
+                if (error_it != reservation_errors.end() &&
+                    IsDfsReplicaFallbackError(error)) {
+                    results.emplace_back(PutStartInternal(
+                        client_id, keys[i], tenant_id, slice_lengths[i],
+                        key_config, std::nullopt, /*skip_dfs_replica=*/true,
+                        error));
+                } else {
+                    results.emplace_back(tl::make_unexpected(error));
+                }
                 continue;
             }
         }
