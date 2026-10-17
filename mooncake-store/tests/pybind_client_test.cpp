@@ -433,6 +433,64 @@ TEST_F(RealClientDfsPrefetchTest, DisabledPrefetchKeepsOrdinaryReadWorking) {
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
 }
 
+TEST_F(RealClientDfsPrefetchTest, StartupDisableReleasesUnusedArena) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+                                "4096");
+    const std::vector<std::string> keys = {"dfs_prefetch_startup_disable"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17831", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+
+    ASSERT_NE(py_client_->file_storage_, nullptr);
+    const size_t capacity =
+        py_client_->file_storage_->PinnedPrefetchArenaCapacity();
+    ASSERT_EQ(capacity, 4096);
+    EXPECT_EQ(
+        py_client_->file_storage_->PinnedPrefetchArenaReport().totalFreeSpace,
+        capacity);
+
+    auto borrowed = py_client_->file_storage_->AllocatePinnedPrefetchBuffer(
+        512, 64);
+    ASSERT_TRUE(borrowed.has_value());
+    EXPECT_FALSE(py_client_->disable_dfs_prefetch());
+    EXPECT_TRUE(py_client_->dfs_prefetch_arena_available());
+    EXPECT_EQ(py_client_->file_storage_->PinnedPrefetchArenaCapacity(),
+              capacity);
+    borrowed.reset();
+
+    EXPECT_TRUE(py_client_->disable_dfs_prefetch());
+    EXPECT_FALSE(py_client_->dfs_prefetch_arena_available());
+    EXPECT_EQ(py_client_->dfs_prefetch_arena_status(), "disabled");
+    EXPECT_EQ(py_client_->file_storage_->PinnedPrefetchArenaCapacity(), 0);
+    EXPECT_EQ(
+        py_client_->file_storage_->PinnedPrefetchArenaReport().totalFreeSpace,
+        0);
+
+    EXPECT_EQ(py_client_->prefetch_arena_stats_, nullptr);
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
+    EXPECT_EQ(py_client_->batch_get_session_prefetch(keys),
+              std::vector<int>{NoAvailableHandle()});
+    ExpectRead(keys[0], 0, 512, /*cache_only=*/false);
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+
+    EXPECT_TRUE(py_client_->disable_dfs_prefetch());
+}
+
+TEST_F(RealClientDfsPrefetchTest, StartupDisableRefusesActiveSession) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+                                "4096");
+    const std::vector<std::string> keys = {"dfs_prefetch_disable_active"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17832", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
+    EXPECT_FALSE(py_client_->disable_dfs_prefetch());
+    EXPECT_TRUE(py_client_->dfs_prefetch_arena_available());
+    EXPECT_EQ(py_client_->file_storage_->PinnedPrefetchArenaCapacity(), 4096);
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+}
+
 TEST_F(RealClientTest, DfsPrefetchArenaUnavailableWithoutFileStorage) {
     StartMasterAndSetupClient();
     EXPECT_FALSE(py_client_->dfs_prefetch_arena_available());

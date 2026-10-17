@@ -3214,6 +3214,15 @@ PYBIND11_MODULE(store, m) {
             "(MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES). When false every DFS "
             "prefetch read fails, so callers should not submit prefetches.")
         .def(
+            "disable_dfs_prefetch",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.is_client_initialized()) return false;
+                py::gil_scoped_release release;
+                return self.store_->disable_dfs_prefetch();
+            },
+            "Startup-only: disable DFS prefetch and release its unused arena. "
+            "Returns false if a session or arena allocation is active.")
+        .def(
             "dfs_prefetch_arena_status",
             [](MooncakeStorePyWrapper &self) {
                 if (!self.is_client_initialized()) {
