@@ -137,6 +137,26 @@ class MasterServiceTest : public ::testing::Test {
         return metadata_it->second.GetCommittedSoftPinTimeout();
     }
 
+    std::optional<std::chrono::system_clock::time_point>
+    GetLeaseTimeoutForTest(MasterService& service, const std::string& key,
+                           const TenantId& tenant_id = TenantId::Default()) {
+        const TenantId normalized_tenant =
+            service.ResolveRequestTenantId(tenant_id);
+        const size_t shard_idx =
+            service.getMetadataShardIndex(normalized_tenant, key);
+        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
+        const auto tenant_it = shard->tenants.find(normalized_tenant);
+        if (tenant_it == shard->tenants.end()) {
+            return std::nullopt;
+        }
+        const auto metadata_it = tenant_it->second.metadata.find(key);
+        if (metadata_it == tenant_it->second.metadata.end()) {
+            return std::nullopt;
+        }
+        SpinLocker locker(&metadata_it->second.lock);
+        return metadata_it->second.lease_timeout;
+    }
+
     void CleanupExpiredSoftPinsAt(
         MasterService& service,
         const std::chrono::system_clock::time_point& now) {
@@ -7263,6 +7283,174 @@ TEST_F(MasterServiceTest, BatchExistKeyTenantAwarePreservesOrder) {
     ASSERT_EQ(default_resp.size(), default_keys.size());
     EXPECT_FALSE(default_resp[0].value());
     EXPECT_TRUE(default_resp[1].value());
+
+    auto tenant_memory_resp = service_->BatchExistKeyByReplicaType(
+        tenant_keys, tenant_id, ReplicaType::MEMORY);
+    ASSERT_EQ(tenant_memory_resp.size(), tenant_keys.size());
+    EXPECT_TRUE(tenant_memory_resp[0].value());
+    EXPECT_FALSE(tenant_memory_resp[1].value());
+    EXPECT_FALSE(tenant_memory_resp[2].value());
+    EXPECT_FALSE(tenant_memory_resp[3].value());
+    EXPECT_TRUE(tenant_memory_resp[4].value());
+
+    auto default_memory_resp = service_->BatchExistKeyByReplicaType(
+        default_keys, TenantId::Default(), ReplicaType::MEMORY);
+    ASSERT_EQ(default_memory_resp.size(), default_keys.size());
+    EXPECT_FALSE(default_memory_resp[0].value());
+    EXPECT_TRUE(default_memory_resp[1].value());
+}
+
+TEST_F(MasterServiceTest,
+       BatchExistKeyByReplicaTypeIsReadOnlyAndPreservesBatchSemantics) {
+    const auto root = MakeDfsTestRoot("typed_batch_exist");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(60000)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+    const auto context = PrepareSimpleSegment(*service);
+    const UUID client_id = context.client_id;
+
+    const std::string group_id =
+        FindGroupIdOnDifferentShard("typed_exist_group_a");
+    ReplicateConfig grouped_memory_config;
+    grouped_memory_config.replica_num = 1;
+    grouped_memory_config.group_ids = std::vector<std::string>{group_id};
+    const std::string group_key_a = "typed_exist_group_a";
+    const std::string group_key_b = "typed_exist_group_b";
+    PutCompletedObject(*service, client_id, group_key_a,
+                       grouped_memory_config);
+    PutCompletedObject(*service, client_id, group_key_b,
+                       grouped_memory_config);
+
+    ReplicateConfig dfs_config;
+    dfs_config.replica_num = 1;
+    dfs_config.dfs_replica_num = 1;
+    const std::string dfs_key = "typed_exist_dfs_only";
+    ASSERT_TRUE(service->PutStart(client_id, dfs_key, TenantId::Default(), 123,
+                                  dfs_config)
+                    .has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, dfs_key, TenantId::Default(),
+                                ReplicaType::DFS)
+                    .has_value());
+
+    const std::string mixed_key = "typed_exist_mixed";
+    ASSERT_TRUE(service->PutStart(client_id, mixed_key, TenantId::Default(),
+                                  456, dfs_config)
+                    .has_value());
+    ASSERT_TRUE(service->PutEnd(client_id, mixed_key, TenantId::Default(),
+                                ReplicaType::ALL)
+                    .has_value());
+
+    ReplicateConfig memory_config;
+    memory_config.replica_num = 1;
+    const std::string incomplete_key = "typed_exist_incomplete";
+    ASSERT_TRUE(service->PutStart(client_id, incomplete_key,
+                                  TenantId::Default(), 789, memory_config)
+                    .has_value());
+
+    const auto group_a_lease_before_opt =
+        GetLeaseTimeoutForTest(*service, group_key_a);
+    const auto group_b_lease_before_opt =
+        GetLeaseTimeoutForTest(*service, group_key_b);
+    ASSERT_TRUE(group_a_lease_before_opt.has_value());
+    ASSERT_TRUE(group_b_lease_before_opt.has_value());
+    const auto group_a_lease_before = *group_a_lease_before_opt;
+    const auto group_b_lease_before = *group_b_lease_before_opt;
+    auto& metrics = MasterMetricManager::instance();
+    struct ReadMetrics {
+        int64_t mem_hits;
+        int64_t file_hits;
+        int64_t dfs_hits;
+        int64_t valid_gets;
+        int64_t total_gets;
+    };
+    const auto capture_metrics = [&]() {
+        const auto serialized = metrics.serialize_metrics();
+        const auto value = [&](const std::string& name) {
+            return ReadPrometheusCounter(serialized, name).value_or(-1);
+        };
+        return ReadMetrics{.mem_hits = value("mem_cache_hit_nums_"),
+                           .file_hits = value("file_cache_hit_nums_"),
+                           .dfs_hits = value("dfs_cache_hit_nums_"),
+                           .valid_gets = value("valid_get_nums_"),
+                           .total_gets = value("total_get_nums_")};
+    };
+    const ReadMetrics before = capture_metrics();
+    ASSERT_NE(before.mem_hits, -1);
+    ASSERT_NE(before.file_hits, -1);
+    ASSERT_NE(before.dfs_hits, -1);
+    ASSERT_NE(before.valid_gets, -1);
+    ASSERT_NE(before.total_gets, -1);
+
+    const std::vector<std::string> keys = {
+        group_key_a, dfs_key, mixed_key, incomplete_key,
+        "typed_exist_missing", group_key_b, group_key_a};
+    const auto results = service->BatchExistKeyByReplicaType(
+        keys, TenantId::Default(), ReplicaType::MEMORY);
+    ASSERT_EQ(results.size(), keys.size());
+    for (const auto& result : results) {
+        ASSERT_TRUE(result.has_value());
+    }
+    EXPECT_TRUE(results[0].value());
+    EXPECT_FALSE(results[1].value());
+    EXPECT_TRUE(results[2].value());
+    EXPECT_FALSE(results[3].value());
+    EXPECT_FALSE(results[4].value());
+    EXPECT_TRUE(results[5].value());
+    EXPECT_TRUE(results[6].value());
+
+    const auto after_typed_exist = capture_metrics();
+    EXPECT_EQ(after_typed_exist.mem_hits, before.mem_hits);
+    EXPECT_EQ(after_typed_exist.file_hits, before.file_hits);
+    EXPECT_EQ(after_typed_exist.dfs_hits, before.dfs_hits);
+    EXPECT_EQ(after_typed_exist.valid_gets, before.valid_gets);
+    EXPECT_EQ(after_typed_exist.total_gets, before.total_gets);
+    EXPECT_EQ(GetLeaseTimeoutForTest(*service, group_key_a),
+              group_a_lease_before);
+    EXPECT_EQ(GetLeaseTimeoutForTest(*service, group_key_b),
+              group_b_lease_before);
+
+    const auto read = service->BatchGetReplicaList({group_key_a},
+                                                   TenantId::Default());
+    ASSERT_EQ(read.size(), 1u);
+    ASSERT_TRUE(read[0].has_value());
+    const auto after_read = capture_metrics();
+    EXPECT_EQ(after_read.mem_hits, after_typed_exist.mem_hits + 1);
+    EXPECT_EQ(after_read.file_hits, after_typed_exist.file_hits);
+    EXPECT_EQ(after_read.dfs_hits, after_typed_exist.dfs_hits);
+    EXPECT_EQ(after_read.valid_gets, after_typed_exist.valid_gets + 1);
+    EXPECT_EQ(after_read.total_gets, after_typed_exist.total_gets + 1);
+    const auto group_a_lease_after_read_opt =
+        GetLeaseTimeoutForTest(*service, group_key_a);
+    const auto group_b_lease_after_read_opt =
+        GetLeaseTimeoutForTest(*service, group_key_b);
+    ASSERT_TRUE(group_a_lease_after_read_opt.has_value());
+    ASSERT_TRUE(group_b_lease_after_read_opt.has_value());
+    const auto group_a_lease_after_read = *group_a_lease_after_read_opt;
+    const auto group_b_lease_after_read = *group_b_lease_after_read_opt;
+    EXPECT_GT(group_a_lease_after_read, group_a_lease_before);
+    EXPECT_GT(group_b_lease_after_read, group_b_lease_before);
+
+    const auto after_read_exist = service->BatchExistKeyByReplicaType(
+        {group_key_a}, TenantId::Default(), ReplicaType::MEMORY);
+    ASSERT_EQ(after_read_exist.size(), 1u);
+    ASSERT_TRUE(after_read_exist[0].has_value());
+    EXPECT_TRUE(after_read_exist[0].value());
+    EXPECT_EQ(GetLeaseTimeoutForTest(*service, group_key_a),
+              group_a_lease_after_read);
+    EXPECT_EQ(GetLeaseTimeoutForTest(*service, group_key_b),
+              group_b_lease_after_read);
+    const auto after_read_exist_metrics = capture_metrics();
+    EXPECT_EQ(after_read_exist_metrics.mem_hits, after_read.mem_hits);
+    EXPECT_EQ(after_read_exist_metrics.file_hits, after_read.file_hits);
+    EXPECT_EQ(after_read_exist_metrics.dfs_hits, after_read.dfs_hits);
+    EXPECT_EQ(after_read_exist_metrics.valid_gets, after_read.valid_gets);
+    EXPECT_EQ(after_read_exist_metrics.total_gets, after_read.total_gets);
+    service.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
 }
 
 TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
@@ -7329,6 +7517,14 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     EXPECT_EQ(base_failures, metrics.get_batch_exist_key_failures());
     EXPECT_EQ(base_partial, metrics.get_batch_exist_key_partial_successes());
     EXPECT_EQ(base_failed_items, metrics.get_batch_exist_key_failed_items());
+
+    auto memory_resp = service_.BatchExistKeyByReplicaType(
+        lookup_keys, tenant_id.value(), ReplicaType::MEMORY);
+    ASSERT_EQ(memory_resp.size(), lookup_keys.size());
+    EXPECT_TRUE(memory_resp[0].value());
+    EXPECT_FALSE(memory_resp[1].value());
+    EXPECT_FALSE(memory_resp[2].value());
+    EXPECT_TRUE(memory_resp[3].value());
 }
 
 TEST_F(MasterServiceTest, WrappedWriteBoundaryRejectsInvalidTenantIds) {

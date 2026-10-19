@@ -161,6 +161,12 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
 
+    // Read-only typed existence check; does not grant leases, update
+    // get/cache-hit metrics, or trigger promotion or dynamic replication.
+    [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>>
+    BatchExistKeyByReplicaType(const std::vector<std::string>& object_keys,
+                               ReplicaType replica_type);
+
     /**
      * @brief Calculate Store-observed cache reuse metrics
      * @param object_keys None

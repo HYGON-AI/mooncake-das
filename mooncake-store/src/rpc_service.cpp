@@ -158,6 +158,48 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     return result;
 }
 
+std::vector<tl::expected<bool, ErrorCode>>
+WrappedMasterService::BatchExistKeyByReplicaType(
+    const std::vector<std::string>& keys, const std::string& tenant_id,
+    ReplicaType replica_type) {
+    ScopedVLogTimer timer(1, "BatchExistKeyByReplicaType");
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys,
+                     ", replica_type=", static_cast<int>(replica_type));
+    MasterMetricManager::instance().inc_batch_exist_key_requests(total_keys);
+
+    auto result = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchExistKeyByReplicaType(
+                keys, resolved_tenant_id, replica_type);
+        });
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < result.size(); ++i) {
+        if (!result[i].has_value()) {
+            failure_count++;
+            LOG(ERROR) << "BatchExistKeyByReplicaType failed for key[" << i
+                       << "] '" << keys[i] << "': "
+                       << toString(result[i].error());
+        }
+    }
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_exist_key_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_exist_key_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponse("total=", result.size(),
+                      ", success=", result.size() - failure_count,
+                      ", failures=", failure_count);
+    return result;
+}
+
 tl::expected<
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
     ErrorCode>
@@ -1852,6 +1894,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchExistKeyByReplicaType>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);

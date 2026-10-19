@@ -307,6 +307,13 @@ class MasterService {
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys, const TenantId& tenant_id);
 
+    // Read-only typed existence check. Unlike BatchExistKey, this does not
+    // grant object/group leases, update get/cache-hit metrics, or trigger
+    // promotion or dynamic replication.
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyByReplicaType(
+        const std::vector<std::string>& keys, const TenantId& tenant_id,
+        ReplicaType replica_type);
+
     /**
      * @brief Fetch all keys for a single tenant.
      * @return ErrorCode::OK if exists
@@ -2958,6 +2965,9 @@ class MasterService {
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyInternal(
+        const std::vector<std::string>& keys, const TenantId& tenant_id,
+        ReplicaType replica_type, bool grant_lease);
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the

@@ -6281,29 +6281,7 @@ std::vector<tl::expected<bool, ErrorCode>> RealClient::batchIsExist_internal(
         return client_->BatchIsExist(keys);
     }
 
-    // A memory-only lookup must not expose a DFS-only hit. Query replicas and
-    // report success only when a COMPLETE memory replica exists.
-    const auto query_results = client_->BatchQuery(keys);
-    const auto local_endpoints = client_->GetLocalEndpoints();
-    std::vector<tl::expected<bool, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto &query_result : query_results) {
-        if (!query_result) {
-            if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                results.emplace_back(false);
-            } else {
-                results.emplace_back(tl::make_unexpected(query_result.error()));
-            }
-            continue;
-        }
-        results.emplace_back(SelectCompleteMemoryReplica(
-                                 query_result->replicas, local_endpoints) !=
-                             nullptr);
-    }
-    while (results.size() < keys.size()) {
-        results.emplace_back(tl::make_unexpected(ErrorCode::RPC_FAIL));
-    }
-    return results;
+    return client_->BatchIsExistByReplicaType(keys, ReplicaType::MEMORY);
 }
 
 int RealClient::put_from_with_metadata(const std::string &key, void *buffer,

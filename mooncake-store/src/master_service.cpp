@@ -2855,6 +2855,21 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys, const TenantId& tenant_id) {
+    return BatchExistKeyInternal(keys, tenant_id, ReplicaType::ALL,
+                                 /*grant_lease=*/true);
+}
+
+std::vector<tl::expected<bool, ErrorCode>>
+MasterService::BatchExistKeyByReplicaType(
+    const std::vector<std::string>& keys, const TenantId& tenant_id,
+    ReplicaType replica_type) {
+    return BatchExistKeyInternal(keys, tenant_id, replica_type,
+                                 /*grant_lease=*/false);
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyInternal(
+    const std::vector<std::string>& keys, const TenantId& tenant_id,
+    ReplicaType replica_type, bool grant_lease) {
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     if (keys.empty()) {
@@ -2910,11 +2925,19 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
             }
 
             const auto& metadata = it->second;
-            if (!HasReadableReplica(metadata)) {
+            const bool has_readable_replica = metadata.HasReplica(
+                [this, replica_type](const Replica& replica) {
+                    return IsReplicaReadable(replica) &&
+                           (replica_type == ReplicaType::ALL ||
+                            replica.type() == replica_type);
+                });
+            if (!has_readable_replica) {
                 results[i] = false;
                 continue;
             }
-            GrantLeaseForGroup(tenant_state, key, metadata);
+            if (grant_lease) {
+                GrantLeaseForGroup(tenant_state, key, metadata);
+            }
             results[i] = true;
         }
     }

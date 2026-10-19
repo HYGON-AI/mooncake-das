@@ -23,6 +23,7 @@
 #endif
 
 #include "config.h"
+#include "master_metric_manager.h"
 #include "read_plan.h"
 #include "pinned_buffer_pool.h"
 #include "real_client.h"
@@ -3033,6 +3034,104 @@ TEST_F(RealClientTest, BatchIsExistMixed) {
     EXPECT_EQ(results[1], 0) << "missing_key should not exist";
     EXPECT_EQ(results[2], 1) << "exist_key_2 should exist";
     EXPECT_EQ(results[3], 0) << "also_missing should not exist";
+}
+
+TEST_F(RealClientTest, BatchIsExistMemoryOnlyHasNoReadSideEffects) {
+    constexpr char kClientAddress[] = "localhost:17813";
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(60000)
+                                  .build()));
+    master_address_ = master_.master_address();
+    const std::string rdma_devices = FLAGS_protocol == "rdma"
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(py_client_->setup_real(kClientAddress, "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     FLAGS_protocol, rdma_devices,
+                                     master_address_),
+              0);
+    ASSERT_EQ(py_client_->set_dfs_access_policy(false, false), 0);
+
+    ReplicateConfig grouped_config;
+    grouped_config.replica_num = 1;
+    grouped_config.group_ids =
+        std::vector<std::string>{"pybind_batch_exist_group"};
+    const std::string first_key = "pybind_batch_exist_group_a";
+    const std::string second_key = "pybind_batch_exist_group_b";
+    const std::string data = "batch existence without a read lease";
+    ASSERT_EQ(py_client_->put(first_key, data, grouped_config), 0);
+    ASSERT_EQ(py_client_->put(second_key, data, grouped_config), 0);
+
+    auto& metrics = MasterMetricManager::instance();
+    const auto read_counter = [&](const std::string& name) -> int64_t {
+        const std::string serialized = metrics.serialize_metrics();
+        const std::string prefix = name + " ";
+        size_t line_start = 0;
+        while (line_start < serialized.size()) {
+            const size_t line_end = serialized.find('\n', line_start);
+            if (serialized.compare(line_start, prefix.size(), prefix) == 0) {
+                const size_t value_start = line_start + prefix.size();
+                return static_cast<int64_t>(std::stoll(serialized.substr(
+                    value_start, line_end == std::string::npos
+                                     ? std::string::npos
+                                     : line_end - value_start)));
+            }
+            if (line_end == std::string::npos) {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+        ADD_FAILURE() << "missing metric " << name;
+        return int64_t{-1};
+    };
+    struct ReadMetrics {
+        int64_t memory_hits;
+        int64_t valid_gets;
+        int64_t total_gets;
+    };
+    const auto capture_metrics = [&]() {
+        return ReadMetrics{.memory_hits = read_counter("mem_cache_hit_nums_"),
+                           .valid_gets = read_counter("valid_get_nums_"),
+                           .total_gets = read_counter("total_get_nums_")};
+    };
+
+    const ReadMetrics before_exist = capture_metrics();
+    ASSERT_NE(before_exist.memory_hits, -1);
+    ASSERT_NE(before_exist.valid_gets, -1);
+    ASSERT_NE(before_exist.total_gets, -1);
+    const std::vector<std::string> keys = {first_key, "pybind_batch_missing",
+                                           second_key, first_key};
+    const auto results = py_client_->batchIsExist(keys);
+    ASSERT_EQ(results.size(), keys.size());
+    EXPECT_EQ(results[0], 1);
+    EXPECT_EQ(results[1], 0);
+    EXPECT_EQ(results[2], 1);
+    EXPECT_EQ(results[3], 1);
+    const ReadMetrics after_exist = capture_metrics();
+    EXPECT_EQ(after_exist.memory_hits, before_exist.memory_hits);
+    EXPECT_EQ(after_exist.valid_gets, before_exist.valid_gets);
+    EXPECT_EQ(after_exist.total_gets, before_exist.total_gets);
+
+    const auto cleared =
+        py_client_->batch_replica_clear({first_key, second_key}, kClientAddress);
+    EXPECT_EQ(cleared.size(), 2u)
+        << "memory-only existence must not lease either grouped object";
+
+    ReplicateConfig normal_config;
+    normal_config.replica_num = 1;
+    const std::string normal_key = "pybind_batch_exist_normal_get";
+    ASSERT_EQ(py_client_->put(normal_key, data, normal_config), 0);
+    const ReadMetrics before_read = capture_metrics();
+    const auto replicas = py_client_->get_replica_desc(normal_key);
+    ASSERT_EQ(replicas.size(), 1u);
+    ASSERT_TRUE(replicas.front().is_memory_replica());
+    const ReadMetrics after_read = capture_metrics();
+    EXPECT_EQ(after_read.memory_hits, before_read.memory_hits + 1);
+    EXPECT_EQ(after_read.valid_gets, before_read.valid_gets + 1);
+    EXPECT_EQ(after_read.total_gets, before_read.total_gets + 1);
+    EXPECT_TRUE(py_client_->batch_replica_clear({normal_key}, kClientAddress)
+                    .empty())
+        << "a normal replica-list read must continue granting a lease";
 }
 
 TEST_F(RealClientTest, ErrBatchIsExistBeforeSetup) {

@@ -991,6 +991,18 @@ TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
             << "Key " << keys[i] << " should not exist";
     }
 
+    auto memory_exist_results = test_client_->BatchIsExistByReplicaType(
+        keys, ReplicaType::MEMORY);
+    ASSERT_EQ(keys.size(), memory_exist_results.size());
+    for (int i = 0; i < batch_size / 2; i++) {
+        ASSERT_TRUE(memory_exist_results[i].has_value());
+        EXPECT_TRUE(memory_exist_results[i].value());
+    }
+    for (int i = batch_size / 2; i < batch_size; i++) {
+        ASSERT_TRUE(memory_exist_results[i].has_value());
+        EXPECT_FALSE(memory_exist_results[i].value());
+    }
+
     // Test with empty keys vector
     std::vector<std::string> empty_keys;
     auto empty_results = test_client_->BatchIsExist(empty_keys);
