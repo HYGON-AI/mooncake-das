@@ -2792,6 +2792,7 @@ class MasterService {
     bool enable_dfs_bucket_recovery_{true};
     bool dfs_restore_from_bucket_metadata_{true};
     double dfs_bucket_low_utilization_threshold_{0.05};
+    int dfs_bucket_low_utilization_evictions_per_tick_{1};
     // Chosen by configuration at startup: DfsGlobalAllocator (SHARD, the
     // default) or ImmutableBucketAllocator (BUCKET). The master only ever talks
     // to it through DfsAllocatorInterface.

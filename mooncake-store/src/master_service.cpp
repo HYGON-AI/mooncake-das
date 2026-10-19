@@ -591,6 +591,8 @@ void MasterService::InitDfsAllocatorFromEnvironment(
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
     dfs_bucket_low_utilization_threshold_ =
         dfs_config.low_utilization_threshold;
+    dfs_bucket_low_utilization_evictions_per_tick_ =
+        dfs_config.low_utilization_evictions_per_tick;
     if (!dfs_config.allocator_type_valid) {
         // An unknown allocator type is a configuration error, not something to
         // paper over by silently defaulting to SHARD.
@@ -7497,12 +7499,13 @@ void MasterService::RunDfsEviction() {
 }
 
 void MasterService::RunBucketDfsEviction() {
-    (void)RunBucketDfsEvictionInternal(/*force_one=*/false);
-    if (dfs_bucket_low_utilization_threshold_ > 0.0) {
+    if (dfs_bucket_low_utilization_threshold_ > 0.0 &&
+        dfs_bucket_low_utilization_evictions_per_tick_ > 0) {
         (void)RunBucketDfsEvictionInternal(
             /*force_one=*/false, std::nullopt,
             dfs_bucket_low_utilization_threshold_);
     }
+    (void)RunBucketDfsEvictionInternal(/*force_one=*/false);
 }
 
 bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
@@ -7526,6 +7529,9 @@ bool MasterService::RunBucketDfsEvictionInternal(
     double low_utilization_threshold) {
     if (bucket_allocator_ == nullptr) return false;
     const bool invalidating_missing_bucket = invalidated_bucket_id.has_value();
+    const bool low_utilization_eviction = low_utilization_threshold >= 0.0;
+    const int max_low_utilization_evictions =
+        dfs_bucket_low_utilization_evictions_per_tick_;
 
     // Free() defers its metadata write so it never fsyncs under a metadata
     // shard lock. This tick holds no master lock, so it is the right place to
@@ -7537,18 +7543,21 @@ bool MasterService::RunBucketDfsEvictionInternal(
     // remaining bucket keeps getting rejected.
     std::set<int64_t> attempted;
     bool evicted = false;
+    int low_utilization_evictions = 0;
 
     while (true) {
-        auto pending = invalidated_bucket_id.has_value()
-                           ? bucket_allocator_->PrepareInvalidation(
-                                 *invalidated_bucket_id)
-                           : (low_utilization_threshold >= 0.0
-                                  ? bucket_allocator_->PrepareEvictionForLowUtilization(
-                                        low_utilization_threshold)
-                           : (force_one
-                                  ? bucket_allocator_
-                                        ->PrepareEvictionForAllocationFailure()
-                                  : bucket_allocator_->PrepareEviction()));
+        ImmutableBucketAllocator::PendingEviction pending;
+        if (invalidated_bucket_id.has_value()) {
+            pending = bucket_allocator_->PrepareInvalidation(
+                *invalidated_bucket_id);
+        } else if (low_utilization_eviction) {
+            pending = bucket_allocator_->PrepareEvictionForLowUtilization(
+                low_utilization_threshold);
+        } else if (force_one) {
+            pending = bucket_allocator_->PrepareEvictionForAllocationFailure();
+        } else {
+            pending = bucket_allocator_->PrepareEviction();
+        }
         // Nothing is evictable right now (below watermark, or every bucket is
         // active/frozen).
         if (pending.bucket_id() < 0) return evicted;
@@ -7557,9 +7566,17 @@ bool MasterService::RunBucketDfsEvictionInternal(
             bucket_allocator_->AbortEviction(std::move(pending));
             return evicted;
         }
+        const int64_t evicted_bucket_id = pending.bucket_id();
         if (!invalidating_missing_bucket) {
-            MasterMetricManager::instance()
-                .inc_dfs_bucket_eviction_attempts();
+            if (low_utilization_eviction) {
+                MasterMetricManager::instance()
+                    .inc_dfs_bucket_low_utilization_eviction_attempts();
+                LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION_ATTEMPT] bucket_id="
+                          << evicted_bucket_id;
+            } else {
+                MasterMetricManager::instance()
+                    .inc_dfs_bucket_eviction_attempts();
+            }
         }
 
         const auto& candidates = pending.Candidates();
@@ -7568,11 +7585,21 @@ bool MasterService::RunBucketDfsEvictionInternal(
             // master to validate, so it can be reclaimed immediately.
             const bool committed =
                 bucket_allocator_->CommitEviction(std::move(pending));
-            if (committed && !invalidating_missing_bucket) {
+            if (committed && low_utilization_eviction) {
+                MasterMetricManager::instance()
+                    .inc_dfs_bucket_low_utilization_evictions();
+                ++low_utilization_evictions;
+                LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION] bucket_id="
+                          << evicted_bucket_id << ", committed=true";
+            } else if (committed && !invalidating_missing_bucket) {
                 MasterMetricManager::instance().inc_dfs_bucket_evictions();
             }
             evicted = true;
-            if (invalidating_missing_bucket || force_one) return true;
+            if (invalidating_missing_bucket || force_one ||
+                (low_utilization_eviction &&
+                 low_utilization_evictions >= max_low_utilization_evictions)) {
+                return true;
+            }
             continue;
         }
 
@@ -7773,11 +7800,21 @@ bool MasterService::RunBucketDfsEvictionInternal(
         // into this bucket, so it is now safe to drop the files.
         const bool committed =
             bucket_allocator_->CommitEviction(std::move(pending));
-        if (committed && !invalidating_missing_bucket) {
+        if (committed && low_utilization_eviction) {
+            MasterMetricManager::instance()
+                .inc_dfs_bucket_low_utilization_evictions();
+            ++low_utilization_evictions;
+            LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION] bucket_id="
+                      << evicted_bucket_id << ", committed=true";
+        } else if (committed && !invalidating_missing_bucket) {
             MasterMetricManager::instance().inc_dfs_bucket_evictions();
         }
         evicted = true;
-        if (force_one) return true;
+        if (force_one ||
+            (low_utilization_eviction &&
+             low_utilization_evictions >= max_low_utilization_evictions)) {
+            return true;
+        }
     }
     return evicted;
 }
