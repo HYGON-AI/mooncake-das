@@ -1105,7 +1105,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     EXPECT_EQ(desc->shard_idx, 3);
 }
 
-TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudget) {
+TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudget) {
     TempDir tmp("bucket_no_recovery");
     auto config = MakeBucketConfig(tmp.path(), kAlignment, 8);
     config.ready_bucket_target = 0;
@@ -1120,14 +1120,9 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudge
     // Include corrupt metadata, a metadata-only ID and an orphan data file.
     std::ofstream(tmp.file("bucket_000041.meta")) << "corrupt metadata";
     std::ofstream(tmp.file("bucket_000042.data")) << "orphan data";
-    auto read_file = [](const std::string& path) {
-        std::ifstream input(path, std::ios::binary);
-        return std::string(std::istreambuf_iterator<char>(input),
-                           std::istreambuf_iterator<char>());
-    };
-    std::unordered_map<std::string, std::string> old_files;
+    std::vector<std::string> old_files;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
-        old_files.emplace(entry.path().string(), read_file(entry.path().string()));
+        old_files.push_back(entry.path().string());
     }
 
     config.bucket_recovery_enabled = false;
@@ -1159,9 +1154,11 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudge
         EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
         EXPECT_FALSE(std::filesystem::exists(first->file_path));
     }
-    for (const auto& [path, contents] : old_files) {
-        ASSERT_TRUE(std::filesystem::exists(path)) << path;
-        EXPECT_EQ(read_file(path), contents) << path;
+    // Recovery was disabled for the second run, so its startup sweep reclaims
+    // every scanned bucket file. The allocator destructor above joins that
+    // sweep before returning, so none of the old files survive.
+    for (const auto& path : old_files) {
+        EXPECT_FALSE(std::filesystem::exists(path)) << path;
     }
 
     // A metadata-only ID also reserves its name without loading its payload.

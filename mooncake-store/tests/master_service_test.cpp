@@ -2327,8 +2327,11 @@ TEST_F(MasterServiceTest, DfsBucketRestartCanSkipRecoveryAndRewriteOldKey) {
                         .has_value());
         EXPECT_TRUE(service.GetReplicaList("same_key", TenantId::Default())
                         .has_value());
-        EXPECT_TRUE(std::filesystem::exists(old_path));
     }
+    // Recovery was disabled for the second run, so its startup sweep reclaims
+    // the first run's bucket files. The service shutdown above joins that
+    // sweep, so the file is gone by the time it returns.
+    EXPECT_FALSE(std::filesystem::exists(old_path));
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
 }
