@@ -36,6 +36,7 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "environ.h"
+#include "environment_variables.h"
 #include "segment.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
@@ -392,6 +393,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
               return std::make_unique<OrderedOpLogWriter>(
                   std::move(writer_config), std::move(write_batch));
           }) {
+    dfs_snapshot_epoch_ = generate_uuid();
+    dfs_heartbeat_interval_seconds_.store(
+        std::max<uint32_t>(
+            Environ::ReadOr(
+                FileStorageEnvironmentVariables::
+                    MOONCAKE_OFFLOAD_DFS_HEARTBEAT_INTERVAL_SECONDS,
+                uint32_t{300}),
+            1),
+        std::memory_order_release);
+    LOG(INFO) << "DFS heartbeat interval initialized to "
+              << dfs_heartbeat_interval_seconds_.load(
+                     std::memory_order_acquire)
+              << "s";
+
     if (default_kv_soft_pin_ttl_ > max_kv_soft_pin_ttl_) {
         LOG(ERROR) << "Invalid soft-pin TTL configuration: default="
                    << default_kv_soft_pin_ttl_
@@ -1748,6 +1763,15 @@ tl::expected<int64_t, ErrorCode> MasterService::SetDfsMaxBucketCount(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     return bucket_allocator_->SetMaxBucketCount(new_max_bucket_count);
+}
+
+tl::expected<uint32_t, ErrorCode> MasterService::SetDfsHeartbeatInterval(
+    uint32_t new_interval_seconds) {
+    if (new_interval_seconds == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return dfs_heartbeat_interval_seconds_.exchange(
+        new_interval_seconds, std::memory_order_acq_rel);
 }
 
 void MasterService::RecomputeTenantEffectiveQuotas() {
@@ -8302,6 +8326,31 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         }
     }
     return std::vector<OffloadTaskItem>{};
+}
+
+auto MasterService::GetDfsBucketSnapshot(
+    const UUID& client_id, const UUID& last_epoch, uint64_t last_version)
+    -> tl::expected<DfsBucketSnapshotResponse, ErrorCode> {
+    (void)client_id;
+    if (bucket_allocator_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    auto snapshot = bucket_allocator_->GetBucketIdSnapshot();
+    if (!snapshot) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    DfsBucketSnapshotResponse response;
+    response.epoch = dfs_snapshot_epoch_;
+    response.version = snapshot->version;
+    response.heartbeat_interval_seconds =
+        dfs_heartbeat_interval_seconds_.load(std::memory_order_acquire);
+    response.unchanged = last_epoch == dfs_snapshot_epoch_ &&
+                         last_version == snapshot->version;
+    if (!response.unchanged) response.bucket_ids = snapshot->bucket_ids;
+    LOG(INFO) << "Returned DFS bucket snapshot, version=" << response.version
+              << ", unchanged=" << response.unchanged
+              << ", bucket_count=" << response.bucket_ids.size();
+    return response;
 }
 
 auto MasterService::PollRemoveAll(const UUID& client_id)

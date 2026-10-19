@@ -345,6 +345,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchInvalidateDfsBuckets> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetDfsBucketSnapshot> {
+    static constexpr const char* value = "GetDfsBucketSnapshot";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
@@ -1103,6 +1108,14 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<DfsBucketSnapshotResponse, ErrorCode>
+MasterClient::GetDfsBucketSnapshot(const UUID& client_id,
+                                   const UUID& last_epoch,
+                                   uint64_t last_version) {
+    return invoke_rpc<&WrappedMasterService::GetDfsBucketSnapshot,
+                      DfsBucketSnapshotResponse>(client_id, last_epoch,
+                                                  last_version);
+}
 tl::expected<bool, ErrorCode> MasterClient::PollRemoveAll() {
     ScopedVLogTimer timer(1, "MasterClient::PollRemoveAll");
     timer.LogRequest("client_id=", client_id_);

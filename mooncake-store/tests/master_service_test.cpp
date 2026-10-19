@@ -1902,6 +1902,61 @@ TEST_F(MasterServiceTest, DfsBucketModeSupportsPutEndAndQuery) {
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_F(MasterServiceTest, DfsBucketSnapshotTracksVersionEpochAndHeartbeatInterval) {
+    const auto root = MakeDfsTestRoot("snapshot_heartbeat");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar ready("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+    ScopedEnvVar interval("MOONCAKE_OFFLOAD_DFS_HEARTBEAT_INTERVAL_SECONDS", "5");
+    UUID old_epoch{};
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        auto first = service.GetDfsBucketSnapshot(context.client_id, {}, 0);
+        ASSERT_TRUE(first.has_value());
+        EXPECT_FALSE(first->unchanged);
+        EXPECT_EQ(first->heartbeat_interval_seconds, 5u);
+        old_epoch = first->epoch;
+
+        ASSERT_TRUE(service.SetDfsHeartbeatInterval(2).has_value());
+        EXPECT_FALSE(service.SetDfsHeartbeatInterval(0).has_value());
+        auto unchanged = service.GetDfsBucketSnapshot(
+            context.client_id, first->epoch, first->version);
+        ASSERT_TRUE(unchanged.has_value());
+        EXPECT_TRUE(unchanged->unchanged);
+        EXPECT_TRUE(unchanged->bucket_ids.empty());
+        EXPECT_EQ(unchanged->heartbeat_interval_seconds, 2u);
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        auto start = service.PutStart(context.client_id, "snapshot_key",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start.has_value());
+        const auto* dfs = FindDfsDescriptor(*start);
+        ASSERT_NE(dfs, nullptr);
+        auto changed = service.GetDfsBucketSnapshot(
+            context.client_id, first->epoch, first->version);
+        ASSERT_TRUE(changed.has_value());
+        EXPECT_FALSE(changed->unchanged);
+        EXPECT_GT(changed->version, first->version);
+        EXPECT_NE(std::find(changed->bucket_ids.begin(), changed->bucket_ids.end(),
+                            dfs->get_dfs_descriptor().shard_idx),
+                  changed->bucket_ids.end());
+    }
+    {
+        MasterService restarted;
+        auto current = restarted.GetDfsBucketSnapshot({}, {}, 0);
+        ASSERT_TRUE(current.has_value());
+        EXPECT_NE(current->epoch, old_epoch);
+        // Even the current version is insufficient when the epoch is stale.
+        auto stale_epoch =
+            restarted.GetDfsBucketSnapshot({}, old_epoch, current->version);
+        ASSERT_TRUE(stale_epoch.has_value());
+        EXPECT_FALSE(stale_epoch->unchanged);
+    }
+    std::filesystem::remove_all(root);
+}
+
 TEST_F(MasterServiceTest, DfsRootIdentityRetriesAfterRootBecomesAvailable) {
     const auto root = MakeDfsTestRoot("identity_retry_after_recovery");
     ScopedBucketDfsEnv env(root, "1048576", "16");

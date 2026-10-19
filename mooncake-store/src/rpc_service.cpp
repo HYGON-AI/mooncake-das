@@ -1616,6 +1616,11 @@ WrappedMasterService::SetDfsMaxBucketCount(int64_t new_max_bucket_count) {
     return master_service_.SetDfsMaxBucketCount(new_max_bucket_count);
 }
 
+tl::expected<uint32_t, ErrorCode>
+WrappedMasterService::SetDfsHeartbeatInterval(uint32_t new_interval_seconds) {
+    return master_service_.SetDfsHeartbeatInterval(new_interval_seconds);
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
     // Compatibility endpoint: /get_all_keys historically listed only the
@@ -1672,6 +1677,13 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<DfsBucketSnapshotResponse, ErrorCode>
+WrappedMasterService::GetDfsBucketSnapshot(
+    const UUID& client_id, const UUID& last_epoch, uint64_t last_version) {
+    ScopedVLogTimer timer(1, "GetDfsBucketSnapshot");
+    return master_service_.GetDfsBucketSnapshot(client_id, last_epoch,
+                                                 last_version);
+}
 tl::expected<bool, ErrorCode> WrappedMasterService::PollRemoveAll(
     const UUID& client_id) {
     ScopedVLogTimer timer(1, "PollRemoveAll");
@@ -1956,6 +1968,9 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::BatchInvalidateDfsBuckets>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetDfsBucketSnapshot>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
         &wrapped_master_service);

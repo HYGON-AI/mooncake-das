@@ -285,6 +285,49 @@ TEST_F(DfsBucketBackendTest, WriteThenReadRoundTrip) {
     EXPECT_EQ(ReadObject(key, desc), value);
 }
 
+TEST_F(DfsBucketBackendTest, CleanupDropsMissingInactiveBucketWithoutRecreatingIt) {
+    const std::string value(4096, 'C');
+    auto desc = WriteObject("cleanup_missing", value);
+    auto cleanup = backend_->CleanupStaleBucketFds({});
+    ASSERT_TRUE(cleanup.has_value());
+    EXPECT_EQ(*cleanup, 0u);  // A path that still exists keeps its handle.
+
+    ASSERT_TRUE(std::filesystem::remove(desc.file_path));
+    cleanup = backend_->CleanupStaleBucketFds({desc.shard_idx});
+    ASSERT_TRUE(cleanup.has_value());
+    EXPECT_EQ(*cleanup, 0u);  // An active snapshot entry is not a candidate.
+    cleanup = backend_->CleanupStaleBucketFds({});
+    ASSERT_TRUE(cleanup.has_value());
+    EXPECT_EQ(*cleanup, 1u);
+
+    auto writes = backend_->BatchWrite(
+        {{"cleanup_missing", desc,
+          {{const_cast<char*>(value.data()), value.size()}}}});
+    ASSERT_EQ(writes.size(), 1u);
+    EXPECT_FALSE(writes[0].has_value());
+    EXPECT_FALSE(std::filesystem::exists(desc.file_path));
+}
+
+TEST_F(DfsBucketBackendTest, EpochInvalidationReopensReusedBucketPath) {
+    const std::string old_value(4096, 'O');
+    const std::string new_value(4096, 'N');
+    auto desc = WriteObject("epoch_reuse", old_value);
+    EXPECT_EQ(ReadObject("epoch_reuse", desc), old_value);
+    std::filesystem::rename(desc.file_path, desc.file_path + ".old");
+    {
+        std::ofstream replacement(desc.file_path, std::ios::binary);
+        replacement.seekp(static_cast<std::streamoff>(desc.offset));
+        replacement.write(new_value.data(), new_value.size());
+        ASSERT_TRUE(replacement.good());
+    }
+    // The cached handles still refer to the previous inode at the same path.
+    EXPECT_EQ(ReadObject("epoch_reuse", desc), old_value);
+    auto invalidated = backend_->InvalidateAllBucketFds();
+    ASSERT_TRUE(invalidated.has_value());
+    EXPECT_GE(*invalidated, 1u);
+    EXPECT_EQ(ReadObject("epoch_reuse", desc), new_value);
+}
+
 TEST_F(DfsBucketBackendTest, WrittenEntryContainsOnlyObjectAndPadding) {
     const std::string key = "layout_key";
     const std::string value(64, 'Z');
@@ -870,6 +913,8 @@ TEST(DistributedStorageBackendRootTest,
     std::ofstream(root + "/" + kDfsRootMarkerFileName) << kDfsRootMarkerPayload;
     ASSERT_TRUE(backend.ProbeWrite().has_value());
     ASSERT_TRUE(backend.ProbeRead().has_value());
+    // The master allocator must create the bucket before a client can write it.
+    std::ofstream(descriptor.file_path, std::ios::binary).close();
     write_results = backend.BatchWrite(
         {{"marker_gate", descriptor, {{value.data(), value.size()}}}});
     ASSERT_EQ(write_results.size(), 1u);

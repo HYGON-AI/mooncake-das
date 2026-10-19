@@ -485,6 +485,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    [[nodiscard]] tl::expected<DfsBucketSnapshotResponse, ErrorCode>
+    GetDfsBucketSnapshot(const UUID& client_id, const UUID& last_epoch,
+                         uint64_t last_version);
+
     /**
      * @brief Poll whether master has requested a full SSD clear.
      * @return true if client should clear all SSD files
