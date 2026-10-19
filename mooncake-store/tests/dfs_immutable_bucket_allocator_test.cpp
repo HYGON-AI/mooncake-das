@@ -37,6 +37,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 namespace mooncake::test {
 
@@ -86,10 +87,13 @@ class ScopedBucketPrecreateLogCapture : public google::LogSink {
         (void)line;
         (void)tm_time;
         const std::string text(message, message_len);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (text.find("Failed to delete bucket") != std::string::npos) {
+            cleanup_messages_.push_back(text);
+        }
         if (text.find("Failed to precreate DFS bucket") == std::string::npos) {
             return;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
         messages_.push_back(text);
     }
 
@@ -98,13 +102,52 @@ class ScopedBucketPrecreateLogCapture : public google::LogSink {
         return messages_;
     }
 
+    std::vector<std::string> cleanup_messages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cleanup_messages_;
+    }
+
    private:
     mutable std::mutex mutex_;
     std::vector<std::string> messages_;
+    std::vector<std::string> cleanup_messages_;
 };
 
 constexpr uint64_t kAlignment = 4096;
 constexpr uint64_t kBucketCapacity = 64 * 1024;
+
+TEST(DfsLogLimiterTest, IndependentSitesCountSuppressedMessagesAcrossWindows) {
+    DfsLogLimiter first;
+    DfsLogLimiter second;
+    const auto now = DfsLogLimiter::Clock::now();
+    ASSERT_EQ(first.ShouldLog(now), std::optional<uint64_t>(0));
+    EXPECT_EQ(second.ShouldLog(now), std::optional<uint64_t>(0));
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_FALSE(first.ShouldLog(now + std::chrono::seconds(29)));
+    }
+    EXPECT_EQ(first.ShouldLog(now + std::chrono::seconds(30)),
+              std::optional<uint64_t>(100));
+    EXPECT_EQ(second.ShouldLog(now + std::chrono::seconds(30)),
+              std::optional<uint64_t>(0));
+}
+
+TEST(DfsLogLimiterTest, ConcurrentFailuresShareOneSiteQuota) {
+    DfsLogLimiter limiter;
+    const auto now = DfsLogLimiter::Clock::now();
+    std::atomic<int> logged{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 8; ++i) {
+        workers.emplace_back([&] {
+            for (int j = 0; j < 100; ++j) {
+                if (limiter.ShouldLog(now)) ++logged;
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(logged.load(), 1);
+    EXPECT_EQ(limiter.ShouldLog(now + std::chrono::seconds(30)),
+              std::optional<uint64_t>(799));
+}
 
 template <typename T, typename = void>
 struct HasBucketGeneration : std::false_type {};
@@ -359,27 +402,59 @@ TEST(ImmutableBucketAllocatorTest,
     auto allocated = alloc.Allocate("precreate_retry", 100);
     ASSERT_TRUE(allocated.has_value());
 
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::seconds(5);
-    auto failures_after = failures_before;
-    while (std::chrono::steady_clock::now() < deadline) {
-        failures_after = ReadDfsBucketCreateFailureTotal();
-        if (failures_after.has_value() &&
-            *failures_after >= *failures_before + 3 &&
-            log_capture.messages().size() >= 1) {
-            break;
-        }
+    const auto first_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(3);
+    while (log_capture.messages().empty() &&
+           std::chrono::steady_clock::now() < first_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    ASSERT_EQ(log_capture.messages().size(), 1u);
+    const auto first_failures = ReadDfsBucketCreateFailureTotal();
+    ASSERT_TRUE(first_failures.has_value());
 
+    // Exhaust the active bucket, then keep requesting space during backoff.
+    // Previously every allocation cleared the deadline and retried metadata I/O.
+    for (int i = 0; i < 200; ++i) {
+        (void)alloc.Allocate("backoff_" + std::to_string(i), kBucketCapacity);
+    }
+    const auto immediate_failures = ReadDfsBucketCreateFailureTotal();
+    ASSERT_TRUE(immediate_failures.has_value());
+    EXPECT_EQ(*immediate_failures, *first_failures);
+    EXPECT_TRUE(log_capture.cleanup_messages().empty());
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    auto failures_after = first_failures;
+    while (std::chrono::steady_clock::now() < deadline) {
+        failures_after = ReadDfsBucketCreateFailureTotal();
+        if (failures_after && *failures_after >= *failures_before + 3) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     ASSERT_TRUE(failures_after.has_value());
-    EXPECT_GE(*failures_after, *failures_before + 2);
+    EXPECT_GE(*failures_after, *failures_before + 3);
+    EXPECT_LE(*failures_after, *failures_before + 3);
     const auto messages = log_capture.messages();
     EXPECT_EQ(messages.size(), 1u);
-    if (!messages.empty()) {
-        EXPECT_NE(messages.front().find("error="), std::string::npos);
-        EXPECT_NE(messages.front().find("ready_count="), std::string::npos);
+    EXPECT_NE(messages.front().find("suppressed=0"), std::string::npos);
+    EXPECT_TRUE(log_capture.cleanup_messages().empty());
+
+    // Recovery is driven by the worker's next timed retry, without resetting it.
+    std::filesystem::remove(tmp.path());
+    std::filesystem::create_directory(tmp.path());
+    const auto recovery_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(6);
+    bool recovered = false;
+    while (std::chrono::steady_clock::now() < recovery_deadline) {
+        auto retry = alloc.Allocate("after_recovery", kBucketCapacity);
+        if (retry) {
+            EXPECT_NE(retry->file_path, allocated->file_path);
+            recovered = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    EXPECT_TRUE(recovered);
+
 }
 
 TEST(ImmutableBucketAllocatorTest, InitRejectsInvalidConfiguration) {

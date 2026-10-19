@@ -1,4 +1,5 @@
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -647,8 +648,12 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id) {
                              kBucketDataSuffix;
     auto fd_result = fs_adapter_->OpenFile(path);
     if (!fd_result) {
-        LOG(ERROR) << "Failed to open DFS bucket file " << path << ": "
-                   << fd_result.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to open DFS bucket file " << path << ": "
+                       << fd_result.error()
+                       << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(fd_result.error());
     }
 

@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <glog/logging.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -90,6 +91,13 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     int WriteCalls() const { return write_calls_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
     void FailAllWrites(bool fail) { fail_all_writes_.store(fail); }
+    void FailAllOpens(bool fail) { fail_all_opens_.store(fail); }
+    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+        if (fail_all_opens_.load()) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        return PosixFsAdapter::OpenFile(path);
+    }
     void BlockWrites() {
         std::lock_guard<std::mutex> lock(mutex_);
         blocked_ = true;
@@ -118,6 +126,7 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     std::atomic<int> write_calls_{0};
     std::atomic<int> fail_write_call_{-1};
     std::atomic<bool> fail_all_writes_{false};
+    std::atomic<bool> fail_all_opens_{false};
     std::mutex mutex_;
     std::condition_variable cv_;
     bool blocked_ = false;
@@ -571,6 +580,46 @@ TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {
         EXPECT_FALSE(replica.is_dfs_replica())
             << "a failed DFS write must not leave a DFS replica behind";
     }
+}
+
+TEST_F(DfsBucketClientTest, OpenFailuresAreRateLimitedAndRevokeEveryDfsReplica) {
+    struct Capture : google::LogSink {
+        Capture() { google::AddLogSink(this); }
+        ~Capture() override { google::RemoveLogSink(this); }
+        std::atomic<int> opens{0}, writes{0};
+        void send(google::LogSeverity, const char*, const char*, int,
+                  const struct ::tm*, const char* message, size_t length) override {
+            const std::string text(message, length);
+            if (text.find("Failed to open DFS bucket file") != std::string::npos) {
+                ++opens;
+                EXPECT_NE(text.find("suppressed=0"), std::string::npos);
+            }
+            if (text.find("Async DFS write failed for key") != std::string::npos) {
+                ++writes;
+                EXPECT_NE(text.find("suppressed=0"), std::string::npos);
+            }
+        }
+    } capture;
+    adapter_->FailAllOpens(true);
+    std::vector<std::string> keys;
+    std::vector<std::string> values(32, std::string(4096, 'F'));
+    for (int i = 0; i < 32; ++i) {
+        keys.push_back("open_failure_" + std::to_string(i));
+    }
+    auto slices = MakeSlices(values);
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(results[i].has_value());
+        ASSERT_TRUE(WaitForKeyGone(keys[i]));
+        auto query = writer_->Query(keys[i]);
+        ASSERT_TRUE(query.has_value());
+        for (const auto& replica : query->replicas) {
+            EXPECT_TRUE(replica.is_memory_replica());
+        }
+    }
+    EXPECT_EQ(capture.opens.load(), 1);
+    EXPECT_EQ(capture.writes.load(), 1);
 }
 
 TEST_F(DfsBucketClientTest, BatchIoFailureRevokesAllKeysInMergedRun) {
