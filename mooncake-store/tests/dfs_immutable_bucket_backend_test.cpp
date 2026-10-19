@@ -779,6 +779,51 @@ TEST(DistributedStorageBackendRootTest,
 }
 
 TEST(DistributedStorageBackendRootTest,
+     ProbeRefreshesEmptyStartupIdentityAndKeepsMountValidation) {
+    BucketTempDir root("dfs_bucket_empty_identity_retry");
+    auto config = MakeBucketConfig(root.path());
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root.path();
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<PosixFsAdapter>());
+    int fetches = 0;
+    tl::expected<std::string, ErrorCode> master_identity = std::string{};
+    backend.SetRootIdentityProvider([&] {
+        ++fetches;
+        return master_identity;
+    });
+
+    // DFS is disabled at startup, then the control-plane RPC briefly fails.
+    EXPECT_FALSE(backend.Init().has_value());
+    master_identity = tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_FALSE(backend.ProbeWrite().has_value());
+    EXPECT_EQ(fetches, 2);
+
+    // The master's recovered identity must still match the client's mount.
+    master_identity = kTestDfsRootIdentity;
+    WriteTestDfsRootIdentity(
+        root.path(), SerializeDfsRootIdentity("wrong_mount", UUID{3, 4}));
+    EXPECT_FALSE(backend.ProbeWrite().has_value());
+    EXPECT_FALSE(backend.IsInitialized());
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(root.path()),
+                            std::filesystem::directory_iterator{}),
+              1);
+
+    WriteTestDfsRootIdentity(root.path());
+    ASSERT_TRUE(backend.ProbeWrite().has_value());
+    EXPECT_TRUE(backend.ProbeRead().has_value());
+    EXPECT_TRUE(backend.IsInitialized());
+    EXPECT_EQ(fetches, 3);
+
+    // Once established, never replace the pinned identity with local contents.
+    WriteTestDfsRootIdentity(
+        root.path(), SerializeDfsRootIdentity("wrong_mount", UUID{3, 4}));
+    EXPECT_FALSE(backend.ProbeWrite().has_value());
+    EXPECT_EQ(fetches, 3);
+}
+
+TEST(DistributedStorageBackendRootTest,
      MarkerIsRequiredForEveryProbeAndBatchIoAndCanRecover) {
     BucketTempDir parent("dfs_bucket_marker_retry");
     const std::string root = parent.file("mount");

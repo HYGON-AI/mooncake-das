@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -134,6 +135,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
     // when another read/write probe is initializing the shared backend.
     tl::expected<void, ErrorCode> EnsureInitialized();
     tl::expected<void, ErrorCode> TryEnsureInitialized();
+
+    // Configure before initialization/probes start. Only an empty startup
+    // identity is refreshed; an established identity remains pinned.
+    void SetRootIdentityProvider(
+        std::function<tl::expected<std::string, ErrorCode>()> provider) {
+        root_identity_provider_ = std::move(provider);
+    }
 
     // Minimal adapter-level probes used by SGLang's health state machine.
     // These methods never touch business keys.
@@ -306,6 +314,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string expected_root_identity_;
+    std::function<tl::expected<std::string, ErrorCode>()> root_identity_provider_;
     std::string root_dir_;
     // Canonical form of root_dir_, used to reject descriptor paths that try to
     // escape the configured DFS root.
