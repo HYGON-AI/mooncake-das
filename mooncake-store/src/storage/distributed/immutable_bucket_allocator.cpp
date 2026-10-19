@@ -225,6 +225,16 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return tl::make_unexpected(adapter_init.error());
     }
 
+    const std::string root_marker_path = fsdir_ + "/" + kDfsRootMarkerFileName;
+    auto marker_result = EnsureDfsRootMarker(*fs_adapter_, root_marker_path);
+    if (!marker_result) {
+        LOG(ERROR) << "Failed to ensure DFS root marker " << root_marker_path
+                   << ": " << marker_result.error();
+        fs_adapter_->Shutdown();
+        fs_adapter_.reset();
+        return marker_result;
+    }
+
     auto recovered = RecoverFromDisk(config.bucket_recovery_enabled);
     if (!recovered) {
         fs_adapter_->Shutdown();
