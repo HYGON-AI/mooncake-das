@@ -273,6 +273,32 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
+    // MC_FORCE_HYLINK:
+    // - Without ENABLE_MULTI_PROTOCOL: HyLink-only (skip RDMA/TCP), like
+    //   MC_FORCE_TCP.
+    // - With ENABLE_MULTI_PROTOCOL: ignored here. Auto-discover still
+    //   installs RDMA/TCP, then HyLink is installed with them. A USE_HYLINK
+    //   build does not install HipTransport.
+#ifndef ENABLE_MULTI_PROTOCOL
+    if (envFlagEnabled("MC_FORCE_HYLINK")) {
+#ifdef USE_HYLINK
+        Transport* hylink_transport =
+            multi_transports_->installTransport("hylink", nullptr);
+        if (!hylink_transport) {
+            LOG(ERROR) << "MC_FORCE_HYLINK is set but failed to install HyLink "
+                          "transport";
+            return -1;
+        }
+        LOG(INFO) << "MC_FORCE_HYLINK is set, using HyLink transport only";
+        return 0;
+#else
+        LOG(ERROR)
+            << "MC_FORCE_HYLINK is set but USE_HYLINK is not compiled in";
+        return -1;
+#endif
+    }
+#endif
+
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     if (shouldInstallAscendTransport(auto_discover_config_.protocol)) {
         Transport* ascend_transport =
@@ -522,9 +548,27 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
         // TODO: install other transports automatically
 
-#ifdef USE_HIP
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+        // After RDMA/TCP, so the segment protocol becomes "rdma,hylink" or
+        // "tcp,hylink". A node without HSL keeps the RDMA/TCP transport
+        // already installed. HipTransport is not installed in a USE_HYLINK
+        // build. MC_FORCE_HYLINK remains a hard failure above.
+        {
+            Transport* hylink_transport =
+                multi_transports_->installTransport("hylink", nullptr);
+            if (!hylink_transport) {
+                LOG(WARNING) << "Failed to install HyLink transport "
+                                "(HSL unavailable)";
+            } else {
+                LOG(INFO) << "HyLink transport installed";
+            }
+        }
+#endif
+
+#if defined(USE_HIP) && !defined(USE_HYLINK)
         // HIP transport handles intra-node GPU P2P via XGMI/IPC and can
         // coexist with the cross-node transport (RDMA/TCP) selected above.
+        // USE_HYLINK installs HylinkTransport instead of HipTransport.
         {
             Transport* hip_transport =
                 multi_transports_->installTransport("hip", nullptr);

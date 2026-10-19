@@ -18,11 +18,12 @@
 #include <hip/hip_runtime.h>
 
 #include <array>
-#include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "tent/common/concurrent/ticket_lock.h"
@@ -133,7 +134,7 @@ class HylinkTransport : public Transport {
                               HylinkTask& task);
 
     Status relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
-                                       uint64_t target_id, int device_id,
+                                       uint64_t target_id,
                                        HylinkHandleKind* kind = nullptr);
 
     Status setPeerAccess();
@@ -153,17 +154,19 @@ class HylinkTransport : public Transport {
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Config> conf_;
 
-    // target -> remote buffer -> local device. Fabric uses device_id so
-    // each GPU imports and maps its own VA. IPC uses key -1.
-    using RelocateMap = std::unordered_map<
-        SegmentID,
-        std::unordered_map<uint64_t, std::unordered_map<int, OpenedMapping>>>;
+    struct RelocateKeyHash {
+        std::size_t operator()(
+            const std::pair<SegmentID, uint64_t>& key) const {
+            std::size_t h1 = std::hash<SegmentID>{}(key.first);
+            std::size_t h2 = std::hash<uint64_t>{}(key.second);
+            return h1 ^ (h2 << 1);
+        }
+    };
+    using RelocateMap = std::unordered_map<std::pair<SegmentID, uint64_t>,
+                                           OpenedMapping, RelocateKeyHash>;
 
     RWSpinlock relocate_lock_;
     RelocateMap relocate_map_;
-    // Bumped on uninstall so per-thread copies of relocate_map_ drop mappings
-    // whose HIP handles have already been closed.
-    std::atomic<uint64_t> relocate_epoch_{1};
 
     static constexpr int kStreamsPerDevice = 8;
     std::mutex stream_pool_mutex_;

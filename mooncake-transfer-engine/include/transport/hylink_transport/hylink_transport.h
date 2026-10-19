@@ -21,8 +21,10 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "common/hash_utils.h"
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -34,8 +36,7 @@ class TransferMetadata;
 // Hylink transport for Hygon DCU memory over HSL (Hygon Scale-up Link).
 // HSL connects DCUs directly, including across machines, and does not use
 // an IB/RoCE NIC. Peers exchange a DTK VMM fabric handle (allocation type
-// 0x8, 512 bytes). An imported fabric address can be granted access only
-// once and only to one device, so each GPU maps its own address.
+// 0x8, 512 bytes).
 class HylinkTransport : public Transport {
    public:
     HylinkTransport();
@@ -99,12 +100,8 @@ class HylinkTransport : public Transport {
     hipStream_t acquireStream(int device_id);
     void closeMapping(OpenedMapping& mapping);
 
-    // target -> remote buffer -> local device. An imported fabric VA accepts
-    // hipMemSetAccess only once and only for one device, so each GPU maps
-    // its own address.
-    using RelocateMap = std::unordered_map<
-        uint64_t,
-        std::unordered_map<uint64_t, std::unordered_map<int, OpenedMapping>>>;
+    using RelocateMap = std::unordered_map<std::pair<uint64_t, uint64_t>,
+                                           OpenedMapping, PairHash>;
 
     RWSpinlock remap_lock_;
     RelocateMap remap_;

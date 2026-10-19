@@ -236,11 +236,7 @@ HylinkTransport::HylinkTransport() = default;
 
 HylinkTransport::~HylinkTransport() {
     RWSpinlock::WriteGuard guard(remap_lock_);
-    for (auto& segment : remap_) {
-        for (auto& buffer : segment.second) {
-            for (auto& device : buffer.second) closeMapping(device.second);
-        }
-    }
+    for (auto& entry : remap_) closeMapping(entry.second);
     remap_.clear();
     std::lock_guard<std::mutex> streams(stream_pool_mutex_);
     for (auto& pool : stream_pools_) {
@@ -577,11 +573,21 @@ int HylinkTransport::registerLocalMemory(void* addr, size_t length,
     hipPointerAttribute_t attr;
     hipError_t attr_err = hipPointerGetAttributes(&attr, addr);
     if (attr_err != hipSuccess || attr.type != hipMemoryTypeDevice) {
+        // Host memory cannot be exported. With ENABLE_MULTI_PROTOCOL,
+        // RDMA/TCP is installed alongside HyLink, so skip this transport.
+        // MC_FORCE_HYLINK installs HyLink alone, and a success here would
+        // record a region with no buffer.
         (void)hipGetLastError();
+#ifdef ENABLE_MULTI_PROTOCOL
         if (globalConfig().trace) {
             LOG(INFO) << "HylinkTransport: skipping non-device memory " << addr;
         }
         return 0;
+#else
+        LOG(ERROR) << "HylinkTransport: memory at " << addr
+                   << " is not device memory";
+        return -1;
+#endif
     }
 
     int saved = 0;
@@ -616,11 +622,23 @@ int HylinkTransport::registerLocalMemory(void* addr, size_t length,
         hipMemGenericAllocationHandle_t handle = nullptr;
         hipError_t retain_err = hipMemRetainAllocationHandle(&handle, base);
         if (retain_err != hipSuccess || !handle) {
+            // Device memory that is not a DTK fabric allocation (for example
+            // hipMalloc) cannot be exported. With ENABLE_MULTI_PROTOCOL,
+            // RDMA/TCP is installed alongside HyLink, so skip this transport
+            // and keep that registration. MC_FORCE_HYLINK installs HyLink
+            // alone, and a success here would record a region with no buffer.
             (void)hipGetLastError();
+#ifdef ENABLE_MULTI_PROTOCOL
+            LOG(WARNING) << "HylinkTransport: memory at " << addr
+                         << " is not a DTK fabric allocation";
+            (void)hipSetDevice(saved);
+            return 0;
+#else
             LOG(ERROR) << "HylinkTransport: memory at " << addr
                        << " is not a DTK fabric allocation";
             (void)hipSetDevice(saved);
             return -1;
+#endif
         }
         DtkFabricHandle fabric{};
         hipError_t export_err = hipMemExportToShareableHandle(
@@ -663,11 +681,6 @@ int HylinkTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
 int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                                                  uint64_t length,
                                                  uint64_t target_id) {
-    int device_id = 0;
-    if (hipGetDevice(&device_id) != hipSuccess) {
-        (void)hipGetLastError();
-        return ERR_INVALID_ARGUMENT;
-    }
     auto desc = metadata_->getSegmentDescByID(target_id);
     if (!desc) {
         LOG(ERROR) << "HylinkTransport: missing segment " << target_id;
@@ -683,29 +696,22 @@ int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         if (!entry.protocol.empty() && entry.protocol != "hylink") continue;
 #endif
 
+        const auto key = std::make_pair(target_id, entry.addr);
         {
             remap_lock_.lockShared();
-            auto segment = remap_.find(target_id);
-            if (segment != remap_.end()) {
-                auto buffer = segment->second.find(entry.addr);
-                if (buffer != segment->second.end()) {
-                    auto mapping = buffer->second.find(device_id);
-                    if (mapping != buffer->second.end()) {
-                        dest_addr = dest_addr - entry.addr +
-                                    reinterpret_cast<uint64_t>(
-                                        mapping->second.shm_addr);
-                        remap_lock_.unlockShared();
-                        return 0;
-                    }
-                }
+            auto mapping = remap_.find(key);
+            if (mapping != remap_.end()) {
+                dest_addr = dest_addr - entry.addr +
+                            reinterpret_cast<uint64_t>(mapping->second.shm_addr);
+                remap_lock_.unlockShared();
+                return 0;
             }
             remap_lock_.unlockShared();
         }
 
         RWSpinlock::WriteGuard guard(remap_lock_);
-        auto& device_map = remap_[target_id][entry.addr];
-        auto existing = device_map.find(device_id);
-        if (existing == device_map.end()) {
+        auto existing = remap_.find(key);
+        if (existing == remap_.end()) {
             DtkFabricHandle fabric{};
             if (!decodeFabric(entry.shm_name, fabric)) {
                 LOG(ERROR) << "HylinkTransport: malformed fabric handle";
@@ -736,17 +742,17 @@ int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                            << hipGetErrorString(err);
                 return -1;
             }
-            if (hipSetDevice(device_id) != hipSuccess) {
-                closeMapping(opened);
-                (void)hipGetLastError();
-                return -1;
+            int device_count = 0;
+            (void)hipGetDeviceCount(&device_count);
+            std::vector<hipMemAccessDesc> access(device_count);
+            for (int i = 0; i < device_count; ++i) {
+                access[i].location.type = hipMemLocationTypeDevice;
+                access[i].location.id = i;
+                access[i].flags = hipMemAccessFlagsProtReadWrite;
             }
-            hipMemAccessDesc access{};
-            access.location.type = hipMemLocationTypeDevice;
-            access.location.id = device_id;
-            access.flags = hipMemAccessFlagsProtReadWrite;
             err = hipMemSetAccess((hipDeviceptr_t)opened.shm_addr,
-                                  opened.length, &access, 1);
+                                  opened.length, access.data(),
+                                  access.size());
             if (err != hipSuccess) {
                 (void)hipGetLastError();
                 closeMapping(opened);
@@ -755,9 +761,8 @@ int HylinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
                 return -1;
             }
             LOG(INFO) << "HylinkTransport: opened DTK fabric mapping for "
-                      << (void*)entry.addr << " on device " << device_id;
-            device_map.emplace(device_id, opened);
-            existing = device_map.find(device_id);
+                      << (void*)entry.addr;
+            existing = remap_.emplace(key, opened).first;
         }
         dest_addr = dest_addr - entry.addr +
                     reinterpret_cast<uint64_t>(existing->second.shm_addr);
