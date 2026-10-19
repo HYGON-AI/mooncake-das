@@ -1921,12 +1921,17 @@ TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
         ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
     }
 
-    // Every file in the directory is either a `.data` or its single `.meta`
-    // companion: no log, no snapshot slots, no rename temporaries.
+    // Bucket files have one `.meta` companion, alongside the master-owned DFS
+    // root marker; there are no logs, snapshot slots, or rename temporaries.
     std::set<std::string> data_ids;
     std::set<std::string> meta_ids;
+    bool found_root_marker = false;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
         const std::string name = entry.path().filename().string();
+        if (name == kDfsRootMarkerFileName) {
+            found_root_marker = true;
+            continue;
+        }
         ASSERT_EQ(name.rfind("bucket_", 0), 0u);
         const std::string id = name.substr(7, 6);
         const std::string suffix = name.substr(13);
@@ -1938,6 +1943,7 @@ TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
             FAIL() << "Unexpected file in the bucket directory: " << name;
         }
     }
+    EXPECT_TRUE(found_root_marker);
     ASSERT_FALSE(meta_ids.empty());
     // Only the still-active bucket has data without metadata.
     EXPECT_EQ(data_ids.size(), meta_ids.size() + 1);
