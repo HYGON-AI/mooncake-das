@@ -92,11 +92,12 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     void FailWriteCall(int call) { fail_write_call_.store(call); }
     void FailAllWrites(bool fail) { fail_all_writes_.store(fail); }
     void FailAllOpens(bool fail) { fail_all_opens_.store(fail); }
-    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+    tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
+        const std::string& path) override {
         if (fail_all_opens_.load()) {
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
-        return PosixFsAdapter::OpenFile(path);
+        return PosixFsAdapter::OpenFileReadWriteExisting(path);
     }
     void BlockWrites() {
         std::lock_guard<std::mutex> lock(mutex_);
