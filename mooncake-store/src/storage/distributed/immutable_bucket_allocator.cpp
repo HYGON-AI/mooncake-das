@@ -616,6 +616,26 @@ void ImmutableBucketAllocator::StopBucketWorkers() {
         if (worker.joinable()) worker.join();
     }
     bucket_create_workers_.clear();
+    // The legacy sweep deletes files through the fs adapter, so it must finish
+    // before the adapter is shut down.
+    if (legacy_cleanup_worker_.joinable()) {
+        legacy_cleanup_worker_.join();
+    }
+}
+
+void ImmutableBucketAllocator::LegacyCleanupWorker(
+    std::vector<int64_t> bucket_ids) {
+    // Deleting these files needs no allocator lock: every id is below
+    // next_bucket_id_, so no bucket this process creates or evicts reuses a
+    // name in this list, and DeleteBucketFiles() touches only the fs adapter.
+    // DeleteBucketFiles() tolerates an already-absent `.meta` or `.data`, so an
+    // id that was recorded from only one of the two files - or whose file was
+    // removed before the sweep reached it - is not a failure.
+    for (const int64_t bucket_id : bucket_ids) {
+        DeleteBucketFiles(bucket_id);
+    }
+    LOG(INFO) << "DFS legacy bucket cleanup finished, buckets="
+              << bucket_ids.size();
 }
 
 void ImmutableBucketAllocator::BucketCreateWorker() {
@@ -1907,10 +1927,36 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
         // deliberately ignored.
     }
     if (!recover_metadata) {
-        // Old files stay outside this process's allocation and eviction state.
+        // Recovery is disabled: the files found above are invisible to this
+        // process's allocation and eviction state, so nothing would ever
+        // reclaim them and they would keep occupying the DFS directory. Record
+        // the id sequence, then delete exactly the scanned ids off the startup
+        // path so a large legacy directory does not stall initialization.
         next_bucket_id_ = max_seen_id + 1;
-        LOG(INFO) << "DFS bucket recovery disabled; retaining existing files, "
-                  << "next_bucket_id=" << next_bucket_id_;
+        std::unordered_set<int64_t> legacy_ids(meta_ids.begin(), meta_ids.end());
+        legacy_ids.insert(data_ids.begin(), data_ids.end());
+        std::vector<int64_t> sweep(legacy_ids.begin(), legacy_ids.end());
+        if (sweep.empty()) {
+            LOG(INFO) << "DFS bucket recovery disabled; no legacy bucket files "
+                         "to delete, next_bucket_id="
+                      << next_bucket_id_;
+            return {};
+        }
+        LOG(INFO) << "DFS bucket recovery disabled; deleting " << sweep.size()
+                  << " legacy bucket(s) in the background, next_bucket_id="
+                  << next_bucket_id_;
+        try {
+            // `sweep` is passed by value so the catch block below can still
+            // reclaim the files if the worker thread cannot be started.
+            legacy_cleanup_worker_ = std::thread(
+                &ImmutableBucketAllocator::LegacyCleanupWorker, this, sweep);
+        } catch (const std::system_error& e) {
+            LOG(WARNING) << "Failed to start DFS legacy bucket cleanup worker: "
+                         << e.what() << ", deleting synchronously";
+            for (const int64_t bucket_id : sweep) {
+                DeleteBucketFiles(bucket_id);
+            }
+        }
         return {};
     }
     std::sort(meta_ids.begin(), meta_ids.end());
