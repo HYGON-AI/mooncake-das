@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -26,6 +29,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "crc32c.h"
+#include "master_metric_manager.h"
 #include "replica.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
@@ -66,6 +70,37 @@ class TempDir {
    private:
     std::filesystem::path path_;
     std::string path_str_;
+};
+
+class ScopedBucketPrecreateLogCapture : public google::LogSink {
+   public:
+    ScopedBucketPrecreateLogCapture() { google::AddLogSink(this); }
+    ~ScopedBucketPrecreateLogCapture() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity severity, const char* full_filename,
+              const char* base_filename, int line, const struct ::tm* tm_time,
+              const char* message, size_t message_len) override {
+        (void)severity;
+        (void)full_filename;
+        (void)base_filename;
+        (void)line;
+        (void)tm_time;
+        const std::string text(message, message_len);
+        if (text.find("Failed to precreate DFS bucket") == std::string::npos) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        messages_.push_back(text);
+    }
+
+    std::vector<std::string> messages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::vector<std::string> messages_;
 };
 
 constexpr uint64_t kAlignment = 4096;
@@ -139,6 +174,29 @@ std::optional<DistributedFSDescriptor> RollOverActiveBucket(
     auto desc = alloc.Allocate(filler_key, bucket_capacity);
     if (!desc) return std::nullopt;
     return *desc;
+}
+
+std::optional<int64_t> ReadDfsBucketCreateFailureTotal() {
+    const std::string serialized =
+        MasterMetricManager::instance().serialize_metrics();
+    const std::string line_prefix =
+        "dfs_bucket_create_total{result=\"failure\"} ";
+    size_t line_begin = 0;
+    while (line_begin < serialized.size()) {
+        const size_t line_end = serialized.find('\n', line_begin);
+        if (serialized.compare(line_begin, line_prefix.size(), line_prefix) ==
+            0) {
+            const size_t value_begin = line_begin + line_prefix.size();
+            const size_t value_end = line_end == std::string::npos
+                                         ? serialized.size()
+                                         : line_end;
+            return std::stoll(
+                serialized.substr(value_begin, value_end - value_begin));
+        }
+        if (line_end == std::string::npos) break;
+        line_begin = line_end + 1;
+    }
+    return std::nullopt;
 }
 
 }  // namespace
@@ -275,6 +333,53 @@ TEST(ImmutableBucketAllocatorTest, UninitializedAllocatorReportsUnavailable) {
     auto desc = alloc.Allocate("k", 100);
     ASSERT_FALSE(desc.has_value());
     EXPECT_EQ(desc.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     BackgroundPrecreateFailuresAreRateLimitedAndRetry) {
+    TempDir tmp("bucket_precreate_failure_rate_limit");
+    auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 8);
+    config.ready_bucket_target = 1;
+    config.bucket_create_concurrency = 1;
+
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    const auto failures_before = ReadDfsBucketCreateFailureTotal();
+    ASSERT_TRUE(failures_before.has_value());
+
+    // Replace the initialized directory with a file. PreallocateFile now fails
+    // deterministically even when the test runs with elevated privileges.
+    std::filesystem::remove_all(tmp.path());
+    {
+        std::ofstream blocker(tmp.path());
+        ASSERT_TRUE(blocker.good());
+    }
+
+    ScopedBucketPrecreateLogCapture log_capture;
+    auto allocated = alloc.Allocate("precreate_retry", 100);
+    ASSERT_TRUE(allocated.has_value());
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    auto failures_after = failures_before;
+    while (std::chrono::steady_clock::now() < deadline) {
+        failures_after = ReadDfsBucketCreateFailureTotal();
+        if (failures_after.has_value() &&
+            *failures_after >= *failures_before + 3 &&
+            log_capture.messages().size() >= 1) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    ASSERT_TRUE(failures_after.has_value());
+    EXPECT_GE(*failures_after, *failures_before + 2);
+    const auto messages = log_capture.messages();
+    EXPECT_EQ(messages.size(), 1u);
+    if (!messages.empty()) {
+        EXPECT_NE(messages.front().find("error="), std::string::npos);
+        EXPECT_NE(messages.front().find("ready_count="), std::string::npos);
+    }
 }
 
 TEST(ImmutableBucketAllocatorTest, InitRejectsInvalidConfiguration) {
