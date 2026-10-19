@@ -342,6 +342,74 @@ TEST_F(DfsBucketClientTest, PutThenGetRoundTrip) {
     EXPECT_EQ(out, value);
 }
 
+TEST_F(DfsBucketClientTest, EmptyStartupIdentityRecoversFromMasterWithoutRestart) {
+    ASSERT_TRUE(provider_->UnmountSegment(segment_, segment_size_).has_value());
+    writer_.reset();
+    provider_.reset();
+    backend_.reset();
+    adapter_ = nullptr;
+    const int rpc_port = master_.rpc_port();
+    const auto master_config =
+        InProcMasterConfigBuilder().set_rpc_port(rpc_port).build();
+    master_.Stop();
+    SetEnv("MOONCAKE_ENABLE_DFS", "0");
+    ASSERT_TRUE(master_.Start(master_config));
+    writer_ = CreateClient("127.0.0.1:18201");
+    ASSERT_NE(writer_, nullptr);
+    ASSERT_TRUE(writer_->GetDfsRootIdentity().empty());
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root_;
+    // Keep this client and backend alive across the master's DFS recovery.
+    auto recovering = std::make_shared<DistributedStorageBackend>(
+        file_config, distributed_config_, std::make_unique<PosixFsAdapter>());
+    ASSERT_FALSE(recovering->Init().has_value());
+    recovering->SetRootIdentityProvider(
+        [weak_client = std::weak_ptr<Client>(writer_)]()
+            -> tl::expected<std::string, ErrorCode> {
+            auto client = weak_client.lock();
+            if (!client) {
+                return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            }
+            return client->FetchDfsRootIdentity();
+        });
+    writer_->SetDfsStorageBackend(recovering);
+    ASSERT_FALSE(recovering->ProbeWrite().has_value());
+    master_.Stop();
+    SetEnv("MOONCAKE_ENABLE_DFS", "1");
+    ASSERT_TRUE(master_.Start(master_config));
+    // A pooled connection can see EOF on the first probe after restart.
+    const auto recovery_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(5);
+    while (!recovering->ProbeWrite() &&
+           std::chrono::steady_clock::now() < recovery_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_TRUE(recovering->ProbeWrite().has_value());
+    ASSERT_TRUE(recovering->ProbeRead().has_value());
+
+    provider_ = CreateClient("127.0.0.1:18202");
+    ASSERT_NE(provider_, nullptr);
+    ASSERT_TRUE(provider_->MountSegment(segment_, segment_size_, "tcp")
+                    .has_value());
+
+    const std::string key = "recovered_startup_identity";
+    std::string value(4096, 'r');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    std::string output(value.size(), '\0');
+    auto read = recovering->BatchRead(
+        {{key, query->replicas[0].get_dfs_descriptor(),
+          {{output.data(), output.size()}}}});
+    ASSERT_EQ(read.size(), 1u);
+    ASSERT_TRUE(read[0].has_value());
+    EXPECT_EQ(output, value);
+}
+
 TEST_F(DfsBucketClientTest, BatchPutWritesEveryKeyAndKeepsBatchContiguous) {
     std::vector<std::string> keys{"bucket_batch_0", "bucket_batch_1",
                                   "bucket_batch_2", "bucket_batch_3"};

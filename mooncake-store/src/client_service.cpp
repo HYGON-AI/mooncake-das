@@ -4386,6 +4386,15 @@ void Client::SetDfsStorageBackend(
     EnsureStorageControlPlaneStarted();
 }
 
+tl::expected<std::string, ErrorCode> Client::FetchDfsRootIdentity() {
+    auto config = master_client_.GetStorageConfig();
+    if (!config) return tl::make_unexpected(config.error());
+    if (config->dfs_root_identity.empty()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    return config->dfs_root_identity;
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);

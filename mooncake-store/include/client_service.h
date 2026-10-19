@@ -82,6 +82,7 @@ class Client {
     const std::string& GetDfsRootIdentity() const {
         return dfs_root_identity_;
     }
+    tl::expected<std::string, ErrorCode> FetchDfsRootIdentity();
 
     /**
      * @brief Creates and initializes a new Client instance

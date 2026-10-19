@@ -527,6 +527,16 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
         return tl::make_unexpected(error);
     }
 
+    // Initialization is serialized and no batch I/O can run until it succeeds.
+    // Retry the control plane when DFS was disabled at client startup, without
+    // adding RPCs to business I/O or trusting the local marker as authority.
+    if (expected_root_identity_.empty() && root_identity_provider_) {
+        auto identity = root_identity_provider_();
+        if (identity && !identity->empty() &&
+            identity->size() <= kMaxDfsRootIdentitySize) {
+            expected_root_identity_ = std::move(*identity);
+        }
+    }
     auto identity_result = ValidateRootIdentity();
     if (!identity_result) {
         LOG(ERROR) << "DFS root identity validation failed for " << root_dir_;
