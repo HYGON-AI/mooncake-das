@@ -1740,18 +1740,18 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             if (bucket_it == buckets_.end()) continue;
             if (bucket_it->second->frozen) continue;
             const auto& candidate = bucket_it->second;
-            const bool has_pending = std::any_of(
-                candidate->entries.begin(), candidate->entries.end(),
-                [](const auto& item) {
-                    return item.second.state == BucketEntryState::PENDING;
-                });
-            if (has_pending) continue;
             if (low_utilization_scan &&
                 static_cast<double>(candidate->live_bytes) /
                         static_cast<double>(candidate->capacity) >=
                     low_utilization_threshold) {
                 continue;
             }
+            const bool has_pending = std::any_of(
+                candidate->entries.begin(), candidate->entries.end(),
+                [](const auto& item) {
+                    return item.second.state == BucketEntryState::PENDING;
+                });
+            if (has_pending) continue;
             victim = candidate;
             break;
         }
