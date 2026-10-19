@@ -382,6 +382,12 @@ MasterMetricManager::MasterMetricManager()
           "Total number of DFS bucket eviction attempts"),
       dfs_bucket_evictions_("master_dfs_bucket_evictions_total",
                             "Total number of DFS buckets evicted"),
+      dfs_bucket_low_utilization_eviction_attempts_(
+          "master_dfs_bucket_low_utilization_eviction_attempts_total",
+          "Total low-utilization DFS bucket eviction attempts"),
+      dfs_bucket_low_utilization_evictions_(
+          "master_dfs_bucket_low_utilization_evictions_total",
+          "Total low-utilization DFS buckets evicted"),
       dfs_bucket_evicted_replicas_(
           "master_dfs_bucket_evicted_replicas_total",
           "Total number of DFS replicas removed by bucket eviction"),
@@ -704,6 +710,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     evicted_size_.inc(0);
     dfs_bucket_eviction_attempts_.inc(0);
     dfs_bucket_evictions_.inc(0);
+    dfs_bucket_low_utilization_eviction_attempts_.inc(0);
+    dfs_bucket_low_utilization_evictions_.inc(0);
     dfs_bucket_evicted_replicas_.inc(0);
     dfs_bucket_evicted_bytes_.inc(0);
 
@@ -1694,6 +1702,16 @@ void MasterMetricManager::inc_dfs_bucket_evictions(int64_t val) {
     dfs_bucket_evictions_.inc(val);
 }
 
+void MasterMetricManager::inc_dfs_bucket_low_utilization_eviction_attempts(
+    int64_t val) {
+    dfs_bucket_low_utilization_eviction_attempts_.inc(val);
+}
+
+void MasterMetricManager::inc_dfs_bucket_low_utilization_evictions(
+    int64_t val) {
+    dfs_bucket_low_utilization_evictions_.inc(val);
+}
+
 void MasterMetricManager::inc_dfs_bucket_evicted_replicas(int64_t val) {
     dfs_bucket_evicted_replicas_.inc(val);
 }
@@ -2149,6 +2167,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_evicted_size_);
     serialize_metric(dfs_bucket_eviction_attempts_);
     serialize_metric(dfs_bucket_evictions_);
+    serialize_metric(dfs_bucket_low_utilization_eviction_attempts_);
+    serialize_metric(dfs_bucket_low_utilization_evictions_);
     serialize_metric(dfs_bucket_evicted_replicas_);
     serialize_metric(dfs_bucket_evicted_bytes_);
 

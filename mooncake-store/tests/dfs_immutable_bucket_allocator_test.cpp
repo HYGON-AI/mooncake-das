@@ -1613,6 +1613,69 @@ TEST(ImmutableBucketAllocatorTest, EvictionUsesFixedCapacityDenominator) {
     EXPECT_LT(alloc.GetUsedBytes(), used_before);
 }
 
+TEST(ImmutableBucketAllocatorTest, FreePendingReservationMakesBucketEvictable) {
+    TempDir tmp("bucket_free_pending");
+    const uint64_t capacity = kAlignment;
+    ImmutableBucketAllocator alloc;
+    auto config = MakeEvictionConfig(tmp.path(), capacity, 4);
+    config.ready_bucket_target = 0;
+    ASSERT_TRUE(alloc.Init(config));
+
+    auto descriptor = alloc.Allocate("pending", 100);
+    ASSERT_TRUE(descriptor.has_value());
+    auto next = alloc.Allocate("next", 100);
+    ASSERT_TRUE(next.has_value());
+
+    alloc.Free("pending", *descriptor);
+    auto pending = alloc.PrepareEvictionForLowUtilization(0.05);
+    ASSERT_FALSE(pending.Empty());
+    EXPECT_EQ(pending.bucket_id(), descriptor->shard_idx);
+    EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
+}
+
+TEST(ImmutableBucketAllocatorTest, LowUtilizationEvictionIgnoresGlobalWatermark) {
+    TempDir tmp("bucket_evict_low_utilization");
+    const uint64_t capacity = kAlignment;
+    ImmutableBucketAllocator alloc;
+    auto config = MakeEvictionConfig(tmp.path(), capacity, 8);
+    config.eviction_high_watermark = 0.9;
+    config.eviction_low_watermark = 0.8;
+    ASSERT_TRUE(alloc.Init(config));
+
+    auto first = alloc.Allocate("first", 100);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(alloc.MarkCommitted("first", *first));
+    auto second = alloc.Allocate("second", 100);
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(alloc.MarkCommitted("second", *second));
+    alloc.Free("first", *first);
+
+    EXPECT_LT(alloc.GetUsedBytes(), alloc.GetTotalCapacity() * 0.9);
+    auto pending = alloc.PrepareEvictionForLowUtilization(0.05);
+    ASSERT_FALSE(pending.Empty());
+    EXPECT_EQ(pending.bucket_id(), first->shard_idx);
+    ASSERT_TRUE(alloc.CommitEviction(std::move(pending)));
+    EXPECT_FALSE(alloc.GetBucketIdForKey("first").has_value());
+    EXPECT_TRUE(alloc.GetBucketIdForKey("second").has_value());
+}
+
+TEST(ImmutableBucketAllocatorTest, LowUtilizationEvictionSkipsHealthyBucket) {
+    TempDir tmp("bucket_skip_low_utilization");
+    const uint64_t capacity = kAlignment;
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), capacity, 8)));
+
+    auto first = alloc.Allocate("first", 100);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(alloc.MarkCommitted("first", *first));
+    auto second = alloc.Allocate("second", 100);
+    ASSERT_TRUE(second.has_value());
+    ASSERT_TRUE(alloc.MarkCommitted("second", *second));
+
+    auto pending = alloc.PrepareEvictionForLowUtilization(0.05);
+    EXPECT_TRUE(pending.Empty());
+}
+
 TEST(ImmutableBucketAllocatorTest, EvictionStopsAtLowWatermark) {
     TempDir tmp("bucket_evict_low");
     const uint64_t capacity = kAlignment;
