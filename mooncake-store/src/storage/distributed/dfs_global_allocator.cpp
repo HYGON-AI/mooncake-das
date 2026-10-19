@@ -91,6 +91,15 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
         return tl::make_unexpected(adapter_init.error());
     }
 
+    const std::string root_marker_path =
+        mount_path_ + "/" + kDfsRootMarkerFileName;
+    auto marker_result = EnsureDfsRootMarker(*fs_adapter_, root_marker_path);
+    if (!marker_result) {
+        LOG(ERROR) << "Failed to ensure DFS root marker " << root_marker_path
+                   << ": " << marker_result.error();
+        return marker_result;
+    }
+
     for (int i = 0; i < shard_count_; ++i) {
         std::string path = mount_path_ + "/dfs_shard_" +
                            FormatShardIdx(i, shard_count_) + ".data";

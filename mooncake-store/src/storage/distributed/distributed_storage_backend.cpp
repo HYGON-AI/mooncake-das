@@ -32,7 +32,7 @@ constexpr int kMaxBucketCreateConcurrency = 8;
 // BatchAllocate output to one read. Larger batches become a few contiguous
 // reads rather than one read per object.
 constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
-constexpr char kDfsHealthProbeFileName[] = ".mooncake_dfs_health_probe";
+constexpr char kDfsHealthProbeFilePrefix[] = ".mooncake_dfs_health_probe_";
 constexpr char kDfsHealthProbePayload[] = "mooncake-dfs-health-v1\n";
 
 struct MergedReadScratch {
@@ -398,6 +398,8 @@ DistributedStorageBackend::DistributedStorageBackend(
     if (object_storage_adapter_) {
         storage_mode_ = DistributedStorageMode::kObjectStorage;
     }
+    health_probe_path_prefix_ = root_dir_ + "/" + kDfsHealthProbeFilePrefix +
+                                UuidToString(generate_uuid());
 }
 
 DistributedStorageBackend::~DistributedStorageBackend() {
@@ -413,6 +415,9 @@ DistributedStorageBackend::~DistributedStorageBackend() {
             shard->read_fd = -1;
             shard->write_fd.store(-1);
         }
+    }
+    if (fs_adapter_ && !active_health_probe_path_.empty()) {
+        (void)fs_adapter_->DeleteFile(active_health_probe_path_);
     }
     // Drop cached bucket handles before the adapter goes away; each handle
     // closes its own fd in its destructor via the adapter pointer it holds.
@@ -603,15 +608,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
     auto initialized = TryEnsureInitialized();
     if (!initialized) return initialized;
     if (UsesObjectStorage()) return {};
-    const std::string probe_path =
-        root_dir_ + "/" + kDfsHealthProbeFileName;
-    constexpr size_t kExpectedSize = sizeof(kDfsHealthProbePayload) - 1;
-    char payload[sizeof(kDfsHealthProbePayload)] = {};
+    const std::string marker_path =
+        root_dir_ + "/" + kDfsRootMarkerFileName;
+    constexpr size_t kExpectedSize = sizeof(kDfsRootMarkerPayload) - 1;
+    char payload[sizeof(kDfsRootMarkerPayload)] = {};
     auto read_result =
-        fs_adapter_->ReadFile(probe_path, payload, sizeof(payload));
+        fs_adapter_->ReadFile(marker_path, payload, sizeof(payload));
     if (!read_result) return tl::make_unexpected(read_result.error());
     if (*read_result != kExpectedSize ||
-        std::memcmp(payload, kDfsHealthProbePayload, kExpectedSize) != 0) {
+        std::memcmp(payload, kDfsRootMarkerPayload, kExpectedSize) != 0) {
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
     return {};
@@ -622,18 +627,39 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
     if (!initialized) return initialized;
     if (UsesObjectStorage()) return {};
 
-    const std::string probe_path =
-        root_dir_ + "/" + kDfsHealthProbeFileName;
-    auto write_result = fs_adapter_->OverwriteFile(
-        probe_path,
+    std::lock_guard probe_lock(health_probe_write_mutex_);
+    // Use a new path each round: deleting the previous file first could free
+    // just enough space for the probe to pass on an otherwise full filesystem.
+    const std::string new_probe_path =
+        health_probe_path_prefix_ + "_" +
+        std::to_string(++health_probe_generation_);
+    auto write_result = fs_adapter_->WriteFile(
+        new_probe_path,
         std::span<const char>(kDfsHealthProbePayload,
                               sizeof(kDfsHealthProbePayload) - 1));
-    if (!write_result) return tl::make_unexpected(write_result.error());
+    if (!write_result) {
+        (void)fs_adapter_->DeleteFile(new_probe_path);
+        return tl::make_unexpected(write_result.error());
+    }
     if (*write_result != sizeof(kDfsHealthProbePayload) - 1) {
+        (void)fs_adapter_->DeleteFile(new_probe_path);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    auto sync_result = fs_adapter_->SyncFile(probe_path);
-    if (!sync_result) return sync_result;
+    auto sync_result = fs_adapter_->SyncFile(new_probe_path);
+    if (!sync_result) {
+        (void)fs_adapter_->DeleteFile(new_probe_path);
+        return sync_result;
+    }
+
+    if (!active_health_probe_path_.empty()) {
+        auto delete_result = fs_adapter_->DeleteFile(active_health_probe_path_);
+        if (!delete_result &&
+            delete_result.error() != ErrorCode::FILE_NOT_FOUND) {
+            (void)fs_adapter_->DeleteFile(new_probe_path);
+            return tl::make_unexpected(delete_result.error());
+        }
+    }
+    active_health_probe_path_ = new_probe_path;
 
     if (!IsBucketMode()) {
         std::vector<int> new_write_fds;
