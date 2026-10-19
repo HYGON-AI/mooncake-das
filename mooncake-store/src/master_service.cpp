@@ -589,6 +589,8 @@ void MasterService::InitDfsAllocatorFromEnvironment(
     }
 
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    dfs_bucket_low_utilization_threshold_ =
+        dfs_config.low_utilization_threshold;
     if (!dfs_config.allocator_type_valid) {
         // An unknown allocator type is a configuration error, not something to
         // paper over by silently defaulting to SHARD.
@@ -7496,6 +7498,11 @@ void MasterService::RunDfsEviction() {
 
 void MasterService::RunBucketDfsEviction() {
     (void)RunBucketDfsEvictionInternal(/*force_one=*/false);
+    if (dfs_bucket_low_utilization_threshold_ > 0.0) {
+        (void)RunBucketDfsEvictionInternal(
+            /*force_one=*/false, std::nullopt,
+            dfs_bucket_low_utilization_threshold_);
+    }
 }
 
 bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
@@ -7515,7 +7522,8 @@ bool MasterService::TryRecoverDfsSpaceAfterAllocationFailure() {
 }
 
 bool MasterService::RunBucketDfsEvictionInternal(
-    bool force_one, std::optional<int64_t> invalidated_bucket_id) {
+    bool force_one, std::optional<int64_t> invalidated_bucket_id,
+    double low_utilization_threshold) {
     if (bucket_allocator_ == nullptr) return false;
     const bool invalidating_missing_bucket = invalidated_bucket_id.has_value();
 
@@ -7534,10 +7542,13 @@ bool MasterService::RunBucketDfsEvictionInternal(
         auto pending = invalidated_bucket_id.has_value()
                            ? bucket_allocator_->PrepareInvalidation(
                                  *invalidated_bucket_id)
+                           : (low_utilization_threshold >= 0.0
+                                  ? bucket_allocator_->PrepareEvictionForLowUtilization(
+                                        low_utilization_threshold)
                            : (force_one
                                   ? bucket_allocator_
                                         ->PrepareEvictionForAllocationFailure()
-                                  : bucket_allocator_->PrepareEviction());
+                                  : bucket_allocator_->PrepareEviction()));
         // Nothing is evictable right now (below watermark, or every bucket is
         // active/frozen).
         if (pending.bucket_id() < 0) return evicted;
