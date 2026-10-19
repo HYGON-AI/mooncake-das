@@ -300,6 +300,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
+    std::string health_probe_path_prefix_;
+    std::string active_health_probe_path_;
+    uint64_t health_probe_generation_{0};
+    std::mutex health_probe_write_mutex_;
     // Canonical form of root_dir_, used to reject descriptor paths that try to
     // escape the configured DFS root.
     std::string canonical_root_dir_;
