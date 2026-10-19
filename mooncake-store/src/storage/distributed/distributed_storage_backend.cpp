@@ -1,4 +1,5 @@
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -14,6 +15,7 @@
 #include "environ.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "thread_pool.h"
 #include "types.h"
@@ -33,7 +35,7 @@ constexpr int kMaxBucketCreateConcurrency = 8;
 // BatchAllocate output to one read. Larger batches become a few contiguous
 // reads rather than one read per object.
 constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
-constexpr char kDfsHealthProbeFileName[] = ".mooncake_dfs_health_probe";
+constexpr char kDfsHealthProbeFilePrefix[] = ".mooncake_dfs_health_probe_";
 constexpr char kDfsHealthProbePayload[] = "mooncake-dfs-health-v1\n";
 
 struct MergedReadScratch {
@@ -371,23 +373,36 @@ DistributedStorageBackend::DistributedStorageBackend(
     const DistributedStorageConfig& distributed_config,
     std::unique_ptr<FileSystemAdapter> fs_adapter)
     : DistributedStorageBackend(file_storage_config, distributed_config,
-                                std::move(fs_adapter), nullptr) {}
+                                std::move(fs_adapter), nullptr, {}) {}
 
 DistributedStorageBackend::DistributedStorageBackend(
     const FileStorageConfig& file_storage_config,
     const DistributedStorageConfig& distributed_config,
     std::unique_ptr<FileSystemAdapter> fs_adapter,
-    std::unique_ptr<ObjectStorageAdapter> object_storage_adapter)
+    std::string expected_root_identity)
+    : DistributedStorageBackend(file_storage_config, distributed_config,
+                                std::move(fs_adapter), nullptr,
+                                std::move(expected_root_identity)) {}
+
+DistributedStorageBackend::DistributedStorageBackend(
+    const FileStorageConfig& file_storage_config,
+    const DistributedStorageConfig& distributed_config,
+    std::unique_ptr<FileSystemAdapter> fs_adapter,
+    std::unique_ptr<ObjectStorageAdapter> object_storage_adapter,
+    std::string expected_root_identity)
     : StorageBackendInterface(file_storage_config),
       fs_adapter_(std::move(fs_adapter)),
       object_storage_adapter_(std::move(object_storage_adapter)),
       distributed_config_(distributed_config),
+      expected_root_identity_(std::move(expected_root_identity)),
       root_dir_(distributed_config.fsdir) {
     CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
         << "DistributedStorageBackend: exactly one I/O adapter is required";
     if (object_storage_adapter_) {
         storage_mode_ = DistributedStorageMode::kObjectStorage;
     }
+    health_probe_path_prefix_ = root_dir_ + "/" + kDfsHealthProbeFilePrefix +
+                                UuidToString(generate_uuid());
 }
 
 DistributedStorageBackend::~DistributedStorageBackend() {
@@ -403,6 +418,9 @@ DistributedStorageBackend::~DistributedStorageBackend() {
             shard->read_fd = -1;
             shard->write_fd.store(-1);
         }
+    }
+    if (fs_adapter_ && !active_health_probe_path_.empty()) {
+        (void)fs_adapter_->DeleteFile(active_health_probe_path_);
     }
     // Drop cached bucket handles before the adapter goes away; each handle
     // closes its own fd in its destructor via the adapter pointer it holds.
@@ -421,18 +439,46 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::EnsureInitialized() {
-    if (initialized_.load(std::memory_order_acquire)) return {};
+    if (initialized_.load(std::memory_order_acquire)) {
+        if (UsesObjectStorage()) return {};
+        return ValidateRootIdentity();
+    }
     return Init();
 }
 
 tl::expected<void, ErrorCode>
 DistributedStorageBackend::TryEnsureInitialized() {
-    if (initialized_.load(std::memory_order_acquire)) return {};
+    if (initialized_.load(std::memory_order_acquire)) {
+        if (UsesObjectStorage()) return {};
+        return ValidateRootIdentity();
+    }
     std::unique_lock<std::mutex> lock(init_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     return InitLocked();
+}
+
+tl::expected<void, ErrorCode>
+DistributedStorageBackend::ValidateRootIdentity() const {
+    if (UsesObjectStorage()) return {};
+    if (expected_root_identity_.empty() ||
+        expected_root_identity_.size() > kMaxDfsRootIdentitySize ||
+        !fs_adapter_) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+
+    std::vector<char> contents(expected_root_identity_.size() + 1);
+    const std::string marker_path =
+        root_dir_ + "/" + kDfsRootIdentityFileName;
+    auto read_result = fs_adapter_->ReadFile(
+        marker_path, contents.data(), contents.size());
+    if (!read_result || *read_result != expected_root_identity_.size() ||
+        std::memcmp(contents.data(), expected_root_identity_.data(),
+                    expected_root_identity_.size()) != 0) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    return {};
 }
 
 void DistributedStorageBackend::ResetFailedInitializationLocked() {
@@ -464,7 +510,7 @@ void DistributedStorageBackend::ResetFailedInitializationLocked() {
 tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
     if (initialized_.load(std::memory_order_acquire)) {
         LOG(WARNING) << "DistributedStorageBackend is already initialized";
-        return {};
+        return ValidateRootIdentity();
     }
 
     if (UsesObjectStorage()) {
@@ -477,11 +523,9 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
     }
 
     std::error_code ec;
-    std::filesystem::create_directories(root_dir_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS root directory " << root_dir_
-                   << ": " << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (!std::filesystem::is_directory(root_dir_, ec) || ec) {
+        LOG(ERROR) << "DFS root directory is unavailable: " << root_dir_;
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
     auto init_result = fs_adapter_->Init(root_dir_);
@@ -489,6 +533,23 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
         const auto error = init_result.error();
         ResetFailedInitializationLocked();
         return tl::make_unexpected(error);
+    }
+
+    // Initialization is serialized and no batch I/O can run until it succeeds.
+    // Retry the control plane when DFS was disabled at client startup, without
+    // adding RPCs to business I/O or trusting the local marker as authority.
+    if (expected_root_identity_.empty() && root_identity_provider_) {
+        auto identity = root_identity_provider_();
+        if (identity && !identity->empty() &&
+            identity->size() <= kMaxDfsRootIdentitySize) {
+            expected_root_identity_ = std::move(*identity);
+        }
+    }
+    auto identity_result = ValidateRootIdentity();
+    if (!identity_result) {
+        LOG(ERROR) << "DFS root identity validation failed for " << root_dir_;
+        ResetFailedInitializationLocked();
+        return identity_result;
     }
 
     if (IsBucketMode()) {
@@ -550,15 +611,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeRead() {
     auto initialized = TryEnsureInitialized();
     if (!initialized) return initialized;
     if (UsesObjectStorage()) return {};
-    const std::string probe_path =
-        root_dir_ + "/" + kDfsHealthProbeFileName;
-    constexpr size_t kExpectedSize = sizeof(kDfsHealthProbePayload) - 1;
-    char payload[sizeof(kDfsHealthProbePayload)] = {};
+    const std::string marker_path =
+        root_dir_ + "/" + kDfsRootMarkerFileName;
+    constexpr size_t kExpectedSize = sizeof(kDfsRootMarkerPayload) - 1;
+    char payload[sizeof(kDfsRootMarkerPayload)] = {};
     auto read_result =
-        fs_adapter_->ReadFile(probe_path, payload, sizeof(payload));
+        fs_adapter_->ReadFile(marker_path, payload, sizeof(payload));
     if (!read_result) return tl::make_unexpected(read_result.error());
     if (*read_result != kExpectedSize ||
-        std::memcmp(payload, kDfsHealthProbePayload, kExpectedSize) != 0) {
+        std::memcmp(payload, kDfsRootMarkerPayload, kExpectedSize) != 0) {
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
     return {};
@@ -569,18 +630,39 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
     if (!initialized) return initialized;
     if (UsesObjectStorage()) return {};
 
-    const std::string probe_path =
-        root_dir_ + "/" + kDfsHealthProbeFileName;
-    auto write_result = fs_adapter_->OverwriteFile(
-        probe_path,
+    std::lock_guard probe_lock(health_probe_write_mutex_);
+    // Use a new path each round: deleting the previous file first could free
+    // just enough space for the probe to pass on an otherwise full filesystem.
+    const std::string new_probe_path =
+        health_probe_path_prefix_ + "_" +
+        std::to_string(++health_probe_generation_);
+    auto write_result = fs_adapter_->WriteFile(
+        new_probe_path,
         std::span<const char>(kDfsHealthProbePayload,
                               sizeof(kDfsHealthProbePayload) - 1));
-    if (!write_result) return tl::make_unexpected(write_result.error());
+    if (!write_result) {
+        (void)fs_adapter_->DeleteFile(new_probe_path);
+        return tl::make_unexpected(write_result.error());
+    }
     if (*write_result != sizeof(kDfsHealthProbePayload) - 1) {
+        (void)fs_adapter_->DeleteFile(new_probe_path);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    auto sync_result = fs_adapter_->SyncFile(probe_path);
-    if (!sync_result) return sync_result;
+    auto sync_result = fs_adapter_->SyncFile(new_probe_path);
+    if (!sync_result) {
+        (void)fs_adapter_->DeleteFile(new_probe_path);
+        return sync_result;
+    }
+
+    if (!active_health_probe_path_.empty()) {
+        auto delete_result = fs_adapter_->DeleteFile(active_health_probe_path_);
+        if (!delete_result &&
+            delete_result.error() != ErrorCode::FILE_NOT_FOUND) {
+            (void)fs_adapter_->DeleteFile(new_probe_path);
+            return tl::make_unexpected(delete_result.error());
+        }
+    }
+    active_health_probe_path_ = new_probe_path;
 
     if (!IsBucketMode()) {
         std::vector<int> new_write_fds;
@@ -623,8 +705,12 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id) {
                              kBucketDataSuffix;
     auto fd_result = fs_adapter_->OpenFileReadWriteExisting(path);
     if (!fd_result) {
-        LOG(ERROR) << "Failed to open DFS bucket file " << path << ": "
-                   << fd_result.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to open DFS bucket file " << path << ": "
+                       << fd_result.error()
+                       << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(fd_result.error());
     }
 
@@ -940,9 +1026,16 @@ DistributedStorageBackend::BatchWrite(
         return results;
     }
     if (!initialized_.load(std::memory_order_acquire)) {
-        LOG(ERROR) << "DistributedStorageBackend is not initialized";
         results.assign(requests.size(),
                        tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+    auto initialized = ValidateRootIdentity();
+    if (!initialized) {
+        LOG(ERROR) << "DistributedStorageBackend is unavailable: "
+                   << initialized.error();
+        results.assign(requests.size(),
+                       tl::make_unexpected(initialized.error()));
         return results;
     }
 
@@ -1556,9 +1649,16 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         return results;
     }
     if (!initialized_.load(std::memory_order_acquire)) {
-        LOG(ERROR) << "DistributedStorageBackend is not initialized";
         std::fill(results.begin(), results.end(),
                   tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+    auto initialized = ValidateRootIdentity();
+    if (!initialized) {
+        LOG(ERROR) << "DistributedStorageBackend is unavailable: "
+                   << initialized.error();
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(initialized.error()));
         return results;
     }
 

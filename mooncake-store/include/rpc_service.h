@@ -46,6 +46,12 @@ class WrappedMasterService {
         const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
+    // Read-only typed existence check; does not grant leases, update
+    // get/cache-hit metrics, or trigger promotion or dynamic replication.
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyByReplicaType(
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id, ReplicaType replica_type);
+
     tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>

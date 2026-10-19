@@ -1726,6 +1726,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config);
+CreateStorageBackend(const FileStorageConfig& config,
+                     const std::string& dfs_root_identity = {});
 
 }  // namespace mooncake

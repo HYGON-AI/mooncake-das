@@ -1,8 +1,11 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -192,11 +195,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_check_interval_ = config.eviction_check_interval;
 
     std::error_code ec;
-    std::filesystem::create_directories(fsdir_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS bucket directory " << fsdir_ << ": "
-                   << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (!std::filesystem::is_directory(fsdir_, ec) || ec) {
+        LOG(ERROR) << "DFS bucket directory must already exist: " << fsdir_;
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
     if (config.fs_adapter_type == "posix") {
@@ -223,6 +224,16 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
                    << ", error=" << adapter_init.error();
         fs_adapter_.reset();
         return tl::make_unexpected(adapter_init.error());
+    }
+
+    const std::string root_marker_path = fsdir_ + "/" + kDfsRootMarkerFileName;
+    auto marker_result = EnsureDfsRootMarker(*fs_adapter_, root_marker_path);
+    if (!marker_result) {
+        LOG(ERROR) << "Failed to ensure DFS root marker " << root_marker_path
+                   << ": " << marker_result.error();
+        fs_adapter_->Shutdown();
+        fs_adapter_.reset();
+        return marker_result;
     }
 
     auto recovered = RecoverFromDisk(config.bucket_recovery_enabled);
@@ -435,21 +446,33 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
     auto write_result = fs_adapter_->WriteFile(
         meta_path, std::span<const char>(payload.data(), payload.size()));
     if (!write_result) {
-        LOG(ERROR) << "Failed to write bucket metadata " << meta_path
-                   << ", error=" << write_result.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to write bucket metadata " << meta_path
+                       << ", error=" << write_result.error()
+                       << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(write_result.error());
     }
     if (*write_result != payload.size()) {
-        LOG(ERROR) << "Short write of bucket metadata " << meta_path
-                   << ", expected=" << payload.size()
-                   << ", actual=" << *write_result;
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Short write of bucket metadata " << meta_path
+                       << ", expected=" << payload.size()
+                       << ", actual=" << *write_result
+                       << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
     auto sync_file = fs_adapter_->SyncFile(meta_path);
     if (!sync_file) {
-        LOG(ERROR) << "Failed to fsync bucket metadata " << meta_path
-                   << ", error=" << sync_file.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to fsync bucket metadata " << meta_path
+                       << ", error=" << sync_file.error()
+                       << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(sync_file.error());
     }
 
@@ -459,8 +482,12 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
     if (!meta_existed) {
         auto sync_dir = fs_adapter_->SyncDirectory(fsdir_);
         if (!sync_dir) {
-            LOG(ERROR) << "Failed to fsync DFS bucket directory " << fsdir_
-                       << ", error=" << sync_dir.error();
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "Failed to fsync DFS bucket directory " << fsdir_
+                           << ", error=" << sync_dir.error()
+                           << ", suppressed=" << *suppressed;
+            }
             return tl::make_unexpected(sync_dir.error());
         }
     }
@@ -471,13 +498,21 @@ void ImmutableBucketAllocator::DeleteBucketFiles(int64_t bucket_id) {
     if (!fs_adapter_) return;
     auto meta_result = fs_adapter_->DeleteFile(BucketMetaPath(bucket_id));
     if (!meta_result && meta_result.error() != ErrorCode::FILE_NOT_FOUND) {
-        LOG(ERROR) << "Failed to delete bucket metadata file for bucket_id="
-                   << bucket_id << ", error=" << meta_result.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to delete bucket metadata file for bucket_id="
+                       << bucket_id << ", error=" << meta_result.error()
+                       << ", suppressed=" << *suppressed;
+        }
     }
     auto data_result = fs_adapter_->DeleteFile(BucketDataPath(bucket_id));
     if (!data_result && data_result.error() != ErrorCode::FILE_NOT_FOUND) {
-        LOG(ERROR) << "Failed to delete bucket data file for bucket_id="
-                   << bucket_id << ", error=" << data_result.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to delete bucket data file for bucket_id="
+                       << bucket_id << ", error=" << data_result.error()
+                       << ", suppressed=" << *suppressed;
+        }
     }
 }
 
@@ -557,16 +592,18 @@ bool ImmutableBucketAllocator::ActiveBucketHasSpaceLocked(
     return true;
 }
 
-void ImmutableBucketAllocator::RequestRefillLocked(bool urgent) {
-    // One urgent retry may bypass the backoff for each observed failure wave.
-    // A stream of waiting allocations cannot continuously reset the delay.
-    if (urgent &&
-        last_urgent_refill_sequence_ != bucket_creation_failure_sequence_) {
-        last_urgent_refill_sequence_ = bucket_creation_failure_sequence_;
-        bucket_creation_retry_after_ =
-            std::chrono::steady_clock::time_point::min();
-    }
+void ImmutableBucketAllocator::RequestRefillLocked() {
+    // Waiting allocations must not bypass an existing failure backoff.
     bucket_pool_cv_.notify_all();
+}
+
+void ImmutableBucketAllocator::RecordBucketCreationFailureLocked(ErrorCode error) {
+    ++bucket_creation_failure_sequence_;
+    last_bucket_creation_error_ = error;
+    bucket_creation_retry_after_ =
+        std::chrono::steady_clock::now() + bucket_creation_retry_delay_;
+    bucket_creation_retry_delay_ =
+        std::min(bucket_creation_retry_delay_ * 2, std::chrono::seconds(30));
 }
 
 ImmutableBucketAllocator::BucketPtr
@@ -619,6 +656,26 @@ void ImmutableBucketAllocator::StopBucketWorkers() {
         if (worker.joinable()) worker.join();
     }
     bucket_create_workers_.clear();
+    // The legacy sweep deletes files through the fs adapter, so it must finish
+    // before the adapter is shut down.
+    if (legacy_cleanup_worker_.joinable()) {
+        legacy_cleanup_worker_.join();
+    }
+}
+
+void ImmutableBucketAllocator::LegacyCleanupWorker(
+    std::vector<int64_t> bucket_ids) {
+    // Deleting these files needs no allocator lock: every id is below
+    // next_bucket_id_, so no bucket this process creates or evicts reuses a
+    // name in this list, and DeleteBucketFiles() touches only the fs adapter.
+    // DeleteBucketFiles() tolerates an already-absent `.meta` or `.data`, so an
+    // id that was recorded from only one of the two files - or whose file was
+    // removed before the sweep reached it - is not a failure.
+    for (const int64_t bucket_id : bucket_ids) {
+        DeleteBucketFiles(bucket_id);
+    }
+    LOG(INFO) << "DFS legacy bucket cleanup finished, buckets="
+              << bucket_ids.size();
 }
 
 void ImmutableBucketAllocator::BucketCreateWorker() {
@@ -664,6 +721,13 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
                 initialization_consumed = true;
             }
 
+            // After a failure, allow only one worker to retry per deadline.
+            if (!initialization_attempt &&
+                last_bucket_creation_error_ != ErrorCode::OK) {
+                bucket_creation_retry_after_ = std::chrono::steady_clock::now() +
+                                               bucket_creation_retry_delay_;
+            }
+
             lock.unlock();
             const auto create_started = std::chrono::steady_clock::now();
             auto preallocated = fs_adapter_->PreallocateFile(
@@ -700,16 +764,15 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
                 PublishBucketIdSnapshotLocked();
                 bucket_creation_retry_after_ =
                     std::chrono::steady_clock::time_point::min();
+                bucket_creation_retry_delay_ = kBucketCreationRetryDelay;
+                last_bucket_creation_error_ = ErrorCode::OK;
                 result = "success";
             } else if (preallocated) {
                 delete_file = true;
                 result = "discarded";
             } else {
-                delete_file = true;
-                ++bucket_creation_failure_sequence_;
-                last_bucket_creation_error_ = preallocated.error();
-                bucket_creation_retry_after_ = std::chrono::steady_clock::now() +
-                                               kBucketCreationRetryDelay;
+                delete_file = preallocated.error() != ErrorCode::FILE_OPEN_FAIL;
+                RecordBucketCreationFailureLocked(preallocated.error());
             }
 
             FinishBucketCreationLocked(/*synchronous=*/false);
@@ -722,12 +785,17 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
 
             MasterMetricManager::instance().inc_dfs_bucket_create_total(result);
             if (!preallocated) {
-                LOG(WARNING) << "Failed to precreate DFS bucket, bucket_id="
-                             << reserved_bucket_id
-                             << ", error=" << preallocated.error()
-                             << ", ready_count=" << ready_count
-                             << ", in_flight=" << in_flight
-                             << ", max_bucket_count=" << max_bucket_count;
+                static DfsLogLimiter precreate_log_limiter;
+                if (auto suppressed = precreate_log_limiter.ShouldLog()) {
+                    LOG(WARNING)
+                        << "Failed to precreate DFS bucket, bucket_id="
+                        << reserved_bucket_id
+                        << ", error=" << preallocated.error()
+                        << ", ready_count=" << ready_count
+                        << ", in_flight=" << in_flight
+                        << ", max_bucket_count=" << max_bucket_count
+                        << ", suppressed=" << *suppressed;
+                }
             } else if (!publish) {
                 VLOG(1)
                     << "Discarded precreated DFS bucket after state change, "
@@ -745,10 +813,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
                 RollbackBucketPublicationLocked(reserved_bucket_id, bucket);
                 FinishBucketCreationLocked(/*synchronous=*/false);
             }
-            ++bucket_creation_failure_sequence_;
-            last_bucket_creation_error_ = ErrorCode::INTERNAL_ERROR;
-            bucket_creation_retry_after_ =
-                std::chrono::steady_clock::now() + kBucketCreationRetryDelay;
+            RecordBucketCreationFailureLocked(ErrorCode::INTERNAL_ERROR);
             bucket_pool_cv_.notify_all();
             lock.unlock();
             if (reservation) DeleteBucketFiles(reserved_bucket_id);
@@ -836,14 +901,20 @@ ImmutableBucketAllocator::CreateBucketUnlocked(
     lock.unlock();
     MasterMetricManager::instance().inc_dfs_bucket_create_total(
         publish ? "success" : (preallocated ? "discarded" : "failure"));
-    if (!publish) DeleteBucketFiles(reservation->bucket_id);
+    if (!publish && (preallocated || error != ErrorCode::FILE_OPEN_FAIL)) {
+        DeleteBucketFiles(reservation->bucket_id);
+    }
     if (publish) FlushDirtyMetadata();
     lock.lock();
 
     if (!publish) {
         if (!preallocated) {
-            LOG(ERROR) << "Failed to create DFS bucket "
-                       << reservation->bucket_id << ", error=" << error;
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "Failed to create DFS bucket "
+                           << reservation->bucket_id << ", error=" << error
+                           << ", suppressed=" << *suppressed;
+            }
         }
         return tl::make_unexpected(error);
     }
@@ -926,17 +997,26 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
             pool_exhaustion_recorded = true;
             MasterMetricManager::instance()
                 .inc_dfs_bucket_pool_exhausted_total();
-            LOG_EVERY_N(WARNING, 100)
-                << "DFS ready bucket pool exhausted, ready_count="
-                << ready_bucket_ids_.size()
-                << ", in_flight=" << bucket_creations_in_flight_
-                << ", waiting_allocators=" << waiting_allocators_
-                << ", active_bucket_id=" << active_bucket_id_
-                << ", max_bucket_count=" << max_bucket_count_;
+            static DfsLogLimiter pool_log_limiter;
+            if (auto suppressed = pool_log_limiter.ShouldLog()) {
+                LOG(WARNING)
+                    << "DFS ready bucket pool exhausted, ready_count="
+                    << ready_bucket_ids_.size()
+                    << ", in_flight=" << bucket_creations_in_flight_
+                    << ", waiting_allocators=" << waiting_allocators_
+                    << ", active_bucket_id=" << active_bucket_id_
+                    << ", max_bucket_count=" << max_bucket_count_
+                    << ", suppressed=" << *suppressed;
+            }
         }
 
+        if (bucket_creations_in_flight_ == 0 &&
+            std::chrono::steady_clock::now() < bucket_creation_retry_after_) {
+            observe_rollover();
+            return tl::make_unexpected(last_bucket_creation_error_);
+        }
         const uint64_t failure_sequence = bucket_creation_failure_sequence_;
-        RequestRefillLocked(/*urgent=*/true);
+        RequestRefillLocked();
         ++waiting_allocators_;
         const auto wait_started = std::chrono::steady_clock::now();
         bucket_pool_cv_.wait(lock, [this, required, failure_sequence] {
@@ -1264,10 +1344,14 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
         if (!bucket_result) {
             // Global failure: no active bucket can be created or found, so
             // remaining keys will fail the same way. Mark them and stop.
-            LOG(ERROR) << "DFS batch allocate active bucket failed: key="
-                       << request.key << ", reserved_size="
-                       << object_layout->aligned_size
-                       << ", error=" << bucket_result.error();
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "DFS batch allocate active bucket failed: key="
+                           << request.key << ", reserved_size="
+                           << object_layout->aligned_size
+                           << ", error=" << bucket_result.error()
+                           << ", suppressed=" << *suppressed;
+            }
             results[index].success = false;
             results[index].descriptor = DistributedFSDescriptor{};
             results[index].error = bucket_result.error();
@@ -1462,8 +1546,12 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
             ++flushed;
             continue;
         }
-        LOG(WARNING) << "Failed to write DFS bucket metadata, bucket_id="
-                     << item.bucket_id << ", error=" << persisted.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(WARNING) << "Failed to write DFS bucket metadata, bucket_id="
+                         << item.bucket_id << ", error=" << persisted.error()
+                         << ", suppressed=" << *suppressed;
+        }
         // Put the flag back so the next maintenance tick retries, unless the
         // bucket changed identity meanwhile - then it is not ours to mark.
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1673,7 +1761,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         }
         if (was_active) {
             active_bucket_id_ = -1;
-            RequestRefillLocked(/*urgent=*/true);
+            RequestRefillLocked();
         }
         pending.owner_ = this;
         pending.bucket_id_ = bucket_id;
@@ -1937,10 +2025,36 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
         // deliberately ignored.
     }
     if (!recover_metadata) {
-        // Old files stay outside this process's allocation and eviction state.
+        // Recovery is disabled: the files found above are invisible to this
+        // process's allocation and eviction state, so nothing would ever
+        // reclaim them and they would keep occupying the DFS directory. Record
+        // the id sequence, then delete exactly the scanned ids off the startup
+        // path so a large legacy directory does not stall initialization.
         next_bucket_id_ = max_seen_id + 1;
-        LOG(INFO) << "DFS bucket recovery disabled; retaining existing files, "
-                  << "next_bucket_id=" << next_bucket_id_;
+        std::unordered_set<int64_t> legacy_ids(meta_ids.begin(), meta_ids.end());
+        legacy_ids.insert(data_ids.begin(), data_ids.end());
+        std::vector<int64_t> sweep(legacy_ids.begin(), legacy_ids.end());
+        if (sweep.empty()) {
+            LOG(INFO) << "DFS bucket recovery disabled; no legacy bucket files "
+                         "to delete, next_bucket_id="
+                      << next_bucket_id_;
+            return {};
+        }
+        LOG(INFO) << "DFS bucket recovery disabled; deleting " << sweep.size()
+                  << " legacy bucket(s) in the background, next_bucket_id="
+                  << next_bucket_id_;
+        try {
+            // `sweep` is passed by value so the catch block below can still
+            // reclaim the files if the worker thread cannot be started.
+            legacy_cleanup_worker_ = std::thread(
+                &ImmutableBucketAllocator::LegacyCleanupWorker, this, sweep);
+        } catch (const std::system_error& e) {
+            LOG(WARNING) << "Failed to start DFS legacy bucket cleanup worker: "
+                         << e.what() << ", deleting synchronously";
+            for (const int64_t bucket_id : sweep) {
+                DeleteBucketFiles(bucket_id);
+            }
+        }
         return {};
     }
     std::sort(meta_ids.begin(), meta_ids.end());
