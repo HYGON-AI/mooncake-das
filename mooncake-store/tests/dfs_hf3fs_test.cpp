@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -16,6 +17,7 @@
 
 #include "hf3fs/hf3fs.h"
 #include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/hf3fs_adapter.h"
 #include "storage_backend.h"
@@ -24,6 +26,16 @@ namespace mooncake::test {
 namespace {
 
 constexpr const char* kDefaultRoot = "/mnt/3fs/mooncake_test";
+const std::string kTestDfsRootIdentity =
+    SerializeDfsRootIdentity("dfs_hf3fs_test", UUID{1, 2});
+
+bool WriteTestDfsRootIdentity(const std::string& root) {
+    std::ofstream marker(root + "/" + kDfsRootIdentityFileName,
+                         std::ios::binary | std::ios::trunc);
+    marker.write(kTestDfsRootIdentity.data(),
+                 static_cast<std::streamsize>(kTestDfsRootIdentity.size()));
+    return marker.good();
+}
 
 bool IsHf3fsPath(const std::string& path) {
     char mount_point[PATH_MAX] = {};
@@ -135,6 +147,7 @@ TEST_F(Hf3fsAdapterTest, WriteAtReadAtThroughUsrbio) {
 }
 
 TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
+    ASSERT_TRUE(WriteTestDfsRootIdentity(test_dir_->path()));
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = test_dir_->path();
@@ -148,7 +161,8 @@ TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
     distributed_config.single_tenant = true;
 
     DistributedStorageBackend backend(file_config, distributed_config,
-                                      std::make_unique<Hf3fsAdapter>());
+                                      std::make_unique<Hf3fsAdapter>(),
+                                      kTestDfsRootIdentity);
     ASSERT_TRUE(backend.Init().has_value());
 
     alignas(4096) std::array<char, 4096> write_buf;

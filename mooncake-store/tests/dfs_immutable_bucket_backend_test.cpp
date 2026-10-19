@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <thread>
@@ -19,6 +21,7 @@
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage_backend.h"
 
@@ -28,6 +31,16 @@ namespace {
 
 constexpr uint64_t kAlignment = 4096;
 constexpr uint64_t kBucketCapacity = 1024 * 1024;
+const std::string kTestDfsRootIdentity =
+    SerializeDfsRootIdentity("dfs_backend_test", UUID{1, 2});
+
+void WriteTestDfsRootIdentity(const std::filesystem::path& root,
+                              const std::string& identity =
+                                  kTestDfsRootIdentity) {
+    std::ofstream marker(root / kDfsRootIdentityFileName,
+                         std::ios::binary | std::ios::trunc);
+    marker.write(identity.data(), static_cast<std::streamsize>(identity.size()));
+}
 
 class BucketTempDir {
    public:
@@ -38,6 +51,7 @@ class BucketTempDir {
                  std::to_string(++counter));
         path_str_ = path_.string();
         std::filesystem::create_directories(path_);
+        WriteTestDfsRootIdentity(path_);
     }
 
     ~BucketTempDir() {
@@ -194,6 +208,15 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir) {
     return config;
 }
 
+std::shared_ptr<DistributedStorageBackend> MakeTestBackend(
+    const FileStorageConfig& file_config,
+    const DistributedStorageConfig& distributed_config,
+    std::unique_ptr<FileSystemAdapter> adapter) {
+    return std::make_shared<DistributedStorageBackend>(
+        file_config, distributed_config, std::move(adapter),
+        kTestDfsRootIdentity);
+}
+
 }  // namespace
 
 class DfsBucketBackendTest : public ::testing::Test {
@@ -211,8 +234,7 @@ class DfsBucketBackendTest : public ::testing::Test {
 
         auto adapter = std::make_unique<FaultyPosixFsAdapter>();
         adapter_ = adapter.get();
-        backend_ = std::make_shared<DistributedStorageBackend>(
-            file_config, config_, std::move(adapter));
+        backend_ = MakeTestBackend(file_config, config_, std::move(adapter));
         ASSERT_TRUE(backend_->Init().has_value());
     }
 
@@ -427,8 +449,8 @@ TEST_F(DfsBucketBackendTest, LargeBucketIdIsAddressable) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = dir.path();
-    auto backend = std::make_shared<DistributedStorageBackend>(
-        file_config, config, std::make_unique<PosixFsAdapter>());
+    auto backend = MakeTestBackend(file_config, config,
+                                   std::make_unique<PosixFsAdapter>());
     ASSERT_TRUE(backend->Init().has_value());
 
     // Push the id well past shard_count.
@@ -623,8 +645,7 @@ TEST_F(DfsBucketBackendTest, DirectOpenUnsupportedUsesBufferedReadFallback) {
     auto adapter = std::make_unique<FaultyPosixFsAdapter>();
     adapter->DisableDirectOpen();
     auto* fallback_adapter = adapter.get();
-    backend_ = std::make_shared<DistributedStorageBackend>(file_config, config_,
-                                                           std::move(adapter));
+    backend_ = MakeTestBackend(file_config, config_, std::move(adapter));
     ASSERT_TRUE(backend_->Init().has_value());
 
     std::string out(value.size(), '\0');
@@ -641,8 +662,8 @@ TEST_F(DfsBucketBackendTest, UninitializedBackendFailsEveryRequest) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = tmp_->path();
-    auto backend = std::make_shared<DistributedStorageBackend>(
-        file_config, config_, std::make_unique<PosixFsAdapter>());
+    auto backend = MakeTestBackend(file_config, config_,
+                                   std::make_unique<PosixFsAdapter>());
     // Deliberately not Init()ed.
 
     DistributedFSDescriptor desc;
@@ -664,6 +685,178 @@ TEST_F(DfsBucketBackendTest, UninitializedBackendFailsEveryRequest) {
     EXPECT_EQ(write_results[0].error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
 }
 
+TEST(DistributedStorageBackendRootTest, MissingRootIsNotCreatedByInitOrProbe) {
+    BucketTempDir parent("dfs_bucket_missing_root");
+    const std::string missing_root = parent.file("missing");
+    ASSERT_FALSE(std::filesystem::exists(missing_root));
+
+    auto config = MakeBucketConfig(missing_root);
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = missing_root;
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<PosixFsAdapter>(),
+                                      kTestDfsRootIdentity);
+
+    auto init_result = backend.Init();
+    EXPECT_FALSE(init_result.has_value());
+    EXPECT_FALSE(std::filesystem::exists(missing_root));
+
+    auto probe_result = backend.ProbeWrite();
+    EXPECT_FALSE(probe_result.has_value());
+    EXPECT_FALSE(std::filesystem::exists(missing_root));
+}
+
+TEST(DistributedStorageBackendRootTest,
+     EmptyRootWithoutMarkerDoesNotCreateProbeOrBucketFiles) {
+    BucketTempDir parent("dfs_bucket_empty_root");
+    const std::string empty_root = parent.file("empty");
+    ASSERT_TRUE(std::filesystem::create_directory(empty_root));
+
+    auto config = MakeBucketConfig(empty_root);
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = empty_root;
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<PosixFsAdapter>(),
+                                      kTestDfsRootIdentity);
+
+    auto init_result = backend.Init();
+    ASSERT_FALSE(init_result.has_value());
+    EXPECT_EQ(init_result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_FALSE(backend.ProbeRead().has_value());
+    EXPECT_FALSE(backend.ProbeWrite().has_value());
+    EXPECT_TRUE(std::filesystem::is_empty(empty_root));
+}
+
+TEST(DistributedStorageBackendRootTest,
+     MismatchedMarkerRejectsInitializationWithoutWriting) {
+    BucketTempDir root("dfs_bucket_wrong_identity");
+    const std::string wrong_identity =
+        SerializeDfsRootIdentity("different_cluster", UUID{3, 4});
+    WriteTestDfsRootIdentity(root.path(), wrong_identity);
+
+    auto config = MakeBucketConfig(root.path());
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root.path();
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<PosixFsAdapter>(),
+                                      kTestDfsRootIdentity);
+
+    auto init_result = backend.Init();
+    ASSERT_FALSE(init_result.has_value());
+    EXPECT_EQ(init_result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_FALSE(backend.ProbeWrite().has_value());
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(root.path()),
+                            std::filesystem::directory_iterator{}),
+              1);
+    std::ifstream marker(root.file(kDfsRootIdentityFileName),
+                         std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(marker)),
+                               std::istreambuf_iterator<char>());
+    EXPECT_EQ(contents, wrong_identity);
+}
+
+TEST(DistributedStorageBackendRootTest,
+     EmptyExpectedIdentityFailsClosedEvenWhenMarkerExists) {
+    BucketTempDir root("dfs_bucket_missing_expectation");
+
+    auto config = MakeBucketConfig(root.path());
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root.path();
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<PosixFsAdapter>());
+
+    auto init_result = backend.Init();
+    ASSERT_FALSE(init_result.has_value());
+    EXPECT_EQ(init_result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_FALSE(backend.ProbeWrite().has_value());
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(root.path()),
+                            std::filesystem::directory_iterator{}),
+              1);
+}
+
+TEST(DistributedStorageBackendRootTest,
+     MarkerIsRequiredForEveryProbeAndBatchIoAndCanRecover) {
+    BucketTempDir parent("dfs_bucket_marker_retry");
+    const std::string root = parent.file("mount");
+    ASSERT_TRUE(std::filesystem::create_directory(root));
+    WriteTestDfsRootIdentity(root);
+
+    auto config = MakeBucketConfig(root);
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root;
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<PosixFsAdapter>(),
+                                      kTestDfsRootIdentity);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    const std::string marker_path = root + "/" + kDfsRootIdentityFileName;
+    ASSERT_TRUE(std::filesystem::remove(marker_path));
+    auto read_probe = backend.ProbeRead();
+    ASSERT_FALSE(read_probe.has_value());
+    EXPECT_EQ(read_probe.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    auto write_probe = backend.ProbeWrite();
+    ASSERT_FALSE(write_probe.has_value());
+    EXPECT_EQ(write_probe.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+
+    DistributedFSDescriptor descriptor{
+        root + "/bucket_000000.data", 0, 4, kAlignment, 0};
+    std::string value = "data";
+    auto write_results = backend.BatchWrite(
+        {{"marker_gate", descriptor, {{value.data(), value.size()}}}});
+    ASSERT_EQ(write_results.size(), 1u);
+    ASSERT_FALSE(write_results[0].has_value());
+    EXPECT_EQ(write_results[0].error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+
+    std::string output(value.size(), '\0');
+    auto read_results = backend.BatchRead(
+        {{"marker_gate", descriptor, {{output.data(), output.size()}}}});
+    ASSERT_EQ(read_results.size(), 1u);
+    ASSERT_FALSE(read_results[0].has_value());
+    EXPECT_EQ(read_results[0].error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_TRUE(std::filesystem::is_empty(root));
+
+    WriteTestDfsRootIdentity(root);
+    ASSERT_TRUE(backend.ProbeWrite().has_value());
+    ASSERT_TRUE(backend.ProbeRead().has_value());
+    write_results = backend.BatchWrite(
+        {{"marker_gate", descriptor, {{value.data(), value.size()}}}});
+    ASSERT_EQ(write_results.size(), 1u);
+    ASSERT_TRUE(write_results[0].has_value());
+    read_results = backend.BatchRead(
+        {{"marker_gate", descriptor, {{output.data(), output.size()}}}});
+    ASSERT_EQ(read_results.size(), 1u);
+    ASSERT_TRUE(read_results[0].has_value());
+    EXPECT_EQ(output, value);
+}
+
+TEST(DistributedStorageBackendRootTest,
+     ProbeRetriesInitializationAfterValidRootReturns) {
+    BucketTempDir parent("dfs_bucket_probe_retry");
+    const std::string root = parent.file("mount");
+    auto config = MakeBucketConfig(root);
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root;
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<PosixFsAdapter>(),
+                                      kTestDfsRootIdentity);
+
+    auto init_result = backend.Init();
+    ASSERT_FALSE(init_result.has_value());
+    EXPECT_FALSE(std::filesystem::exists(root));
+
+    ASSERT_TRUE(std::filesystem::create_directory(root));
+    WriteTestDfsRootIdentity(root);
+    ASSERT_TRUE(backend.ProbeWrite().has_value());
+    EXPECT_TRUE(backend.IsInitialized());
+    EXPECT_TRUE(backend.ProbeRead().has_value());
+}
+
 TEST_F(DfsBucketBackendTest, ObjectsSurviveAcrossBucketRollover) {
     // Force many rollovers by using a tiny bucket capacity.
     BucketTempDir dir("dfs_bucket_rollover_io");
@@ -677,8 +870,8 @@ TEST_F(DfsBucketBackendTest, ObjectsSurviveAcrossBucketRollover) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = dir.path();
-    auto backend = std::make_shared<DistributedStorageBackend>(
-        file_config, config, std::make_unique<PosixFsAdapter>());
+    auto backend = MakeTestBackend(file_config, config,
+                                   std::make_unique<PosixFsAdapter>());
     ASSERT_TRUE(backend->Init().has_value());
 
     std::vector<std::pair<std::string, DistributedFSDescriptor>> written;
@@ -770,8 +963,8 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = dir.path();
-    auto backend = std::make_shared<DistributedStorageBackend>(
-        file_config, config, std::make_unique<PosixFsAdapter>());
+    auto backend = MakeTestBackend(file_config, config,
+                                   std::make_unique<PosixFsAdapter>());
     ASSERT_TRUE(backend->Init().has_value());
 
     {
@@ -997,8 +1190,7 @@ TEST_F(DfsBucketBackendTest, ContiguousEntriesAreMerged) {
     file_config.storage_filepath = tmp_->path();
     auto adapter = std::make_unique<FaultyPosixFsAdapter>();
     adapter_ = adapter.get();
-    backend_ = std::make_shared<DistributedStorageBackend>(file_config, config_,
-                                                           std::move(adapter));
+    backend_ = MakeTestBackend(file_config, config_, std::move(adapter));
     ASSERT_TRUE(backend_->Init().has_value());
 
     // Batch read
@@ -1060,8 +1252,8 @@ TEST_F(DfsBucketBackendTest, BatchReadWithDifferentThreadCounts) {
         FileStorageConfig file_config;
         file_config.storage_backend_type = StorageBackendType::kDistributed;
         file_config.storage_filepath = tmp_->path();
-        backend_ = std::make_shared<DistributedStorageBackend>(
-            file_config, config_, std::make_unique<FaultyPosixFsAdapter>());
+        backend_ = MakeTestBackend(file_config, config_,
+                                   std::make_unique<FaultyPosixFsAdapter>());
         ASSERT_TRUE(backend_->Init().has_value());
 
         // Batch read
@@ -1164,8 +1356,8 @@ TEST_F(DfsBucketBackendTest, BatchReadMixedContiguousAndNonContiguous) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = tmp_->path();
-    backend_ = std::make_shared<DistributedStorageBackend>(
-        file_config, config_, std::make_unique<FaultyPosixFsAdapter>());
+    backend_ = MakeTestBackend(file_config, config_,
+                               std::make_unique<FaultyPosixFsAdapter>());
     ASSERT_TRUE(backend_->Init().has_value());
 
     auto read_results = backend_->BatchRead(reads);
@@ -1202,8 +1394,7 @@ TEST_F(DfsBucketBackendTest, MergedBatchReadUsesIndependentIoTasks) {
     config_.batch_read_threads = 2;
     auto adapter = std::make_unique<FaultyPosixFsAdapter>();
     adapter_ = adapter.get();
-    backend_ = std::make_shared<DistributedStorageBackend>(
-        file_config, config_, std::move(adapter));
+    backend_ = MakeTestBackend(file_config, config_, std::move(adapter));
     ASSERT_TRUE(backend_->Init().has_value());
 
     std::string output1(value1.size(), '\0');
