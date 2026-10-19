@@ -3,6 +3,8 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -30,11 +32,27 @@ constexpr const char* kBucketFilePrefix = "bucket_";
 constexpr const char* kBucketDataSuffix = ".data";
 constexpr const char* kBucketMetaSuffix = ".meta";
 constexpr auto kBucketCreationRetryDelay = std::chrono::seconds(1);
+constexpr int64_t kBucketPrecreateWarningIntervalNs =
+    30LL * 1000 * 1000 * 1000;
 
 int64_t CurrentTimeNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+bool ShouldLogBucketPrecreateFailureWarning() {
+    static std::atomic<int64_t> next_warning_ns{0};
+    const int64_t now_ns = CurrentTimeNs();
+    auto next_warning = next_warning_ns.load(std::memory_order_relaxed);
+    while (now_ns >= next_warning) {
+        if (next_warning_ns.compare_exchange_weak(
+                next_warning, now_ns + kBucketPrecreateWarningIntervalNs,
+                std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool IsLive(BucketEntryState state) {
@@ -728,12 +746,15 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
 
             MasterMetricManager::instance().inc_dfs_bucket_create_total(result);
             if (!preallocated) {
-                LOG(WARNING) << "Failed to precreate DFS bucket, bucket_id="
-                             << reserved_bucket_id
-                             << ", error=" << preallocated.error()
-                             << ", ready_count=" << ready_count
-                             << ", in_flight=" << in_flight
-                             << ", max_bucket_count=" << max_bucket_count;
+                if (ShouldLogBucketPrecreateFailureWarning()) {
+                    LOG(WARNING)
+                        << "Failed to precreate DFS bucket, bucket_id="
+                        << reserved_bucket_id
+                        << ", error=" << preallocated.error()
+                        << ", ready_count=" << ready_count
+                        << ", in_flight=" << in_flight
+                        << ", max_bucket_count=" << max_bucket_count;
+                }
             } else if (!publish) {
                 VLOG(1)
                     << "Discarded precreated DFS bucket after state change, "

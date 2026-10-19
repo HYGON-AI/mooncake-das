@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -68,6 +70,25 @@ namespace mooncake {
 namespace {
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
+constexpr int64_t kDfsFallbackWarningIntervalNs =
+    30LL * 1000 * 1000 * 1000;
+
+bool ShouldLogDfsReplicaFallbackWarning() {
+    static std::atomic<int64_t> next_warning_ns{0};
+    const auto now_ns = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    auto next_warning = next_warning_ns.load(std::memory_order_relaxed);
+    while (now_ns >= next_warning) {
+        if (next_warning_ns.compare_exchange_weak(
+                next_warning, now_ns + kDfsFallbackWarningIntervalNs,
+                std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
 // when offload-on-evict mode is active. Defers memory eviction for at most
@@ -4659,9 +4680,12 @@ auto MasterService::PutStartInternal(
             if (dfs_fallback_reason.has_value()) {
                 MasterMetricManager::instance().inc_dfs_replica_skipped_total(
                     toString(*dfs_fallback_reason));
-                LOG(WARNING) << "key=" << key
-                             << ", action=dfs_replica_skipped_memory_fallback"
-                             << ", error=" << toString(*dfs_fallback_reason);
+                if (ShouldLogDfsReplicaFallbackWarning()) {
+                    LOG(WARNING)
+                        << "key=" << key
+                        << ", action=dfs_replica_skipped_memory_fallback"
+                        << ", error=" << toString(*dfs_fallback_reason);
+                }
             }
             return result;
         }
