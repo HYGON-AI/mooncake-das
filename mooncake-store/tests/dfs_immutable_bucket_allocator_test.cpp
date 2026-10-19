@@ -90,6 +90,7 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
     config.allocator_type = DfsAllocatorType::BUCKET;
     config.bucket_capacity = bucket_capacity;
     config.max_bucket_count = max_bucket_count;
+    config.ready_bucket_target = 0;
     config.alignment = kAlignment;
     config.single_tenant = true;
     config.eviction_enabled = false;
@@ -1349,7 +1350,10 @@ TEST(ImmutableBucketAllocatorTest, AllocationFailureEvictionBypassesLowWatermark
                  100});
         }
         auto results = alloc.BatchAllocate(requests);
-        for (const auto& result : results) ASSERT_TRUE(result.success);
+        for (const auto& result : results) {
+            ASSERT_TRUE(result.success);
+            ASSERT_TRUE(alloc.MarkCommitted(result.key, result.descriptor));
+        }
     }
     // Twenty-four entries pack into 10 + 10 + 4 slots instead of four
     // six-entry buckets. Utilization is still below the configured watermark,
@@ -1379,11 +1383,15 @@ TEST(ImmutableBucketAllocatorTest, EvictionCandidatesExcludeFreedKeys) {
     ASSERT_TRUE(b.has_value());
     ASSERT_EQ(a->shard_idx, 0);
     ASSERT_EQ(b->shard_idx, 0);
+    ASSERT_TRUE(alloc.MarkCommitted("a", *a));
+    ASSERT_TRUE(alloc.MarkCommitted("b", *b));
     alloc.Free("a", *a);
 
     // Fill more buckets so bucket 0 is no longer active and usage is high.
     for (int i = 0; i < 4; ++i) {
-        ASSERT_TRUE(alloc.Allocate("f" + std::to_string(i), 100).has_value());
+        auto desc = alloc.Allocate("f" + std::to_string(i), 100);
+        ASSERT_TRUE(desc.has_value());
+        ASSERT_TRUE(alloc.MarkCommitted("f" + std::to_string(i), *desc));
     }
 
     auto pending = alloc.PrepareEviction();
