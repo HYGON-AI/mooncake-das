@@ -868,7 +868,12 @@ DistributedStorageBackend::BatchWrite(
                        tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
         return results;
     }
-    auto initialized = TryEnsureInitialized();
+    if (!initialized_.load(std::memory_order_acquire)) {
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+    auto initialized = ValidateRootIdentity();
     if (!initialized) {
         LOG(ERROR) << "DistributedStorageBackend is unavailable: "
                    << initialized.error();
@@ -1486,7 +1491,12 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
                        tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
         return results;
     }
-    auto initialized = TryEnsureInitialized();
+    if (!initialized_.load(std::memory_order_acquire)) {
+        std::fill(results.begin(), results.end(),
+                  tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+    auto initialized = ValidateRootIdentity();
     if (!initialized) {
         LOG(ERROR) << "DistributedStorageBackend is unavailable: "
                    << initialized.error();
