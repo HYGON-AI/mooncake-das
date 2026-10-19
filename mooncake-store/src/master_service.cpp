@@ -1,12 +1,15 @@
 #include "master_service.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 #include <algorithm>
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -4510,8 +4513,12 @@ auto MasterService::AllocateAndInsertMetadata(
 
     if (config.dfs_replica_num > 0 && !skip_dfs_replica) {
         if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
-            LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
-                       << ", error=dfs_allocator_not_initialized";
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                           << ", error=dfs_allocator_not_initialized"
+                           << ", suppressed=" << *suppressed;
+            }
             refund_pending_quota();
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
@@ -4523,8 +4530,12 @@ auto MasterService::AllocateAndInsertMetadata(
         } else {
             auto alloc = dfs_allocator_->Allocate(key, value_length);
             if (!alloc) {
-                LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
-                           << ", error=" << alloc.error();
+                static DfsLogLimiter log_limiter;
+                if (auto suppressed = log_limiter.ShouldLog()) {
+                    LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                               << ", error=" << alloc.error()
+                               << ", suppressed=" << *suppressed;
+                }
                 if (dfs_allocation_error != nullptr) {
                     *dfs_allocation_error = alloc.error();
                 }
@@ -4844,9 +4855,14 @@ auto MasterService::PutStartInternal(
             if (dfs_fallback_reason.has_value()) {
                 MasterMetricManager::instance().inc_dfs_replica_skipped_total(
                     toString(*dfs_fallback_reason));
-                LOG(WARNING) << "key=" << key
-                             << ", action=dfs_replica_skipped_memory_fallback"
-                             << ", error=" << toString(*dfs_fallback_reason);
+                static DfsLogLimiter fallback_log_limiter;
+                if (auto suppressed = fallback_log_limiter.ShouldLog()) {
+                    LOG(WARNING)
+                        << "key=" << key
+                        << ", action=dfs_replica_skipped_memory_fallback"
+                        << ", error=" << toString(*dfs_fallback_reason)
+                        << ", suppressed=" << *suppressed;
+                }
             }
             return result;
         }
