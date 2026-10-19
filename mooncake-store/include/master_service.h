@@ -2106,7 +2106,9 @@ class MasterService {
     bool RunBucketDfsEvictionInternal(
         bool force_one,
         std::optional<int64_t> invalidated_bucket_id = std::nullopt,
-        double low_utilization_threshold = -1.0);
+        double low_utilization_threshold = -1.0,
+        int low_utilization_eviction_limit = -1,
+        int low_utilization_attempt_limit = -1);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     tl::expected<bool, ErrorCode> IsDfsBucketDataFilePresent(
         int64_t bucket_id) const;
@@ -2792,7 +2794,9 @@ class MasterService {
     bool enable_dfs_bucket_recovery_{true};
     bool dfs_restore_from_bucket_metadata_{true};
     double dfs_bucket_low_utilization_threshold_{0.05};
+    double dfs_bucket_eviction_high_watermark_{0.9};
     int dfs_bucket_low_utilization_evictions_per_tick_{1};
+    int dfs_bucket_low_utilization_attempts_per_tick_{8};
     // Chosen by configuration at startup: DfsGlobalAllocator (SHARD, the
     // default) or ImmutableBucketAllocator (BUCKET). The master only ever talks
     // to it through DfsAllocatorInterface.
