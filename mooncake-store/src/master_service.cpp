@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 #include <algorithm>
 #include <array>
@@ -70,25 +71,6 @@ namespace mooncake {
 namespace {
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
-constexpr int64_t kDfsFallbackWarningIntervalNs =
-    30LL * 1000 * 1000 * 1000;
-
-bool ShouldLogDfsReplicaFallbackWarning() {
-    static std::atomic<int64_t> next_warning_ns{0};
-    const auto now_ns = static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-    auto next_warning = next_warning_ns.load(std::memory_order_relaxed);
-    while (now_ns >= next_warning) {
-        if (next_warning_ns.compare_exchange_weak(
-                next_warning, now_ns + kDfsFallbackWarningIntervalNs,
-                std::memory_order_relaxed, std::memory_order_relaxed)) {
-            return true;
-        }
-    }
-    return false;
-}
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
 // when offload-on-evict mode is active. Defers memory eviction for at most
@@ -4346,8 +4328,12 @@ auto MasterService::AllocateAndInsertMetadata(
 
     if (config.dfs_replica_num > 0 && !skip_dfs_replica) {
         if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
-            LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
-                       << ", error=dfs_allocator_not_initialized";
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                           << ", error=dfs_allocator_not_initialized"
+                           << ", suppressed=" << *suppressed;
+            }
             refund_pending_quota();
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
@@ -4359,8 +4345,12 @@ auto MasterService::AllocateAndInsertMetadata(
         } else {
             auto alloc = dfs_allocator_->Allocate(key, value_length);
             if (!alloc) {
-                LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
-                           << ", error=" << alloc.error();
+                static DfsLogLimiter log_limiter;
+                if (auto suppressed = log_limiter.ShouldLog()) {
+                    LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                               << ", error=" << alloc.error()
+                               << ", suppressed=" << *suppressed;
+                }
                 if (dfs_allocation_error != nullptr) {
                     *dfs_allocation_error = alloc.error();
                 }
@@ -4680,11 +4670,13 @@ auto MasterService::PutStartInternal(
             if (dfs_fallback_reason.has_value()) {
                 MasterMetricManager::instance().inc_dfs_replica_skipped_total(
                     toString(*dfs_fallback_reason));
-                if (ShouldLogDfsReplicaFallbackWarning()) {
+                static DfsLogLimiter fallback_log_limiter;
+                if (auto suppressed = fallback_log_limiter.ShouldLog()) {
                     LOG(WARNING)
                         << "key=" << key
                         << ", action=dfs_replica_skipped_memory_fallback"
-                        << ", error=" << toString(*dfs_fallback_reason);
+                        << ", error=" << toString(*dfs_fallback_reason)
+                        << ", suppressed=" << *suppressed;
                 }
             }
             return result;

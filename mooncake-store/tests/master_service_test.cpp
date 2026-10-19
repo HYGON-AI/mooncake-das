@@ -87,11 +87,17 @@ class ScopedDfsFallbackLogCapture : public google::LogSink {
         (void)line;
         (void)tm_time;
         const std::string text(message, message_len);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (text.find("Failed to allocate DFS replica for key=") !=
+                std::string::npos ||
+            text.find("DFS batch allocate active bucket failed") !=
+                std::string::npos) {
+            errors_.push_back(text);
+        }
         if (text.find("action=dfs_replica_skipped_memory_fallback") ==
             std::string::npos) {
             return;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
         messages_.push_back(text);
     }
 
@@ -100,9 +106,15 @@ class ScopedDfsFallbackLogCapture : public google::LogSink {
         return messages_;
     }
 
+    std::vector<std::string> errors() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return errors_;
+    }
+
    private:
     mutable std::mutex mutex_;
     std::vector<std::string> messages_;
+    std::vector<std::string> errors_;
 };
 
 class MasterServiceTest : public ::testing::Test {
@@ -2061,6 +2073,11 @@ TEST_F(MasterServiceTest,
 
         const auto fallback_logs = fallback_log_capture.messages();
         EXPECT_LE(fallback_logs.size(), 1u);
+        const auto allocation_errors = fallback_log_capture.errors();
+        EXPECT_EQ(allocation_errors.size(), 2u);
+        for (const auto& message : allocation_errors) {
+            EXPECT_NE(message.find("suppressed=0"), std::string::npos);
+        }
         if (!fallback_logs.empty()) {
             EXPECT_NE(fallback_logs.front().find("key=capacity_single"),
                       std::string::npos);

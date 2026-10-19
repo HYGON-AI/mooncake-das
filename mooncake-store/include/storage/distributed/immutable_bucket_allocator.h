@@ -417,7 +417,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     BucketPtr PromoteReadyBucketLocked();
     bool ActiveBucketHasSpaceLocked(uint64_t required,
                                     BucketPtr* bucket = nullptr) const;
-    void RequestRefillLocked(bool urgent = false);
+    void RequestRefillLocked();
+    void RecordBucketCreationFailureLocked(ErrorCode error);
     void BucketCreateWorker();
     void StopBucketWorkers();
     std::vector<int64_t> DetachReadyBucketsLocked();
@@ -481,9 +482,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     bool stop_bucket_workers_ = false;
     size_t initialization_creations_remaining_ = 0;
     uint64_t bucket_creation_failure_sequence_ = 0;
-    uint64_t last_urgent_refill_sequence_ = static_cast<uint64_t>(-1);
     ErrorCode last_bucket_creation_error_ = ErrorCode::OK;
     std::chrono::steady_clock::time_point bucket_creation_retry_after_{};
+    std::chrono::seconds bucket_creation_retry_delay_{1};
     std::condition_variable bucket_pool_cv_;
     std::vector<std::thread> bucket_create_workers_;
     std::unordered_map<int64_t, BucketPtr> buckets_;
