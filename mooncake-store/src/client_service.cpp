@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -3040,9 +3041,13 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         const auto& key = context->keys[i];
         const bool succeeded = outcomes[i] == ErrorCode::OK;
         if (!succeeded) {
-            LOG(ERROR) << "Async DFS write failed for key " << key
-                       << ", error=" << toString(outcomes[i])
-                       << "; revoking the DFS replica";
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "Async DFS write failed for key " << key
+                           << ", error=" << toString(outcomes[i])
+                           << "; revoking the DFS replica"
+                           << ", suppressed=" << *suppressed;
+            }
         }
 
         tl::expected<void, ErrorCode> completion =

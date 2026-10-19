@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
@@ -70,6 +71,50 @@ class ScopedEnvVar {
 
     std::string name_;
     std::optional<std::string> previous_value_;
+};
+
+class ScopedDfsFallbackLogCapture : public google::LogSink {
+   public:
+    ScopedDfsFallbackLogCapture() { google::AddLogSink(this); }
+    ~ScopedDfsFallbackLogCapture() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity severity, const char* full_filename,
+              const char* base_filename, int line, const struct ::tm* tm_time,
+              const char* message, size_t message_len) override {
+        (void)severity;
+        (void)full_filename;
+        (void)base_filename;
+        (void)line;
+        (void)tm_time;
+        const std::string text(message, message_len);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (text.find("Failed to allocate DFS replica for key=") !=
+                std::string::npos ||
+            text.find("DFS batch allocate active bucket failed") !=
+                std::string::npos) {
+            errors_.push_back(text);
+        }
+        if (text.find("action=dfs_replica_skipped_memory_fallback") ==
+            std::string::npos) {
+            return;
+        }
+        messages_.push_back(text);
+    }
+
+    std::vector<std::string> messages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+    std::vector<std::string> errors() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return errors_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::vector<std::string> messages_;
+    std::vector<std::string> errors_;
 };
 
 class MasterServiceTest : public ::testing::Test {
@@ -2037,6 +2082,8 @@ TEST_F(MasterServiceTest,
         const auto before = skipped_metric("NO_AVAILABLE_HANDLE");
         ASSERT_TRUE(before.has_value());
 
+        ScopedDfsFallbackLogCapture fallback_log_capture;
+
         auto single = service.PutStart(context.client_id, "capacity_single",
                                        TenantId::Default(), 100, config);
         ASSERT_TRUE(single.has_value()) << toString(single.error());
@@ -2075,6 +2122,30 @@ TEST_F(MasterServiceTest,
         const auto after = skipped_metric("NO_AVAILABLE_HANDLE");
         ASSERT_TRUE(after.has_value());
         EXPECT_EQ(*after, *before + 3);
+
+        const auto fallback_logs = fallback_log_capture.messages();
+        EXPECT_LE(fallback_logs.size(), 1u);
+        const auto allocation_errors = fallback_log_capture.errors();
+        // Each site has a process-wide quota that earlier tests may consume.
+        for (const auto* site : {"Failed to allocate DFS replica for key=",
+                                 "DFS batch allocate active bucket failed"}) {
+            EXPECT_LE(std::count_if(allocation_errors.begin(),
+                                    allocation_errors.end(),
+                                    [site](const std::string& message) {
+                                        return message.find(site) !=
+                                               std::string::npos;
+                                    }),
+                      1);
+        }
+        for (const auto& message : allocation_errors) {
+            EXPECT_NE(message.find("suppressed="), std::string::npos);
+        }
+        if (!fallback_logs.empty()) {
+            EXPECT_NE(fallback_logs.front().find("key=capacity_"),
+                      std::string::npos);
+            EXPECT_NE(fallback_logs.front().find("error=NO_AVAILABLE_HANDLE"),
+                      std::string::npos);
+        }
     }
 
     std::error_code ec;
