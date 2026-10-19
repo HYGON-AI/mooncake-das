@@ -5,12 +5,14 @@
 #include <algorithm>
 #include <bitset>
 #include <cassert>
+#include <cerrno>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <filesystem>
 #include <limits>
 #include <set>
 #include <shared_mutex>
@@ -21,6 +23,7 @@
 #include <regex>
 #include <unordered_set>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <ylt/util/tl/expected.hpp>
@@ -54,6 +57,7 @@
 #include "utils/file_util.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
 #include "utils.h"
@@ -68,6 +72,153 @@ namespace mooncake {
 namespace {
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
+
+bool ReadDfsRootIdentity(const std::string& marker_path,
+                         const std::string& cluster_id,
+                         std::string& identity, bool& missing) {
+    missing = false;
+    const int fd = ::open(marker_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        missing = errno == ENOENT;
+        return false;
+    }
+
+    struct stat st {};
+    bool valid = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
+                 static_cast<uint64_t>(st.st_size) <= kMaxDfsRootIdentitySize;
+    std::string contents;
+    if (valid) {
+        contents.resize(static_cast<size_t>(st.st_size));
+        size_t offset = 0;
+        while (offset < contents.size()) {
+            const ssize_t count =
+                ::read(fd, contents.data() + offset, contents.size() - offset);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) {
+                valid = false;
+                break;
+            }
+            offset += static_cast<size_t>(count);
+        }
+    }
+    const int close_result = ::close(fd);
+    if (close_result != 0 || !valid ||
+        !ParseDfsRootIdentity(contents, cluster_id, identity)) {
+        identity.clear();
+        return false;
+    }
+    return true;
+}
+
+bool SyncDfsRootDirectory(const std::string& root) {
+    const int fd = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        return errno == EINVAL || errno == EOPNOTSUPP;
+    }
+    const int result = ::fsync(fd);
+    const int saved_errno = errno;
+    ::close(fd);
+    return result == 0 || saved_errno == EINVAL ||
+           saved_errno == EOPNOTSUPP;
+}
+
+bool WriteAll(int fd, const std::string& contents) {
+    size_t offset = 0;
+    while (offset < contents.size()) {
+        const ssize_t count =
+            ::write(fd, contents.data() + offset, contents.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        offset += static_cast<size_t>(count);
+    }
+    return ::fsync(fd) == 0;
+}
+
+bool EnsureDfsRootIdentity(const std::string& root,
+                           const std::string& cluster_id,
+                           std::string& identity) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec) || ec) {
+        LOG(ERROR) << "DFS root must already exist as a directory; refusing "
+                      "to create it: "
+                   << root;
+        return false;
+    }
+    if (!IsValidClusterIdComponent(cluster_id)) {
+        LOG(ERROR) << "Invalid cluster id for DFS root identity: " << cluster_id;
+        return false;
+    }
+
+    const std::string marker_path =
+        root + "/" + kDfsRootIdentityFileName;
+    bool missing = false;
+    if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
+        return true;
+    }
+    if (!missing) {
+        LOG(ERROR) << "DFS root identity marker is invalid or belongs to a "
+                      "different cluster: "
+                   << marker_path;
+        return false;
+    }
+
+    const UUID token{
+        randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max()),
+        randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max())};
+    const std::string candidate = SerializeDfsRootIdentity(cluster_id, token);
+    if (candidate.empty()) return false;
+
+    const std::string temp_path =
+        marker_path + "." + std::to_string(::getpid()) + "." +
+        UuidToString(token) + ".tmp";
+    const int temp_fd = ::open(temp_path.c_str(),
+                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                               0644);
+    if (temp_fd < 0) {
+        LOG(ERROR) << "Failed to create DFS root identity temp file "
+                   << temp_path << ": " << std::strerror(errno);
+        return false;
+    }
+    const bool temp_written = WriteAll(temp_fd, candidate);
+    const int close_result = ::close(temp_fd);
+    if (!temp_written || close_result != 0) {
+        const int saved_errno = errno;
+        ::unlink(temp_path.c_str());
+        LOG(ERROR) << "Failed to write DFS root identity temp file "
+                   << temp_path << ": " << std::strerror(saved_errno);
+        return false;
+    }
+
+    if (::link(temp_path.c_str(), marker_path.c_str()) == 0) {
+        ::unlink(temp_path.c_str());
+        if (!SyncDfsRootDirectory(root)) {
+            LOG(ERROR) << "Failed to sync DFS root after publishing identity "
+                       << marker_path;
+            return false;
+        }
+        identity = candidate;
+        return true;
+    }
+
+    const int link_error = errno;
+    ::unlink(temp_path.c_str());
+    if (link_error != EEXIST) {
+        LOG(ERROR) << "Failed to publish DFS root identity marker "
+                   << marker_path << ": " << std::strerror(link_error);
+        return false;
+    }
+
+    // Another initializer atomically published the marker first. Its file is
+    // already complete because the temporary inode was synced before link().
+    if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
+        return true;
+    }
+    LOG(ERROR) << "Concurrent DFS root identity marker is invalid or belongs "
+                  "to a different cluster: "
+               << marker_path;
+    return false;
+}
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
 // when offload-on-evict mode is active. Defers memory eviction for at most
@@ -600,6 +751,17 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         LOG(ERROR) << "Currently, DFS backend is not supported in "
                       "multi-tenant mode";
         enable_dfs_ = false;
+        return;
+    }
+
+    if (!dfs_config.ValidateForAllocator()) {
+        enable_dfs_ = false;
+        return;
+    }
+    if (!EnsureDfsRootIdentity(dfs_config.fsdir, cluster_id_,
+                               dfs_root_identity_)) {
+        enable_dfs_ = false;
+        dfs_retry_needed_.store(true, std::memory_order_release);
         return;
     }
 
@@ -7959,16 +8121,19 @@ tl::expected<GetStorageConfigResponse, ErrorCode>
 MasterService::GetStorageConfig() const {
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
     const std::string dfs_fsdir = enable_dfs_ ? dfs_config.fsdir : std::string();
+    const std::string dfs_root_identity =
+        enable_dfs_ ? dfs_root_identity_ : std::string();
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
         LOG(INFO)
             << "Storage root directory or cluster ID is not set. persisting "
                "data is disabled.";
         return GetStorageConfigResponse("", enable_disk_eviction_,
-                                        quota_bytes_, dfs_fsdir);
+                                        quota_bytes_, dfs_fsdir,
+                                        dfs_root_identity);
     }
     std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
     return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_,
-                                    dfs_fsdir);
+                                    dfs_fsdir, dfs_root_identity);
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,

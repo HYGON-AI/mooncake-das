@@ -1177,6 +1177,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         }
     } else {
         auto config = config_response.value();
+        client->dfs_root_identity_ = config.dfs_root_identity;
         WarnOnClientDfsPathMismatch(config.dfs_fsdir);
         if (config.fsdir.empty()) {
             LOG(INFO)
@@ -4383,6 +4384,15 @@ void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
+}
+
+tl::expected<std::string, ErrorCode> Client::FetchDfsRootIdentity() {
+    auto config = master_client_.GetStorageConfig();
+    if (!config) return tl::make_unexpected(config.error());
+    if (config->dfs_root_identity.empty()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    return config->dfs_root_identity;
 }
 
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(

@@ -79,6 +79,10 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+    const std::string& GetDfsRootIdentity() const {
+        return dfs_root_identity_;
+    }
+    tl::expected<std::string, ErrorCode> FetchDfsRootIdentity();
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -1023,6 +1027,7 @@ class Client {
 
     // Client identification
     const UUID client_id_;
+    std::string dfs_root_identity_;
 
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;
