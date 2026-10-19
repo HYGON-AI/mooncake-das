@@ -404,13 +404,14 @@ TEST(ImmutableBucketAllocatorTest,
 
     const auto first_deadline = std::chrono::steady_clock::now() +
                                 std::chrono::seconds(3);
-    while (log_capture.messages().empty() &&
+    auto first_failures = ReadDfsBucketCreateFailureTotal();
+    while ((!first_failures || *first_failures == *failures_before) &&
            std::chrono::steady_clock::now() < first_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        first_failures = ReadDfsBucketCreateFailureTotal();
     }
-    ASSERT_EQ(log_capture.messages().size(), 1u);
-    const auto first_failures = ReadDfsBucketCreateFailureTotal();
     ASSERT_TRUE(first_failures.has_value());
+    ASSERT_GT(*first_failures, *failures_before);
 
     // Exhaust the active bucket, then keep requesting space during backoff.
     // Previously every allocation cleared the deadline and retried metadata I/O.
@@ -434,8 +435,11 @@ TEST(ImmutableBucketAllocatorTest,
     EXPECT_GE(*failures_after, *failures_before + 3);
     EXPECT_LE(*failures_after, *failures_before + 3);
     const auto messages = log_capture.messages();
-    EXPECT_EQ(messages.size(), 1u);
-    EXPECT_NE(messages.front().find("suppressed=0"), std::string::npos);
+    // Another test may have already used this process-wide warning quota.
+    EXPECT_LE(messages.size(), 1u);
+    for (const auto& message : messages) {
+        EXPECT_NE(message.find("suppressed="), std::string::npos);
+    }
     EXPECT_TRUE(log_capture.cleanup_messages().empty());
 
     // Recovery is driven by the worker's next timed retry, without resetting it.
