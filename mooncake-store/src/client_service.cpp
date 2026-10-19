@@ -4280,6 +4280,26 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     return response;
 }
 
+std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExistByReplicaType(
+    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    auto response =
+        master_client_.BatchExistKeyByReplicaType(keys, replica_type);
+
+    if (response.size() != keys.size()) {
+        LOG(ERROR) << "BatchExistKeyByReplicaType response size mismatch. "
+                   << "Expected: " << keys.size() << ", Got: "
+                   << response.size();
+        std::vector<tl::expected<bool, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return results;
+    }
+
+    return response;
+}
+
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
