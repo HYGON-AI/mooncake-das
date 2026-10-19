@@ -183,6 +183,12 @@ bool DistributedStorageConfig::ValidateForAllocator() const {
                    << ", high=" << eviction_high_watermark;
         return false;
     }
+    if (low_utilization_threshold < 0.0 || low_utilization_threshold > 1.0) {
+        LOG(ERROR) << "DistributedStorageConfig: low_utilization_threshold "
+                      "must be in [0,1], value="
+                   << low_utilization_threshold;
+        return false;
+    }
     if (deferred_free_duration.count() < 0) {
         LOG(ERROR) << "DistributedStorageConfig: deferred_free_duration must "
                       "be non-negative, seconds="
@@ -298,6 +304,9 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         "MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", config.eviction_high_watermark);
     config.eviction_low_watermark = Environ::GetDouble(
         "MOONCAKE_DFS_EVICTION_LOW_WATERMARK", config.eviction_low_watermark);
+    config.low_utilization_threshold = Environ::GetDouble(
+        "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD",
+        config.low_utilization_threshold);
     config.deferred_free_duration = std::chrono::seconds(Environ::GetInt(
         "MOONCAKE_DFS_DEFERRED_FREE_SECONDS",
         static_cast<int>(config.deferred_free_duration.count())));
@@ -349,6 +358,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", eviction_enabled=" << eviction_enabled
         << ", eviction_high_watermark=" << eviction_high_watermark
         << ", eviction_low_watermark=" << eviction_low_watermark
+        << ", low_utilization_threshold=" << low_utilization_threshold
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
         << eviction_check_interval.count()

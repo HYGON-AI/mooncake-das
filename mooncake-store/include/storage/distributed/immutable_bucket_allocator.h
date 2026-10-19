@@ -265,6 +265,15 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     PendingEviction PrepareEvictionForAllocationFailure();
 
     /**
+     * @brief Freeze one non-active bucket whose live utilization is below the
+     * supplied threshold.
+     *
+     * The caller must still validate the returned candidates with the master
+     * before committing the eviction.
+     */
+    PendingEviction PrepareEvictionForLowUtilization(double threshold);
+
+    /**
      * @brief Freeze one specific bucket after its data file is confirmed missing.
      */
     PendingEviction PrepareInvalidation(int64_t bucket_id);
@@ -330,7 +339,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // Shared implementation for watermark-driven and allocation-failure-driven
     // eviction. The latter bypasses only the watermark gate and still observes
     // active/frozen state plus the master's full validation protocol.
-    PendingEviction PrepareEvictionInternal(bool force_one);
+    PendingEviction PrepareEvictionInternal(
+        bool force_one, double low_utilization_threshold = -1.0);
     PendingEviction PrepareInvalidationInternal(int64_t bucket_id);
 
     // Shared implementation of AbortEviction. `demote` distinguishes an
