@@ -33,6 +33,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchExistKeyByReplicaType> {
+    static constexpr const char* value = "BatchExistKeyByReplicaType";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
 };
@@ -537,6 +542,20 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
         object_keys.size(), object_keys, tenant_id_.value());
+    timer.LogResponse("result=", result.size(), " keys");
+    return result;
+}
+
+std::vector<tl::expected<bool, ErrorCode>>
+MasterClient::BatchExistKeyByReplicaType(
+    const std::vector<std::string>& object_keys, ReplicaType replica_type) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchExistKeyByReplicaType");
+    timer.LogRequest("keys_count=", object_keys.size(),
+                     ", replica_type=", static_cast<int>(replica_type));
+
+    auto result = invoke_batch_rpc<
+        &WrappedMasterService::BatchExistKeyByReplicaType, bool>(
+        object_keys.size(), object_keys, tenant_id_.value(), replica_type);
     timer.LogResponse("result=", result.size(), " keys");
     return result;
 }

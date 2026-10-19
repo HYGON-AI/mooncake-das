@@ -425,6 +425,10 @@ class Client {
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
+    // Read-only typed existence check; does not grant leases, update
+    // get/cache-hit metrics, or trigger promotion or dynamic replication.
+    std::vector<tl::expected<bool, ErrorCode>> BatchIsExistByReplicaType(
+        const std::vector<std::string>& keys, ReplicaType replica_type);
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
