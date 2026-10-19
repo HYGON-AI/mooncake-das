@@ -90,6 +90,7 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
     config.allocator_type = DfsAllocatorType::BUCKET;
     config.bucket_capacity = bucket_capacity;
     config.max_bucket_count = max_bucket_count;
+    config.ready_bucket_target = 0;
     config.alignment = kAlignment;
     config.single_tenant = true;
     config.eviction_enabled = false;
@@ -1105,7 +1106,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     EXPECT_EQ(desc->shard_idx, 3);
 }
 
-TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudget) {
+TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudget) {
     TempDir tmp("bucket_no_recovery");
     auto config = MakeBucketConfig(tmp.path(), kAlignment, 8);
     config.ready_bucket_target = 0;
@@ -1120,14 +1121,9 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudge
     // Include corrupt metadata, a metadata-only ID and an orphan data file.
     std::ofstream(tmp.file("bucket_000041.meta")) << "corrupt metadata";
     std::ofstream(tmp.file("bucket_000042.data")) << "orphan data";
-    auto read_file = [](const std::string& path) {
-        std::ifstream input(path, std::ios::binary);
-        return std::string(std::istreambuf_iterator<char>(input),
-                           std::istreambuf_iterator<char>());
-    };
-    std::unordered_map<std::string, std::string> old_files;
+    std::vector<std::string> old_files;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
-        old_files.emplace(entry.path().string(), read_file(entry.path().string()));
+        old_files.push_back(entry.path().string());
     }
 
     config.bucket_recovery_enabled = false;
@@ -1159,9 +1155,11 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudge
         EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
         EXPECT_FALSE(std::filesystem::exists(first->file_path));
     }
-    for (const auto& [path, contents] : old_files) {
-        ASSERT_TRUE(std::filesystem::exists(path)) << path;
-        EXPECT_EQ(read_file(path), contents) << path;
+    // Recovery was disabled for the second run, so its startup sweep reclaims
+    // every scanned bucket file. The allocator destructor above joins that
+    // sweep before returning, so none of the old files survive.
+    for (const auto& path : old_files) {
+        EXPECT_FALSE(std::filesystem::exists(path)) << path;
     }
 
     // A metadata-only ID also reserves its name without loading its payload.
@@ -1349,7 +1347,10 @@ TEST(ImmutableBucketAllocatorTest, AllocationFailureEvictionBypassesLowWatermark
                  100});
         }
         auto results = alloc.BatchAllocate(requests);
-        for (const auto& result : results) ASSERT_TRUE(result.success);
+        for (const auto& result : results) {
+            ASSERT_TRUE(result.success);
+            ASSERT_TRUE(alloc.MarkCommitted(result.key, result.descriptor));
+        }
     }
     // Twenty-four entries pack into 10 + 10 + 4 slots instead of four
     // six-entry buckets. Utilization is still below the configured watermark,
@@ -1379,11 +1380,15 @@ TEST(ImmutableBucketAllocatorTest, EvictionCandidatesExcludeFreedKeys) {
     ASSERT_TRUE(b.has_value());
     ASSERT_EQ(a->shard_idx, 0);
     ASSERT_EQ(b->shard_idx, 0);
+    ASSERT_TRUE(alloc.MarkCommitted("a", *a));
+    ASSERT_TRUE(alloc.MarkCommitted("b", *b));
     alloc.Free("a", *a);
 
     // Fill more buckets so bucket 0 is no longer active and usage is high.
     for (int i = 0; i < 4; ++i) {
-        ASSERT_TRUE(alloc.Allocate("f" + std::to_string(i), 100).has_value());
+        auto desc = alloc.Allocate("f" + std::to_string(i), 100);
+        ASSERT_TRUE(desc.has_value());
+        ASSERT_TRUE(alloc.MarkCommitted("f" + std::to_string(i), *desc));
     }
 
     auto pending = alloc.PrepareEviction();
@@ -1921,12 +1926,17 @@ TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
         ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
     }
 
-    // Every file in the directory is either a `.data` or its single `.meta`
-    // companion: no log, no snapshot slots, no rename temporaries.
+    // Bucket files have one `.meta` companion, alongside the master-owned DFS
+    // root marker; there are no logs, snapshot slots, or rename temporaries.
     std::set<std::string> data_ids;
     std::set<std::string> meta_ids;
+    bool found_root_marker = false;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
         const std::string name = entry.path().filename().string();
+        if (name == kDfsRootMarkerFileName) {
+            found_root_marker = true;
+            continue;
+        }
         ASSERT_EQ(name.rfind("bucket_", 0), 0u);
         const std::string id = name.substr(7, 6);
         const std::string suffix = name.substr(13);
@@ -1938,6 +1948,7 @@ TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
             FAIL() << "Unexpected file in the bucket directory: " << name;
         }
     }
+    EXPECT_TRUE(found_root_marker);
     ASSERT_FALSE(meta_ids.empty());
     // Only the still-active bucket has data without metadata.
     EXPECT_EQ(data_ids.size(), meta_ids.size() + 1);

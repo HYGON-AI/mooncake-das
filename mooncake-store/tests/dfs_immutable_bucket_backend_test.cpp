@@ -811,6 +811,7 @@ TEST(DistributedStorageBackendRootTest,
               1);
 
     WriteTestDfsRootIdentity(root.path());
+    std::ofstream(root.file(kDfsRootMarkerFileName)) << kDfsRootMarkerPayload;
     ASSERT_TRUE(backend.ProbeWrite().has_value());
     EXPECT_TRUE(backend.ProbeRead().has_value());
     EXPECT_TRUE(backend.IsInitialized());
@@ -866,6 +867,7 @@ TEST(DistributedStorageBackendRootTest,
     EXPECT_TRUE(std::filesystem::is_empty(root));
 
     WriteTestDfsRootIdentity(root);
+    std::ofstream(root + "/" + kDfsRootMarkerFileName) << kDfsRootMarkerPayload;
     ASSERT_TRUE(backend.ProbeWrite().has_value());
     ASSERT_TRUE(backend.ProbeRead().has_value());
     write_results = backend.BatchWrite(
@@ -897,6 +899,7 @@ TEST(DistributedStorageBackendRootTest,
 
     ASSERT_TRUE(std::filesystem::create_directory(root));
     WriteTestDfsRootIdentity(root);
+    std::ofstream(root + "/" + kDfsRootMarkerFileName) << kDfsRootMarkerPayload;
     ASSERT_TRUE(backend.ProbeWrite().has_value());
     EXPECT_TRUE(backend.IsInitialized());
     EXPECT_TRUE(backend.ProbeRead().has_value());

@@ -294,7 +294,8 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
 bool IsDfsReplicaFallbackError(ErrorCode error) {
     return error == ErrorCode::FILE_OPEN_FAIL ||
            error == ErrorCode::FILE_WRITE_FAIL ||
-           error == ErrorCode::NO_AVAILABLE_HANDLE;
+           error == ErrorCode::NO_AVAILABLE_HANDLE ||
+           error == ErrorCode::DFS_SERVICE_UNAVAILABLE;
 }
 
 void LogTenantQuotaLedgerError(const TenantQuotaResult& result,
@@ -713,13 +714,24 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                                 config.cxl_size);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+
+    if (dfs_retry_needed_.load(std::memory_order_acquire)) {
+        dfs_retry_running_.store(true, std::memory_order_release);
+        dfs_retry_thread_ =
+            std::thread(&MasterService::DfsAllocatorRetryThreadFunc, this);
+    }
 }
 
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
-    enable_dfs_ = Environ::GetBool(
+    dfs_restore_from_bucket_metadata_ =
+        !config.enable_snapshot && !config.enable_snapshot_restore;
+    const bool dfs_enabled = Environ::GetBool(
         "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
-    if (!enable_dfs_) return;
+    if (!dfs_enabled) {
+        enable_dfs_.store(false, std::memory_order_release);
+        return;
+    }
 
     if (enable_oplog_) {
         LOG(ERROR) << "DFS cannot be enabled with oplog recovery until DFS "
@@ -749,40 +761,72 @@ void MasterService::InitDfsAllocatorFromEnvironment(
     if (!EnsureDfsRootIdentity(dfs_config.fsdir, cluster_id_,
                                dfs_root_identity_)) {
         enable_dfs_ = false;
+        dfs_retry_needed_.store(true, std::memory_order_release);
         return;
     }
 
-    bucket_allocator_ = nullptr;
+    std::unique_ptr<DfsAllocatorInterface> allocator;
+    ImmutableBucketAllocator* bucket_allocator = nullptr;
     if (dfs_config.allocator_type == DfsAllocatorType::BUCKET) {
-        auto bucket_allocator = std::make_unique<ImmutableBucketAllocator>();
-        bucket_allocator_ = bucket_allocator.get();
-        dfs_allocator_ = std::move(bucket_allocator);
+        auto bucket_owner = std::make_unique<ImmutableBucketAllocator>();
+        bucket_allocator = bucket_owner.get();
+        allocator = std::move(bucket_owner);
     } else {
-        dfs_allocator_ = std::make_unique<DfsGlobalAllocator>();
+        allocator = std::make_unique<DfsGlobalAllocator>();
     }
 
-    auto init_result = dfs_allocator_->Init(dfs_config);
+    auto init_result = allocator->Init(dfs_config);
     if (!init_result) {
         LOG(ERROR) << "Failed to initialize DFS allocator, error="
                    << init_result.error() << ", config={"
                    << dfs_config.FormatStr() << "}";
-        dfs_allocator_.reset();
-        bucket_allocator_ = nullptr;
         enable_dfs_ = false;
+        dfs_retry_needed_.store(true, std::memory_order_release);
         return;
     }
 
     // Snapshot is the metadata recovery source when enabled. Do not rebuild
     // DFS replicas from bucket state in that mode.
-    if (bucket_allocator_ != nullptr && !config.enable_snapshot &&
-        !config.enable_snapshot_restore) {
-        RestoreRecoveredDfsReplicas();
+    if (bucket_allocator != nullptr && dfs_restore_from_bucket_metadata_) {
+        RestoreRecoveredDfsReplicas(bucket_allocator);
     }
+
+    dfs_allocator_owner_ = std::move(allocator);
+    bucket_allocator_.store(bucket_allocator);
+    dfs_allocator_.store(dfs_allocator_owner_.get());
+    enable_dfs_.store(true, std::memory_order_release);
+    dfs_retry_needed_.store(false, std::memory_order_release);
 
     LOG(INFO) << "DFS allocator initialized, type="
               << ToString(dfs_config.allocator_type) << ", config={"
               << dfs_config.FormatStr() << "}";
     RefreshDfsMetrics();
+}
+
+void MasterService::DfsAllocatorRetryThreadFunc() {
+    constexpr auto kRetryInterval = std::chrono::seconds(5);
+    while (dfs_retry_running_.load(std::memory_order_acquire)) {
+        std::unique_lock lock(dfs_retry_mutex_);
+        if (dfs_retry_cv_.wait_for(lock, kRetryInterval, [this] {
+                return !dfs_retry_running_.load(std::memory_order_acquire);
+            })) {
+            break;
+        }
+        lock.unlock();
+
+        if (!dfs_retry_needed_.load(std::memory_order_acquire)) break;
+        try {
+            MasterServiceConfig retry_config;
+            // The runtime snapshot policy is fixed at construction. Retry the
+            // same configured allocator against the current DFS environment.
+            retry_config.enable_snapshot = !dfs_restore_from_bucket_metadata_;
+            retry_config.enable_snapshot_restore = false;
+            InitDfsAllocatorFromEnvironment(retry_config);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "DFS allocator retry failed, error=" << e.what();
+        }
+        if (!dfs_retry_needed_.load(std::memory_order_acquire)) break;
+    }
 }
 
 void MasterService::RefreshDfsMetrics() const {
@@ -838,6 +882,12 @@ MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
 }
 
 MasterService::~MasterService() {
+    dfs_retry_running_.store(false, std::memory_order_release);
+    dfs_retry_cv_.notify_all();
+    if (dfs_retry_thread_.joinable()) {
+        dfs_retry_thread_.join();
+    }
+
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }
@@ -4569,11 +4619,6 @@ auto MasterService::PutStartInternal(
                    << ", error=dfs_currently_requires_default_tenant";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (config.dfs_replica_num > 0 &&
-        (!enable_dfs_ || !dfs_allocator_ || !dfs_allocator_->IsInitialized())) {
-        LOG(ERROR) << "key=" << key << ", error=dfs_allocator_not_initialized";
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    }
     if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
                    << ", nof_replica_num=" << config.nof_replica_num
@@ -7556,10 +7601,11 @@ void MasterService::FreeDfsReplicas(const std::string& key,
     }
 }
 
-void MasterService::RestoreRecoveredDfsReplicas() {
-    if (bucket_allocator_ == nullptr) return;
+void MasterService::RestoreRecoveredDfsReplicas(
+    ImmutableBucketAllocator* allocator) {
+    if (allocator == nullptr) return;
 
-    auto recovered = bucket_allocator_->TakeRecoveredReplicas();
+    auto recovered = allocator->TakeRecoveredReplicas();
     if (recovered.empty()) return;
 
     const TenantId tenant_id = TenantId::Default();
