@@ -225,7 +225,10 @@ class FileStorage {
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
         bool prefer_pinned);
 
+    tl::expected<void, ErrorCode> InitDfs();
+
     void ClientBufferGCThreadFunc();
+    void DfsHeartbeatThreadFunc();
 
     /**
      * @brief Re-registers all offloaded objects with the master.
@@ -263,6 +266,11 @@ class FileStorage {
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
+    std::atomic<bool> dfs_heartbeat_running_{false};
+    std::thread dfs_heartbeat_thread_;
+    std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{300};
+    uint64_t dfs_snapshot_version_ = 0;
+    UUID dfs_snapshot_epoch_{};
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
     // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the

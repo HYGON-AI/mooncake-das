@@ -9,6 +9,8 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <sys/stat.h>
+#include <unordered_set>
 
 #include "environ.h"
 #include "storage/distributed/bucket_entry_layout.h"
@@ -701,7 +703,7 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id) {
     const std::string path = canonical_root_dir_ + "/" + kBucketFilePrefix +
                              ImmutableBucketAllocator::FormatBucketId(bucket_id) +
                              kBucketDataSuffix;
-    auto fd_result = fs_adapter_->OpenFile(path);
+    auto fd_result = fs_adapter_->OpenFileReadWriteExisting(path);
     if (!fd_result) {
         static DfsLogLimiter log_limiter;
         if (auto suppressed = log_limiter.ShouldLog()) {
@@ -723,6 +725,120 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id) {
     auto [it, inserted] = bucket_id_cache_.emplace(bucket_id, handle);
     (void)inserted;
     return it->second;
+}
+
+tl::expected<bool, ErrorCode>
+DistributedStorageBackend::CleanupBucketFd(int64_t bucket_id) {
+    if (!IsBucketMode() || bucket_id < 0) return false;
+
+    std::shared_ptr<OpenFileHandle> regular_handle;
+    std::shared_ptr<OpenFileHandle> direct_handle;
+    {
+        std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
+        auto regular_it = bucket_id_cache_.find(bucket_id);
+        if (regular_it != bucket_id_cache_.end()) regular_handle = regular_it->second;
+        auto direct_it = bucket_id_direct_cache_.find(bucket_id);
+        if (direct_it != bucket_id_direct_cache_.end()) direct_handle = direct_it->second;
+    }
+    if (!regular_handle && !direct_handle) return false;
+
+    const auto& handle = regular_handle ? regular_handle : direct_handle;
+    struct stat path_stat {};
+    if (::stat(handle->path.c_str(), &path_stat) == 0) return false;
+    if (errno != ENOENT && errno != ESTALE) {
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
+    bool erased = false;
+    auto regular_it = bucket_id_cache_.find(bucket_id);
+    if (regular_it != bucket_id_cache_.end() &&
+        regular_it->second == regular_handle) {
+        bucket_id_cache_.erase(regular_it);
+        erased = true;
+    }
+    auto direct_it = bucket_id_direct_cache_.find(bucket_id);
+    if (direct_it != bucket_id_direct_cache_.end() &&
+        direct_it->second == direct_handle) {
+        bucket_id_direct_cache_.erase(direct_it);
+        erased = true;
+    }
+    return erased;
+}
+
+tl::expected<size_t, ErrorCode>
+DistributedStorageBackend::InvalidateAllBucketFds() {
+    if (!IsBucketMode()) return size_t{0};
+
+    std::vector<std::shared_ptr<OpenFileHandle>> handles;
+    {
+        std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
+        handles.reserve(bucket_id_cache_.size() +
+                        bucket_id_direct_cache_.size());
+        for (auto& [bucket_id, handle] : bucket_id_cache_) {
+            handles.push_back(std::move(handle));
+        }
+        for (auto& [bucket_id, handle] : bucket_id_direct_cache_) {
+            handles.push_back(std::move(handle));
+        }
+        bucket_id_cache_.clear();
+        bucket_id_direct_cache_.clear();
+    }
+    return handles.size();
+}
+
+tl::expected<size_t, ErrorCode>
+DistributedStorageBackend::CleanupStaleBucketFds(
+    const std::vector<int64_t>& active_bucket_ids) {
+    if (!IsBucketMode()) return size_t{0};
+
+    std::unordered_set<int64_t> active_ids(active_bucket_ids.begin(),
+                                           active_bucket_ids.end());
+    std::vector<int64_t> bucket_ids;
+    {
+        std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
+        bucket_ids.reserve(bucket_id_cache_.size() + bucket_id_direct_cache_.size());
+        for (const auto& [bucket_id, handle] : bucket_id_cache_) {
+            if (!active_ids.contains(bucket_id)) bucket_ids.push_back(bucket_id);
+        }
+        for (const auto& [bucket_id, handle] : bucket_id_direct_cache_) {
+            if (!active_ids.contains(bucket_id)) bucket_ids.push_back(bucket_id);
+        }
+    }
+    std::sort(bucket_ids.begin(), bucket_ids.end());
+    bucket_ids.erase(std::unique(bucket_ids.begin(), bucket_ids.end()),
+                     bucket_ids.end());
+    if (bucket_ids.empty()) return size_t{0};
+
+    std::ostringstream bucket_id_list;
+    for (size_t i = 0; i < bucket_ids.size(); ++i) {
+        if (i != 0) bucket_id_list << ',';
+        bucket_id_list << bucket_ids[i];
+    }
+    LOG(INFO) << "DFS bucket FD cleanup candidates, size=" << bucket_ids.size()
+              << ", bucket_ids=" << bucket_id_list.str();
+
+    size_t cleaned = 0;
+    std::vector<int64_t> failed_bucket_ids;
+    for (int64_t bucket_id : bucket_ids) {
+        auto result = CleanupBucketFd(bucket_id);
+        if (!result) {
+            failed_bucket_ids.push_back(bucket_id);
+            continue;
+        }
+        if (*result) ++cleaned;
+    }
+    if (!failed_bucket_ids.empty()) {
+        std::ostringstream failed_id_list;
+        for (size_t i = 0; i < failed_bucket_ids.size(); ++i) {
+            if (i != 0) failed_id_list << ',';
+            failed_id_list << failed_bucket_ids[i];
+        }
+        LOG(WARNING) << "Failed to inspect DFS bucket FDs, size="
+                     << failed_bucket_ids.size()
+                     << ", bucket_ids=" << failed_id_list.str();
+    }
+    return cleaned;
 }
 
 tl::expected<std::shared_ptr<DistributedStorageBackend::OpenFileHandle>,

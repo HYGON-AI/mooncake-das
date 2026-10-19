@@ -501,6 +501,9 @@ class Client {
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
+    tl::expected<DfsBucketSnapshotResponse, ErrorCode> GetDfsBucketSnapshot(
+        const UUID& last_epoch, uint64_t last_version);
+
     tl::expected<bool, ErrorCode> PollRemoveAll();
 
     tl::expected<void, ErrorCode> ReportSsdCapacity(
