@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <cstring>
+#include <cmath>
 #include <filesystem>
 #include <iterator>
 #include <limits>
@@ -183,12 +184,6 @@ bool DistributedStorageConfig::ValidateForAllocator() const {
                    << ", high=" << eviction_high_watermark;
         return false;
     }
-    if (low_utilization_threshold < 0.0 || low_utilization_threshold > 1.0) {
-        LOG(ERROR) << "DistributedStorageConfig: low_utilization_threshold "
-                      "must be in [0,1], value="
-                   << low_utilization_threshold;
-        return false;
-    }
     if (deferred_free_duration.count() < 0) {
         LOG(ERROR) << "DistributedStorageConfig: deferred_free_duration must "
                       "be non-negative, seconds="
@@ -307,6 +302,24 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.low_utilization_threshold = Environ::GetDouble(
         "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD",
         config.low_utilization_threshold);
+    if (!std::isfinite(config.low_utilization_threshold) ||
+        config.low_utilization_threshold < 0.0 ||
+        config.low_utilization_threshold > 1.0) {
+        LOG(WARNING) << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD="
+                     << config.low_utilization_threshold
+                     << "; using default 0.05";
+        config.low_utilization_threshold = 0.05;
+    }
+    config.low_utilization_evictions_per_tick = Environ::GetInt(
+        "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_EVICTIONS_PER_TICK",
+        config.low_utilization_evictions_per_tick);
+    if (config.low_utilization_evictions_per_tick < 0) {
+        LOG(WARNING)
+            << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_EVICTIONS_PER_TICK="
+            << config.low_utilization_evictions_per_tick
+            << "; using default 1";
+        config.low_utilization_evictions_per_tick = 1;
+    }
     config.deferred_free_duration = std::chrono::seconds(Environ::GetInt(
         "MOONCAKE_DFS_DEFERRED_FREE_SECONDS",
         static_cast<int>(config.deferred_free_duration.count())));
@@ -359,6 +372,8 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", eviction_high_watermark=" << eviction_high_watermark
         << ", eviction_low_watermark=" << eviction_low_watermark
         << ", low_utilization_threshold=" << low_utilization_threshold
+        << ", low_utilization_evictions_per_tick="
+        << low_utilization_evictions_per_tick
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
         << eviction_check_interval.count()

@@ -302,6 +302,8 @@ class MasterMetricManager {
     // DFS bucket eviction metrics
     void inc_dfs_bucket_eviction_attempts(int64_t val = 1);
     void inc_dfs_bucket_evictions(int64_t val = 1);
+    void inc_dfs_bucket_low_utilization_eviction_attempts(int64_t val = 1);
+    void inc_dfs_bucket_low_utilization_evictions(int64_t val = 1);
     void inc_dfs_bucket_evicted_replicas(int64_t val = 1);
     void inc_dfs_bucket_evicted_bytes(int64_t val = 1);
 
@@ -734,6 +736,8 @@ class MasterMetricManager {
     // DFS bucket eviction metrics
     ylt::metric::counter_t dfs_bucket_eviction_attempts_;
     ylt::metric::counter_t dfs_bucket_evictions_;
+    ylt::metric::counter_t dfs_bucket_low_utilization_eviction_attempts_;
+    ylt::metric::counter_t dfs_bucket_low_utilization_evictions_;
     ylt::metric::counter_t dfs_bucket_evicted_replicas_;
     ylt::metric::counter_t dfs_bucket_evicted_bytes_;
 
