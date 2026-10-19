@@ -1837,6 +1837,79 @@ TEST_F(MasterServiceTest, DfsBucketModeSupportsPutEndAndQuery) {
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
+    const auto root = MakeDfsTestRoot("retry_after_recovery");
+    const auto saved_root = root + "_saved";
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+
+    {
+        MasterService initial_service;
+        const auto initial_context = PrepareSimpleSegment(initial_service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        ASSERT_TRUE(initial_service
+                        .PutStart(initial_context.client_id, "retry_existing",
+                                  TenantId::Default(), 4096, config)
+                        .has_value());
+        ASSERT_TRUE(initial_service
+                        .PutEnd(initial_context.client_id, "retry_existing",
+                                 TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+    }
+
+    std::filesystem::rename(root, saved_root);
+    {
+        std::ofstream blocker(root);
+        ASSERT_TRUE(blocker.good());
+    }
+
+    {
+        MasterService service;
+        EXPECT_FALSE(service.UsesDfsBucketAllocator());
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        auto degraded = service.PutStart(context.client_id, "retry_degraded",
+                                         TenantId::Default(), 4096, config);
+        ASSERT_TRUE(degraded.has_value()) << toString(degraded.error());
+        ASSERT_EQ(degraded->size(), 1u);
+        EXPECT_TRUE(degraded->front().is_memory_replica());
+
+        std::error_code ec;
+        ASSERT_TRUE(std::filesystem::remove(root, ec));
+        ASSERT_FALSE(ec);
+        std::filesystem::rename(saved_root, root);
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(20);
+        while (!service.UsesDfsBucketAllocator() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        ASSERT_TRUE(service.UsesDfsBucketAllocator())
+            << "master did not retry DFS allocator initialization";
+
+        auto existing =
+            service.GetReplicaList("retry_existing", TenantId::Default());
+        ASSERT_TRUE(existing.has_value());
+        ASSERT_EQ(existing->replicas.size(), 1u);
+        EXPECT_TRUE(existing->replicas.front().is_dfs_replica());
+
+        auto recovered = service.PutStart(context.client_id, "retry_recovered",
+                                          TenantId::Default(), 4096, config);
+        ASSERT_TRUE(recovered.has_value()) << toString(recovered.error());
+        ASSERT_EQ(recovered->size(), 2u);
+        EXPECT_NE(FindDfsDescriptor(*recovered), nullptr);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::remove_all(saved_root, ec);
+}
+
 TEST_F(MasterServiceTest, DfsBucketAllocationFailureEvictsBeforeRetryingPut) {
     const auto root = MakeDfsTestRoot("forced_eviction");
     // Keep the background eviction thread asleep so the second PutStart must
