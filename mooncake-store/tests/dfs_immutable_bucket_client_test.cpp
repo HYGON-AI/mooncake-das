@@ -177,7 +177,8 @@ class DfsBucketClientTest : public ::testing::Test {
         auto adapter = std::make_unique<FailingBucketFsAdapter>();
         adapter_ = adapter.get();
         backend_ = std::make_shared<DistributedStorageBackend>(
-            file_config, distributed_config_, std::move(adapter));
+            file_config, distributed_config_, std::move(adapter),
+            writer_->GetDfsRootIdentity());
         ASSERT_TRUE(backend_->Init().has_value());
         writer_->SetDfsStorageBackend(backend_);
     }

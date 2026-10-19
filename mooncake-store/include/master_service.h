@@ -2732,6 +2732,8 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    // Persisted identity token for the configured DFS root.
+    std::string dfs_root_identity_;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // storage backend eviction configuration

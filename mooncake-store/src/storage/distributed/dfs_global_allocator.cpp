@@ -53,11 +53,10 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
     eviction_check_interval_ = config.eviction_check_interval;
 
     std::error_code ec;
-    std::filesystem::create_directories(mount_path_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS mount path " << mount_path_ << ": "
-                   << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (!std::filesystem::is_directory(mount_path_, ec) || ec) {
+        LOG(ERROR) << "DFS mount path must already exist as a directory: "
+                   << mount_path_;
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
     if (config.fs_adapter_type == "posix") {

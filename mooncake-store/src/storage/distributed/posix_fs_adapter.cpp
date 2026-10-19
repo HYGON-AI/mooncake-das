@@ -58,8 +58,9 @@ tl::expected<void, ErrorCode> PosixFsAdapter::Init(
     const std::string& mount_path) {
     mount_path_ = mount_path;
     std::error_code ec;
-    std::filesystem::create_directories(mount_path_, ec);
-    if (ec) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (!std::filesystem::is_directory(mount_path_, ec) || ec) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
     return {};
 }
 

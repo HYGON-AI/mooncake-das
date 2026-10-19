@@ -106,6 +106,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter);
+    DistributedStorageBackend(
+        const FileStorageConfig& file_storage_config,
+        const DistributedStorageConfig& distributed_config,
+        std::unique_ptr<FileSystemAdapter> fs_adapter,
+        std::string expected_root_identity);
     ~DistributedStorageBackend() override;
 
     // Exactly one adapter must be non-null.
@@ -113,7 +118,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter,
-        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter);
+        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter,
+        std::string expected_root_identity = {});
 
     DistributedStorageMode GetStorageMode() const { return storage_mode_; }
 
@@ -299,6 +305,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
+    std::string expected_root_identity_;
     std::string root_dir_;
     // Canonical form of root_dir_, used to reject descriptor paths that try to
     // escape the configured DFS root.
@@ -317,6 +324,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
     tl::expected<void, ErrorCode> InitLocked();
+    tl::expected<void, ErrorCode> ValidateRootIdentity() const;
     void ResetFailedInitializationLocked();
 
     mutable std::mutex init_mutex_;
