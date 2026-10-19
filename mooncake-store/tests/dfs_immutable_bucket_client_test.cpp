@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <glog/logging.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -90,6 +91,13 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     int WriteCalls() const { return write_calls_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
     void FailAllWrites(bool fail) { fail_all_writes_.store(fail); }
+    void FailAllOpens(bool fail) { fail_all_opens_.store(fail); }
+    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+        if (fail_all_opens_.load()) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        return PosixFsAdapter::OpenFile(path);
+    }
     void BlockWrites() {
         std::lock_guard<std::mutex> lock(mutex_);
         blocked_ = true;
@@ -118,6 +126,7 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     std::atomic<int> write_calls_{0};
     std::atomic<int> fail_write_call_{-1};
     std::atomic<bool> fail_all_writes_{false};
+    std::atomic<bool> fail_all_opens_{false};
     std::mutex mutex_;
     std::condition_variable cv_;
     bool blocked_ = false;
@@ -177,7 +186,8 @@ class DfsBucketClientTest : public ::testing::Test {
         auto adapter = std::make_unique<FailingBucketFsAdapter>();
         adapter_ = adapter.get();
         backend_ = std::make_shared<DistributedStorageBackend>(
-            file_config, distributed_config_, std::move(adapter));
+            file_config, distributed_config_, std::move(adapter),
+            writer_->GetDfsRootIdentity());
         ASSERT_TRUE(backend_->Init().has_value());
         writer_->SetDfsStorageBackend(backend_);
     }
@@ -339,6 +349,74 @@ TEST_F(DfsBucketClientTest, PutThenGetRoundTrip) {
     std::vector<Slice> read_slices{{out.data(), out.size()}};
     ASSERT_TRUE(writer_->Get(key, *query, read_slices).has_value());
     EXPECT_EQ(out, value);
+}
+
+TEST_F(DfsBucketClientTest, EmptyStartupIdentityRecoversFromMasterWithoutRestart) {
+    ASSERT_TRUE(provider_->UnmountSegment(segment_, segment_size_).has_value());
+    writer_.reset();
+    provider_.reset();
+    backend_.reset();
+    adapter_ = nullptr;
+    const int rpc_port = master_.rpc_port();
+    const auto master_config =
+        InProcMasterConfigBuilder().set_rpc_port(rpc_port).build();
+    master_.Stop();
+    SetEnv("MOONCAKE_ENABLE_DFS", "0");
+    ASSERT_TRUE(master_.Start(master_config));
+    writer_ = CreateClient("127.0.0.1:18201");
+    ASSERT_NE(writer_, nullptr);
+    ASSERT_TRUE(writer_->GetDfsRootIdentity().empty());
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root_;
+    // Keep this client and backend alive across the master's DFS recovery.
+    auto recovering = std::make_shared<DistributedStorageBackend>(
+        file_config, distributed_config_, std::make_unique<PosixFsAdapter>());
+    ASSERT_FALSE(recovering->Init().has_value());
+    recovering->SetRootIdentityProvider(
+        [weak_client = std::weak_ptr<Client>(writer_)]()
+            -> tl::expected<std::string, ErrorCode> {
+            auto client = weak_client.lock();
+            if (!client) {
+                return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            }
+            return client->FetchDfsRootIdentity();
+        });
+    writer_->SetDfsStorageBackend(recovering);
+    ASSERT_FALSE(recovering->ProbeWrite().has_value());
+    master_.Stop();
+    SetEnv("MOONCAKE_ENABLE_DFS", "1");
+    ASSERT_TRUE(master_.Start(master_config));
+    // A pooled connection can see EOF on the first probe after restart.
+    const auto recovery_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(5);
+    while (!recovering->ProbeWrite() &&
+           std::chrono::steady_clock::now() < recovery_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_TRUE(recovering->ProbeWrite().has_value());
+    ASSERT_TRUE(recovering->ProbeRead().has_value());
+
+    provider_ = CreateClient("127.0.0.1:18202");
+    ASSERT_NE(provider_, nullptr);
+    ASSERT_TRUE(provider_->MountSegment(segment_, segment_size_, "tcp")
+                    .has_value());
+
+    const std::string key = "recovered_startup_identity";
+    std::string value(4096, 'r');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    std::string output(value.size(), '\0');
+    auto read = recovering->BatchRead(
+        {{key, query->replicas[0].get_dfs_descriptor(),
+          {{output.data(), output.size()}}}});
+    ASSERT_EQ(read.size(), 1u);
+    ASSERT_TRUE(read[0].has_value());
+    EXPECT_EQ(output, value);
 }
 
 TEST_F(DfsBucketClientTest, BatchPutWritesEveryKeyAndKeepsBatchContiguous) {
@@ -571,6 +649,48 @@ TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {
         EXPECT_FALSE(replica.is_dfs_replica())
             << "a failed DFS write must not leave a DFS replica behind";
     }
+}
+
+TEST_F(DfsBucketClientTest, OpenFailuresAreRateLimitedAndRevokeEveryDfsReplica) {
+    struct Capture : google::LogSink {
+        Capture() { google::AddLogSink(this); }
+        ~Capture() override { google::RemoveLogSink(this); }
+        std::atomic<int> opens{0}, writes{0};
+        void send(google::LogSeverity, const char*, const char*, int,
+                  const struct ::tm*, const char* message, size_t length) override {
+            const std::string text(message, length);
+            if (text.find("Failed to open DFS bucket file") != std::string::npos) {
+                ++opens;
+                EXPECT_NE(text.find("suppressed="), std::string::npos);
+            }
+            if (text.find("Async DFS write failed for key") != std::string::npos) {
+                ++writes;
+                EXPECT_NE(text.find("suppressed="), std::string::npos);
+            }
+        }
+    } capture;
+    adapter_->FailAllOpens(true);
+    std::vector<std::string> keys;
+    std::vector<std::string> values(32, std::string(4096, 'F'));
+    for (int i = 0; i < 32; ++i) {
+        keys.push_back("open_failure_" + std::to_string(i));
+    }
+    auto slices = MakeSlices(values);
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(results[i].has_value());
+        ASSERT_TRUE(WaitForKeyGone(keys[i]));
+        auto query = writer_->Query(keys[i]);
+        ASSERT_TRUE(query.has_value());
+        for (const auto& replica : query->replicas) {
+            EXPECT_TRUE(replica.is_memory_replica());
+        }
+    }
+    // Earlier tests can consume these process-wide log quotas. The limiter
+    // unit tests verify first-log and suppressed-count behavior independently.
+    EXPECT_LE(capture.opens.load(), 1);
+    EXPECT_LE(capture.writes.load(), 1);
 }
 
 TEST_F(DfsBucketClientTest, BatchIoFailureRevokesAllKeysInMergedRun) {

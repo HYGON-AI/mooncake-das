@@ -425,9 +425,16 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     BucketPtr PromoteReadyBucketLocked();
     bool ActiveBucketHasSpaceLocked(uint64_t required,
                                     BucketPtr* bucket = nullptr) const;
-    void RequestRefillLocked(bool urgent = false);
+    void RequestRefillLocked();
+    void RecordBucketCreationFailureLocked(ErrorCode error);
     void BucketCreateWorker();
     void StopBucketWorkers();
+
+    // One-shot background sweep that reclaims the bucket files recorded by the
+    // disabled-recovery scan. Their ids are all below `next_bucket_id_`, so no
+    // bucket this process creates reuses a name in the list. Joined by
+    // StopBucketWorkers() before the fs adapter shuts down.
+    void LegacyCleanupWorker(std::vector<int64_t> bucket_ids);
     std::vector<int64_t> DetachReadyBucketsLocked();
     void UpdateBucketPoolMetricsLocked() const;
 
@@ -489,11 +496,14 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     bool stop_bucket_workers_ = false;
     size_t initialization_creations_remaining_ = 0;
     uint64_t bucket_creation_failure_sequence_ = 0;
-    uint64_t last_urgent_refill_sequence_ = static_cast<uint64_t>(-1);
     ErrorCode last_bucket_creation_error_ = ErrorCode::OK;
     std::chrono::steady_clock::time_point bucket_creation_retry_after_{};
+    std::chrono::seconds bucket_creation_retry_delay_{1};
     std::condition_variable bucket_pool_cv_;
     std::vector<std::thread> bucket_create_workers_;
+    // One-shot sweep of legacy bucket files, spawned only when metadata
+    // recovery is disabled. Joined by StopBucketWorkers().
+    std::thread legacy_cleanup_worker_;
     std::unordered_map<int64_t, BucketPtr> buckets_;
     std::unordered_map<std::string, int64_t> key_index_;
     int64_t next_bucket_id_ = 0;

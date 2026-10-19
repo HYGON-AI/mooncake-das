@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -18,11 +19,28 @@
 
 #include "replica.h"
 #include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage_backend.h"
 
 namespace mooncake::test {
+
+namespace {
+
+const std::string kTestDfsRootIdentity =
+    SerializeDfsRootIdentity("dfs_posix_test", UUID{1, 2});
+
+bool WriteTestDfsRootIdentity(const std::string& root) {
+    const std::string marker_path =
+        root + "/" + kDfsRootIdentityFileName;
+    std::ofstream marker(marker_path, std::ios::binary | std::ios::trunc);
+    marker.write(kTestDfsRootIdentity.data(),
+                 static_cast<std::streamsize>(kTestDfsRootIdentity.size()));
+    return marker.good();
+}
+
+}  // namespace
 
 class TempDir {
    public:
@@ -789,6 +807,7 @@ class DfsBackendTest : public ::testing::Test {
    protected:
     void SetUp() override {
         tmp_ = std::make_unique<TempDir>("dfs_backend");
+        ASSERT_TRUE(WriteTestDfsRootIdentity(tmp_->path()));
         FileStorageConfig file_config;
         file_config.storage_backend_type = StorageBackendType::kDistributed;
         file_config.storage_filepath = tmp_->path();
@@ -802,7 +821,7 @@ class DfsBackendTest : public ::testing::Test {
 
         backend_ = std::make_unique<DistributedStorageBackend>(
             file_config, distributed_config,
-            std::make_unique<PosixFsAdapter>());
+            std::make_unique<PosixFsAdapter>(), kTestDfsRootIdentity);
         ASSERT_TRUE(backend_->Init().has_value());
     }
 
@@ -821,20 +840,64 @@ class DfsBackendTest : public ::testing::Test {
     std::unique_ptr<DistributedStorageBackend> backend_;
 };
 
-TEST_F(DfsBackendTest, HealthProbeUsesOnePersistentFile) {
-    const std::string probe_path =
-        tmp_->file(".mooncake_dfs_health_probe");
-    EXPECT_FALSE(std::filesystem::exists(probe_path));
+TEST(DfsRootMarkerTest, ShardAllocatorPublishesMarkerForReadProbes) {
+    TempDir tmp("dfs_root_marker");
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+
+    DfsGlobalAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+    EXPECT_TRUE(std::filesystem::exists(tmp.file(kDfsRootMarkerFileName)));
+}
+
+TEST_F(DfsBackendTest, HealthProbesUseMasterMarkerAndCreateFreshClientFile) {
+    const std::string marker_path = tmp_->file(kDfsRootMarkerFileName);
+    EXPECT_FALSE(std::filesystem::exists(marker_path));
 
     auto read_before_write = backend_->ProbeRead();
     ASSERT_FALSE(read_before_write.has_value());
     EXPECT_EQ(read_before_write.error(), ErrorCode::FILE_NOT_FOUND);
 
+    {
+        std::ofstream marker(marker_path);
+        ASSERT_TRUE(marker.good());
+        marker.write(kDfsRootMarkerPayload,
+                     sizeof(kDfsRootMarkerPayload) - 1);
+    }
+    EXPECT_TRUE(backend_->ProbeRead().has_value())
+        << "read probe must not depend on a prior client write probe";
+
     ASSERT_TRUE(backend_->ProbeWrite().has_value());
-    EXPECT_TRUE(std::filesystem::exists(probe_path));
+    FileStorageConfig second_file_config;
+    second_file_config.storage_backend_type = StorageBackendType::kDistributed;
+    second_file_config.storage_filepath = tmp_->path();
+    DistributedStorageConfig second_distributed_config;
+    second_distributed_config.fsdir = tmp_->path();
+    second_distributed_config.fs_adapter_type = "posix";
+    second_distributed_config.shard_count = 4;
+    second_distributed_config.shard_capacity = 64 * 1024 * 1024;
+    second_distributed_config.alignment = 4096;
+    DistributedStorageBackend second_client_backend(
+        second_file_config, second_distributed_config,
+        std::make_unique<PosixFsAdapter>(), kTestDfsRootIdentity);
+    ASSERT_TRUE(second_client_backend.Init().has_value());
+    ASSERT_TRUE(second_client_backend.ProbeWrite().has_value());
+
+    size_t probe_file_count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
+        if (entry.path().filename().string().starts_with(
+                ".mooncake_dfs_health_probe_")) {
+            ++probe_file_count;
+        }
+    }
+    EXPECT_EQ(probe_file_count, 2u);
     EXPECT_TRUE(backend_->ProbeRead().has_value());
 
-    const int fd = ::open(probe_path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+    const int fd = ::open(marker_path.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
     ASSERT_GE(fd, 0);
     constexpr char kCorruptPayload[] = "bad";
     ASSERT_EQ(::write(fd, kCorruptPayload, sizeof(kCorruptPayload) - 1),
@@ -842,27 +905,42 @@ TEST_F(DfsBackendTest, HealthProbeUsesOnePersistentFile) {
     ASSERT_EQ(::close(fd), 0);
     EXPECT_FALSE(backend_->ProbeRead().has_value());
 
+    {
+        std::ofstream marker(marker_path, std::ios::trunc);
+        ASSERT_TRUE(marker.good());
+        marker.write(kDfsRootMarkerPayload,
+                     sizeof(kDfsRootMarkerPayload) - 1);
+    }
     ASSERT_TRUE(backend_->ProbeWrite().has_value());
     EXPECT_TRUE(backend_->ProbeRead().has_value());
 
-    size_t probe_file_count = 0;
+    probe_file_count = 0;
     for (const auto& entry : std::filesystem::directory_iterator(tmp_->path())) {
         if (entry.path().filename().string().starts_with(
-                ".mooncake_dfs_health_probe")) {
+                ".mooncake_dfs_health_probe_")) {
             ++probe_file_count;
         }
     }
-    EXPECT_EQ(probe_file_count, 1u);
+    EXPECT_EQ(probe_file_count, 2u);
 }
 
 class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
+    void FailNextFileCreate() { fail_file_create_.store(true); }
     void FailWriteCall(int call) { fail_write_call_ = call; }
     void FailReadCall(int call) { fail_read_call_ = call; }
     void ShortWriteCall(int call) { short_write_call_ = call; }
     void ShortReadCall(int call) { short_read_call_ = call; }
     int WriteCallCount() const { return write_calls_.load(); }
     int ReadCallCount() const { return read_calls_.load(); }
+
+    tl::expected<size_t, ErrorCode> WriteFile(
+        const std::string& path, std::span<const char> data) override {
+        if (fail_file_create_.exchange(false)) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return PosixFsAdapter::WriteFile(path, data);
+    }
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
@@ -898,6 +976,7 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     }
 
    private:
+    std::atomic<bool> fail_file_create_{false};
     std::atomic<int> write_calls_{0};
     std::atomic<int> read_calls_{0};
     int fail_write_call_ = -1;
@@ -905,6 +984,30 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int fail_read_call_ = -1;
     int short_read_call_ = -1;
 };
+
+TEST_F(DfsBackendTest, HealthWriteProbeFailsWhenCreatingANewFileFails) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = tmp_->path();
+    distributed_config.fs_adapter_type = "posix";
+    distributed_config.shard_count = 4;
+    distributed_config.shard_capacity = 64 * 1024 * 1024;
+    distributed_config.alignment = 4096;
+
+    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
+    auto* controlled_adapter = adapter.get();
+    DistributedStorageBackend backend(file_config, distributed_config,
+                                      std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    controlled_adapter->FailNextFileCreate();
+    auto result = backend.ProbeWrite();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+}
 
 TEST_F(DfsBackendTest, BatchWriteUsesExplicitDescriptors) {
     AlignedBuffer write_buf(4096);
@@ -956,7 +1059,8 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
-        file_config, distributed_config, std::move(adapter));
+        file_config, distributed_config, std::move(adapter),
+        kTestDfsRootIdentity);
     ASSERT_TRUE(backend->Init().has_value());
     controlled_adapter->FailWriteCall(2);
     controlled_adapter->ShortWriteCall(3);
@@ -1049,7 +1153,8 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
-        file_config, distributed_config, std::move(adapter));
+        file_config, distributed_config, std::move(adapter),
+        kTestDfsRootIdentity);
     ASSERT_TRUE(backend->Init().has_value());
 
     AlignedBuffer write_buf(4096);
@@ -1104,7 +1209,8 @@ TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
-        file_config, distributed_config, std::move(adapter));
+        file_config, distributed_config, std::move(adapter),
+        kTestDfsRootIdentity);
     ASSERT_TRUE(backend->Init().has_value());
 
     AlignedBuffer small_buf(4096);
@@ -1284,6 +1390,7 @@ TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_factory");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
     env.Set("MOONCAKE_DFS_ROOT_DIR", tmp.path().c_str());
     env.Set("MOONCAKE_DFS_SHARD_COUNT", "2");
     env.Set("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
@@ -1294,7 +1401,7 @@ TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = tmp.path();
 
-    auto backend = CreateStorageBackend(file_config);
+    auto backend = CreateStorageBackend(file_config, kTestDfsRootIdentity);
     ASSERT_TRUE(backend.has_value());
     ASSERT_NE(*backend, nullptr);
     EXPECT_TRUE((*backend)->Init().has_value());

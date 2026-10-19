@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -1177,6 +1178,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         }
     } else {
         auto config = config_response.value();
+        client->dfs_root_identity_ = config.dfs_root_identity;
         WarnOnClientDfsPathMismatch(config.dfs_fsdir);
         if (config.fsdir.empty()) {
             LOG(INFO)
@@ -3039,9 +3041,13 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         const auto& key = context->keys[i];
         const bool succeeded = outcomes[i] == ErrorCode::OK;
         if (!succeeded) {
-            LOG(ERROR) << "Async DFS write failed for key " << key
-                       << ", error=" << toString(outcomes[i])
-                       << "; revoking the DFS replica";
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "Async DFS write failed for key " << key
+                           << ", error=" << toString(outcomes[i])
+                           << "; revoking the DFS replica"
+                           << ", suppressed=" << *suppressed;
+            }
         }
 
         tl::expected<void, ErrorCode> completion =
@@ -4279,6 +4285,26 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     return response;
 }
 
+std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExistByReplicaType(
+    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    auto response =
+        master_client_.BatchExistKeyByReplicaType(keys, replica_type);
+
+    if (response.size() != keys.size()) {
+        LOG(ERROR) << "BatchExistKeyByReplicaType response size mismatch. "
+                   << "Expected: " << keys.size() << ", Got: "
+                   << response.size();
+        std::vector<tl::expected<bool, ErrorCode>> results;
+        results.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return results;
+    }
+
+    return response;
+}
+
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
@@ -4389,6 +4415,15 @@ void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
+}
+
+tl::expected<std::string, ErrorCode> Client::FetchDfsRootIdentity() {
+    auto config = master_client_.GetStorageConfig();
+    if (!config) return tl::make_unexpected(config.error());
+    if (config->dfs_root_identity.empty()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    return config->dfs_root_identity;
 }
 
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(

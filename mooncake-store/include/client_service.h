@@ -79,6 +79,10 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+    const std::string& GetDfsRootIdentity() const {
+        return dfs_root_identity_;
+    }
+    tl::expected<std::string, ErrorCode> FetchDfsRootIdentity();
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -421,6 +425,10 @@ class Client {
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
+    // Read-only typed existence check; does not grant leases, update
+    // get/cache-hit metrics, or trigger promotion or dynamic replication.
+    std::vector<tl::expected<bool, ErrorCode>> BatchIsExistByReplicaType(
+        const std::vector<std::string>& keys, ReplicaType replica_type);
 
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
@@ -1026,6 +1034,7 @@ class Client {
 
     // Client identification
     const UUID client_id_;
+    std::string dfs_root_identity_;
 
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;

@@ -1,16 +1,21 @@
 #include "master_service.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 #include <algorithm>
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cassert>
+#include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <filesystem>
 #include <limits>
 #include <set>
 #include <shared_mutex>
@@ -21,6 +26,7 @@
 #include <regex>
 #include <unordered_set>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <ylt/util/tl/expected.hpp>
@@ -55,6 +61,7 @@
 #include "utils/file_util.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
 #include "utils.h"
@@ -69,6 +76,153 @@ namespace mooncake {
 namespace {
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
+
+bool ReadDfsRootIdentity(const std::string& marker_path,
+                         const std::string& cluster_id,
+                         std::string& identity, bool& missing) {
+    missing = false;
+    const int fd = ::open(marker_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        missing = errno == ENOENT;
+        return false;
+    }
+
+    struct stat st {};
+    bool valid = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
+                 static_cast<uint64_t>(st.st_size) <= kMaxDfsRootIdentitySize;
+    std::string contents;
+    if (valid) {
+        contents.resize(static_cast<size_t>(st.st_size));
+        size_t offset = 0;
+        while (offset < contents.size()) {
+            const ssize_t count =
+                ::read(fd, contents.data() + offset, contents.size() - offset);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) {
+                valid = false;
+                break;
+            }
+            offset += static_cast<size_t>(count);
+        }
+    }
+    const int close_result = ::close(fd);
+    if (close_result != 0 || !valid ||
+        !ParseDfsRootIdentity(contents, cluster_id, identity)) {
+        identity.clear();
+        return false;
+    }
+    return true;
+}
+
+bool SyncDfsRootDirectory(const std::string& root) {
+    const int fd = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        return errno == EINVAL || errno == EOPNOTSUPP;
+    }
+    const int result = ::fsync(fd);
+    const int saved_errno = errno;
+    ::close(fd);
+    return result == 0 || saved_errno == EINVAL ||
+           saved_errno == EOPNOTSUPP;
+}
+
+bool WriteAll(int fd, const std::string& contents) {
+    size_t offset = 0;
+    while (offset < contents.size()) {
+        const ssize_t count =
+            ::write(fd, contents.data() + offset, contents.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return false;
+        offset += static_cast<size_t>(count);
+    }
+    return ::fsync(fd) == 0;
+}
+
+bool EnsureDfsRootIdentity(const std::string& root,
+                           const std::string& cluster_id,
+                           std::string& identity) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec) || ec) {
+        LOG(ERROR) << "DFS root must already exist as a directory; refusing "
+                      "to create it: "
+                   << root;
+        return false;
+    }
+    if (!IsValidClusterIdComponent(cluster_id)) {
+        LOG(ERROR) << "Invalid cluster id for DFS root identity: " << cluster_id;
+        return false;
+    }
+
+    const std::string marker_path =
+        root + "/" + kDfsRootIdentityFileName;
+    bool missing = false;
+    if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
+        return true;
+    }
+    if (!missing) {
+        LOG(ERROR) << "DFS root identity marker is invalid or belongs to a "
+                      "different cluster: "
+                   << marker_path;
+        return false;
+    }
+
+    const UUID token{
+        randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max()),
+        randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max())};
+    const std::string candidate = SerializeDfsRootIdentity(cluster_id, token);
+    if (candidate.empty()) return false;
+
+    const std::string temp_path =
+        marker_path + "." + std::to_string(::getpid()) + "." +
+        UuidToString(token) + ".tmp";
+    const int temp_fd = ::open(temp_path.c_str(),
+                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                               0644);
+    if (temp_fd < 0) {
+        LOG(ERROR) << "Failed to create DFS root identity temp file "
+                   << temp_path << ": " << std::strerror(errno);
+        return false;
+    }
+    const bool temp_written = WriteAll(temp_fd, candidate);
+    const int close_result = ::close(temp_fd);
+    if (!temp_written || close_result != 0) {
+        const int saved_errno = errno;
+        ::unlink(temp_path.c_str());
+        LOG(ERROR) << "Failed to write DFS root identity temp file "
+                   << temp_path << ": " << std::strerror(saved_errno);
+        return false;
+    }
+
+    if (::link(temp_path.c_str(), marker_path.c_str()) == 0) {
+        ::unlink(temp_path.c_str());
+        if (!SyncDfsRootDirectory(root)) {
+            LOG(ERROR) << "Failed to sync DFS root after publishing identity "
+                       << marker_path;
+            return false;
+        }
+        identity = candidate;
+        return true;
+    }
+
+    const int link_error = errno;
+    ::unlink(temp_path.c_str());
+    if (link_error != EEXIST) {
+        LOG(ERROR) << "Failed to publish DFS root identity marker "
+                   << marker_path << ": " << std::strerror(link_error);
+        return false;
+    }
+
+    // Another initializer atomically published the marker first. Its file is
+    // already complete because the temporary inode was synced before link().
+    if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
+        return true;
+    }
+    LOG(ERROR) << "Concurrent DFS root identity marker is invalid or belongs "
+                  "to a different cluster: "
+               << marker_path;
+    return false;
+}
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
 // when offload-on-evict mode is active. Defers memory eviction for at most
@@ -144,7 +298,8 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
 bool IsDfsReplicaFallbackError(ErrorCode error) {
     return error == ErrorCode::FILE_OPEN_FAIL ||
            error == ErrorCode::FILE_WRITE_FAIL ||
-           error == ErrorCode::NO_AVAILABLE_HANDLE;
+           error == ErrorCode::NO_AVAILABLE_HANDLE ||
+           error == ErrorCode::DFS_SERVICE_UNAVAILABLE;
 }
 
 void LogTenantQuotaLedgerError(const TenantQuotaResult& result,
@@ -577,13 +732,24 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                                 config.cxl_size);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
+
+    if (dfs_retry_needed_.load(std::memory_order_acquire)) {
+        dfs_retry_running_.store(true, std::memory_order_release);
+        dfs_retry_thread_ =
+            std::thread(&MasterService::DfsAllocatorRetryThreadFunc, this);
+    }
 }
 
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
-    enable_dfs_ = Environ::GetBool(
+    dfs_restore_from_bucket_metadata_ =
+        !config.enable_snapshot && !config.enable_snapshot_restore;
+    const bool dfs_enabled = Environ::GetBool(
         "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
-    if (!enable_dfs_) return;
+    if (!dfs_enabled) {
+        enable_dfs_.store(false, std::memory_order_release);
+        return;
+    }
 
     if (enable_oplog_) {
         LOG(ERROR) << "DFS cannot be enabled with oplog recovery until DFS "
@@ -606,37 +772,79 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         return;
     }
 
-    bucket_allocator_ = nullptr;
-    if (dfs_config.allocator_type == DfsAllocatorType::BUCKET) {
-        auto bucket_allocator = std::make_unique<ImmutableBucketAllocator>();
-        bucket_allocator_ = bucket_allocator.get();
-        dfs_allocator_ = std::move(bucket_allocator);
-    } else {
-        dfs_allocator_ = std::make_unique<DfsGlobalAllocator>();
+    if (!dfs_config.ValidateForAllocator()) {
+        enable_dfs_ = false;
+        return;
+    }
+    if (!EnsureDfsRootIdentity(dfs_config.fsdir, cluster_id_,
+                               dfs_root_identity_)) {
+        enable_dfs_ = false;
+        dfs_retry_needed_.store(true, std::memory_order_release);
+        return;
     }
 
-    auto init_result = dfs_allocator_->Init(dfs_config);
+    std::unique_ptr<DfsAllocatorInterface> allocator;
+    ImmutableBucketAllocator* bucket_allocator = nullptr;
+    if (dfs_config.allocator_type == DfsAllocatorType::BUCKET) {
+        auto bucket_owner = std::make_unique<ImmutableBucketAllocator>();
+        bucket_allocator = bucket_owner.get();
+        allocator = std::move(bucket_owner);
+    } else {
+        allocator = std::make_unique<DfsGlobalAllocator>();
+    }
+
+    auto init_result = allocator->Init(dfs_config);
     if (!init_result) {
         LOG(ERROR) << "Failed to initialize DFS allocator, error="
                    << init_result.error() << ", config={"
                    << dfs_config.FormatStr() << "}";
-        dfs_allocator_.reset();
-        bucket_allocator_ = nullptr;
         enable_dfs_ = false;
+        dfs_retry_needed_.store(true, std::memory_order_release);
         return;
     }
 
     // Snapshot is the metadata recovery source when enabled. Do not rebuild
     // DFS replicas from bucket state in that mode.
-    if (bucket_allocator_ != nullptr && !config.enable_snapshot &&
-        !config.enable_snapshot_restore) {
-        RestoreRecoveredDfsReplicas();
+    if (bucket_allocator != nullptr && dfs_restore_from_bucket_metadata_) {
+        RestoreRecoveredDfsReplicas(bucket_allocator);
     }
+
+    dfs_allocator_owner_ = std::move(allocator);
+    bucket_allocator_.store(bucket_allocator);
+    dfs_allocator_.store(dfs_allocator_owner_.get());
+    enable_dfs_.store(true, std::memory_order_release);
+    dfs_retry_needed_.store(false, std::memory_order_release);
 
     LOG(INFO) << "DFS allocator initialized, type="
               << ToString(dfs_config.allocator_type) << ", config={"
               << dfs_config.FormatStr() << "}";
     RefreshDfsMetrics();
+}
+
+void MasterService::DfsAllocatorRetryThreadFunc() {
+    constexpr auto kRetryInterval = std::chrono::seconds(5);
+    while (dfs_retry_running_.load(std::memory_order_acquire)) {
+        std::unique_lock lock(dfs_retry_mutex_);
+        if (dfs_retry_cv_.wait_for(lock, kRetryInterval, [this] {
+                return !dfs_retry_running_.load(std::memory_order_acquire);
+            })) {
+            break;
+        }
+        lock.unlock();
+
+        if (!dfs_retry_needed_.load(std::memory_order_acquire)) break;
+        try {
+            MasterServiceConfig retry_config;
+            // The runtime snapshot policy is fixed at construction. Retry the
+            // same configured allocator against the current DFS environment.
+            retry_config.enable_snapshot = !dfs_restore_from_bucket_metadata_;
+            retry_config.enable_snapshot_restore = false;
+            InitDfsAllocatorFromEnvironment(retry_config);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "DFS allocator retry failed, error=" << e.what();
+        }
+        if (!dfs_retry_needed_.load(std::memory_order_acquire)) break;
+    }
 }
 
 void MasterService::RefreshDfsMetrics() const {
@@ -692,6 +900,12 @@ MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
 }
 
 MasterService::~MasterService() {
+    dfs_retry_running_.store(false, std::memory_order_release);
+    dfs_retry_cv_.notify_all();
+    if (dfs_retry_thread_.joinable()) {
+        dfs_retry_thread_.join();
+    }
+
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }
@@ -2879,6 +3093,21 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
 
 std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     const std::vector<std::string>& keys, const TenantId& tenant_id) {
+    return BatchExistKeyInternal(keys, tenant_id, ReplicaType::ALL,
+                                 /*grant_lease=*/true);
+}
+
+std::vector<tl::expected<bool, ErrorCode>>
+MasterService::BatchExistKeyByReplicaType(
+    const std::vector<std::string>& keys, const TenantId& tenant_id,
+    ReplicaType replica_type) {
+    return BatchExistKeyInternal(keys, tenant_id, replica_type,
+                                 /*grant_lease=*/false);
+}
+
+std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyInternal(
+    const std::vector<std::string>& keys, const TenantId& tenant_id,
+    ReplicaType replica_type, bool grant_lease) {
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     if (keys.empty()) {
@@ -2934,11 +3163,19 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
             }
 
             const auto& metadata = it->second;
-            if (!HasReadableReplica(metadata)) {
+            const bool has_readable_replica = metadata.HasReplica(
+                [this, replica_type](const Replica& replica) {
+                    return IsReplicaReadable(replica) &&
+                           (replica_type == ReplicaType::ALL ||
+                            replica.type() == replica_type);
+                });
+            if (!has_readable_replica) {
                 results[i] = false;
                 continue;
             }
-            GrantLeaseForGroup(tenant_state, key, metadata);
+            if (grant_lease) {
+                GrantLeaseForGroup(tenant_state, key, metadata);
+            }
             results[i] = true;
         }
     }
@@ -4300,8 +4537,12 @@ auto MasterService::AllocateAndInsertMetadata(
 
     if (config.dfs_replica_num > 0 && !skip_dfs_replica) {
         if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
-            LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
-                       << ", error=dfs_allocator_not_initialized";
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                           << ", error=dfs_allocator_not_initialized"
+                           << ", suppressed=" << *suppressed;
+            }
             refund_pending_quota();
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
@@ -4313,8 +4554,12 @@ auto MasterService::AllocateAndInsertMetadata(
         } else {
             auto alloc = dfs_allocator_->Allocate(key, value_length);
             if (!alloc) {
-                LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
-                           << ", error=" << alloc.error();
+                static DfsLogLimiter log_limiter;
+                if (auto suppressed = log_limiter.ShouldLog()) {
+                    LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
+                               << ", error=" << alloc.error()
+                               << ", suppressed=" << *suppressed;
+                }
                 if (dfs_allocation_error != nullptr) {
                     *dfs_allocation_error = alloc.error();
                 }
@@ -4431,11 +4676,6 @@ auto MasterService::PutStartInternal(
         LOG(ERROR) << "key=" << key << ", tenant_id=" << tenant_id
                    << ", error=dfs_currently_requires_default_tenant";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (config.dfs_replica_num > 0 &&
-        (!enable_dfs_ || !dfs_allocator_ || !dfs_allocator_->IsInitialized())) {
-        LOG(ERROR) << "key=" << key << ", error=dfs_allocator_not_initialized";
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     if (config.prefer_alloc_in_same_node && config.nof_replica_num > 0) {
         LOG(ERROR) << "key=" << key
@@ -4639,9 +4879,14 @@ auto MasterService::PutStartInternal(
             if (dfs_fallback_reason.has_value()) {
                 MasterMetricManager::instance().inc_dfs_replica_skipped_total(
                     toString(*dfs_fallback_reason));
-                LOG(WARNING) << "key=" << key
-                             << ", action=dfs_replica_skipped_memory_fallback"
-                             << ", error=" << toString(*dfs_fallback_reason);
+                static DfsLogLimiter fallback_log_limiter;
+                if (auto suppressed = fallback_log_limiter.ShouldLog()) {
+                    LOG(WARNING)
+                        << "key=" << key
+                        << ", action=dfs_replica_skipped_memory_fallback"
+                        << ", error=" << toString(*dfs_fallback_reason)
+                        << ", suppressed=" << *suppressed;
+                }
             }
             return result;
         }
@@ -7419,10 +7664,11 @@ void MasterService::FreeDfsReplicas(const std::string& key,
     }
 }
 
-void MasterService::RestoreRecoveredDfsReplicas() {
-    if (bucket_allocator_ == nullptr) return;
+void MasterService::RestoreRecoveredDfsReplicas(
+    ImmutableBucketAllocator* allocator) {
+    if (allocator == nullptr) return;
 
-    auto recovered = bucket_allocator_->TakeRecoveredReplicas();
+    auto recovered = allocator->TakeRecoveredReplicas();
     if (recovered.empty()) return;
 
     const TenantId tenant_id = TenantId::Default();
@@ -7938,16 +8184,19 @@ tl::expected<GetStorageConfigResponse, ErrorCode>
 MasterService::GetStorageConfig() const {
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
     const std::string dfs_fsdir = enable_dfs_ ? dfs_config.fsdir : std::string();
+    const std::string dfs_root_identity =
+        enable_dfs_ ? dfs_root_identity_ : std::string();
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
         LOG(INFO)
             << "Storage root directory or cluster ID is not set. persisting "
                "data is disabled.";
         return GetStorageConfigResponse("", enable_disk_eviction_,
-                                        quota_bytes_, dfs_fsdir);
+                                        quota_bytes_, dfs_fsdir,
+                                        dfs_root_identity);
     }
     std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
     return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_,
-                                    dfs_fsdir);
+                                    dfs_fsdir, dfs_root_identity);
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,

@@ -53,10 +53,19 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
     eviction_check_interval_ = config.eviction_check_interval;
 
     std::error_code ec;
-    std::filesystem::create_directories(mount_path_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS mount path " << mount_path_ << ": "
-                   << ec.message();
+    if (!std::filesystem::exists(mount_path_, ec)) {
+        if (ec) {
+            LOG(ERROR) << "Failed to access DFS mount path " << mount_path_
+                       << ": " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        LOG(ERROR) << "DFS mount path must already exist: " << mount_path_;
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    const bool is_directory = std::filesystem::is_directory(mount_path_, ec);
+    if (ec || !is_directory) {
+        LOG(ERROR) << "DFS mount path must already exist as a directory: "
+                   << mount_path_;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
@@ -80,6 +89,15 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
                    << " for mount_path=" << mount_path_
                    << ", error=" << adapter_init.error();
         return tl::make_unexpected(adapter_init.error());
+    }
+
+    const std::string root_marker_path =
+        mount_path_ + "/" + kDfsRootMarkerFileName;
+    auto marker_result = EnsureDfsRootMarker(*fs_adapter_, root_marker_path);
+    if (!marker_result) {
+        LOG(ERROR) << "Failed to ensure DFS root marker " << root_marker_path
+                   << ": " << marker_result.error();
+        return marker_result;
     }
 
     for (int i = 0; i < shard_count_; ++i) {

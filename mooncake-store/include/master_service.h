@@ -53,6 +53,20 @@
 
 namespace mooncake {
 
+// Atomically publishes a borrowed allocator pointer. Its unique_ptr owner is
+// kept stable for the lifetime of MasterService.
+template <typename T>
+class AtomicBorrowedPtr {
+   public:
+    T* get() const { return ptr_.load(std::memory_order_acquire); }
+    T* operator->() const { return get(); }
+    operator T*() const { return get(); }
+    void store(T* ptr) { ptr_.store(ptr, std::memory_order_release); }
+
+   private:
+    std::atomic<T*> ptr_{nullptr};
+};
+
 // Forward declaration for MasterSnapshotManager
 class MasterSnapshotManager;
 class MasterSnapshotRepository;
@@ -208,10 +222,11 @@ class MasterService {
      */
     tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
         int64_t new_max_bucket_count);
-
     tl::expected<uint32_t, ErrorCode> SetDfsHeartbeatInterval(
         uint32_t new_interval_seconds);
-    bool UsesDfsBucketAllocator() const { return bucket_allocator_ != nullptr; }
+    bool UsesDfsBucketAllocator() const {
+        return bucket_allocator_.get() != nullptr;
+    }
 
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
@@ -309,6 +324,13 @@ class MasterService {
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys, const TenantId& tenant_id);
+
+    // Read-only typed existence check. Unlike BatchExistKey, this does not
+    // grant object/group leases, update get/cache-hit metrics, or trigger
+    // promotion or dynamic replication.
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyByReplicaType(
+        const std::vector<std::string>& keys, const TenantId& tenant_id,
+        ReplicaType replica_type);
 
     /**
      * @brief Fetch all keys for a single tenant.
@@ -2103,9 +2125,10 @@ class MasterService {
     // Shard-mode per-key eviction (unchanged behaviour).
     void RunShardDfsEviction();
     // Re-registers DFS replicas recovered from bucket metadata as COMPLETE so
-    // a restarted master can serve them. Called once, before serving traffic.
-    void RestoreRecoveredDfsReplicas();
+    // the master can serve them after startup or allocator recovery.
+    void RestoreRecoveredDfsReplicas(ImmutableBucketAllocator* allocator);
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
+    void DfsAllocatorRetryThreadFunc();
     /**
      * @brief Helper to release space of expired discarded replicas.
      * @return Number of released objects that have memory replicas
@@ -2739,6 +2762,8 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    // Persisted identity token for the configured DFS root.
+    std::string dfs_root_identity_;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // storage backend eviction configuration
@@ -2777,19 +2802,26 @@ class MasterService {
     void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};
-    bool enable_dfs_{false};
+    std::atomic<bool> enable_dfs_{false};
     bool enable_dfs_bucket_recovery_{true};
+    bool dfs_restore_from_bucket_metadata_{true};
     // Chosen by configuration at startup: DfsGlobalAllocator (SHARD, the
     // default) or ImmutableBucketAllocator (BUCKET). The master only ever talks
     // to it through DfsAllocatorInterface.
-    std::unique_ptr<DfsAllocatorInterface> dfs_allocator_;
+    std::unique_ptr<DfsAllocatorInterface> dfs_allocator_owner_;
+    AtomicBorrowedPtr<DfsAllocatorInterface> dfs_allocator_;
     // Non-owning downcast of dfs_allocator_, set only in BUCKET mode. Used for
     // the bucket-specific lifecycle calls (MarkCommitted, two-phase eviction,
     // recovery, deferred metadata flush) that are not part of the common
     // interface.
     std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{300};
     UUID dfs_snapshot_epoch_{};
-    ImmutableBucketAllocator* bucket_allocator_{nullptr};
+    AtomicBorrowedPtr<ImmutableBucketAllocator> bucket_allocator_;
+    std::atomic<bool> dfs_retry_running_{false};
+    std::atomic<bool> dfs_retry_needed_{false};
+    std::thread dfs_retry_thread_;
+    std::mutex dfs_retry_mutex_;
+    std::condition_variable dfs_retry_cv_;
 
     // Segment management
     SegmentManager segment_manager_;
@@ -2967,6 +2999,9 @@ class MasterService {
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyInternal(
+        const std::vector<std::string>& keys, const TenantId& tenant_id,
+        ReplicaType replica_type, bool grant_lease);
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the

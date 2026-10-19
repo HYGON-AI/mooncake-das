@@ -749,7 +749,7 @@ regular shared filesystem.
 #### Restarting without recovering old DFS bucket replicas
 
 For `MOONCAKE_DFS_ALLOCATOR_TYPE=bucket`, the master normally recovers bucket
-metadata at startup. To ignore old DFS replicas while retaining their files:
+metadata at startup. To ignore old DFS replicas and reclaim their files:
 
 ```bash
 export MOONCAKE_DFS_ALLOCATOR_TYPE=bucket
@@ -763,17 +763,19 @@ lists; other replica types follow their existing recovery rules. Keys with only
 DFS replicas are omitted. This option does not enable DFS HA/standby recovery.
 
 The allocator scans existing `.data` and `.meta` filenames only, and starts new
-bucket IDs above the largest existing ID. It does not read old bucket metadata,
-modify old files, or include old buckets in allocation or eviction state. New
-buckets use the existing allocation and eviction policies.
+bucket IDs above the largest existing ID. It does not read old bucket metadata
+or include old buckets in allocation or eviction state; instead it deletes the
+scanned `.data` and `.meta` files in a background sweep shortly after startup.
+New buckets use the existing allocation and eviction policies.
 
 Before each restart, set `MOONCAKE_DFS_MAX_BUCKET_COUNT` from the DFS space still
 available for new buckets, leaving headroom for other users and metadata. The
 budget includes precreated ready buckets. Capacity and eviction watermarks cover
-only this run's managed buckets; they do not measure total filesystem usage.
-Old files continue consuming storage and require separate operator management.
-Re-enabling recovery over the same directory makes retained metadata eligible
-for recovery again, including old versions of keys rewritten in later runs.
+only this run's managed buckets; they do not measure total filesystem usage. The
+background sweep returns the space held by old bucket files to the filesystem;
+until it finishes, those files transiently consume storage. Because the sweep
+deletes them, re-enabling recovery over the same directory can no longer restore
+the reclaimed buckets: only buckets written after re-enabling are eligible.
 
 #### Client configuration
 

@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -26,6 +29,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "crc32c.h"
+#include "master_metric_manager.h"
 #include "replica.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
@@ -33,6 +37,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 namespace mooncake::test {
 
@@ -68,8 +73,81 @@ class TempDir {
     std::string path_str_;
 };
 
+class ScopedBucketPrecreateLogCapture : public google::LogSink {
+   public:
+    ScopedBucketPrecreateLogCapture() { google::AddLogSink(this); }
+    ~ScopedBucketPrecreateLogCapture() override { google::RemoveLogSink(this); }
+
+    void send(google::LogSeverity severity, const char* full_filename,
+              const char* base_filename, int line, const struct ::tm* tm_time,
+              const char* message, size_t message_len) override {
+        (void)severity;
+        (void)full_filename;
+        (void)base_filename;
+        (void)line;
+        (void)tm_time;
+        const std::string text(message, message_len);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (text.find("Failed to delete bucket") != std::string::npos) {
+            cleanup_messages_.push_back(text);
+        }
+        if (text.find("Failed to precreate DFS bucket") == std::string::npos) {
+            return;
+        }
+        messages_.push_back(text);
+    }
+
+    std::vector<std::string> messages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+    std::vector<std::string> cleanup_messages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cleanup_messages_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::vector<std::string> messages_;
+    std::vector<std::string> cleanup_messages_;
+};
+
 constexpr uint64_t kAlignment = 4096;
 constexpr uint64_t kBucketCapacity = 64 * 1024;
+
+TEST(DfsLogLimiterTest, IndependentSitesCountSuppressedMessagesAcrossWindows) {
+    DfsLogLimiter first;
+    DfsLogLimiter second;
+    const auto now = DfsLogLimiter::Clock::now();
+    ASSERT_EQ(first.ShouldLog(now), std::optional<uint64_t>(0));
+    EXPECT_EQ(second.ShouldLog(now), std::optional<uint64_t>(0));
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_FALSE(first.ShouldLog(now + std::chrono::seconds(29)));
+    }
+    EXPECT_EQ(first.ShouldLog(now + std::chrono::seconds(30)),
+              std::optional<uint64_t>(100));
+    EXPECT_EQ(second.ShouldLog(now + std::chrono::seconds(30)),
+              std::optional<uint64_t>(0));
+}
+
+TEST(DfsLogLimiterTest, ConcurrentFailuresShareOneSiteQuota) {
+    DfsLogLimiter limiter;
+    const auto now = DfsLogLimiter::Clock::now();
+    std::atomic<int> logged{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 8; ++i) {
+        workers.emplace_back([&] {
+            for (int j = 0; j < 100; ++j) {
+                if (limiter.ShouldLog(now)) ++logged;
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    EXPECT_EQ(logged.load(), 1);
+    EXPECT_EQ(limiter.ShouldLog(now + std::chrono::seconds(30)),
+              std::optional<uint64_t>(799));
+}
 
 template <typename T, typename = void>
 struct HasBucketGeneration : std::false_type {};
@@ -90,6 +168,7 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
     config.allocator_type = DfsAllocatorType::BUCKET;
     config.bucket_capacity = bucket_capacity;
     config.max_bucket_count = max_bucket_count;
+    config.ready_bucket_target = 0;
     config.alignment = kAlignment;
     config.single_tenant = true;
     config.eviction_enabled = false;
@@ -139,6 +218,29 @@ std::optional<DistributedFSDescriptor> RollOverActiveBucket(
     auto desc = alloc.Allocate(filler_key, bucket_capacity);
     if (!desc) return std::nullopt;
     return *desc;
+}
+
+std::optional<int64_t> ReadDfsBucketCreateFailureTotal() {
+    const std::string serialized =
+        MasterMetricManager::instance().serialize_metrics();
+    const std::string line_prefix =
+        "dfs_bucket_create_total{result=\"failure\"} ";
+    size_t line_begin = 0;
+    while (line_begin < serialized.size()) {
+        const size_t line_end = serialized.find('\n', line_begin);
+        if (serialized.compare(line_begin, line_prefix.size(), line_prefix) ==
+            0) {
+            const size_t value_begin = line_begin + line_prefix.size();
+            const size_t value_end = line_end == std::string::npos
+                                         ? serialized.size()
+                                         : line_end;
+            return std::stoll(
+                serialized.substr(value_begin, value_end - value_begin));
+        }
+        if (line_end == std::string::npos) break;
+        line_begin = line_end + 1;
+    }
+    return std::nullopt;
 }
 
 }  // namespace
@@ -275,6 +377,89 @@ TEST(ImmutableBucketAllocatorTest, UninitializedAllocatorReportsUnavailable) {
     auto desc = alloc.Allocate("k", 100);
     ASSERT_FALSE(desc.has_value());
     EXPECT_EQ(desc.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     BackgroundPrecreateFailuresAreRateLimitedAndRetry) {
+    TempDir tmp("bucket_precreate_failure_rate_limit");
+    auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 8);
+    config.ready_bucket_target = 1;
+    config.bucket_create_concurrency = 1;
+
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+    const auto failures_before = ReadDfsBucketCreateFailureTotal();
+    ASSERT_TRUE(failures_before.has_value());
+
+    // Replace the initialized directory with a file. PreallocateFile now fails
+    // deterministically even when the test runs with elevated privileges.
+    std::filesystem::remove_all(tmp.path());
+    {
+        std::ofstream blocker(tmp.path());
+        ASSERT_TRUE(blocker.good());
+    }
+
+    ScopedBucketPrecreateLogCapture log_capture;
+    auto allocated = alloc.Allocate("precreate_retry", 100);
+    ASSERT_TRUE(allocated.has_value());
+
+    const auto first_deadline = std::chrono::steady_clock::now() +
+                                std::chrono::seconds(3);
+    auto first_failures = ReadDfsBucketCreateFailureTotal();
+    while ((!first_failures || *first_failures == *failures_before) &&
+           std::chrono::steady_clock::now() < first_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        first_failures = ReadDfsBucketCreateFailureTotal();
+    }
+    ASSERT_TRUE(first_failures.has_value());
+    ASSERT_GT(*first_failures, *failures_before);
+
+    // Exhaust the active bucket, then keep requesting space during backoff.
+    // Previously every allocation cleared the deadline and retried metadata I/O.
+    for (int i = 0; i < 200; ++i) {
+        (void)alloc.Allocate("backoff_" + std::to_string(i), kBucketCapacity);
+    }
+    const auto immediate_failures = ReadDfsBucketCreateFailureTotal();
+    ASSERT_TRUE(immediate_failures.has_value());
+    EXPECT_EQ(*immediate_failures, *first_failures);
+    EXPECT_TRUE(log_capture.cleanup_messages().empty());
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    auto failures_after = first_failures;
+    while (std::chrono::steady_clock::now() < deadline) {
+        failures_after = ReadDfsBucketCreateFailureTotal();
+        if (failures_after && *failures_after >= *failures_before + 3) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(failures_after.has_value());
+    EXPECT_GE(*failures_after, *failures_before + 3);
+    EXPECT_LE(*failures_after, *failures_before + 3);
+    const auto messages = log_capture.messages();
+    // Another test may have already used this process-wide warning quota.
+    EXPECT_LE(messages.size(), 1u);
+    for (const auto& message : messages) {
+        EXPECT_NE(message.find("suppressed="), std::string::npos);
+    }
+    EXPECT_TRUE(log_capture.cleanup_messages().empty());
+
+    // Recovery is driven by the worker's next timed retry, without resetting it.
+    std::filesystem::remove(tmp.path());
+    std::filesystem::create_directory(tmp.path());
+    const auto recovery_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(6);
+    bool recovered = false;
+    while (std::chrono::steady_clock::now() < recovery_deadline) {
+        auto retry = alloc.Allocate("after_recovery", kBucketCapacity);
+        if (retry) {
+            EXPECT_NE(retry->file_path, allocated->file_path);
+            recovered = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(recovered);
+
 }
 
 TEST(ImmutableBucketAllocatorTest, InitRejectsInvalidConfiguration) {
@@ -1105,7 +1290,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     EXPECT_EQ(desc->shard_idx, 3);
 }
 
-TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudget) {
+TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudget) {
     TempDir tmp("bucket_no_recovery");
     auto config = MakeBucketConfig(tmp.path(), kAlignment, 8);
     config.ready_bucket_target = 0;
@@ -1120,14 +1305,9 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudge
     // Include corrupt metadata, a metadata-only ID and an orphan data file.
     std::ofstream(tmp.file("bucket_000041.meta")) << "corrupt metadata";
     std::ofstream(tmp.file("bucket_000042.data")) << "orphan data";
-    auto read_file = [](const std::string& path) {
-        std::ifstream input(path, std::ios::binary);
-        return std::string(std::istreambuf_iterator<char>(input),
-                           std::istreambuf_iterator<char>());
-    };
-    std::unordered_map<std::string, std::string> old_files;
+    std::vector<std::string> old_files;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
-        old_files.emplace(entry.path().string(), read_file(entry.path().string()));
+        old_files.push_back(entry.path().string());
     }
 
     config.bucket_recovery_enabled = false;
@@ -1159,9 +1339,11 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledRetainsFilesAndUsesFreshBudge
         EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
         EXPECT_FALSE(std::filesystem::exists(first->file_path));
     }
-    for (const auto& [path, contents] : old_files) {
-        ASSERT_TRUE(std::filesystem::exists(path)) << path;
-        EXPECT_EQ(read_file(path), contents) << path;
+    // Recovery was disabled for the second run, so its startup sweep reclaims
+    // every scanned bucket file. The allocator destructor above joins that
+    // sweep before returning, so none of the old files survive.
+    for (const auto& path : old_files) {
+        EXPECT_FALSE(std::filesystem::exists(path)) << path;
     }
 
     // A metadata-only ID also reserves its name without loading its payload.
@@ -1349,7 +1531,10 @@ TEST(ImmutableBucketAllocatorTest, AllocationFailureEvictionBypassesLowWatermark
                  100});
         }
         auto results = alloc.BatchAllocate(requests);
-        for (const auto& result : results) ASSERT_TRUE(result.success);
+        for (const auto& result : results) {
+            ASSERT_TRUE(result.success);
+            ASSERT_TRUE(alloc.MarkCommitted(result.key, result.descriptor));
+        }
     }
     // Twenty-four entries pack into 10 + 10 + 4 slots instead of four
     // six-entry buckets. Utilization is still below the configured watermark,
@@ -1379,11 +1564,15 @@ TEST(ImmutableBucketAllocatorTest, EvictionCandidatesExcludeFreedKeys) {
     ASSERT_TRUE(b.has_value());
     ASSERT_EQ(a->shard_idx, 0);
     ASSERT_EQ(b->shard_idx, 0);
+    ASSERT_TRUE(alloc.MarkCommitted("a", *a));
+    ASSERT_TRUE(alloc.MarkCommitted("b", *b));
     alloc.Free("a", *a);
 
     // Fill more buckets so bucket 0 is no longer active and usage is high.
     for (int i = 0; i < 4; ++i) {
-        ASSERT_TRUE(alloc.Allocate("f" + std::to_string(i), 100).has_value());
+        auto desc = alloc.Allocate("f" + std::to_string(i), 100);
+        ASSERT_TRUE(desc.has_value());
+        ASSERT_TRUE(alloc.MarkCommitted("f" + std::to_string(i), *desc));
     }
 
     auto pending = alloc.PrepareEviction();
@@ -1921,12 +2110,17 @@ TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
         ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
     }
 
-    // Every file in the directory is either a `.data` or its single `.meta`
-    // companion: no log, no snapshot slots, no rename temporaries.
+    // Bucket files have one `.meta` companion, alongside the master-owned DFS
+    // root marker; there are no logs, snapshot slots, or rename temporaries.
     std::set<std::string> data_ids;
     std::set<std::string> meta_ids;
+    bool found_root_marker = false;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
         const std::string name = entry.path().filename().string();
+        if (name == kDfsRootMarkerFileName) {
+            found_root_marker = true;
+            continue;
+        }
         ASSERT_EQ(name.rfind("bucket_", 0), 0u);
         const std::string id = name.substr(7, 6);
         const std::string suffix = name.substr(13);
@@ -1938,6 +2132,7 @@ TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
             FAIL() << "Unexpected file in the bucket directory: " << name;
         }
     }
+    EXPECT_TRUE(found_root_marker);
     ASSERT_FALSE(meta_ids.empty());
     // Only the still-active bucket has data without metadata.
     EXPECT_EQ(data_ids.size(), meta_ids.size() + 1);
