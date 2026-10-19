@@ -239,6 +239,13 @@ tl::expected<int, ErrorCode> PosixFsAdapter::OpenFileReadOnly(
     return fd;
 }
 
+tl::expected<int, ErrorCode> PosixFsAdapter::OpenFileReadWriteExisting(
+    const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) return tl::make_unexpected(ReadOpenError());
+    return fd;
+}
+
 tl::expected<void, ErrorCode> PosixFsAdapter::CloseFile(int fd) {
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
     if (::close(fd) != 0) {

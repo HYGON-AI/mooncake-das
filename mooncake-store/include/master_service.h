@@ -208,6 +208,9 @@ class MasterService {
      */
     tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
         int64_t new_max_bucket_count);
+
+    tl::expected<uint32_t, ErrorCode> SetDfsHeartbeatInterval(
+        uint32_t new_interval_seconds);
     bool UsesDfsBucketAllocator() const { return bucket_allocator_ != nullptr; }
 
     /**
@@ -805,6 +808,10 @@ class MasterService {
      */
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode>;
+
+    auto GetDfsBucketSnapshot(
+        const UUID& client_id, const UUID& last_epoch, uint64_t last_version)
+        -> tl::expected<DfsBucketSnapshotResponse, ErrorCode>;
 
     /**
      * @brief Client polls whether master has requested a full SSD clear
@@ -2780,6 +2787,8 @@ class MasterService {
     // the bucket-specific lifecycle calls (MarkCommitted, two-phase eviction,
     // recovery, deferred metadata flush) that are not part of the common
     // interface.
+    std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{300};
+    UUID dfs_snapshot_epoch_{};
     ImmutableBucketAllocator* bucket_allocator_{nullptr};
 
     // Segment management

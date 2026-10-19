@@ -534,7 +534,10 @@ void ImmutableBucketAllocator::RollbackBucketPublicationLocked(
     RemoveFromLruLocked(bucket_id);
     if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
     auto it = buckets_.find(bucket_id);
-    if (it != buckets_.end() && it->second == bucket) buckets_.erase(it);
+    if (it != buckets_.end() && it->second == bucket) {
+        buckets_.erase(it);
+        PublishBucketIdSnapshotLocked();
+    }
 }
 
 bool ImmutableBucketAllocator::ActiveBucketHasSpaceLocked(
@@ -694,6 +697,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
                     buckets_.emplace(bucket->bucket_id, bucket).second;
                 if (!inserted) throw std::runtime_error("duplicate bucket id");
                 ready_bucket_ids_.push_back(bucket->bucket_id);
+                PublishBucketIdSnapshotLocked();
                 bucket_creation_retry_after_ =
                     std::chrono::steady_clock::time_point::min();
                 result = "success";
@@ -809,6 +813,7 @@ ImmutableBucketAllocator::CreateBucketUnlocked(
             SealActiveBucketLocked();
             active_bucket_id_ = bucket->bucket_id;
             TouchLruLocked(bucket->bucket_id, bucket->last_access_ns);
+            PublishBucketIdSnapshotLocked();
         } else if (preallocated) {
             error = ErrorCode::NO_AVAILABLE_HANDLE;
         }
@@ -1528,6 +1533,7 @@ int64_t ImmutableBucketAllocator::SetMaxBucketCount(int64_t new_max_bucket_count
             buckets_.erase(it);
             removed_ready_buckets.push_back(bucket_id);
         }
+        if (!removed_ready_buckets.empty()) PublishBucketIdSnapshotLocked();
         if (new_max_bucket_count > old) {
             bucket_creation_retry_after_ =
                 std::chrono::steady_clock::time_point::min();
@@ -1548,6 +1554,29 @@ int64_t ImmutableBucketAllocator::SetMaxBucketCount(int64_t new_max_bucket_count
 size_t ImmutableBucketAllocator::GetBucketCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return buckets_.size();
+}
+
+std::shared_ptr<const ImmutableBucketAllocator::BucketIdSnapshot>
+ImmutableBucketAllocator::GetBucketIdSnapshot() const {
+    return std::atomic_load_explicit(&bucket_id_snapshot_,
+                                     std::memory_order_acquire);
+}
+
+void ImmutableBucketAllocator::PublishBucketIdSnapshotLocked() {
+    auto snapshot = std::make_shared<BucketIdSnapshot>();
+    snapshot->version = bucket_snapshot_version_.load(
+                            std::memory_order_relaxed) +
+                        1;
+    snapshot->bucket_ids.reserve(buckets_.size());
+    for (const auto& [bucket_id, bucket] : buckets_) {
+        snapshot->bucket_ids.push_back(bucket_id);
+    }
+    bucket_snapshot_version_.store(snapshot->version,
+                                   std::memory_order_relaxed);
+    std::atomic_store_explicit(
+        &bucket_id_snapshot_,
+        std::shared_ptr<const BucketIdSnapshot>(std::move(snapshot)),
+        std::memory_order_release);
 }
 
 std::optional<int64_t> ImmutableBucketAllocator::GetBucketIdForKey(
@@ -1823,6 +1852,7 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
             }
         }
         buckets_.erase(it);
+        PublishBucketIdSnapshotLocked();
         RemoveFromLruLocked(bucket_id);
         if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
     }
@@ -2205,6 +2235,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
         lru_index_[bucket_id] = lru_list_.begin();
     }
 
+    PublishBucketIdSnapshotLocked();
     return {};
 }
 

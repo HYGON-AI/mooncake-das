@@ -118,6 +118,11 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    virtual tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     virtual tl::expected<void, ErrorCode> CloseFile(int /*fd*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }

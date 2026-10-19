@@ -4318,6 +4318,12 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
+tl::expected<DfsBucketSnapshotResponse, ErrorCode>
+Client::GetDfsBucketSnapshot(const UUID& last_epoch, uint64_t last_version) {
+    return master_client_.GetDfsBucketSnapshot(client_id_, last_epoch,
+                                                last_version);
+}
+
 tl::expected<bool, ErrorCode> Client::PollRemoveAll() {
     return master_client_.PollRemoveAll();
 }

@@ -175,6 +175,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
         return distributed_config_.allocator_type;
     }
 
+    tl::expected<size_t, ErrorCode> InvalidateAllBucketFds();
+    tl::expected<size_t, ErrorCode> CleanupStaleBucketFds(
+        const std::vector<int64_t>& active_bucket_ids);
+    tl::expected<bool, ErrorCode> CleanupBucketFd(int64_t bucket_id);
+
    private:
     struct ShardFile {
         std::string path;

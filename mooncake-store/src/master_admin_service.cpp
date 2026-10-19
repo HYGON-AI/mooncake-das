@@ -233,6 +233,19 @@ struct HttpDfsMaxBucketCountResponse {
 };
 YLT_REFL(HttpDfsMaxBucketCountResponse, success, old_value, new_value);
 
+struct HttpDfsHeartbeatIntervalRequest {
+    uint32_t interval_seconds{0};
+};
+YLT_REFL(HttpDfsHeartbeatIntervalRequest, interval_seconds);
+
+struct HttpDfsHeartbeatIntervalResponse {
+    bool success{true};
+    uint32_t old_value{0};
+    uint32_t new_value{0};
+};
+YLT_REFL(HttpDfsHeartbeatIntervalResponse, success, old_value, new_value);
+
+
 tl::expected<std::string, ErrorCode> ParseAdminTenantId(
     coro_http::coro_http_request& req) {
     auto tenant_id_view = req.get_decode_query_value("tenant_id");
@@ -281,6 +294,21 @@ ParseDfsMaxBucketCountBody(coro_http::coro_http_request& req) {
         return tl::make_unexpected(
             "max_bucket_count exceeds maximum addressable bucket id (" +
             std::to_string(kDfsMaxBucketCountLimit) + ")");
+    }
+    return request;
+}
+
+tl::expected<HttpDfsHeartbeatIntervalRequest, std::string>
+ParseDfsHeartbeatIntervalBody(coro_http::coro_http_request& req) {
+    HttpDfsHeartbeatIntervalRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(std::string("Invalid JSON body: ") +
+                                   e.what());
+    }
+    if (request.interval_seconds == 0) {
+        return tl::make_unexpected("interval_seconds must be positive (>0)");
     }
     return request;
 }
@@ -1299,6 +1327,30 @@ void MasterAdminServer::HandleSetDfsMaxBucketCount(
     });
 }
 
+void MasterAdminServer::HandleSetDfsHeartbeatInterval(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto body_result = ParseDfsHeartbeatIntervalBody(req);
+    if (!body_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, body_result.error());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->SetDfsHeartbeatInterval(
+            body_result->interval_seconds);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        HttpDfsHeartbeatIntervalResponse response;
+        response.old_value = result.value();
+        response.new_value = body_result->interval_seconds;
+        WriteJsonResponse(resp, coro_http::status_type::ok, response);
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1406,6 +1458,11 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/dfs/max_bucket_count",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSetDfsMaxBucketCount(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/dfs/heartbeat_interval",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetDfsHeartbeatInterval(req, resp);
         });
 }
 }  // namespace mooncake
