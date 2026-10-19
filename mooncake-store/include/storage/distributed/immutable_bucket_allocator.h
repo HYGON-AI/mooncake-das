@@ -363,7 +363,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         uint64_t capacity = 0;
         uint64_t append_offset = 0;
         // Bytes reserved by entries that are still live (PENDING or
-        // COMMITTED). Drives the "is this bucket worth evicting" decision.
+        // COMMITTED). A failed PutStart must Free() its PENDING entry before
+        // this value can represent reclaimable live capacity.
         uint64_t live_bytes = 0;
         int64_t last_access_ns = 0;
         // Set between PrepareEviction and Commit/Abort. A frozen bucket
