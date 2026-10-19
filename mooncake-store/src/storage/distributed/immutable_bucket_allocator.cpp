@@ -1779,7 +1779,16 @@ ImmutableBucketAllocator::PrepareEvictionForAllocationFailure() {
 }
 
 ImmutableBucketAllocator::PendingEviction
-ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
+ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
+    if (threshold <= 0.0 || threshold > 1.0) {
+        return {};
+    }
+    return PrepareEvictionInternal(/*force_one=*/false, threshold);
+}
+
+ImmutableBucketAllocator::PendingEviction
+ImmutableBucketAllocator::PrepareEvictionInternal(
+    bool force_one, double low_utilization_threshold) {
     PendingEviction pending;
     if (!initialized_.load(std::memory_order_acquire)) return pending;
 
@@ -1794,7 +1803,8 @@ ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
 
         const double usage = static_cast<double>(UsedBytesLocked()) /
                              static_cast<double>(capacity);
-        if (!force_one) {
+        const bool low_utilization_scan = low_utilization_threshold >= 0.0;
+        if (!force_one && !low_utilization_scan) {
             if (usage >= eviction_high_watermark_) {
                 eviction_active_ = true;
             }
@@ -1816,14 +1826,20 @@ ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
             auto bucket_it = buckets_.find(bucket_id);
             if (bucket_it == buckets_.end()) continue;
             if (bucket_it->second->frozen) continue;
+            const auto& candidate = bucket_it->second;
+            if (low_utilization_scan &&
+                static_cast<double>(candidate->live_bytes) /
+                        static_cast<double>(candidate->capacity) >=
+                    low_utilization_threshold) {
+                continue;
+            }
             const bool has_pending = std::any_of(
-                bucket_it->second->entries.begin(),
-                bucket_it->second->entries.end(),
+                candidate->entries.begin(), candidate->entries.end(),
                 [](const auto& item) {
                     return item.second.state == BucketEntryState::PENDING;
                 });
             if (has_pending) continue;
-            victim = bucket_it->second;
+            victim = candidate;
             break;
         }
         if (!victim) return pending;
