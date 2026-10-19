@@ -5660,7 +5660,8 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
 //-----------------------------------------------------------------------------
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config) {
+CreateStorageBackend(const FileStorageConfig& config,
+                     const std::string& dfs_root_identity) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
@@ -5714,7 +5715,8 @@ CreateStorageBackend(const FileStorageConfig& config) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             return std::make_shared<DistributedStorageBackend>(
-                config, distributed_config, std::move(adapter));
+                config, distributed_config, std::move(adapter),
+                dfs_root_identity);
         }
         default: {
             LOG(ERROR) << "Unsupported backend type: "

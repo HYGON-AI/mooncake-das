@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -106,6 +107,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter);
+    DistributedStorageBackend(
+        const FileStorageConfig& file_storage_config,
+        const DistributedStorageConfig& distributed_config,
+        std::unique_ptr<FileSystemAdapter> fs_adapter,
+        std::string expected_root_identity);
     ~DistributedStorageBackend() override;
 
     // Exactly one adapter must be non-null.
@@ -113,7 +119,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter,
-        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter);
+        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter,
+        std::string expected_root_identity = {});
 
     DistributedStorageMode GetStorageMode() const { return storage_mode_; }
 
@@ -128,6 +135,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
     // when another read/write probe is initializing the shared backend.
     tl::expected<void, ErrorCode> EnsureInitialized();
     tl::expected<void, ErrorCode> TryEnsureInitialized();
+
+    // Configure before initialization/probes start. Only an empty startup
+    // identity is refreshed; an established identity remains pinned.
+    void SetRootIdentityProvider(
+        std::function<tl::expected<std::string, ErrorCode>()> provider) {
+        root_identity_provider_ = std::move(provider);
+    }
 
     // Minimal adapter-level probes used by SGLang's health state machine.
     // These methods never touch business keys.
@@ -299,6 +313,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
+    std::string expected_root_identity_;
+    std::function<tl::expected<std::string, ErrorCode>()> root_identity_provider_;
     std::string root_dir_;
     std::string health_probe_path_prefix_;
     std::string active_health_probe_path_;
@@ -321,6 +337,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
     tl::expected<void, ErrorCode> InitLocked();
+    tl::expected<void, ErrorCode> ValidateRootIdentity() const;
     void ResetFailedInitializationLocked();
 
     mutable std::mutex init_mutex_;

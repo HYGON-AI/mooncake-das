@@ -192,11 +192,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_check_interval_ = config.eviction_check_interval;
 
     std::error_code ec;
-    std::filesystem::create_directories(fsdir_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS bucket directory " << fsdir_ << ": "
-                   << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (!std::filesystem::is_directory(fsdir_, ec) || ec) {
+        LOG(ERROR) << "DFS bucket directory must already exist: " << fsdir_;
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
     if (config.fs_adapter_type == "posix") {

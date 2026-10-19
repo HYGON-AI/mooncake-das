@@ -118,19 +118,22 @@ struct GetStorageConfigResponse {
     bool enable_disk_eviction;
     uint64_t quota_bytes;
     std::string dfs_fsdir;
+    std::string dfs_root_identity;
 
     GetStorageConfigResponse()
         : enable_disk_eviction(true), quota_bytes(0) {}
     GetStorageConfigResponse(const std::string& fsdir_param,
                              bool enable_eviction, uint64_t quota,
-                             std::string dfs_fsdir_param = {})
+                             std::string dfs_fsdir_param = {},
+                             std::string dfs_root_identity_param = {})
         : fsdir(fsdir_param),
           enable_disk_eviction(enable_eviction),
           quota_bytes(quota),
-          dfs_fsdir(std::move(dfs_fsdir_param)) {}
+          dfs_fsdir(std::move(dfs_fsdir_param)),
+          dfs_root_identity(std::move(dfs_root_identity_param)) {}
 };
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes,
-         dfs_fsdir);
+         dfs_fsdir, dfs_root_identity);
 
 struct NoFSegmentOwnerInfo {
     UUID segment_id;

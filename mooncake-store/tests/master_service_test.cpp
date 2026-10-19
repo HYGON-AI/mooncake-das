@@ -1837,6 +1837,38 @@ TEST_F(MasterServiceTest, DfsBucketModeSupportsPutEndAndQuery) {
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_F(MasterServiceTest, DfsRootIdentityRetriesAfterRootBecomesAvailable) {
+    const auto root = MakeDfsTestRoot("identity_retry_after_recovery");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    std::filesystem::remove_all(root);
+    {
+        std::ofstream blocker(root);
+        ASSERT_TRUE(blocker.good());
+    }
+    {
+        MasterService service;
+        EXPECT_FALSE(service.UsesDfsBucketAllocator());
+        auto storage = service.GetStorageConfig();
+        ASSERT_TRUE(storage.has_value());
+        EXPECT_TRUE(storage->dfs_root_identity.empty());
+
+        ASSERT_TRUE(std::filesystem::remove(root));
+        ASSERT_TRUE(std::filesystem::create_directory(root));
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(20);
+        while (storage->dfs_root_identity.empty() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            storage = service.GetStorageConfig();
+            ASSERT_TRUE(storage.has_value());
+        }
+        ASSERT_TRUE(service.UsesDfsBucketAllocator());
+        EXPECT_EQ(storage->dfs_fsdir, root);
+        EXPECT_FALSE(storage->dfs_root_identity.empty());
+    }
+    std::filesystem::remove_all(root);
+}
+
 TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
     const auto root = MakeDfsTestRoot("retry_after_recovery");
     const auto saved_root = root + "_saved";

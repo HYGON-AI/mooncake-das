@@ -19,11 +19,28 @@
 
 #include "replica.h"
 #include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage_backend.h"
 
 namespace mooncake::test {
+
+namespace {
+
+const std::string kTestDfsRootIdentity =
+    SerializeDfsRootIdentity("dfs_posix_test", UUID{1, 2});
+
+bool WriteTestDfsRootIdentity(const std::string& root) {
+    const std::string marker_path =
+        root + "/" + kDfsRootIdentityFileName;
+    std::ofstream marker(marker_path, std::ios::binary | std::ios::trunc);
+    marker.write(kTestDfsRootIdentity.data(),
+                 static_cast<std::streamsize>(kTestDfsRootIdentity.size()));
+    return marker.good();
+}
+
+}  // namespace
 
 class TempDir {
    public:
@@ -790,6 +807,7 @@ class DfsBackendTest : public ::testing::Test {
    protected:
     void SetUp() override {
         tmp_ = std::make_unique<TempDir>("dfs_backend");
+        ASSERT_TRUE(WriteTestDfsRootIdentity(tmp_->path()));
         FileStorageConfig file_config;
         file_config.storage_backend_type = StorageBackendType::kDistributed;
         file_config.storage_filepath = tmp_->path();
@@ -803,7 +821,7 @@ class DfsBackendTest : public ::testing::Test {
 
         backend_ = std::make_unique<DistributedStorageBackend>(
             file_config, distributed_config,
-            std::make_unique<PosixFsAdapter>());
+            std::make_unique<PosixFsAdapter>(), kTestDfsRootIdentity);
         ASSERT_TRUE(backend_->Init().has_value());
     }
 
@@ -865,7 +883,7 @@ TEST_F(DfsBackendTest, HealthProbesUseMasterMarkerAndCreateFreshClientFile) {
     second_distributed_config.alignment = 4096;
     DistributedStorageBackend second_client_backend(
         second_file_config, second_distributed_config,
-        std::make_unique<PosixFsAdapter>());
+        std::make_unique<PosixFsAdapter>(), kTestDfsRootIdentity);
     ASSERT_TRUE(second_client_backend.Init().has_value());
     ASSERT_TRUE(second_client_backend.ProbeWrite().has_value());
 
@@ -982,7 +1000,7 @@ TEST_F(DfsBackendTest, HealthWriteProbeFailsWhenCreatingANewFileFails) {
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
     DistributedStorageBackend backend(file_config, distributed_config,
-                                      std::move(adapter));
+                                      std::move(adapter), kTestDfsRootIdentity);
     ASSERT_TRUE(backend.Init().has_value());
 
     controlled_adapter->FailNextFileCreate();
@@ -1041,7 +1059,8 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
-        file_config, distributed_config, std::move(adapter));
+        file_config, distributed_config, std::move(adapter),
+        kTestDfsRootIdentity);
     ASSERT_TRUE(backend->Init().has_value());
     controlled_adapter->FailWriteCall(2);
     controlled_adapter->ShortWriteCall(3);
@@ -1134,7 +1153,8 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
-        file_config, distributed_config, std::move(adapter));
+        file_config, distributed_config, std::move(adapter),
+        kTestDfsRootIdentity);
     ASSERT_TRUE(backend->Init().has_value());
 
     AlignedBuffer write_buf(4096);
@@ -1189,7 +1209,8 @@ TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
-        file_config, distributed_config, std::move(adapter));
+        file_config, distributed_config, std::move(adapter),
+        kTestDfsRootIdentity);
     ASSERT_TRUE(backend->Init().has_value());
 
     AlignedBuffer small_buf(4096);
@@ -1369,6 +1390,7 @@ TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_factory");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
     env.Set("MOONCAKE_DFS_ROOT_DIR", tmp.path().c_str());
     env.Set("MOONCAKE_DFS_SHARD_COUNT", "2");
     env.Set("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
@@ -1379,7 +1401,7 @@ TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = tmp.path();
 
-    auto backend = CreateStorageBackend(file_config);
+    auto backend = CreateStorageBackend(file_config, kTestDfsRootIdentity);
     ASSERT_TRUE(backend.has_value());
     ASSERT_NE(*backend, nullptr);
     EXPECT_TRUE((*backend)->Init().has_value());

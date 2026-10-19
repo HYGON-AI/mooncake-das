@@ -98,7 +98,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 
     InitPinnedPrefetchArena(config, client);
 
-    auto create_storage_backend_result = CreateStorageBackend(config_);
+    auto create_storage_backend_result = CreateStorageBackend(
+        config_, client_ ? client_->GetDfsRootIdentity() : std::string{});
     if (!create_storage_backend_result) {
         LOG(ERROR) << "Failed to create storage backend";
         throw std::runtime_error("Failed to create storage backend");
@@ -110,6 +111,16 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                 storage_backend_)) {
         distributed_backend_ = distributed_backend;
         if (client_) {
+            distributed_backend->SetRootIdentityProvider(
+                [weak_client = std::weak_ptr<Client>(client_)]()
+                    -> tl::expected<std::string, ErrorCode> {
+                    auto client = weak_client.lock();
+                    if (!client) {
+                        return tl::make_unexpected(
+                            ErrorCode::DFS_SERVICE_UNAVAILABLE);
+                    }
+                    return client->FetchDfsRootIdentity();
+                });
             client_->SetDfsStorageBackend(distributed_backend);
         }
     }
