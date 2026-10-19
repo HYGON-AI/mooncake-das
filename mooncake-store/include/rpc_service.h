@@ -209,6 +209,8 @@ class WrappedMasterService {
      */
     tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
         int64_t new_max_bucket_count);
+    tl::expected<uint32_t, ErrorCode> SetDfsHeartbeatInterval(
+        uint32_t new_interval_seconds);
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
@@ -228,6 +230,9 @@ class WrappedMasterService {
 
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    tl::expected<DfsBucketSnapshotResponse, ErrorCode> GetDfsBucketSnapshot(
+        const UUID& client_id, const UUID& last_epoch, uint64_t last_version);
 
     tl::expected<bool, ErrorCode> PollRemoveAll(const UUID& client_id);
 

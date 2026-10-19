@@ -317,6 +317,12 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
      */
     size_t GetBucketCount() const;
 
+    struct BucketIdSnapshot {
+        uint64_t version = 0;
+        std::vector<int64_t> bucket_ids;
+    };
+    std::shared_ptr<const BucketIdSnapshot> GetBucketIdSnapshot() const;
+
     /**
      * @brief Bucket id an existing key currently lives in, if any.
      */
@@ -326,6 +332,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
    private:
     friend class PendingEviction;
+
+    void PublishBucketIdSnapshotLocked();
 
     // Shared implementation for watermark-driven and allocation-failure-driven
     // eviction. The latter bypasses only the watermark gate and still observes
@@ -500,6 +508,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_index_;
 
     std::vector<RecoveredReplica> recovered_replicas_;
+
+    std::shared_ptr<const BucketIdSnapshot> bucket_id_snapshot_;
+    std::atomic<uint64_t> bucket_snapshot_version_{0};
 
     std::atomic<bool> initialized_{false};
 };

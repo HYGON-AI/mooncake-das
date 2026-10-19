@@ -146,6 +146,10 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    dfs_heartbeat_running_ = false;
+    if (dfs_heartbeat_thread_.joinable()) {
+        dfs_heartbeat_thread_.join();
+    }
 }
 
 std::optional<BufferHandle> FileStorage::AllocatePinnedStagingBuffer(
@@ -248,6 +252,19 @@ bool FileStorage::ReleasePinnedPrefetchArena() {
     return true;
 }
 
+tl::expected<void, ErrorCode> FileStorage::InitDfs() {
+    dfs_heartbeat_interval_seconds_.store(300, std::memory_order_release);
+    LOG(INFO) << "DFS storage mode enabled; starting DFS heartbeat thread";
+    dfs_heartbeat_running_.store(true);
+    dfs_heartbeat_thread_ =
+        std::thread(&FileStorage::DfsHeartbeatThreadFunc, this);
+
+    client_buffer_gc_running_.store(true);
+    client_buffer_gc_thread_ =
+        std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
+    return {};
+}
+
 tl::expected<void, ErrorCode> FileStorage::Init() {
     auto register_memory_result = RegisterLocalMemory();
     if (!register_memory_result) {
@@ -267,11 +284,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                      << init_storage_backend_result.error();
     }
     if (config_.enable_dfs) {
-        client_buffer_gc_running_.store(true);
-        client_buffer_gc_thread_ =
-            std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
-        return {};
+        return InitDfs();
     }
+
     auto enable_offloading_result = IsEnableOffloading();
     if (enable_offloading_result.has_value()) {
         LOG(INFO) << "IsEnableOffloading result: "
@@ -298,10 +313,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     }
     // Report configured SSD capacity to Master so it can populate
     // file_total_capacity_ (the denominator in "SSD Storage: X / Y").
-    // Called once at init; old Masters that lack this RPC will log an error
-    // but FileStorage continues normally.
     if (config_.total_size_limit > 0) {
-        auto cap_result = client_->ReportSsdCapacity(config_.total_size_limit);
+        auto cap_result =
+            client_->ReportSsdCapacity(config_.total_size_limit);
         if (!cap_result) {
             LOG(WARNING) << "ReportSsdCapacity failed (old Master?): "
                          << cap_result.error();
@@ -326,15 +340,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         });
 
     if (!scan_meta_result) {
-        if (config_.enable_dfs &&
-            scan_meta_result.error() == ErrorCode::NOT_SUPPORTED) {
-            LOG(INFO) << "Currently, DFS backend does not support ScanMeta; "
-                         "skip re-registering offloaded objects";
-        } else {
-            LOG(ERROR) << "Failed to scan meta and send to master: "
-                       << scan_meta_result.error();
-            return scan_meta_result;
-        }
+        LOG(ERROR) << "Failed to scan meta and send to master: "
+                   << scan_meta_result.error();
+        return scan_meta_result;
     }
 
     heartbeat_running_.store(true);
@@ -1294,6 +1302,79 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     }
     result->total_size = total_size;
     return result;
+}
+
+void FileStorage::DfsHeartbeatThreadFunc() {
+    const auto initial_delay_seconds = generate_uuid().first % 6;
+    for (uint64_t elapsed = 0;
+         elapsed < initial_delay_seconds && dfs_heartbeat_running_.load();
+         ++elapsed) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    LOG(INFO) << "Starting DFS heartbeat thread with interval="
+              << dfs_heartbeat_interval_seconds_.load(
+                     std::memory_order_acquire)
+              << "s";
+    while (dfs_heartbeat_running_.load()) {
+        if (distributed_backend_) {
+            auto snapshot = client_->GetDfsBucketSnapshot(
+                dfs_snapshot_epoch_, dfs_snapshot_version_);
+            if (!snapshot) {
+                LOG(WARNING) << "DFS bucket snapshot request failed: "
+                             << snapshot.error();
+            } else {
+                const uint32_t heartbeat_interval = std::max<uint32_t>(
+                    snapshot->heartbeat_interval_seconds, 1);
+                const uint32_t previous_interval =
+                    dfs_heartbeat_interval_seconds_.exchange(
+                        heartbeat_interval, std::memory_order_acq_rel);
+                if (previous_interval != heartbeat_interval) {
+                    LOG(INFO) << "Updated DFS heartbeat interval from "
+                              << previous_interval << "s to "
+                              << heartbeat_interval << "s";
+                }
+                const bool master_restarted =
+                    dfs_snapshot_epoch_ != UUID{} &&
+                    dfs_snapshot_epoch_ != snapshot->epoch;
+                if (master_restarted) {
+                    auto result =
+                        distributed_backend_->InvalidateAllBucketFds();
+                    if (!result) {
+                        LOG(WARNING)
+                            << "Failed to invalidate DFS bucket FDs after "
+                               "Master epoch changed: "
+                            << result.error();
+                    } else if (*result > 0) {
+                        LOG(INFO) << "Invalidated " << *result
+                                  << " DFS bucket handles after Master epoch "
+                                     "changed";
+                    }
+                }
+                if (!snapshot->unchanged) {
+                    dfs_snapshot_epoch_ = snapshot->epoch;
+                    dfs_snapshot_version_ = snapshot->version;
+                    auto result = distributed_backend_->CleanupStaleBucketFds(
+                        snapshot->bucket_ids);
+                    if (!result) {
+                        LOG(WARNING) << "DFS FD cleanup failed: "
+                                     << result.error();
+                    } else if (*result > 0) {
+                        LOG(INFO) << "DFS FD cleanup removed " << *result
+                                  << " stale bucket handles";
+                    }
+                }
+            }
+        }
+        const uint32_t heartbeat_interval = std::max<uint32_t>(
+            dfs_heartbeat_interval_seconds_.load(std::memory_order_acquire), 1);
+        for (uint32_t elapsed = 0;
+             elapsed < heartbeat_interval &&
+             dfs_heartbeat_running_.load();
+             ++elapsed) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
 }
 
 void FileStorage::ClientBufferGCThreadFunc() {

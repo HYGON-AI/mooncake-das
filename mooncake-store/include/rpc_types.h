@@ -20,6 +20,16 @@ struct DfsMissingBucketReport {
 };
 YLT_REFL(DfsMissingBucketReport, bucket_id);
 
+struct DfsBucketSnapshotResponse {
+    UUID epoch{};
+    uint64_t version = 0;
+    bool unchanged = false;
+    uint32_t heartbeat_interval_seconds = 300;
+    std::vector<int64_t> bucket_ids;
+};
+YLT_REFL(DfsBucketSnapshotResponse, epoch, version, unchanged,
+         heartbeat_interval_seconds, bucket_ids);
+
 enum class ReplicaActionType {
     ADD = 0,
 };
