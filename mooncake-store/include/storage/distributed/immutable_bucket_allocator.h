@@ -274,6 +274,12 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     PendingEviction PrepareEvictionForLowUtilization(double threshold);
 
     /**
+     * @brief Returns whether a non-active bucket is below the utilization
+     * threshold and has no pending entries.
+     */
+    bool HasLowUtilizationBucket(double threshold) const;
+
+    /**
      * @brief Freeze one specific bucket after its data file is confirmed missing.
      */
     PendingEviction PrepareInvalidation(int64_t bucket_id);
@@ -366,6 +372,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // COMMITTED). A failed PutStart must Free() its PENDING entry before
         // this value can represent reclaimable live capacity.
         uint64_t live_bytes = 0;
+        uint64_t pending_entries = 0;
         int64_t last_access_ns = 0;
         // Set between PrepareEviction and Commit/Abort. A frozen bucket
         // accepts no new allocations and cannot be selected again.

@@ -1438,11 +1438,13 @@ TEST(ImmutableBucketAllocatorTest, FreePendingReservationMakesBucketEvictable) {
 
     alloc.Free("committed", *committed);
     auto blocked = alloc.PrepareEvictionForLowUtilization(0.6);
+    EXPECT_LT(blocked.bucket_id(), 0);
     EXPECT_TRUE(blocked.Empty());
 
     alloc.Free("pending", *descriptor);
     auto pending = alloc.PrepareEvictionForLowUtilization(0.6);
-    ASSERT_FALSE(pending.Empty());
+    ASSERT_GE(pending.bucket_id(), 0);
+    EXPECT_TRUE(pending.Empty());
     EXPECT_EQ(pending.bucket_id(), descriptor->shard_idx);
     EXPECT_TRUE(alloc.CommitEviction(std::move(pending)));
 }

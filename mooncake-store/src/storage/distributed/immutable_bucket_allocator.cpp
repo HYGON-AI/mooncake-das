@@ -1067,6 +1067,7 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     bucket.entries[key] = entry;
     bucket.append_offset = layout->end();
     bucket.live_bytes += layout->aligned_size;
+    ++bucket.pending_entries;
     key_index_[key] = bucket.bucket_id;
 
     // Reservations in the active bucket touch no file at all. A reservation in
@@ -1101,6 +1102,8 @@ void ImmutableBucketAllocator::UnreserveInBucketLocked(
     } else {
         bucket.live_bytes = 0;
     }
+
+    if (bucket.pending_entries > 0) --bucket.pending_entries;
 
     // The reservation existed only in memory, so undoing it is just erasing it.
     // If the bucket happens to be sealed already, its `.meta` file has to be
@@ -1387,6 +1390,10 @@ bool ImmutableBucketAllocator::MarkCommitted(
                    << ", state=" << static_cast<int32_t>(entry->state);
         return false;
     }
+    if (entry->state == BucketEntryState::PENDING &&
+        bucket->pending_entries > 0) {
+        --bucket->pending_entries;
+    }
     entry->state = BucketEntryState::COMMITTED;
     // PutEnd never touches a file. For the active bucket the transition is
     // simply part of the state that gets written when the bucket is sealed; for
@@ -1413,6 +1420,10 @@ void ImmutableBucketAllocator::Free(const std::string& key,
     // Buckets are append-only, so freeing leaves a tombstone rather than
     // reclaiming the middle of the file. Space comes back only when the
     // whole bucket is evicted.
+    if (entry->state == BucketEntryState::PENDING &&
+        bucket->pending_entries > 0) {
+        --bucket->pending_entries;
+    }
     entry->state = BucketEntryState::TOMBSTONE;
     ++bucket->tombstones;
     if (bucket->live_bytes >= entry->reserved_size) {
@@ -1693,10 +1704,28 @@ ImmutableBucketAllocator::PrepareEvictionForAllocationFailure() {
 
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
-    if (threshold <= 0.0 || threshold > 1.0) {
+    if (threshold <= 0.0 || threshold >= 1.0) {
         return {};
     }
     return PrepareEvictionInternal(/*force_one=*/false, threshold);
+}
+
+bool ImmutableBucketAllocator::HasLowUtilizationBucket(double threshold) const {
+    if (threshold <= 0.0 || threshold >= 1.0) return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [bucket_id, bucket] : buckets_) {
+        if (bucket_id == active_bucket_id_ || bucket->frozen ||
+            bucket->capacity == 0) {
+            continue;
+        }
+        if (static_cast<double>(bucket->live_bytes) /
+                static_cast<double>(bucket->capacity) >= threshold) {
+            continue;
+        }
+        if (bucket->pending_entries == 0) return true;
+    }
+    return false;
 }
 
 ImmutableBucketAllocator::PendingEviction
@@ -2140,6 +2169,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
             bucket->append_offset =
                 std::max(bucket->append_offset, layout->end());
             bucket->entries[persisted.key] = entry;
+            if (entry.state == BucketEntryState::PENDING) {
+                ++bucket->pending_entries;
+            }
         }
         if (!bucket_ok) {
             DeleteBucketFiles(bucket_id);
@@ -2180,6 +2212,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
                 }
                 bucket->live_bytes += entry.reserved_size;
                 continue;
+            }
+            if (entry.state == BucketEntryState::PENDING) {
+                --bucket->pending_entries;
             }
             entry.state = BucketEntryState::TOMBSTONE;
             ++bucket->tombstones;

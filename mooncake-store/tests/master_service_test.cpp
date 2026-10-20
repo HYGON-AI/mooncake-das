@@ -1467,6 +1467,8 @@ const std::vector<std::string>& DfsBucketEvictionMetricNames() {
     static const std::vector<std::string> names = {
         "master_dfs_bucket_eviction_attempts_total",
         "master_dfs_bucket_evictions_total",
+        "master_dfs_bucket_low_utilization_eviction_attempts_total",
+        "master_dfs_bucket_low_utilization_evictions_total",
         "master_dfs_bucket_evicted_replicas_total",
         "master_dfs_bucket_evicted_bytes_total",
         "master_attempted_evictions_total",
@@ -1491,7 +1493,7 @@ DfsBucketEvictionMetrics CaptureDfsBucketEvictionMetrics() {
     const auto serialized = MasterMetricManager::instance().serialize_metrics();
     DfsBucketEvictionMetrics metrics;
     const auto& names = DfsBucketEvictionMetricNames();
-    for (size_t i = 0; i < 4; ++i) {
+    for (size_t i = 0; i < 6; ++i) {
         const auto& name = names[i];
         const auto value = ReadPrometheusCounter(serialized, name);
         EXPECT_TRUE(value.has_value()) << "missing metric " << name;
@@ -1501,18 +1503,18 @@ DfsBucketEvictionMetrics CaptureDfsBucketEvictionMetrics() {
     // Read legacy counters through getters because not all of their series are
     // exported. Keep checking their values without changing their export.
     auto& manager = MasterMetricManager::instance();
-    metrics.emplace(names[4], manager.get_eviction_attempts());
-    metrics.emplace(names[5], manager.get_eviction_success());
-    metrics.emplace(names[6], manager.get_evicted_key_count());
-    metrics.emplace(names[7], manager.get_evicted_size());
-    metrics.emplace(names[8], manager.get_mem_eviction_attempts());
-    metrics.emplace(names[9], manager.get_mem_eviction_success());
-    metrics.emplace(names[10], manager.get_mem_evicted_key_count());
-    metrics.emplace(names[11], manager.get_mem_evicted_size());
-    metrics.emplace(names[12], manager.get_nof_eviction_attempts());
-    metrics.emplace(names[13], manager.get_nof_eviction_success());
-    metrics.emplace(names[14], manager.get_nof_evicted_key_count());
-    metrics.emplace(names[15], manager.get_nof_evicted_size());
+    metrics.emplace(names[6], manager.get_eviction_attempts());
+    metrics.emplace(names[7], manager.get_eviction_success());
+    metrics.emplace(names[8], manager.get_evicted_key_count());
+    metrics.emplace(names[9], manager.get_evicted_size());
+    metrics.emplace(names[10], manager.get_mem_eviction_attempts());
+    metrics.emplace(names[11], manager.get_mem_eviction_success());
+    metrics.emplace(names[12], manager.get_mem_evicted_key_count());
+    metrics.emplace(names[13], manager.get_mem_evicted_size());
+    metrics.emplace(names[14], manager.get_nof_eviction_attempts());
+    metrics.emplace(names[15], manager.get_nof_eviction_success());
+    metrics.emplace(names[16], manager.get_nof_evicted_key_count());
+    metrics.emplace(names[17], manager.get_nof_evicted_size());
     return metrics;
 }
 
@@ -2418,7 +2420,7 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRemovesWholeBucket) {
         EXPECT_EQ(metrics_after.at("master_dfs_bucket_evicted_bytes_total"),
                   metrics_before.at("master_dfs_bucket_evicted_bytes_total") +
                       200);
-        for (size_t i = 4; i < DfsBucketEvictionMetricNames().size(); ++i) {
+        for (size_t i = 6; i < DfsBucketEvictionMetricNames().size(); ++i) {
             const auto& name = DfsBucketEvictionMetricNames()[i];
             EXPECT_EQ(metrics_after.at(name), metrics_before.at(name)) << name;
         }
@@ -2484,7 +2486,7 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRejectsLeasedBucketWithoutChanges) {
             metrics_before.at("master_dfs_bucket_evicted_replicas_total"));
         EXPECT_EQ(metrics_after.at("master_dfs_bucket_evicted_bytes_total"),
                   metrics_before.at("master_dfs_bucket_evicted_bytes_total"));
-        for (size_t i = 4; i < DfsBucketEvictionMetricNames().size(); ++i) {
+        for (size_t i = 6; i < DfsBucketEvictionMetricNames().size(); ++i) {
             const auto& name = DfsBucketEvictionMetricNames()[i];
             EXPECT_EQ(metrics_after.at(name), metrics_before.at(name)) << name;
         }
