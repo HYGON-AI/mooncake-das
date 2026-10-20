@@ -1224,6 +1224,10 @@ class RealClient : public PyClient {
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     int start_http_server(int port);
     void stop_http_server();
+    void handle_get_logging(coro_http::coro_http_request& req,
+                            coro_http::coro_http_response& resp);
+    void handle_update_logging(coro_http::coro_http_request& req,
+                               coro_http::coro_http_response& resp);
 
     void handle_ipc_shm_register(UdsConnection &connection);
     void handle_ipc_shm_fd_request(UdsConnection &connection);
