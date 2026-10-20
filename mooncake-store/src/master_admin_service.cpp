@@ -250,22 +250,27 @@ struct HttpLoggingUpdateRequest {
     std::optional<std::string> minloglevel;
     std::optional<int> vlog_level;
     std::optional<std::string> ylt_severity;
+    std::optional<bool> dfs_read_trace;
 };
-YLT_REFL(HttpLoggingUpdateRequest, minloglevel, vlog_level, ylt_severity);
+YLT_REFL(HttpLoggingUpdateRequest, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
 
 struct HttpLoggingResponse {
     bool success{true};
     std::string minloglevel;
     int vlog_level{0};
     std::string ylt_severity;
+    bool dfs_read_trace{false};
 };
-YLT_REFL(HttpLoggingResponse, success, minloglevel, vlog_level, ylt_severity);
+YLT_REFL(HttpLoggingResponse, success, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
 
 void FillLoggingResponse(HttpLoggingResponse* response) {
     const auto config = GetRuntimeLogConfig();
     response->minloglevel = config.minloglevel;
     response->vlog_level = config.vlog_level;
     response->ylt_severity = config.ylt_severity;
+    response->dfs_read_trace = config.dfs_read_trace;
 }
 
 
@@ -1521,6 +1526,7 @@ void MasterAdminServer::HandleUpdateLogging(
         .minloglevel = request.minloglevel,
         .vlog_level = request.vlog_level,
         .ylt_severity = request.ylt_severity,
+        .dfs_read_trace = request.dfs_read_trace,
     };
     std::string error;
     if (!UpdateRuntimeLogConfig(update, &error)) {
