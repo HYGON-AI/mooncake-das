@@ -302,9 +302,11 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.low_utilization_threshold = Environ::GetDouble(
         "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD",
         config.low_utilization_threshold);
-    if (!std::isfinite(config.low_utilization_threshold) ||
-        config.low_utilization_threshold < 0.0 ||
-        config.low_utilization_threshold > 1.0) {
+    const bool valid_low_utilization_threshold =
+        std::isfinite(config.low_utilization_threshold) &&
+        config.low_utilization_threshold >= 0.0 &&
+        config.low_utilization_threshold < 1.0;
+    if (!valid_low_utilization_threshold) {
         LOG(WARNING) << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD="
                      << config.low_utilization_threshold
                      << "; using default 0.05";

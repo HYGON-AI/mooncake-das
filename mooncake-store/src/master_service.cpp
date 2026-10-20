@@ -591,7 +591,6 @@ void MasterService::InitDfsAllocatorFromEnvironment(
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
     dfs_bucket_low_utilization_threshold_ =
         dfs_config.low_utilization_threshold;
-    dfs_bucket_eviction_high_watermark_ = dfs_config.eviction_high_watermark;
     dfs_bucket_low_utilization_evictions_per_tick_ =
         dfs_config.low_utilization_evictions_per_tick;
     dfs_bucket_low_utilization_attempts_per_tick_ =
@@ -7503,22 +7502,20 @@ void MasterService::RunDfsEviction() {
 }
 
 void MasterService::RunBucketDfsEviction() {
-    const uint64_t capacity = bucket_allocator_->GetTotalCapacity();
-    const uint64_t used = bucket_allocator_->GetUsedBytes();
-    const bool above_high_watermark =
-        capacity > 0 && static_cast<double>(used) / capacity >=
-                             dfs_bucket_eviction_high_watermark_;
-    if (dfs_bucket_low_utilization_threshold_ > 0.0) {
-        const int eviction_limit = above_high_watermark
-                                        ? -1
-                                        : dfs_bucket_low_utilization_evictions_per_tick_;
-        const int attempt_limit = above_high_watermark
-                                      ? -1
-                                      : dfs_bucket_low_utilization_attempts_per_tick_;
-        (void)RunBucketDfsEvictionInternal(
+    const bool low_utilization_enabled =
+        dfs_bucket_low_utilization_threshold_ > 0.0 &&
+        dfs_bucket_low_utilization_evictions_per_tick_ > 0;
+    if (low_utilization_enabled) {
+        const bool low_utilization_evicted = RunBucketDfsEvictionInternal(
             /*force_one=*/false, std::nullopt,
-            dfs_bucket_low_utilization_threshold_, eviction_limit,
-            attempt_limit);
+            dfs_bucket_low_utilization_threshold_,
+            dfs_bucket_low_utilization_evictions_per_tick_,
+            dfs_bucket_low_utilization_attempts_per_tick_);
+        if (low_utilization_evicted ||
+            bucket_allocator_->HasLowUtilizationBucket(
+                dfs_bucket_low_utilization_threshold_)) {
+            return;
+        }
     }
     (void)RunBucketDfsEvictionInternal(/*force_one=*/false);
 }
@@ -7570,6 +7567,10 @@ bool MasterService::RunBucketDfsEvictionInternal(
             : dfs_bucket_low_utilization_attempts_per_tick_;
 
     while (true) {
+        if (low_utilization_eviction && max_low_utilization_attempts >= 0 &&
+            low_utilization_attempts >= max_low_utilization_attempts) {
+            break;
+        }
         ImmutableBucketAllocator::PendingEviction pending;
         if (invalidated_bucket_id.has_value()) {
             pending = bucket_allocator_->PrepareInvalidation(
@@ -7590,15 +7591,12 @@ bool MasterService::RunBucketDfsEvictionInternal(
             bucket_allocator_->AbortEviction(std::move(pending));
             return evicted;
         }
-        if (low_utilization_eviction && max_low_utilization_attempts >= 0 &&
-            low_utilization_attempts >= max_low_utilization_attempts) {
-            bucket_allocator_->AbortEviction(std::move(pending));
-            break;
-        }
         const int64_t evicted_bucket_id = pending.bucket_id();
         if (low_utilization_eviction) ++low_utilization_attempts;
         if (!invalidating_missing_bucket) {
             if (low_utilization_eviction) {
+                MasterMetricManager::instance()
+                    .inc_dfs_bucket_eviction_attempts();
                 MasterMetricManager::instance()
                     .inc_dfs_bucket_low_utilization_eviction_attempts();
             } else {
