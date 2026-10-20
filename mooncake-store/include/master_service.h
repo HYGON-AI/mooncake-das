@@ -2130,6 +2130,9 @@ class MasterService {
     void RestoreRecoveredDfsReplicas(ImmutableBucketAllocator* allocator);
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();
+    bool InitializeDfsRootGuard(const std::string& root,
+                                const std::string& identity);
+    void ReconcileDfsRootFiles();
     /**
      * @brief Helper to release space of expired discarded replicas.
      * @return Number of released objects that have memory replicas
@@ -2825,6 +2828,13 @@ class MasterService {
     std::thread dfs_retry_thread_;
     std::mutex dfs_retry_mutex_;
     std::condition_variable dfs_retry_cv_;
+    std::mutex dfs_root_guard_mutex_;
+    std::string dfs_root_guard_path_;
+    std::string dfs_root_guard_identity_;
+    uint64_t dfs_root_guard_device_{0};
+    uint64_t dfs_root_guard_inode_{0};
+    bool dfs_root_guard_ready_{false};
+    std::chrono::seconds dfs_root_guard_interval_{5};
 
     // Segment management
     SegmentManager segment_manager_;
