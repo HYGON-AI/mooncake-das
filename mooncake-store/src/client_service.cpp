@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -25,12 +26,14 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <string_view>
 #include <sched.h>
 #include <thread>
 #include <set>
 #include <utility>
 #include <vector>
 #include <ylt/struct_json/json_reader.h>
+#include <boost/asio/ip/address.hpp>
 
 #include "transfer_engine.h"
 #include "topology.h"
@@ -68,6 +71,51 @@ std::optional<size_t> GetTransportRegistrationLimit(
 namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
+
+bool IsValidServiceEndpoint(const std::string& endpoint) {
+    if (endpoint.empty()) return false;
+
+    std::string host;
+    std::string_view port_text;
+    if (endpoint.front() == '[') {
+        const auto closing_bracket = endpoint.find(']');
+        if (closing_bracket == std::string::npos ||
+            closing_bracket + 1 >= endpoint.size() ||
+            endpoint[closing_bracket + 1] != ':') {
+            return false;
+        }
+        host = endpoint.substr(1, closing_bracket - 1);
+        port_text = std::string_view(endpoint).substr(closing_bracket + 2);
+        boost::system::error_code error;
+        const auto address = boost::asio::ip::make_address(host, error);
+        if (error || !address.is_v6() || address.is_unspecified()) {
+            return false;
+        }
+    } else {
+        const auto separator = endpoint.rfind(':');
+        if (separator == std::string::npos ||
+            endpoint.find(':') != separator) {
+            return false;
+        }
+        host = endpoint.substr(0, separator);
+        port_text = std::string_view(endpoint).substr(separator + 1);
+        if (host.empty() || host == "*") return false;
+        boost::system::error_code error;
+        const auto address = boost::asio::ip::make_address(host, error);
+        if (error || !address.is_v4() || address.is_unspecified()) {
+            return false;
+        }
+    }
+
+    if (port_text.empty()) return false;
+    uint32_t port = 0;
+    for (unsigned char c : port_text) {
+        if (!std::isdigit(c)) return false;
+        port = port * 10 + static_cast<uint32_t>(c - '0');
+        if (port > 65535) return false;
+    }
+    return port != 0;
+}
 
 class ScopedObjectChecksumBuffer {
    public:
@@ -484,12 +532,144 @@ Client::Client(const std::string& local_hostname,
     }
 }
 
+int Client::SetServiceEndpoint(const std::string& endpoint) {
+    if (!IsValidServiceEndpoint(endpoint)) {
+        return toInt(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    if (!service_metrics_snapshot_.service_endpoint.empty()) {
+        return service_metrics_snapshot_.service_endpoint == endpoint
+                   ? 0
+                   : toInt(ErrorCode::INVALID_PARAMS);
+    }
+    service_metrics_snapshot_.service_endpoint = endpoint;
+    service_metrics_report_running_.store(true, std::memory_order_release);
+    try {
+        service_metrics_report_thread_ =
+            std::thread(&Client::ServiceMetricsReporterLoop, this);
+    } catch (const std::exception& error) {
+        service_metrics_report_running_.store(false, std::memory_order_release);
+        service_metrics_snapshot_.service_endpoint.clear();
+        LOG(ERROR) << "Failed to start service metrics reporter: "
+                   << error.what();
+        return toInt(ErrorCode::INTERNAL_ERROR);
+    }
+    return 0;
+}
+
+void Client::RecordServiceReadFailure(ReplicaType replica_type) {
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    if (service_metrics_snapshot_.service_endpoint.empty()) return;
+    if (replica_type == ReplicaType::MEMORY) {
+        ++service_metrics_snapshot_.read_failures_memory;
+    } else if (replica_type == ReplicaType::DFS) {
+        ++service_metrics_snapshot_.read_failures_dfs;
+    }
+}
+
+void Client::RecordServiceDualWrite(bool memory_succeeded,
+                                    bool dfs_succeeded) {
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    if (service_metrics_snapshot_.service_endpoint.empty()) return;
+    if (memory_succeeded && dfs_succeeded) {
+        ++service_metrics_snapshot_.dual_write_both_success;
+    } else if (memory_succeeded) {
+        ++service_metrics_snapshot_.dual_write_memory_only;
+    } else if (dfs_succeeded) {
+        ++service_metrics_snapshot_.dual_write_dfs_only;
+    } else {
+        ++service_metrics_snapshot_.dual_write_neither_success;
+    }
+}
+
+void Client::BeginServiceDualWritePending() {
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    if (!service_metrics_snapshot_.service_endpoint.empty()) {
+        ++service_metrics_snapshot_.dual_write_pending;
+    }
+}
+
+void Client::CancelServiceDualWritePending() {
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    if (!service_metrics_snapshot_.service_endpoint.empty() &&
+        service_metrics_snapshot_.dual_write_pending > 0) {
+        --service_metrics_snapshot_.dual_write_pending;
+    }
+}
+
+void Client::CompleteServiceDualWrite(bool memory_succeeded,
+                                      bool dfs_succeeded) {
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    if (service_metrics_snapshot_.service_endpoint.empty()) return;
+    if (service_metrics_snapshot_.dual_write_pending > 0) {
+        --service_metrics_snapshot_.dual_write_pending;
+    }
+    if (memory_succeeded && dfs_succeeded) {
+        ++service_metrics_snapshot_.dual_write_both_success;
+    } else if (memory_succeeded) {
+        ++service_metrics_snapshot_.dual_write_memory_only;
+    } else if (dfs_succeeded) {
+        ++service_metrics_snapshot_.dual_write_dfs_only;
+    } else {
+        ++service_metrics_snapshot_.dual_write_neither_success;
+    }
+}
+
+void Client::ServiceMetricsReporterLoop() {
+    while (service_metrics_report_running_.load(std::memory_order_acquire)) {
+        for (int i = 0; i < 50 &&
+                        service_metrics_report_running_.load(
+                            std::memory_order_acquire);
+             ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!service_metrics_report_running_.load(std::memory_order_acquire)) {
+            break;
+        }
+
+        ServiceMetricsSnapshot snapshot;
+        {
+            std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+            if (service_metrics_snapshot_.service_endpoint.empty()) return;
+            snapshot = service_metrics_snapshot_;
+            snapshot.sequence = ++service_metrics_snapshot_.sequence;
+        }
+        auto result = master_client_.ReportServiceMetrics(snapshot);
+        if (!result) {
+            VLOG(1) << "Service metrics report failed: "
+                    << toString(result.error());
+        }
+    }
+}
+
+void Client::StopServiceMetricsReporter() {
+    service_metrics_report_running_.store(false, std::memory_order_release);
+    if (service_metrics_report_thread_.joinable()) {
+        service_metrics_report_thread_.join();
+    }
+
+    ServiceMetricsSnapshot snapshot;
+    {
+        std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+        if (service_metrics_snapshot_.service_endpoint.empty()) return;
+        snapshot = service_metrics_snapshot_;
+        snapshot.sequence = ++service_metrics_snapshot_.sequence;
+    }
+    auto result = master_client_.ReportServiceMetrics(snapshot);
+    if (!result) {
+        VLOG(1) << "Final service metrics report failed: "
+                << toString(result.error());
+    }
+}
+
 Client::~Client() {
     // Stop accepting new asynchronous DFS writes and wait for the queued ones.
     // They report their result through master_client_ and write through
     // dfs_storage_backend_, so they must not outlive this object.
     DrainAsyncDfsWrites();
     write_thread_pool_.stop();
+    StopServiceMetricsReporter();
 
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
@@ -1510,6 +1690,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     if (err != ErrorCode::OK) {
+        if (replica.is_memory_replica() || replica.is_dfs_replica()) {
+            RecordServiceReadFailure(replica.is_memory_replica()
+                                         ? ReplicaType::MEMORY
+                                         : ReplicaType::DFS);
+        }
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
     }
@@ -1518,6 +1703,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         VerifyObjectChecksum(object_key, slices, calculate_total_size(replica),
                              query_result.object_checksum);
     if (!checksum_result) {
+        if (replica.is_memory_replica() || replica.is_dfs_replica()) {
+            RecordServiceReadFailure(replica.is_memory_replica()
+                                         ? ReplicaType::MEMORY
+                                         : ReplicaType::DFS);
+        }
         return tl::unexpected(checksum_result.error());
     }
 
@@ -1570,6 +1760,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     if (err != ErrorCode::OK) {
+        RecordServiceReadFailure(ReplicaType::MEMORY);
         LOG(ERROR) << "transfer_read_range_failed key=" << object_key;
         return tl::unexpected(err);
     }
@@ -1659,6 +1850,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     op.cache_used[idx]) {
                     hot_cache_->ReleaseHotKey(object_keys[index]);
                 }
+                RecordServiceReadFailure(ReplicaType::MEMORY);
                 results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
                 LOG(ERROR) << "Failed to submit transfer operation for key: "
                            << object_keys[index];
@@ -1681,6 +1873,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     op.cache_used[idx]) {
                     hot_cache_->ReleaseHotKey(object_keys[index]);
                 }
+                RecordServiceReadFailure(ReplicaType::MEMORY);
                 results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
                 LOG(ERROR) << "Failed to submit transfer operation for key: "
                            << object_keys[index];
@@ -1703,6 +1896,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     calculate_total_size(op.replicas[idx]),
                     query_results[index].object_checksum);
                 if (!checksum_result) {
+                    RecordServiceReadFailure(ReplicaType::MEMORY);
                     results[index] = tl::unexpected(checksum_result.error());
                     continue;
                 }
@@ -1735,6 +1929,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         std::vector<tl::expected<void, ErrorCode>> results;
         results.reserve(object_keys.size());
         for (size_t i = 0; i < object_keys.size(); ++i) {
+            if (i < query_results.size()) {
+                Replica::Descriptor replica;
+                if (FindFirstCompleteReplica(query_results[i].replicas,
+                                             replica) == ErrorCode::OK &&
+                    (replica.is_memory_replica() ||
+                     replica.is_dfs_replica())) {
+                    RecordServiceReadFailure(
+                        replica.is_memory_replica() ? ReplicaType::MEMORY
+                                                    : ReplicaType::DFS);
+                }
+            }
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         return results;
@@ -1818,12 +2023,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         std::optional<TransferFuture> future;
         if (replica.is_dfs_replica()) {
             if (!DfsReadAllowed()) {
+                RecordServiceReadFailure(ReplicaType::DFS);
                 results[i] =
                     tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
                 continue;
             }
             if (!dfs_storage_backend_) {
                 LOG(ERROR) << "DFS backend is not initialized";
+                RecordServiceReadFailure(ReplicaType::DFS);
                 results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
                 continue;
             }
@@ -1853,6 +2060,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
             LOG(ERROR) << "Failed to submit transfer operation for key: "
                        << key;
+            if (replica.is_memory_replica()) {
+                RecordServiceReadFailure(ReplicaType::MEMORY);
+            }
             results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
             continue;
         }
@@ -1872,6 +2082,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                        << dfs_read_requests.size() << ", got "
                        << dfs_results.size();
             for (size_t index : dfs_read_indices) {
+                RecordServiceReadFailure(ReplicaType::DFS);
                 results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
             }
         } else {
@@ -1879,6 +2090,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 const size_t index = dfs_read_indices[i];
                 const auto& request = dfs_read_requests[i];
                 if (!dfs_results[i]) {
+                    RecordServiceReadFailure(ReplicaType::DFS);
                     if (dfs_results[i].error() == ErrorCode::FILE_NOT_FOUND) {
                         if (missing_bucket_reports.empty()) {
                             missing_bucket_reports.reserve(
@@ -1894,6 +2106,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     request.key, request.slices, request.descriptor.object_size,
                     query_results[index].object_checksum);
                 if (!checksum_result) {
+                    RecordServiceReadFailure(ReplicaType::DFS);
                     results[index] = tl::unexpected(checksum_result.error());
                     continue;
                 }
@@ -1948,6 +2161,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             hot_cache_->ReleaseHotKey(key);
         }
         if (result != ErrorCode::OK) {
+            if (stored_replica.is_memory_replica()) {
+                RecordServiceReadFailure(ReplicaType::MEMORY);
+            }
             LOG(ERROR) << "Transfer failed for key: " << key
                        << " with error: " << static_cast<int>(result);
             results[index] = tl::unexpected(result);
@@ -1963,6 +2179,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 key, slices_it->second, calculate_total_size(stored_replica),
                 query_results[index].object_checksum);
             if (!checksum_result) {
+                if (stored_replica.is_memory_replica() ||
+                    stored_replica.is_dfs_replica()) {
+                    RecordServiceReadFailure(
+                        stored_replica.is_memory_replica() ? ReplicaType::MEMORY
+                                                           : ReplicaType::DFS);
+                }
                 results[index] = tl::unexpected(checksum_result.error());
                 continue;
             }
@@ -2034,11 +2256,22 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    ReplicateConfig client_cfg = AttachConfig(config);
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+    const bool service_dual_write_eligible =
+        client_cfg.replica_num > 0 && client_cfg.dfs_replica_num > 0;
+
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
+            if (service_dual_write_eligible &&
+                checksum_result.error() != ErrorCode::INVALID_PARAMS) {
+                RecordServiceDualWrite(false, false);
+            }
             return tl::unexpected(checksum_result.error());
         }
         object_checksum = *checksum_result;
@@ -2048,11 +2281,6 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     std::vector<size_t> slice_lengths;
     for (size_t i = 0; i < slices.size(); ++i) {
         slice_lengths.emplace_back(slices[i].size);
-    }
-
-    ReplicateConfig client_cfg = AttachConfig(config);
-    if (protocol_ == "cxl") {
-        client_cfg.preferred_segment = local_hostname_;
     }
 
     if (hot_cache_) {
@@ -2066,6 +2294,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
             return {};
+        }
+        if (service_dual_write_eligible && err != ErrorCode::INVALID_PARAMS) {
+            RecordServiceDualWrite(false, false);
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
             LOG(WARNING) << "Failed to start put operation for key=" << key
@@ -2138,6 +2369,14 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
+    if (service_dual_write_eligible) {
+        RecordServiceDualWrite(
+            transfer_summary.successful_memory_transfers ==
+                client_cfg.replica_num,
+            transfer_summary.successful_dfs_transfers ==
+                client_cfg.dfs_replica_num);
+    }
+
     auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_put)
                       .count();
@@ -2178,11 +2417,22 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
+    ReplicateConfig client_cfg = AttachConfig(config);
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+    const bool service_dual_write_eligible =
+        client_cfg.replica_num > 0 && client_cfg.dfs_replica_num > 0;
+
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
+            if (service_dual_write_eligible &&
+                checksum_result.error() != ErrorCode::INVALID_PARAMS) {
+                RecordServiceDualWrite(false, false);
+            }
             return tl::unexpected(checksum_result.error());
         }
         object_checksum = *checksum_result;
@@ -2194,11 +2444,6 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
-    ReplicateConfig client_cfg = AttachConfig(config);
-    if (protocol_ == "cxl") {
-        client_cfg.preferred_segment = local_hostname_;
-    }
-
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
@@ -2208,6 +2453,9 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         master_client_.UpsertStart(key, slice_lengths, client_cfg);
     if (!start_result) {
         ErrorCode err = start_result.error();
+        if (service_dual_write_eligible && err != ErrorCode::INVALID_PARAMS) {
+            RecordServiceDualWrite(false, false);
+        }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
             LOG(WARNING) << "Failed to start upsert operation for key=" << key
                          << PUT_NO_SPACE_HELPER_STR;
@@ -2277,6 +2525,14 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
 
+    if (service_dual_write_eligible) {
+        RecordServiceDualWrite(
+            transfer_summary.successful_memory_transfers ==
+                client_cfg.replica_num,
+            transfer_summary.successful_dfs_transfers ==
+                client_cfg.dfs_replica_num);
+    }
+
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
@@ -2333,7 +2589,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
-    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    std::vector<PutOperation> ops =
+        CreatePutOperations(keys, batched_slices, client_cfg);
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
@@ -2362,6 +2619,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
 
+    RecordBatchServiceDualWriteMetrics(ops);
     FinalizeBatchUpsert(ops);
     return CollectResults(ops);
 }
@@ -2406,6 +2664,9 @@ class PutOperation {
     size_t requested_memory_replicas = 0;
     size_t requested_nof_replicas = 0;
     size_t requested_dfs_replicas = 0;
+    bool service_dual_write_eligible = false;
+    bool service_metric_recorded = false;
+    bool service_metric_excluded = false;
     ReplicaTransferSummary transfer_summary;
 
     // Error context for debugging
@@ -2459,6 +2720,8 @@ class PutOperation {
         requested_memory_replicas = config.replica_num;
         requested_nof_replicas = config.nof_replica_num;
         requested_dfs_replicas = config.dfs_replica_num;
+        service_dual_write_eligible = requested_memory_replicas > 0 &&
+                                      requested_dfs_replicas > 0;
     }
 
     ReplicateConfig ToReplicateConfig() const {
@@ -2485,13 +2748,39 @@ class PutOperation {
 
 std::vector<PutOperation> Client::CreatePutOperations(
     const std::vector<ObjectKey>& keys,
-    const std::vector<std::vector<Slice>>& batched_slices) {
+    const std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config) {
     std::vector<PutOperation> ops;
     ops.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         ops.emplace_back(keys[i], batched_slices[i]);
+        ops.back().InitializeRequestedReplicas(config);
     }
     return ops;
+}
+
+void Client::RecordBatchServiceDualWriteMetrics(
+    std::vector<PutOperation>& ops) {
+    for (auto& op : ops) {
+        if (!op.service_dual_write_eligible || op.service_metric_recorded ||
+            op.service_metric_excluded ||
+            op.transfer_summary.dfs_completion_deferred) {
+            continue;
+        }
+        if (!op.result.has_value() &&
+            op.result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            continue;
+        }
+
+        const bool memory_succeeded =
+            op.transfer_summary.successful_memory_transfers ==
+            op.requested_memory_replicas;
+        const bool dfs_succeeded =
+            op.transfer_summary.successful_dfs_transfers ==
+            op.requested_dfs_replicas;
+        RecordServiceDualWrite(memory_succeeded, dfs_succeeded);
+        op.service_metric_recorded = true;
+    }
 }
 
 void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
@@ -2511,6 +2800,9 @@ void Client::ComputePutObjectChecksum(PutOperation& op,
         auto checksum_result = ComputeObjectChecksumForSlices(
             op.key, slices, CalculateSliceSize(op.slices), staged_for_dfs);
         if (!checksum_result) {
+            if (checksum_result.error() == ErrorCode::INVALID_PARAMS) {
+                op.service_metric_excluded = true;
+            }
             op.SetTerminalError(checksum_result.error(),
                                 op.replicas.empty()
                                     ? PutOperationState::MASTER_FAILED
@@ -2586,6 +2878,9 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         auto& op = ops[active_indices[i]];
         op.InitializeRequestedReplicas(config);
         if (!start_responses[i]) {
+            if (start_responses[i].error() == ErrorCode::INVALID_PARAMS) {
+                op.service_metric_excluded = true;
+            }
             op.SetTerminalError(start_responses[i].error(),
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start put operation");
@@ -2666,6 +2961,9 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         auto& op = ops[active_indices[i]];
         op.InitializeRequestedReplicas(config);
         if (!start_responses[i]) {
+            if (start_responses[i].error() == ErrorCode::INVALID_PARAMS) {
+                op.service_metric_excluded = true;
+            }
             op.SetTerminalError(start_responses[i].error(),
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start upsert operation");
@@ -3030,6 +3328,23 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             }
         }
     }
+
+    for (size_t i = 0; i < context->service_dual_writes.size(); ++i) {
+        const auto& metric = context->service_dual_writes[i];
+        if (!metric.eligible ||
+            (i < context->service_metrics_settled.size() &&
+             context->service_metrics_settled[i])) {
+            continue;
+        }
+        const bool dfs_succeeded =
+            i < outcomes.size() && outcomes[i] == ErrorCode::OK &&
+            metric.requested_dfs_replicas == 1;
+        CompleteServiceDualWrite(metric.memory_succeeded, dfs_succeeded);
+        if (i < context->service_metrics_settled.size()) {
+            context->service_metrics_settled[i] = true;
+        }
+    }
+
     ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
                     all_succeeded, successful_bytes,
                     write_duration_seconds);
@@ -3177,6 +3492,17 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         context->pinned_pool = pinned_buffer_pool_;
         context->is_upsert = is_upsert;
         context->object_checksums.resize(keys.size());
+        context->service_dual_writes.resize(keys.size());
+        context->service_metrics_settled.assign(keys.size(), false);
+        for (size_t i = 0; i < op_indices.size(); ++i) {
+            const auto& op = ops[op_indices[i]];
+            auto& metric = context->service_dual_writes[i];
+            metric.eligible = op.service_dual_write_eligible;
+            metric.memory_succeeded =
+                op.transfer_summary.successful_memory_transfers ==
+                op.requested_memory_replicas;
+            metric.requested_dfs_replicas = op.requested_dfs_replicas;
+        }
         staged = StageDfsWriteData(*context, slice_lists);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Failed to stage async DFS write: " << e.what();
@@ -3231,14 +3557,44 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         dfs_inflight_cv_.notify_all();
     };
 
+    for (const auto& metric : context->service_dual_writes) {
+        if (metric.eligible) BeginServiceDualWritePending();
+    }
+
     try {
         write_thread_pool_.enqueue([this, context, release_inflight]() {
             try {
                 RunAsyncDfsWrite(context);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Async DFS write task threw: " << e.what();
+                for (size_t i = 0; i < context->service_dual_writes.size();
+                     ++i) {
+                    const auto& metric = context->service_dual_writes[i];
+                    if (!metric.eligible ||
+                        (i < context->service_metrics_settled.size() &&
+                         context->service_metrics_settled[i])) {
+                        continue;
+                    }
+                    CompleteServiceDualWrite(metric.memory_succeeded, false);
+                    if (i < context->service_metrics_settled.size()) {
+                        context->service_metrics_settled[i] = true;
+                    }
+                }
             } catch (...) {
                 LOG(ERROR) << "Async DFS write task threw an unknown exception";
+                for (size_t i = 0; i < context->service_dual_writes.size();
+                     ++i) {
+                    const auto& metric = context->service_dual_writes[i];
+                    if (!metric.eligible ||
+                        (i < context->service_metrics_settled.size() &&
+                         context->service_metrics_settled[i])) {
+                        continue;
+                    }
+                    CompleteServiceDualWrite(metric.memory_succeeded, false);
+                    if (i < context->service_metrics_settled.size()) {
+                        context->service_metrics_settled[i] = true;
+                    }
+                }
             }
             release_inflight();
         });
@@ -3246,6 +3602,9 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         // The pool was stopped between the shutdown check and the enqueue.
         LOG(ERROR) << "Failed to enqueue async DFS write: " << e.what();
         release_inflight();
+        for (const auto& metric : context->service_dual_writes) {
+            if (metric.eligible) CancelServiceDualWritePending();
+        }
         for (const size_t index : op_indices) {
             auto& op = ops[index];
             op.transfer_summary.RecordFailure(
@@ -3653,6 +4012,9 @@ void Client::StageWriteBuffersForRemoteReplicas(
         }
         auto staged_slices = stager(op.slices);
         if (!staged_slices) {
+            if (staged_slices.error() == ErrorCode::INVALID_PARAMS) {
+                op.service_metric_excluded = true;
+            }
             op.SetError(staged_slices.error(),
                         "Failed to stage non-local write buffers");
             continue;
@@ -3760,6 +4122,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
+    RecordBatchServiceDualWriteMetrics(ops);
     if (is_upsert) {
         FinalizeBatchUpsert(ops);
     } else {
@@ -3783,7 +4146,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
-    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    std::vector<PutOperation> ops =
+        CreatePutOperations(keys, batched_slices, client_cfg);
     const bool reuse_dfs_staging =
         object_checksum_enabled_ && !client_cfg.prefer_alloc_in_same_node &&
         client_cfg.dfs_replica_num > 0 && dfs_storage_backend_ &&
@@ -3795,6 +4159,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         for (auto& op : ops) {
             for (const auto& slice : op.slices) {
                 if (slice.size != 0 && slice.ptr == nullptr) {
+                    op.service_metric_excluded = true;
                     op.SetTerminalError(ErrorCode::INVALID_PARAMS,
                                         PutOperationState::MASTER_FAILED,
                                         "Object checksum has a null slice");
@@ -3829,6 +4194,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
 
+    RecordBatchServiceDualWriteMetrics(ops);
     FinalizeBatchPut(ops);
     return CollectResults(ops);
 }
@@ -3854,7 +4220,8 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
     for (size_t i = 0; i < keys.size(); ++i) {
         batched_slices[i] = {Slice{nullptr, object_sizes[i]}};
     }
-    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    std::vector<PutOperation> ops =
+        CreatePutOperations(keys, batched_slices, client_cfg);
     StartBatchPut(ops, client_cfg);
 
     for (size_t i = 0; i < ops.size(); ++i) {
@@ -4959,9 +5326,10 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
     auto operation = SubmitScatter(builder.ranges());
     if (!operation) {
         LOG(ERROR) << "Failed to submit batch range read";
-        for (auto& result : results) {
-            if (result.has_value()) {
-                result = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i].has_value()) {
+                RecordServiceReadFailure(ReplicaType::MEMORY);
+                results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
             }
         }
         return results;
@@ -4969,12 +5337,16 @@ std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
     (void)operation->wait();
 
     for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i].has_value() || !entry_errors[i].has_value()) {
+        if (!results[i].has_value()) {
             continue;
         }
-        LOG(ERROR) << "Range read failed, entry=" << i
-                   << ", error=" << static_cast<int>(entry_errors[i].value());
-        results[i] = tl::unexpected(entry_errors[i].value());
+        if (entry_errors[i].has_value()) {
+            RecordServiceReadFailure(ReplicaType::MEMORY);
+            LOG(ERROR) << "Range read failed, entry=" << i
+                       << ", error="
+                       << static_cast<int>(entry_errors[i].value());
+            results[i] = tl::unexpected(entry_errors[i].value());
+        }
     }
     return results;
 }

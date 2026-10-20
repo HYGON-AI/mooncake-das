@@ -1554,6 +1554,11 @@ int DummyClient::set_dfs_access_policy(bool allow_read, bool allow_write) {
     return result ? result.value() : toInt(result.error());
 }
 
+int DummyClient::set_service_endpoint(const std::string& endpoint) {
+    auto result = invoke_rpc<&RealClient::set_service_endpoint, int>(endpoint);
+    return result ? result.value() : toInt(result.error());
+}
+
 int DummyClient::request_hot_cache_fd() {
     UdsConnector connector(ipc_socket_path_);
     auto connection_result = connector.connect();

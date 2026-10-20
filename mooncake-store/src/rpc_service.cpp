@@ -1536,6 +1536,12 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     return result;
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::ReportServiceMetrics(
+    const UUID& client_id, const ServiceMetricsSnapshot& snapshot) {
+    return MasterMetricManager::instance().ReportServiceMetrics(client_id,
+                                                                 snapshot);
+}
+
 tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
@@ -1894,6 +1900,9 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::GetNoFSegmentsByName>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReportServiceMetrics>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
         &wrapped_master_service);
