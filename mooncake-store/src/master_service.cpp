@@ -7506,16 +7506,11 @@ void MasterService::RunBucketDfsEviction() {
         dfs_bucket_low_utilization_threshold_ > 0.0 &&
         dfs_bucket_low_utilization_evictions_per_tick_ > 0;
     if (low_utilization_enabled) {
-        const bool low_utilization_evicted = RunBucketDfsEvictionInternal(
+        (void)RunBucketDfsEvictionInternal(
             /*force_one=*/false, std::nullopt,
             dfs_bucket_low_utilization_threshold_,
             dfs_bucket_low_utilization_evictions_per_tick_,
             dfs_bucket_low_utilization_attempts_per_tick_);
-        if (low_utilization_evicted ||
-            bucket_allocator_->HasLowUtilizationBucket(
-                dfs_bucket_low_utilization_threshold_)) {
-            return;
-        }
     }
     (void)RunBucketDfsEvictionInternal(/*force_one=*/false);
 }
@@ -7621,11 +7616,12 @@ bool MasterService::RunBucketDfsEvictionInternal(
                 LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION] bucket_id="
                           << evicted_bucket_id << ", committed=true";
             }
-            evicted = true;
-            if (invalidating_missing_bucket || force_one ||
-                (low_utilization_eviction &&
-                 max_low_utilization_evictions >= 0 &&
-                 low_utilization_evictions >= max_low_utilization_evictions)) {
+            evicted = committed;
+            if (committed &&
+                (invalidating_missing_bucket || force_one ||
+                 (low_utilization_eviction &&
+                  max_low_utilization_evictions >= 0 &&
+                  low_utilization_evictions >= max_low_utilization_evictions))) {
                 return true;
             }
             continue;

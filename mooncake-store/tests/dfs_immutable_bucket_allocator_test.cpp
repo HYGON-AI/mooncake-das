@@ -1468,7 +1468,8 @@ TEST(ImmutableBucketAllocatorTest, LowUtilizationEvictionIgnoresGlobalWatermark)
 
     EXPECT_LT(alloc.GetUsedBytes(), alloc.GetTotalCapacity() * 0.9);
     auto pending = alloc.PrepareEvictionForLowUtilization(0.05);
-    ASSERT_FALSE(pending.Empty());
+    ASSERT_GE(pending.bucket_id(), 0);
+    EXPECT_TRUE(pending.Empty());
     EXPECT_EQ(pending.bucket_id(), first->shard_idx);
     ASSERT_TRUE(alloc.CommitEviction(std::move(pending)));
     EXPECT_FALSE(alloc.GetBucketIdForKey("first").has_value());

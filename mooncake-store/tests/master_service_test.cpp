@@ -2601,7 +2601,7 @@ TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
         service.ProcessInvalidatedDfsBucketsForTesting();
         const auto metrics_after = CaptureDfsBucketEvictionMetrics();
 
-        for (size_t i = 0; i < 4; ++i) {
+        for (size_t i = 0; i < 6; ++i) {
             const auto& name = DfsBucketEvictionMetricNames()[i];
             EXPECT_EQ(metrics_after.at(name), metrics_before.at(name)) << name;
         }

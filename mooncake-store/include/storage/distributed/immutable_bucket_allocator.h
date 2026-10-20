@@ -249,7 +249,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     };
 
     /**
-     * @brief Freeze the coldest evictable bucket and return its live entries.
+     * @brief Freeze an eligible bucket and return its live entries.
+     *
+     * When watermark eviction is active, low-utilization buckets are preferred
+     * before falling back to the coldest eligible bucket.
      * Returns an empty transaction when nothing can be evicted.
      */
     PendingEviction PrepareEviction();
@@ -272,12 +275,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
      * before committing the eviction.
      */
     PendingEviction PrepareEvictionForLowUtilization(double threshold);
-
-    /**
-     * @brief Returns whether a non-active bucket is below the utilization
-     * threshold and has no pending entries.
-     */
-    bool HasLowUtilizationBucket(double threshold) const;
 
     /**
      * @brief Freeze one specific bucket after its data file is confirmed missing.
@@ -346,7 +343,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // eviction. The latter bypasses only the watermark gate and still observes
     // active/frozen state plus the master's full validation protocol.
     PendingEviction PrepareEvictionInternal(
-        bool force_one, double low_utilization_threshold = -1.0);
+        bool force_one, double low_utilization_threshold = -1.0,
+        bool low_utilization_only = false);
     PendingEviction PrepareInvalidationInternal(int64_t bucket_id);
 
     // Shared implementation of AbortEviction. `demote` distinguishes an
@@ -490,6 +488,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     bool eviction_enabled_ = true;
     double eviction_high_watermark_ = 0.9;
     double eviction_low_watermark_ = 0.7;
+    double low_utilization_threshold_ = 0.05;
     std::chrono::seconds eviction_check_interval_{5};
 
     mutable std::mutex mutex_;

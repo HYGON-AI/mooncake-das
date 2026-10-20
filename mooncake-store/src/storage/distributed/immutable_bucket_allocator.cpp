@@ -189,6 +189,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_enabled_ = config.eviction_enabled;
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
+    low_utilization_threshold_ = config.low_utilization_threshold;
     eviction_check_interval_ = config.eviction_check_interval;
 
     std::error_code ec;
@@ -1609,7 +1610,8 @@ ImmutableBucketAllocator::TakeRecoveredReplicas() {
 
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEviction() {
-    return PrepareEvictionInternal(/*force_one=*/false);
+    return PrepareEvictionInternal(/*force_one=*/false,
+                                   low_utilization_threshold_);
 }
 
 ImmutableBucketAllocator::PendingEviction
@@ -1651,11 +1653,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         }
         const bool was_active = active_bucket_id_ == bucket_id;
         const BucketPtr& victim = bucket_it->second;
-        const bool has_pending = std::any_of(
-            victim->entries.begin(), victim->entries.end(), [](const auto& item) {
-                return item.second.state == BucketEntryState::PENDING;
-            });
-        if (has_pending) return pending;
+        if (victim->pending_entries != 0) return pending;
 
         std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
         for (const auto& [key, entry] : victim->entries) {
@@ -1707,30 +1705,13 @@ ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
     if (threshold <= 0.0 || threshold >= 1.0) {
         return {};
     }
-    return PrepareEvictionInternal(/*force_one=*/false, threshold);
-}
-
-bool ImmutableBucketAllocator::HasLowUtilizationBucket(double threshold) const {
-    if (threshold <= 0.0 || threshold >= 1.0) return false;
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& [bucket_id, bucket] : buckets_) {
-        if (bucket_id == active_bucket_id_ || bucket->frozen ||
-            bucket->capacity == 0) {
-            continue;
-        }
-        if (static_cast<double>(bucket->live_bytes) /
-                static_cast<double>(bucket->capacity) >= threshold) {
-            continue;
-        }
-        if (bucket->pending_entries == 0) return true;
-    }
-    return false;
+    return PrepareEvictionInternal(/*force_one=*/false, threshold,
+                                   /*low_utilization_only=*/true);
 }
 
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionInternal(
-    bool force_one, double low_utilization_threshold) {
+    bool force_one, double low_utilization_threshold, bool low_utilization_only) {
     PendingEviction pending;
     if (!initialized_.load(std::memory_order_acquire)) return pending;
 
@@ -1745,8 +1726,10 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
 
         const double usage = static_cast<double>(UsedBytesLocked()) /
                              static_cast<double>(capacity);
-        const bool low_utilization_scan = low_utilization_threshold >= 0.0;
-        if (!force_one && !low_utilization_scan) {
+        const bool prioritize_low_utilization =
+            low_utilization_threshold > 0.0 &&
+            low_utilization_threshold < 1.0;
+        if (!force_one && !low_utilization_only) {
             if (usage >= eviction_high_watermark_) {
                 eviction_active_ = true;
             }
@@ -1757,32 +1740,34 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             }
         }
 
-        // Walk the LRU from the cold end and take the first bucket that is
-        // neither active, frozen, nor still waiting for an async write to
-        // finish. A PENDING entry means the client has not called PutEnd yet,
-        // so the bucket's data file must not be deleted underneath it.
+        // Walk the LRU from the cold end. Watermark eviction prefers low-
+        // utilization buckets, but falls back to any eligible bucket when a
+        // sparse bucket is protected by the master.
         BucketPtr victim;
-        for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
-            const int64_t bucket_id = *it;
-            if (bucket_id == active_bucket_id_) continue;
-            auto bucket_it = buckets_.find(bucket_id);
-            if (bucket_it == buckets_.end()) continue;
-            if (bucket_it->second->frozen) continue;
-            const auto& candidate = bucket_it->second;
-            if (low_utilization_scan &&
-                static_cast<double>(candidate->live_bytes) /
-                        static_cast<double>(candidate->capacity) >=
-                    low_utilization_threshold) {
-                continue;
+        const int eviction_passes =
+            prioritize_low_utilization && !low_utilization_only ? 2 : 1;
+        for (int pass = 0; pass < eviction_passes && !victim; ++pass) {
+            for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
+                const int64_t bucket_id = *it;
+                if (bucket_id == active_bucket_id_) continue;
+                auto bucket_it = buckets_.find(bucket_id);
+                if (bucket_it == buckets_.end()) continue;
+                if (bucket_it->second->frozen) continue;
+                const auto& candidate = bucket_it->second;
+                const bool is_low_utilization =
+                    candidate->capacity > 0 &&
+                    static_cast<double>(candidate->live_bytes) /
+                            static_cast<double>(candidate->capacity) <
+                        low_utilization_threshold;
+                if (prioritize_low_utilization &&
+                    ((pass == 0 && !is_low_utilization) ||
+                     (pass == 1 && is_low_utilization))) {
+                    continue;
+                }
+                if (candidate->pending_entries != 0) continue;
+                victim = candidate;
+                break;
             }
-            const bool has_pending = std::any_of(
-                candidate->entries.begin(), candidate->entries.end(),
-                [](const auto& item) {
-                    return item.second.state == BucketEntryState::PENDING;
-                });
-            if (has_pending) continue;
-            victim = candidate;
-            break;
         }
         if (!victim) return pending;
 
@@ -1852,12 +1837,7 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
         if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
             return false;
         }
-        const bool has_pending = std::any_of(
-            it->second->entries.begin(), it->second->entries.end(),
-            [](const auto& item) {
-                return item.second.state == BucketEntryState::PENDING;
-            });
-        if (has_pending) {
+        if (it->second->pending_entries != 0) {
             it->second->frozen = false;
             // Restore cold LRU position so the next round can reconsider it
             // after the pending write completes or times out.
