@@ -87,6 +87,26 @@ struct PingResponse {
 };
 YLT_REFL(PingResponse, view_version_id, client_status);
 
+// Cumulative, per-client service-level I/O metrics. Reports are sent from a
+// background thread so they do not add RPCs to foreground data operations or
+// the heartbeat path. The master deduplicates reports by client UUID and
+// sequence number.
+struct ServiceMetricsSnapshot {
+    std::string service_endpoint;
+    uint64_t sequence = 0;
+    uint64_t dual_write_both_success = 0;
+    uint64_t dual_write_memory_only = 0;
+    uint64_t dual_write_dfs_only = 0;
+    uint64_t dual_write_neither_success = 0;
+    uint64_t dual_write_pending = 0;
+    uint64_t read_failures_memory = 0;
+    uint64_t read_failures_dfs = 0;
+};
+YLT_REFL(ServiceMetricsSnapshot, service_endpoint, sequence,
+         dual_write_both_success, dual_write_memory_only,
+         dual_write_dfs_only, dual_write_neither_success,
+         dual_write_pending, read_failures_memory, read_failures_dfs);
+
 /**
  * @brief Response structure for GetReplicaList operation
  */

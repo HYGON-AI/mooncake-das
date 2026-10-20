@@ -1,12 +1,16 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
 
+#include "types.h"
+#include "ylt/util/tl/expected.hpp"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -14,6 +18,7 @@
 namespace mooncake {
 
 struct TieredStorageUsageSnapshot;
+struct ServiceMetricsSnapshot;
 
 class MasterMetricManager {
    public:
@@ -67,6 +72,12 @@ class MasterMetricManager {
      * snapshots directly and must not read the resulting gauges.
      */
     void project_storage_usage(const TieredStorageUsageSnapshot& snapshot);
+
+    // Apply a cumulative per-client report exactly once. Repeated identical
+    // sequence numbers are accepted for retry idempotency; stale or conflicting
+    // reports and endpoint changes are rejected.
+    tl::expected<void, ErrorCode> ReportServiceMetrics(
+        const UUID& client_id, const ServiceMetricsSnapshot& snapshot);
 
     enum class CacheHitStat {
         MEMORY_HITS,
@@ -557,6 +568,14 @@ class MasterMetricManager {
         SummaryCounters counters;
     };
 
+    struct ServiceMetricClientState {
+        std::string endpoint;
+        uint64_t sequence = 0;
+        std::array<uint64_t, 4> dual_write{};
+        uint64_t pending = 0;
+        std::array<uint64_t, 2> read_failures{};
+    };
+
     // --- Metric Members ---
     std::mutex summary_snapshot_mutex_;
     SummarySnapshot summary_snapshot_;
@@ -564,6 +583,10 @@ class MasterMetricManager {
     std::mutex storage_projection_mutex_;
     std::set<std::string> projected_mem_segments_;
     std::set<std::string> projected_nof_segments_;
+
+    std::mutex service_metrics_mutex_;
+    std::map<UUID, ServiceMetricClientState> service_metric_clients_;
+    std::map<std::string, int64_t> service_pending_by_endpoint_;
 
     // Memory Storage Metrics
     ylt::metric::gauge_t
@@ -800,6 +823,10 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    ylt::metric::dynamic_counter_2t service_dual_write_total_;
+    ylt::metric::dynamic_gauge_1t service_dual_write_pending_;
+    ylt::metric::dynamic_counter_2t service_read_failures_total_;
 };
 
 }  // namespace mooncake

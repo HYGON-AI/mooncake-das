@@ -46,6 +46,7 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::probe_dfs_write_rpc>(&real_client);
     server.register_handler<&RealClient::probe_dfs_health>(&real_client);
     server.register_handler<&RealClient::set_dfs_access_policy>(&real_client);
+    server.register_handler<&RealClient::set_service_endpoint>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(
         &real_client);

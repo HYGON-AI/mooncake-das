@@ -2745,6 +2745,11 @@ int RealClient::set_dfs_access_policy(bool allow_read, bool allow_write) {
     return 0;
 }
 
+int RealClient::set_service_endpoint(const std::string& endpoint) {
+    if (!client_) return toInt(ErrorCode::INVALID_PARAMS);
+    return client_->SetServiceEndpoint(endpoint);
+}
+
 int RealClient::start_http_server(int port) {
     using namespace coro_http;
 
