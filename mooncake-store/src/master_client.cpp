@@ -198,6 +198,11 @@ struct RpcNameTraits<&WrappedMasterService::Ping> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ReportServiceMetrics> {
+    static constexpr const char* value = "ReportServiceMetrics";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
     static constexpr const char* value = "GetFsdir";
 };
@@ -1000,6 +1005,12 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
             ping_pool, client_id_);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportServiceMetrics(
+    const ServiceMetricsSnapshot& snapshot) {
+    return invoke_rpc<&WrappedMasterService::ReportServiceMetrics, void>(
+        client_id_, snapshot);
 }
 
 tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {

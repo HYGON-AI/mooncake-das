@@ -462,6 +462,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
 
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportServiceMetrics(
+        const ServiceMetricsSnapshot& snapshot);
+
     /**
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
