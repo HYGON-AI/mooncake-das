@@ -70,6 +70,8 @@ class QueryResult {
  * @brief Client for interacting with the mooncake distributed object store
  */
 class Client {
+    friend class MasterClientTestPeer;
+
    public:
     virtual ~Client();
 
