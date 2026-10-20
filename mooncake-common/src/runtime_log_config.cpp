@@ -1,7 +1,9 @@
 #include "runtime_log_config.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <mutex>
 #include <string_view>
 
@@ -80,6 +82,16 @@ std::mutex& RuntimeLogMutex() {
     return mutex;
 }
 
+bool ReadDfsReadTraceEnvValue() {
+    const char* val = std::getenv("MC_STORE_DFS_READ_TRACE");
+    if (!val || val[0] == '\0') return false;
+    std::string value(val);
+    value = ToLower(std::move(value));
+    return value != "0" && value != "false" && value != "off";
+}
+
+std::atomic<bool> g_dfs_read_trace_enabled{ReadDfsReadTraceEnvValue()};
+
 }  // namespace
 
 RuntimeLogConfig GetRuntimeLogConfig() {
@@ -120,6 +132,7 @@ RuntimeLogConfig GetRuntimeLogConfig() {
             config.ylt_severity = "CRITICAL";
             break;
     }
+    config.dfs_read_trace = GetDfsReadTraceEnabled();
     return config;
 }
 
@@ -167,7 +180,18 @@ bool UpdateRuntimeLogConfig(const RuntimeLogConfigUpdate& update,
         easylog::set_min_severity(
             ParseYltLevel(*update.ylt_severity, &normalized));
     }
+    if (update.dfs_read_trace.has_value()) {
+        SetDfsReadTraceEnabled(*update.dfs_read_trace);
+    }
     return true;
+}
+
+bool GetDfsReadTraceEnabled() {
+    return g_dfs_read_trace_enabled.load(std::memory_order_relaxed);
+}
+
+void SetDfsReadTraceEnabled(bool enabled) {
+    g_dfs_read_trace_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 }  // namespace mooncake
