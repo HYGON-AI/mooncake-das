@@ -655,6 +655,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
+    // DFS initialization may succeed later on the allocator retry thread.
+    dfs_eviction_thread_ =
+        std::thread(&MasterService::DfsEvictionThreadFunc, this);
+    VLOG(1) << "action=start_dfs_eviction_thread";
 
     // Start client monitor thread in all modes so TTL/heartbeat works
     client_monitor_running_ = true;
@@ -940,6 +944,9 @@ MasterService::~MasterService() {
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
+    }
+    if (dfs_eviction_thread_.joinable()) {
+        dfs_eviction_thread_.join();
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
@@ -10127,7 +10134,6 @@ void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
-    auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
@@ -10176,6 +10182,22 @@ void MasterService::EvictionThreadFunc() {
         }
 #endif
 
+        if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
+            RunPromotionCandidateRetry();
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kEvictionThreadSleepMs));
+    }
+
+    VLOG(1) << "action=eviction_thread_stopped";
+}
+
+void MasterService::DfsEvictionThreadFunc() {
+    VLOG(1) << "action=dfs_eviction_thread_started";
+
+    auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    while (eviction_running_) {
         if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
             ProcessInvalidatedDfsBuckets();
             const auto steady_now = std::chrono::steady_clock::now();
@@ -10198,15 +10220,11 @@ void MasterService::EvictionThreadFunc() {
             }
         }
 
-        if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
-            RunPromotionCandidateRetry();
-        }
-
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kEvictionThreadSleepMs));
     }
 
-    VLOG(1) << "action=eviction_thread_stopped";
+    VLOG(1) << "action=dfs_eviction_thread_stopped";
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(

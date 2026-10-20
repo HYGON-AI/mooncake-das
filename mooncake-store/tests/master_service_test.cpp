@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "tenant_quota_policy_store.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 #include "types.h"
 #include "utils.h"
 
@@ -140,6 +141,20 @@ class MasterServiceTest : public ::testing::Test {
     void ResumeReplicaCleanup(MasterService& service) {
         service.replica_cleanup_worker_.Start();
         service.replica_cleanup_worker_.Schedule();
+    }
+
+    void SetDfsAllocator(MasterService& service,
+                         DfsAllocatorInterface* allocator) {
+        service.dfs_allocator_.store(allocator);
+    }
+
+    void RequestMemoryEviction(MasterService& service) {
+        service.need_mem_eviction_ = true;
+    }
+
+    auto LockFirstMetadataShard(MasterService& service) {
+        return std::make_unique<MasterService::MetadataShardAccessorRW>(
+            &service, 0);
     }
 
     void ExpectKeyHiddenFromReadApis(MasterService& service,
@@ -1449,6 +1464,55 @@ TEST_F(MasterServiceTest,
 
 namespace {
 
+class BlockingDfsAllocator : public DfsAllocatorInterface {
+   public:
+    explicit BlockingDfsAllocator(bool blocked) : blocked_(blocked) {}
+
+    DfsAllocatorType Type() const override { return DfsAllocatorType::SHARD; }
+    tl::expected<void, ErrorCode> Init(
+        const DistributedStorageConfig&) override {
+        return {};
+    }
+    bool IsInitialized() const override { return true; }
+    tl::expected<DistributedFSDescriptor, ErrorCode> Allocate(
+        const std::string&, uint64_t) override {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    std::vector<BatchAllocateResult> BatchAllocate(
+        const std::vector<BatchAllocateRequest>&) override {
+        return {};
+    }
+    void Free(const std::string&, const DistributedFSDescriptor&) override {}
+    void UpdateAccess(const std::string&,
+                      const DistributedFSDescriptor&) override {}
+    bool IsEvictionEnabled() const override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++checks;
+        cv_.wait(lock, [this] { return !blocked_; });
+        return false;
+    }
+    std::chrono::seconds GetEvictionCheckInterval() const override {
+        return std::chrono::seconds(1);
+    }
+    uint64_t GetTotalCapacity() const override { return 0; }
+    uint64_t GetUsedBytes() const override { return 0; }
+
+    void Unblock() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            blocked_ = false;
+        }
+        cv_.notify_all();
+    }
+
+    mutable std::atomic<size_t> checks{0};
+
+   private:
+    mutable std::mutex mutex_;
+    mutable std::condition_variable cv_;
+    bool blocked_;
+};
+
 // Applies the environment needed to run the master with the BUCKET allocator.
 class ScopedBucketDfsEnv {
    public:
@@ -1588,6 +1652,46 @@ std::optional<int64_t> ReadDfsReplicaGauge(const std::string& serialized,
 }
 
 }  // namespace
+
+TEST_F(MasterServiceTest, MemoryEvictionContinuesWhileDfsMaintenanceIsBlocked) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "0");
+    BlockingDfsAllocator allocator(/*blocked=*/true);
+    const auto config = MasterServiceConfig::builder()
+                            .set_default_kv_lease_ttl(0)
+                            .set_eviction_ratio(1.0)
+                            .build();
+    MasterService service(config);
+    const auto context = PrepareSimpleSegment(service);
+    PutCompletedObject(service, context.client_id, "memory_during_dfs", {});
+
+    SetDfsAllocator(service, &allocator);
+    WaitUntil([&] { return allocator.checks.load() > 0; });
+    RequestMemoryEviction(service);
+    WaitUntil([&] {
+        return !service
+                    .GetReplicaListForAdmin("memory_during_dfs",
+                                            TenantId::Default())
+                    .has_value();
+    });
+    allocator.Unblock();
+}
+
+TEST_F(MasterServiceTest, DfsMaintenanceContinuesWhileMemoryEvictionIsBlocked) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "0");
+    BlockingDfsAllocator allocator(/*blocked=*/false);
+    const auto config =
+        MasterServiceConfig::builder().set_eviction_ratio(1.0).build();
+    MasterService service(config);
+    SetDfsAllocator(service, &allocator);
+    WaitUntil([&] { return allocator.checks.load() > 0; });
+
+    // BatchEvict's census cannot finish while this shard is locked.
+    auto shard_lock = LockFirstMetadataShard(service);
+    RequestMemoryEviction(service);
+    const auto checks_before = allocator.checks.load();
+    // A shared loop could finish at most its current DFS check before blocking.
+    WaitUntil([&] { return allocator.checks.load() >= checks_before + 3; });
+}
 
 TEST_F(MasterServiceTest, DfsGetMetricsFollowFirstReadableReplica) {
     const auto root = MakeDfsTestRoot("query_metrics");
