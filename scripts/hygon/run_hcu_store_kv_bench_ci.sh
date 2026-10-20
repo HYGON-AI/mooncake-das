@@ -14,7 +14,6 @@ Node addresses are resolved at runtime and are not stored in this file.
 
 Required environment variables:
   HCU_TEST_IMAGE            Container image used on both nodes
-  HCU_TEST_DTK_PKG_URL      DTK tarball installed in both containers
 
 Optional environment variables:
   HCU_TEST_TARGET_HOST      Primary host (default: nmz4)
@@ -129,17 +128,13 @@ PY
 prepare_container() {
     local wheel_path="$1"
     local install_etcd="$2"
-    local dtk_tarball="/tmp/$(basename "${HCU_TEST_DTK_PKG_URL}")"
-    local dtk_dir=""
 
-    wget -q "${HCU_TEST_DTK_PKG_URL}" -O "${dtk_tarball}"
-    tar -xzf "${dtk_tarball}" -C /opt
-    dtk_dir="$(find /opt -mindepth 1 -maxdepth 1 -type d -name 'dtk-*' -print -quit)"
-    if [ -z "${dtk_dir}" ]; then
-        echo "ERROR: the DTK archive did not create /opt/dtk-*" >&2
+    # The CI images are expected to ship DTK under /opt/dtk; there is no
+    # fallback installation path.
+    if [ ! -f /opt/dtk/env.sh ]; then
+        echo "ERROR: DTK is not installed in this container image (/opt/dtk/env.sh is missing)." >&2
         exit 1
     fi
-    ln -s "${dtk_dir}" /opt/dtk
     activate_runtime
 
     python3 -m pip install "${wheel_path}"
@@ -248,7 +243,6 @@ run_store_benchmark() {
 
 case "${1:-}" in
     __container_prepare)
-        require_env HCU_TEST_DTK_PKG_URL
         require_env HCU_STORE_ETCD_URL
         prepare_container "$2" "$3"
         exit 0
@@ -287,7 +281,6 @@ if [ "$#" -ne 1 ]; then
 fi
 
 require_env HCU_TEST_IMAGE
-require_env HCU_TEST_DTK_PKG_URL
 
 for command_name in awk docker flock getent grep python3 realpath scp sed ssh timeout; do
     command -v "${command_name}" >/dev/null 2>&1 || {
@@ -511,7 +504,7 @@ echo "Cross-node test locks acquired."
 ssh "${SSH_OPTIONS[@]}" "${REMOTE}" mkdir -p "${REMOTE_WORK_DIR}"
 scp "${SCP_OPTIONS[@]}" "${WHEEL_PATH}" "${SELF_PATH}" "${REMOTE}:${REMOTE_WORK_DIR}/"
 
-DOCKER_ENV_ARGS=(-e "HCU_TEST_DTK_PKG_URL=${HCU_TEST_DTK_PKG_URL}" -e "HCU_STORE_ETCD_URL=${ETCD_URL}")
+DOCKER_ENV_ARGS=(-e "HCU_STORE_ETCD_URL=${ETCD_URL}")
 [ -n "${PIP_INDEX_URL:-}" ] && DOCKER_ENV_ARGS+=(-e "PIP_INDEX_URL=${PIP_INDEX_URL}")
 [ -n "${PIP_TRUSTED_HOST:-}" ] && DOCKER_ENV_ARGS+=(-e "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}")
 
@@ -526,12 +519,12 @@ docker run -d --name "${PRIMARY_CONTAINER}" --network host --privileged \
 
 ssh "${SSH_OPTIONS[@]}" "${REMOTE}" bash -s -- \
     "${REMOTE_WORK_DIR}" "${WHEEL_BASENAME}" "$(basename "${SELF_PATH}")" \
-    "${SECONDARY_CONTAINER}" "${HCU_TEST_IMAGE}" "${HCU_TEST_DTK_PKG_URL}" "${ETCD_URL}" \
+    "${SECONDARY_CONTAINER}" "${HCU_TEST_IMAGE}" "${ETCD_URL}" \
     "${PIP_INDEX_URL:-}" "${PIP_TRUSTED_HOST:-}" <<'REMOTE_CONTAINER' >/dev/null
 set -Eeuo pipefail
 remote_dir="$1"; wheel="$2"; script="$3"; container="$4"; image="$5"
-dtk_url="$6"; etcd_url="$7"; pip_index="$8"; pip_trusted="$9"
-env_args=(-e "HCU_TEST_DTK_PKG_URL=${dtk_url}" -e "HCU_STORE_ETCD_URL=${etcd_url}")
+etcd_url="$6"; pip_index="$7"; pip_trusted="$8"
+env_args=(-e "HCU_STORE_ETCD_URL=${etcd_url}")
 [ -n "${pip_index}" ] && env_args+=(-e "PIP_INDEX_URL=${pip_index}")
 [ -n "${pip_trusted}" ] && env_args+=(-e "PIP_TRUSTED_HOST=${pip_trusted}")
 docker run -d --name "${container}" --network host --privileged \
