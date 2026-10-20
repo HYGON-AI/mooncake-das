@@ -77,6 +77,47 @@ namespace {
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
 
+enum class DfsRootFileStatus {
+    kMatch,
+    kMissing,
+    kInvalid,
+    kIoError,
+};
+
+DfsRootFileStatus ReadExpectedDfsRootFile(const std::string& path,
+                                          std::string_view expected) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        return errno == ENOENT ? DfsRootFileStatus::kMissing
+                              : DfsRootFileStatus::kIoError;
+    }
+
+    struct stat st {};
+    bool valid = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                 static_cast<uint64_t>(st.st_size) == expected.size();
+    std::string contents;
+    if (valid) {
+        contents.resize(expected.size());
+        size_t offset = 0;
+        while (offset < contents.size()) {
+            const ssize_t count =
+                ::read(fd, contents.data() + offset, contents.size() - offset);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) {
+                valid = false;
+                break;
+            }
+            offset += static_cast<size_t>(count);
+        }
+    }
+    const int close_result = ::close(fd);
+    if (close_result != 0) return DfsRootFileStatus::kIoError;
+    if (!valid || std::string_view(contents) != expected) {
+        return DfsRootFileStatus::kInvalid;
+    }
+    return DfsRootFileStatus::kMatch;
+}
+
 bool ReadDfsRootIdentity(const std::string& marker_path,
                          const std::string& cluster_id,
                          std::string& identity, bool& missing) {
@@ -138,6 +179,56 @@ bool WriteAll(int fd, const std::string& contents) {
     return ::fsync(fd) == 0;
 }
 
+bool PublishExpectedDfsRootFile(const std::string& root,
+                                const std::string& path,
+                                const std::string& contents) {
+    const UUID suffix = generate_uuid();
+    const std::string temp_path =
+        path + "." + std::to_string(::getpid()) + "." +
+        UuidToString(suffix) + ".tmp";
+    const int temp_fd = ::open(temp_path.c_str(),
+                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
+                                   O_NOFOLLOW,
+                               0644);
+    if (temp_fd < 0) {
+        LOG(ERROR) << "Failed to create DFS root temp file " << temp_path
+                   << ": " << std::strerror(errno);
+        return false;
+    }
+
+    const bool temp_written = WriteAll(temp_fd, contents);
+    const int close_result = ::close(temp_fd);
+    if (!temp_written || close_result != 0) {
+        const int saved_errno = errno;
+        ::unlink(temp_path.c_str());
+        LOG(ERROR) << "Failed to write DFS root temp file " << temp_path
+                   << ": " << std::strerror(saved_errno);
+        return false;
+    }
+
+    const int link_result = ::link(temp_path.c_str(), path.c_str());
+    const int link_errno = errno;
+    if (link_result != 0 && link_errno != EEXIST) {
+        ::unlink(temp_path.c_str());
+        LOG(ERROR) << "Failed to publish DFS root file " << path << ": "
+                   << std::strerror(link_errno);
+        return false;
+    }
+    ::unlink(temp_path.c_str());
+
+    // EEXIST means another writer won the race, not that it published the
+    // expected bytes. Re-read in both cases before declaring success.
+    if (ReadExpectedDfsRootFile(path, contents) !=
+        DfsRootFileStatus::kMatch) {
+        return false;
+    }
+    if (!SyncDfsRootDirectory(root)) {
+        LOG(ERROR) << "Failed to sync DFS root after publishing " << path;
+        return false;
+    }
+    return true;
+}
+
 bool EnsureDfsRootIdentity(const std::string& root,
                            const std::string& cluster_id,
                            std::string& identity) {
@@ -166,62 +257,40 @@ bool EnsureDfsRootIdentity(const std::string& root,
         return false;
     }
 
-    const UUID token{
-        randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max()),
-        randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max())};
-    const std::string candidate = SerializeDfsRootIdentity(cluster_id, token);
-    if (candidate.empty()) return false;
-
-    const std::string temp_path =
-        marker_path + "." + std::to_string(::getpid()) + "." +
-        UuidToString(token) + ".tmp";
-    const int temp_fd = ::open(temp_path.c_str(),
-                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
-                                   O_NOFOLLOW,
-                               0644);
-    if (temp_fd < 0) {
-        LOG(ERROR) << "Failed to create DFS root identity temp file "
-                   << temp_path << ": " << std::strerror(errno);
-        return false;
-    }
-    const bool temp_written = WriteAll(temp_fd, candidate);
-    const int close_result = ::close(temp_fd);
-    if (!temp_written || close_result != 0) {
-        const int saved_errno = errno;
-        ::unlink(temp_path.c_str());
-        LOG(ERROR) << "Failed to write DFS root identity temp file "
-                   << temp_path << ": " << std::strerror(saved_errno);
-        return false;
-    }
-
-    if (::link(temp_path.c_str(), marker_path.c_str()) == 0) {
-        ::unlink(temp_path.c_str());
-        if (!SyncDfsRootDirectory(root)) {
-            LOG(ERROR) << "Failed to sync DFS root after publishing identity "
+    const bool restoring_cached_identity = !identity.empty();
+    std::string candidate = identity;
+    if (restoring_cached_identity) {
+        std::string parsed;
+        if (!ParseDfsRootIdentity(candidate, cluster_id, parsed) ||
+            parsed != candidate) {
+            LOG(ERROR) << "Refusing to restore an invalid cached DFS root "
+                          "identity for "
                        << marker_path;
             return false;
         }
-        identity = candidate;
-        return true;
+    } else {
+        const UUID token{
+            randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max()),
+            randomUniform<uint64_t>(0, std::numeric_limits<uint64_t>::max())};
+        candidate = SerializeDfsRootIdentity(cluster_id, token);
+        if (candidate.empty()) return false;
     }
 
-    const int link_error = errno;
-    ::unlink(temp_path.c_str());
-    if (link_error != EEXIST) {
-        LOG(ERROR) << "Failed to publish DFS root identity marker "
-                   << marker_path << ": " << std::strerror(link_error);
+    if (!PublishExpectedDfsRootFile(root, marker_path, candidate)) {
+        // Concurrent first-time initializers legitimately generate different
+        // candidates. The atomic link chooses one; initializers that lose the
+        // race adopt the complete, valid winner. Recovery from a cached
+        // identity must remain exact and may never adopt a different value.
+        if (!restoring_cached_identity &&
+            ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
+            return true;
+        }
+        LOG(ERROR) << "Failed to publish or validate DFS root identity "
+                   << marker_path;
         return false;
     }
-
-    // Another initializer atomically published the marker first. Its file is
-    // already complete because the temporary inode was synced before link().
-    if (ReadDfsRootIdentity(marker_path, cluster_id, identity, missing)) {
-        return true;
-    }
-    LOG(ERROR) << "Concurrent DFS root identity marker is invalid or belongs "
-                  "to a different cluster: "
-               << marker_path;
-    return false;
+    identity = std::move(candidate);
+    return true;
 }
 
 // Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
@@ -402,6 +471,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 uint32_t{300}),
             1),
         std::memory_order_release);
+    dfs_root_guard_interval_ = std::chrono::seconds(std::max(
+        Environ::GetInt("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS", 5), 1));
     LOG(INFO) << "DFS heartbeat interval initialized to "
               << dfs_heartbeat_interval_seconds_.load(
                      std::memory_order_acquire)
@@ -807,6 +878,14 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         return;
     }
 
+    if (!InitializeDfsRootGuard(dfs_config.fsdir, dfs_root_identity_)) {
+        LOG(ERROR) << "Failed to initialize DFS root file guard for "
+                   << dfs_config.fsdir;
+        enable_dfs_ = false;
+        dfs_retry_needed_.store(true, std::memory_order_release);
+        return;
+    }
+
     // Snapshot is the metadata recovery source when enabled. Do not rebuild
     // DFS replicas from bucket state in that mode.
     if (bucket_allocator != nullptr && dfs_restore_from_bucket_metadata_) {
@@ -849,6 +928,86 @@ void MasterService::DfsAllocatorRetryThreadFunc() {
         }
         if (!dfs_retry_needed_.load(std::memory_order_acquire)) break;
     }
+}
+
+bool MasterService::InitializeDfsRootGuard(const std::string& root,
+                                           const std::string& identity) {
+    struct stat st {};
+    if (::stat(root.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return false;
+    }
+
+    const std::string identity_path = root + "/" + kDfsRootIdentityFileName;
+    if (ReadExpectedDfsRootFile(identity_path, identity) !=
+        DfsRootFileStatus::kMatch) {
+        return false;
+    }
+
+    std::lock_guard lock(dfs_root_guard_mutex_);
+    dfs_root_guard_path_ = root;
+    dfs_root_guard_identity_ = identity;
+    dfs_root_guard_device_ = static_cast<uint64_t>(st.st_dev);
+    dfs_root_guard_inode_ = static_cast<uint64_t>(st.st_ino);
+    dfs_root_guard_ready_ = true;
+    return true;
+}
+
+void MasterService::ReconcileDfsRootFiles() {
+    std::lock_guard lock(dfs_root_guard_mutex_);
+    if (!dfs_root_guard_ready_ ||
+        !enable_dfs_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    struct stat st {};
+    if (::stat(dfs_root_guard_path_.c_str(), &st) != 0 ||
+        !S_ISDIR(st.st_mode) ||
+        static_cast<uint64_t>(st.st_dev) != dfs_root_guard_device_ ||
+        static_cast<uint64_t>(st.st_ino) != dfs_root_guard_inode_) {
+        static DfsLogLimiter mount_log_limiter;
+        if (auto suppressed = mount_log_limiter.ShouldLog()) {
+            LOG(ERROR) << "DFS root mount identity changed; refusing to "
+                          "recreate guard files, root="
+                       << dfs_root_guard_path_
+                       << ", suppressed=" << *suppressed;
+        }
+        return;
+    }
+
+    const auto reconcile = [this](const char* filename,
+                                  const std::string& expected) {
+        const std::string path = dfs_root_guard_path_ + "/" + filename;
+        switch (ReadExpectedDfsRootFile(path, expected)) {
+            case DfsRootFileStatus::kMatch:
+                return true;
+            case DfsRootFileStatus::kMissing:
+                if (PublishExpectedDfsRootFile(dfs_root_guard_path_, path,
+                                               expected)) {
+                    LOG(WARNING) << "Recreated missing DFS root file " << path;
+                    return true;
+                }
+                LOG(ERROR) << "Failed to recreate missing DFS root file "
+                           << path;
+                return false;
+            case DfsRootFileStatus::kInvalid:
+                LOG(ERROR) << "DFS root file has unexpected contents; "
+                              "refusing to overwrite "
+                           << path;
+                return false;
+            case DfsRootFileStatus::kIoError:
+                LOG(ERROR) << "Failed to inspect DFS root file " << path;
+                return false;
+        }
+        return false;
+    };
+
+    // Identity is the safety boundary. Do not recreate the read-probe marker
+    // until the root still carries (or has atomically recovered) the exact
+    // identity pinned when the allocator was initialized.
+    if (!reconcile(kDfsRootIdentityFileName, dfs_root_guard_identity_)) return;
+    reconcile(kDfsRootMarkerFileName,
+              std::string(kDfsRootMarkerPayload,
+                          sizeof(kDfsRootMarkerPayload) - 1));
 }
 
 void MasterService::RefreshDfsMetrics() const {
@@ -10128,6 +10287,7 @@ void MasterService::EvictionThreadFunc() {
 
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_dfs_root_guard_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
@@ -10200,6 +10360,12 @@ void MasterService::EvictionThreadFunc() {
 
         if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
             RunPromotionCandidateRetry();
+        }
+
+        const auto guard_now = std::chrono::steady_clock::now();
+        if (guard_now >= next_dfs_root_guard_time) {
+            ReconcileDfsRootFiles();
+            next_dfs_root_guard_time = guard_now + dfs_root_guard_interval_;
         }
 
         std::this_thread::sleep_for(
