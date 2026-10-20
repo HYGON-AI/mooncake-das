@@ -1997,7 +1997,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const int selected_http_port =
         enable_client_http_server ? client_http_port : FLAGS_http_port;
     if (should_start_http_server) {
-        if (selected_http_port <= 0 || selected_http_port > 65535) {
+        // Port zero asks the listening socket to allocate an available port.
+        // Independent SGLang instances can then enable HTTP metrics without
+        // sharing a rank-derived fixed port.
+        if (selected_http_port < 0 || selected_http_port > 65535) {
             LOG(ERROR) << "Invalid client HTTP server port: "
                        << selected_http_port;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2772,6 +2775,11 @@ int RealClient::set_dfs_access_policy(bool allow_read, bool allow_write) {
     return 0;
 }
 
+int RealClient::set_service_endpoint(const std::string& endpoint) {
+    if (!client_) return toInt(ErrorCode::INVALID_PARAMS);
+    return client_->SetServiceEndpoint(endpoint);
+}
+
 int RealClient::start_http_server(int port) {
     using namespace coro_http;
 
@@ -2861,7 +2869,7 @@ int RealClient::start_http_server(int port) {
         http_server_.reset();
         return -1;
     }
-    LOG(INFO) << "Client HTTP server started on port " << port;
+    LOG(INFO) << "Client HTTP server started on port " << http_server_->port();
     return 0;
 }
 

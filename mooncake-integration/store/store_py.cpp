@@ -2511,6 +2511,15 @@ PYBIND11_MODULE(store, m) {
              "Probe DFS read capability and return an error code.")
         .def("probe_dfs_write", &MooncakeStorePyWrapper::probe_dfs_write,
              "Probe DFS write capability and return an error code.")
+        .def(
+            "set_service_endpoint",
+            [](MooncakeStorePyWrapper &self, const std::string &endpoint) {
+                if (!self.store_) return toInt(ErrorCode::INVALID_PARAMS);
+                py::gil_scoped_release release;
+                return self.store_->set_service_endpoint(endpoint);
+            },
+            py::arg("endpoint"),
+            "Enable master-reported service metrics for this immutable service endpoint.")
         .def("set_dfs_access_policy",
              &MooncakeStorePyWrapper::set_dfs_access_policy,
              py::arg("allow_read"), py::arg("allow_write"),

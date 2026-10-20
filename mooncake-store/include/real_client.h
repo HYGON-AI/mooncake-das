@@ -469,6 +469,7 @@ class RealClient : public PyClient {
     async_simple::coro::Lazy<int> probe_dfs_write_rpc();
     std::vector<int> probe_dfs_health() override;
     int set_dfs_access_policy(bool allow_read, bool allow_write) override;
+    int set_service_endpoint(const std::string& endpoint) override;
 
     /**
      * @brief Check if an object exists

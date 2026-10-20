@@ -5,9 +5,11 @@
 // calls std::signal without including <csignal> itself.
 #include <csignal>
 #include <cstdlib>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_metric.h"
@@ -451,6 +453,63 @@ TEST_F(ClientMetricsTest, HttpMetricsEndpointsReturnData) {
     EXPECT_NE(summary.body.find("Client Metrics Summary"), std::string::npos);
 
     EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, HttpMetricsAutoPortsKeepEightClientsAccessible) {
+    ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
+    setenv("MC_STORE_CLIENT_METRIC", "1", 1);
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_http_metadata_port(0)
+                                 .build()));
+
+    // Observe the actual bound ports advertised to users, not preselected ports.
+    class PortLogSink : public google::LogSink {
+       public:
+        PortLogSink() { google::AddLogSink(this); }
+        ~PortLogSink() override { google::RemoveLogSink(this); }
+        void send(google::LogSeverity, const char*, const char*, int,
+                  const struct ::tm*, const char* message, size_t length) override {
+            const std::string text(message, length);
+            const std::string prefix = "Client HTTP server started on port ";
+            const auto offset = text.find(prefix);
+            if (offset == std::string::npos) return;
+            const int port = std::stoi(text.substr(offset + prefix.size()));
+            std::lock_guard<std::mutex> lock(mutex_);
+            ports_.push_back(port);
+        }
+        std::vector<int> ports() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return ports_;
+        }
+
+       private:
+        std::mutex mutex_;
+        std::vector<int> ports_;
+    } log_sink;
+
+    std::vector<std::shared_ptr<RealClient>> clients;
+    // Four TP=2 services share the same network namespace: eight live Clients.
+    for (int i = 0; i < 8; ++i) {
+        auto client = RealClient::create();
+        clients.push_back(client);
+        auto setup = SetupClientWithHttp(client, "127.0.0.1",
+                                         master.master_address(), true, 0);
+        ASSERT_TRUE(setup.has_value()) << toString(setup.error());
+    }
+    const auto ports = log_sink.ports();
+    ASSERT_EQ(ports.size(), clients.size());
+    const std::unordered_set<int> distinct_ports(ports.begin(), ports.end());
+    EXPECT_EQ(distinct_ports.size(), clients.size());
+    for (int port : ports) {
+        ASSERT_GT(port, 0);
+        const auto endpoint = "http://127.0.0.1:" + std::to_string(port);
+        EXPECT_EQ(FetchUrl(endpoint + "/health").status, 200);
+        const auto metrics = FetchUrl(endpoint + "/metrics");
+        EXPECT_EQ(metrics.status, 200);
+        EXPECT_NE(metrics.body.find("# HELP"), std::string::npos);
+    }
+    for (auto& client : clients) EXPECT_EQ(client->tearDownAll(), 0);
 }
 
 TEST_F(ClientMetricsTest, HttpMetricsConfigParserTrimsWhitespace) {
