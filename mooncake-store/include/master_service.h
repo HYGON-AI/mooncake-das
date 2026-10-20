@@ -2111,10 +2111,9 @@ class MasterService {
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
     void ProcessInvalidatedDfsBuckets();
-    // Whole-bucket eviction (BUCKET mode). Uses a strict two-phase protocol:
-    // validate every candidate first and only mutate metadata once all of them
-    // are accepted, so a bucket file is never deleted while the master still
-    // hands out a descriptor into it.
+    // Whole-bucket eviction (BUCKET mode). Freeze reads as candidates pass
+    // validation, then remove replicas and bucket files after revalidation.
+    // Aborting eviction restores reads for the matching replica generations.
     void RunBucketDfsEviction();
     bool RunBucketDfsEvictionInternal(
         bool force_one,
