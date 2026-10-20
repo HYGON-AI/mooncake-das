@@ -122,7 +122,7 @@ jobs:
       DTK_VERSION: ${{ matrix.dtk_version }}
     steps:
       - name: Checkout PR source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           # Pin to the head SHA from the event payload so a later push cannot
           # swap the code under a maintainer-approved run.
@@ -200,7 +200,7 @@ jobs:
       PIP_INDEX_URL: "${{ vars.PYPI_URL }}/nightly/dtk2610/+simple/"
     steps:
       - name: Checkout test script
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           allow-unsafe-pr-checkout: true
@@ -251,7 +251,7 @@ jobs:
       PIP_INDEX_URL: "${{ vars.PYPI_URL }}/nightly/dtk2610/+simple/"
     steps:
       - name: Checkout Store benchmark source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           allow-unsafe-pr-checkout: true
