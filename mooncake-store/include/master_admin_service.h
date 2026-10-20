@@ -108,6 +108,10 @@ class MasterAdminServer {
                                     coro_http::coro_http_response& resp);
     void HandleSetDfsHeartbeatInterval(coro_http::coro_http_request& req,
                                        coro_http::coro_http_response& resp);
+    void HandleGetLogging(coro_http::coro_http_request& req,
+                          coro_http::coro_http_response& resp);
+    void HandleUpdateLogging(coro_http::coro_http_request& req,
+                             coro_http::coro_http_response& resp);
 
     void RegisterHandler();
     void RefreshStorageMetrics() const;
