@@ -275,6 +275,15 @@ For `mooncake.mooncake_store_service`, set
 `MOONCAKE_CLIENT_HTTP_PORT=<port>`. For the standalone `mooncake_client`, use
 `--enable_http_server=true --http_port=<port>`.
 
+In SGLang, `--enable-metrics` also enables the Mooncake Client HTTP server.
+By default each Client binds port `0`, so the OS assigns a free port even when
+several TP/DP services share one host. The startup log prints the actual port
+as `Client HTTP server started on port <port>`. SGLang's own metrics endpoint
+and the Master's service-level metrics keep their existing ports.
+An explicitly configured positive `MOONCAKE_CLIENT_METRICS_PORT_BASE` retains
+the fixed base-plus-rank allocation; separate services must then use disjoint
+ranges. Programmatic Mooncake clients can also pass `client_http_port=0`.
+
 | Endpoint | Content-Type | Description |
 |----------|--------------|-------------|
 | `GET /health` | `application/json` | Client health check |
