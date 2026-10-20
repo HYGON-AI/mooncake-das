@@ -21,6 +21,7 @@
 #include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
+#include "runtime_log_config.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "utils.h"
@@ -32,6 +33,13 @@ namespace test {
 
 namespace {
 
+struct HttpErrorResponse {
+    bool success{false};
+    int32_t error_code{0};
+    std::string error_message;
+};
+YLT_REFL(HttpErrorResponse, success, error_code, error_message);
+
 struct HttpCreateDrainJobResponse {
     bool success{false};
     std::string job_id;
@@ -41,6 +49,14 @@ struct HttpCreateDrainJobResponse {
 };
 YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
          error_message);
+
+struct HttpLoggingResponse {
+    bool success{false};
+    std::string minloglevel;
+    int vlog_level{0};
+    std::string ylt_severity;
+};
+YLT_REFL(HttpLoggingResponse, success, minloglevel, vlog_level, ylt_severity);
 
 struct HttpQueryDrainJobResponse {
     bool success{false};
@@ -76,13 +92,6 @@ struct HttpSegmentStatusResponse {
 };
 YLT_REFL(HttpSegmentStatusResponse, success, segment, status, status_name,
          error_code, error_message);
-
-struct HttpErrorResponse {
-    bool success{false};
-    int32_t error_code{0};
-    std::string error_message;
-};
-YLT_REFL(HttpErrorResponse, success, error_code, error_message);
 
 struct HttpSegmentsDetailResponse {
     uint64_t total_segments{0};
@@ -195,9 +204,50 @@ class MasterAdminServerTest : public ::testing::Test {
     }
 };
 
-// =========================================================================
-// Always-available endpoint tests
-// =========================================================================
+TEST_F(MasterAdminServerTest, LoggingEndpointUpdatesRuntimeConfig) {
+    const auto original = GetRuntimeLogConfig();
+    const int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+
+    auto response = HttpGet(port, "/api/v1/logging");
+    ASSERT_EQ(response.http_status, 200);
+    HttpLoggingResponse initial;
+    struct_json::from_json(initial, response.body);
+    ASSERT_TRUE(initial.success);
+
+    response = HttpPutJson(
+        port, "/api/v1/logging",
+        R"({"minloglevel":"INFO","vlog_level":1,"ylt_severity":"INFO"})");
+    ASSERT_EQ(response.http_status, 200);
+    HttpLoggingResponse updated;
+    struct_json::from_json(updated, response.body);
+    EXPECT_TRUE(updated.success);
+    EXPECT_EQ(updated.minloglevel, "INFO");
+    EXPECT_EQ(updated.vlog_level, 1);
+    EXPECT_EQ(updated.ylt_severity, "INFO");
+
+    RuntimeLogConfigUpdate restore{
+        .minloglevel = original.minloglevel,
+        .vlog_level = original.vlog_level,
+        .ylt_severity = original.ylt_severity,
+    };
+    std::string error;
+    ASSERT_TRUE(UpdateRuntimeLogConfig(restore, &error)) << error;
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, LoggingEndpointRejectsInvalidConfig) {
+    const int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+
+    auto response = HttpPutJson(port, "/api/v1/logging",
+                                 R"({"vlog_level":3})");
+    EXPECT_EQ(response.http_status, 400);
+    EXPECT_NE(response.body.find("vlog_level"), std::string::npos);
+    admin.Stop();
+}
 
 TEST_F(MasterAdminServerTest, MetricsEndpointReturns200) {
     int port = getFreeTcpPort();
