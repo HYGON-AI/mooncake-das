@@ -5505,8 +5505,9 @@ void Client::StorageHeartbeatThreadMain() {
             LOG(ERROR) << "Failed to ping master for " << ping_fail_count
                        << " times (non-HA); reconnecting to "
                        << current_master_address;
-            auto err = master_client_.Connect(current_master_address,
-                                              /*force_recreate=*/true);
+            // Closed connections are replaced by the pool itself. Reusing the
+            // address pool also bounds retention while the master is down.
+            auto err = master_client_.Connect(current_master_address);
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Reconnect failed to " << current_master_address
                            << ": " << toString(err);

@@ -20,6 +20,14 @@
 #include "default_config.h"
 
 namespace mooncake {
+
+class MasterClientTestPeer {
+   public:
+    static auto Pool(const Client& client) {
+        return client.master_client_.client_accessor_.GetClientPool();
+    }
+};
+
 namespace testing {
 
 TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatOnlyAfterMount) {
@@ -120,6 +128,8 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     ASSERT_NE(seg_ptr, nullptr);
     auto mount_res = client->MountSegment(seg_ptr, ram_buffer_size);
     ASSERT_TRUE(mount_res.has_value()) << toString(mount_res.error());
+    const auto pool = MasterClientTestPeer::Pool(*client);
+    ASSERT_NE(pool, nullptr);
 
     // Verify segment is visible via helper (expected-based)
     {
@@ -132,7 +142,9 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
 
     // Stop master, wait for ping failures to accumulate
     master.Stop();
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    std::this_thread::sleep_for(std::chrono::seconds(6));
+    EXPECT_EQ(MasterClientTestPeer::Pool(*client), pool)
+        << "failed heartbeats must not retire a new pool on every reconnect";
 
     auto vis_result = CheckSegmentVisible(master, local_hostname);
     ASSERT_FALSE(vis_result.has_value())
@@ -158,6 +170,7 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     ASSERT_TRUE(found) << "Client did not reconnect and remount in time";
+    EXPECT_EQ(MasterClientTestPeer::Pool(*client), pool);
 
     // Cleanup
     auto unmount_res = client->UnmountSegment(seg_ptr, ram_buffer_size);
