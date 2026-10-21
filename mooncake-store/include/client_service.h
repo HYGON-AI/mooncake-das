@@ -981,7 +981,8 @@ class Client {
                              const std::vector<size_t>& op_indices,
                              bool is_upsert, bool allow_async,
                              bool* slot_timed_out = nullptr);
-    void FinalizeBatchPut(std::vector<PutOperation>& ops);
+    void FinalizeBatchPut(std::vector<PutOperation>& ops,
+                          bool allow_memory_only_fallback);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
@@ -1112,6 +1113,7 @@ class Client {
     const bool object_checksum_enabled_;
     const size_t dfs_write_arena_count_;
     const size_t dfs_write_chunk_size_;
+    const std::chrono::milliseconds dfs_write_arena_wait_;
 
     // Explicitly enabled by the serving application after setup. This reporter
     // has its own thread and cumulative snapshot, independent of local metrics.

@@ -1030,8 +1030,20 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
     EXPECT_FALSE(put_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
 
+    // NoF and DFS cannot be combined because ReplicaType::ALL cannot address
+    // either subset without also touching the third replica type.
+    config.replica_num = 1;
+    config.nof_replica_num = 1;
+    config.dfs_replica_num = 1;
+    config.prefer_alloc_in_same_node = false;
+    auto mixed_result =
+        service_->PutStart(client_id, key, TenantId::Default(), 1024, config);
+    EXPECT_FALSE(mixed_result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, mixed_result.error());
+
     // Test prefer_alloc_in_same_node with nof replicas
     config.nof_replica_num = 1;
+    config.dfs_replica_num = 0;
     config.prefer_alloc_in_same_node = true;
     auto put_result3 =
         service_->PutStart(client_id, key, TenantId::Default(), 1024, config);

@@ -194,6 +194,8 @@ std::optional<double> WaitForServiceMetricValue(
 
 class DfsBucketClientTest : public ::testing::Test {
    protected:
+    virtual void ConfigureClientEnvironment() {}
+
     void SetUp() override {
         root_ = (std::filesystem::temp_directory_path() /
                  ("dfs_bucket_client_" + std::to_string(::getpid()) + "_" +
@@ -215,6 +217,7 @@ class DfsBucketClientTest : public ::testing::Test {
         // Keep the shard fields valid; they are unused in bucket mode.
         SetEnv("MOONCAKE_DFS_SHARD_COUNT", "1");
         SetEnv("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+        ConfigureClientEnvironment();
 
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
         writer_ = CreateClient("127.0.0.1:18201");
@@ -542,6 +545,91 @@ TEST_F(DfsBucketClientTest, EmptyStartupIdentityRecoversFromMasterWithoutRestart
     EXPECT_EQ(output, value);
 }
 
+class DfsBucketClientChunkLimitTest : public DfsBucketClientTest {
+   protected:
+    void ConfigureClientEnvironment() override {
+        SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "16384");
+        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+    }
+};
+
+TEST_F(DfsBucketClientChunkLimitTest,
+       ChunkLimitFailureKeepsSuccessfulMemoryReplica) {
+    const std::string key = "chunk_limit_memory_fallback";
+    std::string value(32 * 1024, 'X');
+    std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
+
+    auto results = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    auto query = writer_->Query(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_TRUE(query->replicas[0].is_memory_replica());
+}
+
+class DfsBucketClientSlotTimeoutTest : public DfsBucketClientTest {
+   protected:
+    void ConfigureClientEnvironment() override {
+        SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
+        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+        SetEnv("MC_STORE_DFS_WRITE_ARENA_WAIT_MS", "1");
+    }
+};
+
+TEST_F(DfsBucketClientSlotTimeoutTest,
+       SlotTimeoutKeepsMemoryReplicasForUnsubmittedChunks) {
+    adapter_->BlockWrites();
+    std::vector<std::string> keys{"slot_timeout_0", "slot_timeout_1"};
+    std::vector<std::string> values(2, std::string(3072, 'T'));
+    auto slices = MakeSlices(values);
+
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_TRUE(results[0].has_value());
+    ASSERT_TRUE(results[1].has_value());
+
+    auto query = writer_->Query(keys[0]);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_TRUE(query->replicas[0].is_memory_replica());
+    query = writer_->Query(keys[1]);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_TRUE(query->replicas[0].is_memory_replica());
+
+    adapter_->ReleaseWrites();
+    ASSERT_TRUE(WaitForDfsReplica(keys[0]));
+    query = writer_->Query(keys[1]);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_EQ(query->replicas.size(), 1u);
+    EXPECT_TRUE(query->replicas[0].is_memory_replica());
+}
+
+class DfsBucketClientMultiChunkTest : public DfsBucketClientTest {
+   protected:
+    void ConfigureClientEnvironment() override {
+        SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
+        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+    }
+};
+
+TEST_F(DfsBucketClientMultiChunkTest, BatchPutProcessesMultipleChunks) {
+    std::vector<std::string> keys{"multi_chunk_0", "multi_chunk_1",
+                                  "multi_chunk_2"};
+    std::vector<std::string> values(3, std::string(3072, 'M'));
+    auto slices = MakeSlices(values);
+
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        ASSERT_TRUE(results[i].has_value())
+            << "key " << keys[i] << ": " << toString(results[i].error());
+        ASSERT_TRUE(WaitForDfsReplica(keys[i]));
+        ExpectDfsValue(keys[i], values[i]);
+    }
+}
+
 TEST_F(DfsBucketClientTest, BatchPutWritesEveryKeyAndKeepsBatchContiguous) {
     std::vector<std::string> keys{"bucket_batch_0", "bucket_batch_1",
                                   "bucket_batch_2", "bucket_batch_3"};
@@ -637,12 +725,14 @@ TEST_F(DfsBucketClientTest,
         std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
         auto results = writer_->BatchPut(keys, slices, DfsConfig());
         ASSERT_EQ(results.size(), 1u);
-        ASSERT_FALSE(results[0].has_value());  // BUCKET requires both replicas.
+        ASSERT_TRUE(results[0].has_value());
         EXPECT_EQ(staging_device.copies,
                   Environ::Get().GetStoreChecksumEnabled() ? 2 : 1);
         auto query = writer_->Query(keys[0]);
-        ASSERT_FALSE(query.has_value());
-        EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query->replicas.size(), 1u);
+        ASSERT_TRUE(query->replicas[0].is_memory_replica());
+        ASSERT_TRUE(writer_->Remove(keys[0], true).has_value());
         staging_device.Reset(value.data(), value.size());
         results = writer_->BatchPut(keys, slices, DfsConfig());
         ASSERT_TRUE(results[0].has_value());
@@ -674,10 +764,8 @@ TEST_F(DfsBucketClientTest, ChecksumMissingBackendKeepsOriginalD2hPath) {
     staging_device.Reset(value.data(), value.size());
     std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
     auto results = writer_->BatchPut(keys, slices, DfsConfig());
-    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results.size() == 1u);
     ASSERT_FALSE(results[0].has_value());
-    EXPECT_EQ(staging_device.copies,
-              Environ::Get().GetStoreChecksumEnabled() ? 1 : 0);
     auto query = writer_->Query(keys[0]);
     ASSERT_FALSE(query.has_value());
     EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);

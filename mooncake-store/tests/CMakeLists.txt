@@ -161,6 +161,7 @@ add_store_test(dfs_immutable_bucket_backend_test
                dfs_immutable_bucket_backend_test.cpp)
 add_store_test(dfs_immutable_bucket_client_test
                dfs_immutable_bucket_client_test.cpp)
+add_store_test(dfs_write_staging_pool_test dfs_write_staging_pool_test.cpp)
 add_test(NAME dfs_bucket_write_checksum_test
          COMMAND dfs_immutable_bucket_client_test)
 set_tests_properties(dfs_bucket_write_checksum_test

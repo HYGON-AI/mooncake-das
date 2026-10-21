@@ -4853,8 +4853,10 @@ auto MasterService::PutStartInternal(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 1 ||
-        (config.dfs_replica_num > 0 && config.replica_num == 0)) {
+        (config.dfs_replica_num > 0 && config.replica_num == 0) ||
+        (config.dfs_replica_num > 0 && config.nof_replica_num > 0)) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", nof_replica_num=" << config.nof_replica_num
                    << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", error=invalid_dfs_replica_config";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -5151,6 +5153,11 @@ MasterService::BatchPutStart(const UUID& client_id,
         results;
     results.reserve(keys.size());
     if (keys.size() != slice_lengths.size()) {
+        results.assign(keys.size(),
+                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+    if (config.nof_replica_num > 0 && config.dfs_replica_num > 0) {
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
         return results;
@@ -5722,8 +5729,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 1 ||
-        (config.dfs_replica_num > 0 && config.replica_num == 0)) {
+        (config.dfs_replica_num > 0 && config.replica_num == 0) ||
+        (config.dfs_replica_num > 0 && config.nof_replica_num > 0)) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
+                   << ", nof_replica_num=" << config.nof_replica_num
                    << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", error=invalid_dfs_replica_config";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);

@@ -20,7 +20,8 @@ DfsWriteStagingPool::DfsWriteStagingPool(size_t arena_size,
             backing = PinnedBufferPool::Buffer::Pageable(arena_size);
         }
         if (!backing.data) {
-            throw std::runtime_error("Failed to allocate DFS write staging arena");
+            throw std::runtime_error(
+                "Failed to allocate DFS write staging arena");
         }
         auto slot = std::make_shared<Slot>();
         slot->backing = std::move(backing);
@@ -35,8 +36,9 @@ std::shared_ptr<DfsWriteStagingPool::Slot> DfsWriteStagingPool::Acquire(
     std::chrono::milliseconds timeout, bool* timed_out) {
     if (timed_out) *timed_out = false;
     std::unique_lock<std::mutex> lock(mutex_);
-    if (!cv_.wait_for(lock, timeout,
-                      [this] { return shutting_down_ || !free_slots_.empty(); })) {
+    if (!cv_.wait_for(
+            lock, timeout,
+            [this] { return shutting_down_ || !free_slots_.empty(); })) {
         if (timed_out) *timed_out = true;
         return nullptr;
     }
