@@ -12,7 +12,7 @@ on:
 jobs:
   publish:
     name: Publish ${{ matrix.build_variant }} wheel (dtk${{ matrix.dtk_version }}-py${{ matrix.py }})
-    runs-on: [self-hosted, Linux, X64, hcu]
+    runs-on: [self-hosted, Linux, X64, hcu1]
     container:
       image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ matrix.dtk_version }}-ubuntu22.04-py${{ matrix.py }}
       options: >-
