@@ -306,9 +306,11 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.low_utilization_threshold = Environ::GetDouble(
         "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD",
         config.low_utilization_threshold);
-    if (!std::isfinite(config.low_utilization_threshold) ||
-        config.low_utilization_threshold < 0.0 ||
-        config.low_utilization_threshold > 1.0) {
+    const bool valid_low_utilization_threshold =
+        std::isfinite(config.low_utilization_threshold) &&
+        config.low_utilization_threshold >= 0.0 &&
+        config.low_utilization_threshold < 1.0;
+    if (!valid_low_utilization_threshold) {
         LOG(WARNING) << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_THRESHOLD="
                      << config.low_utilization_threshold
                      << "; using default 0.05";
@@ -323,6 +325,16 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
             << config.low_utilization_evictions_per_tick
             << "; using default 1";
         config.low_utilization_evictions_per_tick = 1;
+    }
+    config.low_utilization_eviction_attempts_per_tick = Environ::GetInt(
+        "MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_ATTEMPTS_PER_TICK",
+        config.low_utilization_eviction_attempts_per_tick);
+    if (config.low_utilization_eviction_attempts_per_tick < 1) {
+        LOG(WARNING)
+            << "Invalid MOONCAKE_DFS_BUCKET_LOW_UTILIZATION_ATTEMPTS_PER_TICK="
+            << config.low_utilization_eviction_attempts_per_tick
+            << "; using default 8";
+        config.low_utilization_eviction_attempts_per_tick = 8;
     }
     config.deferred_free_duration = std::chrono::seconds(Environ::GetInt(
         "MOONCAKE_DFS_DEFERRED_FREE_SECONDS",
@@ -378,6 +390,8 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", low_utilization_threshold=" << low_utilization_threshold
         << ", low_utilization_evictions_per_tick="
         << low_utilization_evictions_per_tick
+        << ", low_utilization_eviction_attempts_per_tick="
+        << low_utilization_eviction_attempts_per_tick
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
         << eviction_check_interval.count()
