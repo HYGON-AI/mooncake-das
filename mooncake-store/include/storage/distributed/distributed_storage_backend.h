@@ -42,6 +42,9 @@ struct DistributedStorageConfig {
     double low_utilization_threshold = 0.05;
     // Maximum number of low-utilization buckets reclaimed per maintenance tick.
     int low_utilization_evictions_per_tick = 1;
+    // Maximum number of low-utilization candidates inspected per maintenance
+    // tick. This bounds work when candidates are rejected by the Master.
+    int low_utilization_eviction_attempts_per_tick = 8;
     std::chrono::seconds deferred_free_duration{30};
     std::chrono::seconds eviction_check_interval{5};
 

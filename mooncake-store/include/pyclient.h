@@ -490,6 +490,9 @@ class PyClient {
                                       bool /*allow_write*/) {
         return toInt(ErrorCode::NOT_SUPPORTED);
     }
+    virtual int set_service_endpoint(const std::string& /*endpoint*/) {
+        return toInt(ErrorCode::NOT_SUPPORTED);
+    }
 
     virtual tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets) = 0;

@@ -20,6 +20,7 @@
 #include "allocator.h"
 #include "ha_metric_manager.h"
 #include "master_metric_manager.h"
+#include "runtime_log_config.h"
 #include "rpc_service.h"
 #include "types.h"
 
@@ -244,6 +245,33 @@ struct HttpDfsHeartbeatIntervalResponse {
     uint32_t new_value{0};
 };
 YLT_REFL(HttpDfsHeartbeatIntervalResponse, success, old_value, new_value);
+
+struct HttpLoggingUpdateRequest {
+    std::optional<std::string> minloglevel;
+    std::optional<int> vlog_level;
+    std::optional<std::string> ylt_severity;
+    std::optional<bool> dfs_read_trace;
+};
+YLT_REFL(HttpLoggingUpdateRequest, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
+
+struct HttpLoggingResponse {
+    bool success{true};
+    std::string minloglevel;
+    int vlog_level{0};
+    std::string ylt_severity;
+    bool dfs_read_trace{false};
+};
+YLT_REFL(HttpLoggingResponse, success, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
+
+void FillLoggingResponse(HttpLoggingResponse* response) {
+    const auto config = GetRuntimeLogConfig();
+    response->minloglevel = config.minloglevel;
+    response->vlog_level = config.vlog_level;
+    response->ylt_severity = config.ylt_severity;
+    response->dfs_read_trace = config.dfs_read_trace;
+}
 
 
 tl::expected<std::string, ErrorCode> ParseAdminTenantId(
@@ -1464,5 +1492,51 @@ void MasterAdminServer::RegisterHandler() {
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSetDfsHeartbeatInterval(req, resp);
         });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/logging",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetLogging(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/logging",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleUpdateLogging(req, resp);
+        });
+}
+
+void MasterAdminServer::HandleGetLogging(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    HttpLoggingResponse response;
+    FillLoggingResponse(&response);
+    WriteJsonResponse(resp, coro_http::status_type::ok, response);
+}
+
+void MasterAdminServer::HandleUpdateLogging(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    HttpLoggingUpdateRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        WriteSimpleErrorResponse(resp, coro_http::status_type::bad_request,
+                                 std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+
+    RuntimeLogConfigUpdate update{
+        .minloglevel = request.minloglevel,
+        .vlog_level = request.vlog_level,
+        .ylt_severity = request.ylt_severity,
+        .dfs_read_trace = request.dfs_read_trace,
+    };
+    std::string error;
+    if (!UpdateRuntimeLogConfig(update, &error)) {
+        WriteSimpleErrorResponse(resp, coro_http::status_type::bad_request,
+                                 std::move(error));
+        return;
+    }
+
+    HttpLoggingResponse response;
+    FillLoggingResponse(&response);
+    WriteJsonResponse(resp, coro_http::status_type::ok, response);
 }
 }  // namespace mooncake

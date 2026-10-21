@@ -479,7 +479,7 @@ int64_t time_gen();
 // Gates the verbose per-batch timing logs on the DFS read path (alloc/read
 // split, scatter range/byte totals, backend BatchRead/ReadFully). Off by
 // default so the hot path pays nothing; set MC_STORE_DFS_READ_TRACE=1 (or
-// true/on) to enable. Read once and cached, so the per-batch cost is one load.
+// true/on) to enable. The runtime API can update the current value.
 bool dfs_read_trace_enabled();
 
 // Helper: Get integer from environment variable, fallback to default

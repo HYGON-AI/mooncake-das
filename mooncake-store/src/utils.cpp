@@ -6,6 +6,7 @@
 #include "ascii_string.h"
 #include "bool_parser.h"
 #include "environ.h"
+#include "runtime_log_config.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -600,18 +601,7 @@ int64_t time_gen() {
 }
 
 bool dfs_read_trace_enabled() {
-    static const bool enabled = [] {
-        const char *val = std::getenv("MC_STORE_DFS_READ_TRACE");
-        if (!val || val[0] == '\0') {
-            return false;  // unset: disabled
-        }
-        std::string s(val);
-        for (auto &c : s) {
-            c = std::tolower(c);
-        }
-        return s != "0" && s != "false" && s != "off";
-    }();
-    return enabled;
+    return GetDfsReadTraceEnabled();
 }
 
 std::string GetEnvStringOr(const char *name, const std::string &default_value) {
