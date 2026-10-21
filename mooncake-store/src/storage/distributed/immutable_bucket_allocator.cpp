@@ -1,8 +1,11 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
+#include "storage/distributed/dfs_log_limiter.h"
 
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -192,11 +195,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_check_interval_ = config.eviction_check_interval;
 
     std::error_code ec;
-    std::filesystem::create_directories(fsdir_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS bucket directory " << fsdir_ << ": "
-                   << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (!std::filesystem::is_directory(fsdir_, ec) || ec) {
+        LOG(ERROR) << "DFS bucket directory must already exist: " << fsdir_;
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
     if (config.fs_adapter_type == "posix") {
@@ -225,7 +226,17 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return tl::make_unexpected(adapter_init.error());
     }
 
-    auto recovered = RecoverFromDisk();
+    const std::string root_marker_path = fsdir_ + "/" + kDfsRootMarkerFileName;
+    auto marker_result = EnsureDfsRootMarker(*fs_adapter_, root_marker_path);
+    if (!marker_result) {
+        LOG(ERROR) << "Failed to ensure DFS root marker " << root_marker_path
+                   << ": " << marker_result.error();
+        fs_adapter_->Shutdown();
+        fs_adapter_.reset();
+        return marker_result;
+    }
+
+    auto recovered = RecoverFromDisk(config.bucket_recovery_enabled);
     if (!recovered) {
         fs_adapter_->Shutdown();
         fs_adapter_.reset();
@@ -435,21 +446,33 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
     auto write_result = fs_adapter_->WriteFile(
         meta_path, std::span<const char>(payload.data(), payload.size()));
     if (!write_result) {
-        LOG(ERROR) << "Failed to write bucket metadata " << meta_path
-                   << ", error=" << write_result.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to write bucket metadata " << meta_path
+                       << ", error=" << write_result.error()
+                       << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(write_result.error());
     }
     if (*write_result != payload.size()) {
-        LOG(ERROR) << "Short write of bucket metadata " << meta_path
-                   << ", expected=" << payload.size()
-                   << ", actual=" << *write_result;
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Short write of bucket metadata " << meta_path
+                       << ", expected=" << payload.size()
+                       << ", actual=" << *write_result
+                       << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
     auto sync_file = fs_adapter_->SyncFile(meta_path);
     if (!sync_file) {
-        LOG(ERROR) << "Failed to fsync bucket metadata " << meta_path
-                   << ", error=" << sync_file.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to fsync bucket metadata " << meta_path
+                       << ", error=" << sync_file.error()
+                       << ", suppressed=" << *suppressed;
+        }
         return tl::make_unexpected(sync_file.error());
     }
 
@@ -459,8 +482,12 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
     if (!meta_existed) {
         auto sync_dir = fs_adapter_->SyncDirectory(fsdir_);
         if (!sync_dir) {
-            LOG(ERROR) << "Failed to fsync DFS bucket directory " << fsdir_
-                       << ", error=" << sync_dir.error();
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "Failed to fsync DFS bucket directory " << fsdir_
+                           << ", error=" << sync_dir.error()
+                           << ", suppressed=" << *suppressed;
+            }
             return tl::make_unexpected(sync_dir.error());
         }
     }
@@ -471,13 +498,21 @@ void ImmutableBucketAllocator::DeleteBucketFiles(int64_t bucket_id) {
     if (!fs_adapter_) return;
     auto meta_result = fs_adapter_->DeleteFile(BucketMetaPath(bucket_id));
     if (!meta_result && meta_result.error() != ErrorCode::FILE_NOT_FOUND) {
-        LOG(ERROR) << "Failed to delete bucket metadata file for bucket_id="
-                   << bucket_id << ", error=" << meta_result.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to delete bucket metadata file for bucket_id="
+                       << bucket_id << ", error=" << meta_result.error()
+                       << ", suppressed=" << *suppressed;
+        }
     }
     auto data_result = fs_adapter_->DeleteFile(BucketDataPath(bucket_id));
     if (!data_result && data_result.error() != ErrorCode::FILE_NOT_FOUND) {
-        LOG(ERROR) << "Failed to delete bucket data file for bucket_id="
-                   << bucket_id << ", error=" << data_result.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to delete bucket data file for bucket_id="
+                       << bucket_id << ", error=" << data_result.error()
+                       << ", suppressed=" << *suppressed;
+        }
     }
 }
 
@@ -534,7 +569,10 @@ void ImmutableBucketAllocator::RollbackBucketPublicationLocked(
     RemoveFromLruLocked(bucket_id);
     if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
     auto it = buckets_.find(bucket_id);
-    if (it != buckets_.end() && it->second == bucket) buckets_.erase(it);
+    if (it != buckets_.end() && it->second == bucket) {
+        buckets_.erase(it);
+        PublishBucketIdSnapshotLocked();
+    }
 }
 
 bool ImmutableBucketAllocator::ActiveBucketHasSpaceLocked(
@@ -554,16 +592,18 @@ bool ImmutableBucketAllocator::ActiveBucketHasSpaceLocked(
     return true;
 }
 
-void ImmutableBucketAllocator::RequestRefillLocked(bool urgent) {
-    // One urgent retry may bypass the backoff for each observed failure wave.
-    // A stream of waiting allocations cannot continuously reset the delay.
-    if (urgent &&
-        last_urgent_refill_sequence_ != bucket_creation_failure_sequence_) {
-        last_urgent_refill_sequence_ = bucket_creation_failure_sequence_;
-        bucket_creation_retry_after_ =
-            std::chrono::steady_clock::time_point::min();
-    }
+void ImmutableBucketAllocator::RequestRefillLocked() {
+    // Waiting allocations must not bypass an existing failure backoff.
     bucket_pool_cv_.notify_all();
+}
+
+void ImmutableBucketAllocator::RecordBucketCreationFailureLocked(ErrorCode error) {
+    ++bucket_creation_failure_sequence_;
+    last_bucket_creation_error_ = error;
+    bucket_creation_retry_after_ =
+        std::chrono::steady_clock::now() + bucket_creation_retry_delay_;
+    bucket_creation_retry_delay_ =
+        std::min(bucket_creation_retry_delay_ * 2, std::chrono::seconds(30));
 }
 
 ImmutableBucketAllocator::BucketPtr
@@ -616,6 +656,26 @@ void ImmutableBucketAllocator::StopBucketWorkers() {
         if (worker.joinable()) worker.join();
     }
     bucket_create_workers_.clear();
+    // The legacy sweep deletes files through the fs adapter, so it must finish
+    // before the adapter is shut down.
+    if (legacy_cleanup_worker_.joinable()) {
+        legacy_cleanup_worker_.join();
+    }
+}
+
+void ImmutableBucketAllocator::LegacyCleanupWorker(
+    std::vector<int64_t> bucket_ids) {
+    // Deleting these files needs no allocator lock: every id is below
+    // next_bucket_id_, so no bucket this process creates or evicts reuses a
+    // name in this list, and DeleteBucketFiles() touches only the fs adapter.
+    // DeleteBucketFiles() tolerates an already-absent `.meta` or `.data`, so an
+    // id that was recorded from only one of the two files - or whose file was
+    // removed before the sweep reached it - is not a failure.
+    for (const int64_t bucket_id : bucket_ids) {
+        DeleteBucketFiles(bucket_id);
+    }
+    LOG(INFO) << "DFS legacy bucket cleanup finished, buckets="
+              << bucket_ids.size();
 }
 
 void ImmutableBucketAllocator::BucketCreateWorker() {
@@ -661,6 +721,13 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
                 initialization_consumed = true;
             }
 
+            // After a failure, allow only one worker to retry per deadline.
+            if (!initialization_attempt &&
+                last_bucket_creation_error_ != ErrorCode::OK) {
+                bucket_creation_retry_after_ = std::chrono::steady_clock::now() +
+                                               bucket_creation_retry_delay_;
+            }
+
             lock.unlock();
             const auto create_started = std::chrono::steady_clock::now();
             auto preallocated = fs_adapter_->PreallocateFile(
@@ -694,18 +761,18 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
                     buckets_.emplace(bucket->bucket_id, bucket).second;
                 if (!inserted) throw std::runtime_error("duplicate bucket id");
                 ready_bucket_ids_.push_back(bucket->bucket_id);
+                PublishBucketIdSnapshotLocked();
                 bucket_creation_retry_after_ =
                     std::chrono::steady_clock::time_point::min();
+                bucket_creation_retry_delay_ = kBucketCreationRetryDelay;
+                last_bucket_creation_error_ = ErrorCode::OK;
                 result = "success";
             } else if (preallocated) {
                 delete_file = true;
                 result = "discarded";
             } else {
-                delete_file = true;
-                ++bucket_creation_failure_sequence_;
-                last_bucket_creation_error_ = preallocated.error();
-                bucket_creation_retry_after_ = std::chrono::steady_clock::now() +
-                                               kBucketCreationRetryDelay;
+                delete_file = preallocated.error() != ErrorCode::FILE_OPEN_FAIL;
+                RecordBucketCreationFailureLocked(preallocated.error());
             }
 
             FinishBucketCreationLocked(/*synchronous=*/false);
@@ -718,12 +785,17 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
 
             MasterMetricManager::instance().inc_dfs_bucket_create_total(result);
             if (!preallocated) {
-                LOG(WARNING) << "Failed to precreate DFS bucket, bucket_id="
-                             << reserved_bucket_id
-                             << ", error=" << preallocated.error()
-                             << ", ready_count=" << ready_count
-                             << ", in_flight=" << in_flight
-                             << ", max_bucket_count=" << max_bucket_count;
+                static DfsLogLimiter precreate_log_limiter;
+                if (auto suppressed = precreate_log_limiter.ShouldLog()) {
+                    LOG(WARNING)
+                        << "Failed to precreate DFS bucket, bucket_id="
+                        << reserved_bucket_id
+                        << ", error=" << preallocated.error()
+                        << ", ready_count=" << ready_count
+                        << ", in_flight=" << in_flight
+                        << ", max_bucket_count=" << max_bucket_count
+                        << ", suppressed=" << *suppressed;
+                }
             } else if (!publish) {
                 VLOG(1)
                     << "Discarded precreated DFS bucket after state change, "
@@ -741,10 +813,7 @@ void ImmutableBucketAllocator::BucketCreateWorker() {
                 RollbackBucketPublicationLocked(reserved_bucket_id, bucket);
                 FinishBucketCreationLocked(/*synchronous=*/false);
             }
-            ++bucket_creation_failure_sequence_;
-            last_bucket_creation_error_ = ErrorCode::INTERNAL_ERROR;
-            bucket_creation_retry_after_ =
-                std::chrono::steady_clock::now() + kBucketCreationRetryDelay;
+            RecordBucketCreationFailureLocked(ErrorCode::INTERNAL_ERROR);
             bucket_pool_cv_.notify_all();
             lock.unlock();
             if (reservation) DeleteBucketFiles(reserved_bucket_id);
@@ -809,6 +878,7 @@ ImmutableBucketAllocator::CreateBucketUnlocked(
             SealActiveBucketLocked();
             active_bucket_id_ = bucket->bucket_id;
             TouchLruLocked(bucket->bucket_id, bucket->last_access_ns);
+            PublishBucketIdSnapshotLocked();
         } else if (preallocated) {
             error = ErrorCode::NO_AVAILABLE_HANDLE;
         }
@@ -831,14 +901,20 @@ ImmutableBucketAllocator::CreateBucketUnlocked(
     lock.unlock();
     MasterMetricManager::instance().inc_dfs_bucket_create_total(
         publish ? "success" : (preallocated ? "discarded" : "failure"));
-    if (!publish) DeleteBucketFiles(reservation->bucket_id);
+    if (!publish && (preallocated || error != ErrorCode::FILE_OPEN_FAIL)) {
+        DeleteBucketFiles(reservation->bucket_id);
+    }
     if (publish) FlushDirtyMetadata();
     lock.lock();
 
     if (!publish) {
         if (!preallocated) {
-            LOG(ERROR) << "Failed to create DFS bucket "
-                       << reservation->bucket_id << ", error=" << error;
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "Failed to create DFS bucket "
+                           << reservation->bucket_id << ", error=" << error
+                           << ", suppressed=" << *suppressed;
+            }
         }
         return tl::make_unexpected(error);
     }
@@ -921,17 +997,26 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
             pool_exhaustion_recorded = true;
             MasterMetricManager::instance()
                 .inc_dfs_bucket_pool_exhausted_total();
-            LOG_EVERY_N(WARNING, 100)
-                << "DFS ready bucket pool exhausted, ready_count="
-                << ready_bucket_ids_.size()
-                << ", in_flight=" << bucket_creations_in_flight_
-                << ", waiting_allocators=" << waiting_allocators_
-                << ", active_bucket_id=" << active_bucket_id_
-                << ", max_bucket_count=" << max_bucket_count_;
+            static DfsLogLimiter pool_log_limiter;
+            if (auto suppressed = pool_log_limiter.ShouldLog()) {
+                LOG(WARNING)
+                    << "DFS ready bucket pool exhausted, ready_count="
+                    << ready_bucket_ids_.size()
+                    << ", in_flight=" << bucket_creations_in_flight_
+                    << ", waiting_allocators=" << waiting_allocators_
+                    << ", active_bucket_id=" << active_bucket_id_
+                    << ", max_bucket_count=" << max_bucket_count_
+                    << ", suppressed=" << *suppressed;
+            }
         }
 
+        if (bucket_creations_in_flight_ == 0 &&
+            std::chrono::steady_clock::now() < bucket_creation_retry_after_) {
+            observe_rollover();
+            return tl::make_unexpected(last_bucket_creation_error_);
+        }
         const uint64_t failure_sequence = bucket_creation_failure_sequence_;
-        RequestRefillLocked(/*urgent=*/true);
+        RequestRefillLocked();
         ++waiting_allocators_;
         const auto wait_started = std::chrono::steady_clock::now();
         bucket_pool_cv_.wait(lock, [this, required, failure_sequence] {
@@ -1037,6 +1122,7 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     bucket.entries[key] = entry;
     bucket.append_offset = layout->end();
     bucket.live_bytes += layout->aligned_size;
+    ++bucket.pending_entries;
     key_index_[key] = bucket.bucket_id;
 
     // Reservations in the active bucket touch no file at all. A reservation in
@@ -1071,6 +1157,8 @@ void ImmutableBucketAllocator::UnreserveInBucketLocked(
     } else {
         bucket.live_bytes = 0;
     }
+
+    if (bucket.pending_entries > 0) --bucket.pending_entries;
 
     // The reservation existed only in memory, so undoing it is just erasing it.
     // If the bucket happens to be sealed already, its `.meta` file has to be
@@ -1259,10 +1347,14 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
         if (!bucket_result) {
             // Global failure: no active bucket can be created or found, so
             // remaining keys will fail the same way. Mark them and stop.
-            LOG(ERROR) << "DFS batch allocate active bucket failed: key="
-                       << request.key << ", reserved_size="
-                       << object_layout->aligned_size
-                       << ", error=" << bucket_result.error();
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR) << "DFS batch allocate active bucket failed: key="
+                           << request.key << ", reserved_size="
+                           << object_layout->aligned_size
+                           << ", error=" << bucket_result.error()
+                           << ", suppressed=" << *suppressed;
+            }
             results[index].success = false;
             results[index].descriptor = DistributedFSDescriptor{};
             results[index].error = bucket_result.error();
@@ -1357,6 +1449,10 @@ bool ImmutableBucketAllocator::MarkCommitted(
                    << ", state=" << static_cast<int32_t>(entry->state);
         return false;
     }
+    if (entry->state == BucketEntryState::PENDING &&
+        bucket->pending_entries > 0) {
+        --bucket->pending_entries;
+    }
     entry->state = BucketEntryState::COMMITTED;
     // PutEnd never touches a file. For the active bucket the transition is
     // simply part of the state that gets written when the bucket is sealed; for
@@ -1383,6 +1479,10 @@ void ImmutableBucketAllocator::Free(const std::string& key,
     // Buckets are append-only, so freeing leaves a tombstone rather than
     // reclaiming the middle of the file. Space comes back only when the
     // whole bucket is evicted.
+    if (entry->state == BucketEntryState::PENDING &&
+        bucket->pending_entries > 0) {
+        --bucket->pending_entries;
+    }
     entry->state = BucketEntryState::TOMBSTONE;
     ++bucket->tombstones;
     if (bucket->live_bytes >= entry->reserved_size) {
@@ -1457,8 +1557,12 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
             ++flushed;
             continue;
         }
-        LOG(WARNING) << "Failed to write DFS bucket metadata, bucket_id="
-                     << item.bucket_id << ", error=" << persisted.error();
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(WARNING) << "Failed to write DFS bucket metadata, bucket_id="
+                         << item.bucket_id << ", error=" << persisted.error()
+                         << ", suppressed=" << *suppressed;
+        }
         // Put the flag back so the next maintenance tick retries, unless the
         // bucket changed identity meanwhile - then it is not ours to mark.
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1528,6 +1632,7 @@ int64_t ImmutableBucketAllocator::SetMaxBucketCount(int64_t new_max_bucket_count
             buckets_.erase(it);
             removed_ready_buckets.push_back(bucket_id);
         }
+        if (!removed_ready_buckets.empty()) PublishBucketIdSnapshotLocked();
         if (new_max_bucket_count > old) {
             bucket_creation_retry_after_ =
                 std::chrono::steady_clock::time_point::min();
@@ -1548,6 +1653,29 @@ int64_t ImmutableBucketAllocator::SetMaxBucketCount(int64_t new_max_bucket_count
 size_t ImmutableBucketAllocator::GetBucketCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return buckets_.size();
+}
+
+std::shared_ptr<const ImmutableBucketAllocator::BucketIdSnapshot>
+ImmutableBucketAllocator::GetBucketIdSnapshot() const {
+    return std::atomic_load_explicit(&bucket_id_snapshot_,
+                                     std::memory_order_acquire);
+}
+
+void ImmutableBucketAllocator::PublishBucketIdSnapshotLocked() {
+    auto snapshot = std::make_shared<BucketIdSnapshot>();
+    snapshot->version = bucket_snapshot_version_.load(
+                            std::memory_order_relaxed) +
+                        1;
+    snapshot->bucket_ids.reserve(buckets_.size());
+    for (const auto& [bucket_id, bucket] : buckets_) {
+        snapshot->bucket_ids.push_back(bucket_id);
+    }
+    bucket_snapshot_version_.store(snapshot->version,
+                                   std::memory_order_relaxed);
+    std::atomic_store_explicit(
+        &bucket_id_snapshot_,
+        std::shared_ptr<const BucketIdSnapshot>(std::move(snapshot)),
+        std::memory_order_release);
 }
 
 std::optional<int64_t> ImmutableBucketAllocator::GetBucketIdForKey(
@@ -1581,6 +1709,20 @@ bool ImmutableBucketAllocator::HasBucket(int64_t bucket_id) const {
     return buckets_.contains(bucket_id);
 }
 
+tl::expected<bool, ErrorCode>
+ImmutableBucketAllocator::IsBucketDataFilePresent(int64_t bucket_id) const {
+    if (bucket_id < 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto root_present = fs_adapter_->FileExists(fsdir_);
+    if (!root_present || !*root_present) {
+        LOG(WARNING) << "Cannot verify DFS bucket directory " << fsdir_
+                     << ": filesystem is unavailable";
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    return fs_adapter_->FileExists(BucketDataPath(bucket_id));
+}
+
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
     PendingEviction pending;
@@ -1596,11 +1738,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         }
         const bool was_active = active_bucket_id_ == bucket_id;
         const BucketPtr& victim = bucket_it->second;
-        const bool has_pending = std::any_of(
-            victim->entries.begin(), victim->entries.end(), [](const auto& item) {
-                return item.second.state == BucketEntryState::PENDING;
-            });
-        if (has_pending) return pending;
+        if (victim->pending_entries != 0) return pending;
 
         std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
         for (const auto& [key, entry] : victim->entries) {
@@ -1630,7 +1768,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         }
         if (was_active) {
             active_bucket_id_ = -1;
-            RequestRefillLocked(/*urgent=*/true);
+            RequestRefillLocked();
         }
         pending.owner_ = this;
         pending.bucket_id_ = bucket_id;
@@ -1648,7 +1786,17 @@ ImmutableBucketAllocator::PrepareEvictionForAllocationFailure() {
 }
 
 ImmutableBucketAllocator::PendingEviction
-ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
+ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
+    if (threshold <= 0.0 || threshold >= 1.0) {
+        return {};
+    }
+    return PrepareEvictionInternal(/*force_one=*/false, threshold,
+                                   /*low_utilization_only=*/true);
+}
+
+ImmutableBucketAllocator::PendingEviction
+ImmutableBucketAllocator::PrepareEvictionInternal(
+    bool force_one, double low_utilization_threshold, bool low_utilization_only) {
     PendingEviction pending;
     if (!initialized_.load(std::memory_order_acquire)) return pending;
 
@@ -1663,7 +1811,10 @@ ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
 
         const double usage = static_cast<double>(UsedBytesLocked()) /
                              static_cast<double>(capacity);
-        if (!force_one) {
+        const bool prioritize_low_utilization =
+            low_utilization_threshold > 0.0 &&
+            low_utilization_threshold < 1.0;
+        if (!force_one && !low_utilization_only) {
             if (usage >= eviction_high_watermark_) {
                 eviction_active_ = true;
             }
@@ -1674,26 +1825,34 @@ ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
             }
         }
 
-        // Walk the LRU from the cold end and take the first bucket that is
-        // neither active, frozen, nor still waiting for an async write to
-        // finish. A PENDING entry means the client has not called PutEnd yet,
-        // so the bucket's data file must not be deleted underneath it.
+        // Walk the LRU from the cold end. Watermark eviction prefers low-
+        // utilization buckets, but falls back to any eligible bucket when a
+        // sparse bucket is protected by the master.
         BucketPtr victim;
-        for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
-            const int64_t bucket_id = *it;
-            if (bucket_id == active_bucket_id_) continue;
-            auto bucket_it = buckets_.find(bucket_id);
-            if (bucket_it == buckets_.end()) continue;
-            if (bucket_it->second->frozen) continue;
-            const bool has_pending = std::any_of(
-                bucket_it->second->entries.begin(),
-                bucket_it->second->entries.end(),
-                [](const auto& item) {
-                    return item.second.state == BucketEntryState::PENDING;
-                });
-            if (has_pending) continue;
-            victim = bucket_it->second;
-            break;
+        const int eviction_passes =
+            prioritize_low_utilization && !low_utilization_only ? 2 : 1;
+        for (int pass = 0; pass < eviction_passes && !victim; ++pass) {
+            for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
+                const int64_t bucket_id = *it;
+                if (bucket_id == active_bucket_id_) continue;
+                auto bucket_it = buckets_.find(bucket_id);
+                if (bucket_it == buckets_.end()) continue;
+                if (bucket_it->second->frozen) continue;
+                const auto& candidate = bucket_it->second;
+                const bool is_low_utilization =
+                    candidate->capacity > 0 &&
+                    static_cast<double>(candidate->live_bytes) /
+                            static_cast<double>(candidate->capacity) <
+                        low_utilization_threshold;
+                if (prioritize_low_utilization &&
+                    ((pass == 0 && !is_low_utilization) ||
+                     (pass == 1 && is_low_utilization))) {
+                    continue;
+                }
+                if (candidate->pending_entries != 0) continue;
+                victim = candidate;
+                break;
+            }
         }
         if (!victim) return pending;
 
@@ -1763,12 +1922,7 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
         if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
             return false;
         }
-        const bool has_pending = std::any_of(
-            it->second->entries.begin(), it->second->entries.end(),
-            [](const auto& item) {
-                return item.second.state == BucketEntryState::PENDING;
-            });
-        if (has_pending) {
+        if (it->second->pending_entries != 0) {
             it->second->frozen = false;
             // Restore cold LRU position so the next round can reconsider it
             // after the pending write completes or times out.
@@ -1809,6 +1963,7 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
             }
         }
         buckets_.erase(it);
+        PublishBucketIdSnapshotLocked();
         RemoveFromLruLocked(bucket_id);
         if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
     }
@@ -1864,10 +2019,13 @@ void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending,
 
 // === recovery ===
 
-tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
+tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
+    bool recover_metadata) {
     auto files = fs_adapter_->ListFiles(fsdir_);
     if (!files) {
-        if (files.error() == ErrorCode::FILE_NOT_FOUND) return {};
+        if (recover_metadata && files.error() == ErrorCode::FILE_NOT_FOUND) {
+            return {};
+        }
         LOG(ERROR) << "Failed to list DFS bucket directory " << fsdir_
                    << ", error=" << files.error();
         return tl::make_unexpected(files.error());
@@ -1875,20 +2033,55 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
 
     std::vector<int64_t> meta_ids;
     std::vector<int64_t> data_ids;
+    int64_t max_seen_id = -1;
     for (const auto& name : *files) {
         if (auto id = ParseBucketFileName(name, kBucketMetaSuffix)) {
             meta_ids.push_back(*id);
+            max_seen_id = std::max(max_seen_id, *id);
         } else if (auto data_id =
                        ParseBucketFileName(name, kBucketDataSuffix)) {
             data_ids.push_back(*data_id);
+            max_seen_id = std::max(max_seen_id, *data_id);
         }
         // Anything else - including `.meta.0`/`.meta.1` snapshot slots,
         // `.meta.log` and `.meta.tmp.*` leftovers from older layouts - is
         // deliberately ignored.
     }
+    if (!recover_metadata) {
+        // Recovery is disabled: the files found above are invisible to this
+        // process's allocation and eviction state, so nothing would ever
+        // reclaim them and they would keep occupying the DFS directory. Record
+        // the id sequence, then delete exactly the scanned ids off the startup
+        // path so a large legacy directory does not stall initialization.
+        next_bucket_id_ = max_seen_id + 1;
+        std::unordered_set<int64_t> legacy_ids(meta_ids.begin(), meta_ids.end());
+        legacy_ids.insert(data_ids.begin(), data_ids.end());
+        std::vector<int64_t> sweep(legacy_ids.begin(), legacy_ids.end());
+        if (sweep.empty()) {
+            LOG(INFO) << "DFS bucket recovery disabled; no legacy bucket files "
+                         "to delete, next_bucket_id="
+                      << next_bucket_id_;
+            return {};
+        }
+        LOG(INFO) << "DFS bucket recovery disabled; deleting " << sweep.size()
+                  << " legacy bucket(s) in the background, next_bucket_id="
+                  << next_bucket_id_;
+        try {
+            // `sweep` is passed by value so the catch block below can still
+            // reclaim the files if the worker thread cannot be started.
+            legacy_cleanup_worker_ = std::thread(
+                &ImmutableBucketAllocator::LegacyCleanupWorker, this, sweep);
+        } catch (const std::system_error& e) {
+            LOG(WARNING) << "Failed to start DFS legacy bucket cleanup worker: "
+                         << e.what() << ", deleting synchronously";
+            for (const int64_t bucket_id : sweep) {
+                DeleteBucketFiles(bucket_id);
+            }
+        }
+        return {};
+    }
     std::sort(meta_ids.begin(), meta_ids.end());
 
-    int64_t max_seen_id = -1;
     uint64_t max_generation = 0;
     // Buckets already reclaimed by this pass: their metadata could not be
     // trusted, so both files were deleted. A cache entry that cannot be proven
@@ -1908,8 +2101,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
     std::unordered_map<std::string, RecoveryWinner> winners;
 
     for (const int64_t bucket_id : meta_ids) {
-        max_seen_id = std::max(max_seen_id, bucket_id);
-
         const std::string meta_path = BucketMetaPath(bucket_id);
         PersistedBucketMetadata snapshot;
         bool valid = false;
@@ -2044,6 +2235,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
             bucket->append_offset =
                 std::max(bucket->append_offset, layout->end());
             bucket->entries[persisted.key] = entry;
+            if (entry.state == BucketEntryState::PENDING) {
+                ++bucket->pending_entries;
+            }
         }
         if (!bucket_ok) {
             DeleteBucketFiles(bucket_id);
@@ -2084,6 +2278,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
                 }
                 bucket->live_bytes += entry.reserved_size;
                 continue;
+            }
+            if (entry.state == BucketEntryState::PENDING) {
+                --bucket->pending_entries;
             }
             entry.state = BucketEntryState::TOMBSTONE;
             ++bucket->tombstones;
@@ -2152,7 +2349,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
     // can ever address the data again. Reclaim it. Buckets rejected above were
     // already deleted, so they are skipped here to avoid a duplicate log line.
     for (const int64_t data_id : data_ids) {
-        max_seen_id = std::max(max_seen_id, data_id);
         if (buckets_.count(data_id) > 0) continue;
         if (discarded_ids.count(data_id) > 0) continue;
         LOG(WARNING) << "Removing orphaned DFS bucket data file for bucket_id="
@@ -2182,6 +2378,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
         lru_index_[bucket_id] = lru_list_.begin();
     }
 
+    PublishBucketIdSnapshotLocked();
     return {};
 }
 

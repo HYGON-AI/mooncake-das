@@ -20,6 +20,7 @@
 #include "allocator.h"
 #include "ha_metric_manager.h"
 #include "master_metric_manager.h"
+#include "runtime_log_config.h"
 #include "rpc_service.h"
 #include "types.h"
 
@@ -233,6 +234,46 @@ struct HttpDfsMaxBucketCountResponse {
 };
 YLT_REFL(HttpDfsMaxBucketCountResponse, success, old_value, new_value);
 
+struct HttpDfsHeartbeatIntervalRequest {
+    uint32_t interval_seconds{0};
+};
+YLT_REFL(HttpDfsHeartbeatIntervalRequest, interval_seconds);
+
+struct HttpDfsHeartbeatIntervalResponse {
+    bool success{true};
+    uint32_t old_value{0};
+    uint32_t new_value{0};
+};
+YLT_REFL(HttpDfsHeartbeatIntervalResponse, success, old_value, new_value);
+
+struct HttpLoggingUpdateRequest {
+    std::optional<std::string> minloglevel;
+    std::optional<int> vlog_level;
+    std::optional<std::string> ylt_severity;
+    std::optional<bool> dfs_read_trace;
+};
+YLT_REFL(HttpLoggingUpdateRequest, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
+
+struct HttpLoggingResponse {
+    bool success{true};
+    std::string minloglevel;
+    int vlog_level{0};
+    std::string ylt_severity;
+    bool dfs_read_trace{false};
+};
+YLT_REFL(HttpLoggingResponse, success, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
+
+void FillLoggingResponse(HttpLoggingResponse* response) {
+    const auto config = GetRuntimeLogConfig();
+    response->minloglevel = config.minloglevel;
+    response->vlog_level = config.vlog_level;
+    response->ylt_severity = config.ylt_severity;
+    response->dfs_read_trace = config.dfs_read_trace;
+}
+
+
 tl::expected<std::string, ErrorCode> ParseAdminTenantId(
     coro_http::coro_http_request& req) {
     auto tenant_id_view = req.get_decode_query_value("tenant_id");
@@ -281,6 +322,21 @@ ParseDfsMaxBucketCountBody(coro_http::coro_http_request& req) {
         return tl::make_unexpected(
             "max_bucket_count exceeds maximum addressable bucket id (" +
             std::to_string(kDfsMaxBucketCountLimit) + ")");
+    }
+    return request;
+}
+
+tl::expected<HttpDfsHeartbeatIntervalRequest, std::string>
+ParseDfsHeartbeatIntervalBody(coro_http::coro_http_request& req) {
+    HttpDfsHeartbeatIntervalRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(std::string("Invalid JSON body: ") +
+                                   e.what());
+    }
+    if (request.interval_seconds == 0) {
+        return tl::make_unexpected("interval_seconds must be positive (>0)");
     }
     return request;
 }
@@ -386,7 +442,9 @@ void MasterAdminServer::SetServiceDelegate(
         clear_storage_metrics = !service_available_;
     }
     if (clear_storage_metrics) {
-        MasterMetricManager::instance().project_storage_usage({});
+        auto& metrics = MasterMetricManager::instance();
+        metrics.project_storage_usage({});
+        metrics.set_dfs_storage_usage(0, 0, false);
     }
 }
 
@@ -399,7 +457,9 @@ void MasterAdminServer::SetServiceAvailable(bool available) {
         service_available = service_available_;
     }
     if (!service_available) {
-        MasterMetricManager::instance().project_storage_usage({});
+        auto& metrics = MasterMetricManager::instance();
+        metrics.project_storage_usage({});
+        metrics.set_dfs_storage_usage(0, 0, false);
     }
 }
 
@@ -415,10 +475,6 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
 
 std::string MasterAdminServer::BuildMetricsText() const {
     RefreshStorageMetrics();
-    auto snapshot = SnapshotState();
-    if (snapshot.service) {
-        snapshot.service->RefreshDfsMetrics();
-    }
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
@@ -579,7 +635,13 @@ void MasterAdminServer::RefreshStorageMetrics() const {
     const auto storage = runtime.service_available && runtime.service
                              ? runtime.service->GetStorageUsageSnapshot()
                              : TieredStorageUsageSnapshot{};
-    MasterMetricManager::instance().project_storage_usage(storage);
+    auto& metrics = MasterMetricManager::instance();
+    metrics.project_storage_usage(storage);
+    if (runtime.service_available && runtime.service) {
+        runtime.service->RefreshDfsMetrics();
+    } else {
+        metrics.set_dfs_storage_usage(0, 0, false);
+    }
 }
 
 template <typename Handler>
@@ -1293,6 +1355,30 @@ void MasterAdminServer::HandleSetDfsMaxBucketCount(
     });
 }
 
+void MasterAdminServer::HandleSetDfsHeartbeatInterval(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto body_result = ParseDfsHeartbeatIntervalBody(req);
+    if (!body_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, body_result.error());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->SetDfsHeartbeatInterval(
+            body_result->interval_seconds);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        HttpDfsHeartbeatIntervalResponse response;
+        response.old_value = result.value();
+        response.new_value = body_result->interval_seconds;
+        WriteJsonResponse(resp, coro_http::status_type::ok, response);
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1401,5 +1487,56 @@ void MasterAdminServer::RegisterHandler() {
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSetDfsMaxBucketCount(req, resp);
         });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/dfs/heartbeat_interval",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetDfsHeartbeatInterval(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/logging",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetLogging(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/logging",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleUpdateLogging(req, resp);
+        });
+}
+
+void MasterAdminServer::HandleGetLogging(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    HttpLoggingResponse response;
+    FillLoggingResponse(&response);
+    WriteJsonResponse(resp, coro_http::status_type::ok, response);
+}
+
+void MasterAdminServer::HandleUpdateLogging(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    HttpLoggingUpdateRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        WriteSimpleErrorResponse(resp, coro_http::status_type::bad_request,
+                                 std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+
+    RuntimeLogConfigUpdate update{
+        .minloglevel = request.minloglevel,
+        .vlog_level = request.vlog_level,
+        .ylt_severity = request.ylt_severity,
+        .dfs_read_trace = request.dfs_read_trace,
+    };
+    std::string error;
+    if (!UpdateRuntimeLogConfig(update, &error)) {
+        WriteSimpleErrorResponse(resp, coro_http::status_type::bad_request,
+                                 std::move(error));
+        return;
+    }
+
+    HttpLoggingResponse response;
+    FillLoggingResponse(&response);
+    WriteJsonResponse(resp, coro_http::status_type::ok, response);
 }
 }  // namespace mooncake

@@ -7,9 +7,11 @@
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 #include <cmath>
+#include <limits>
 
 #include "segment.h"
 #include "utils.h"
+#include "rpc_types.h"
 
 namespace mooncake {
 
@@ -60,6 +62,10 @@ MasterMetricManager::MasterMetricManager()
           "Whether DFS capacity is configured as unlimited"),
       dfs_replicas_("master_dfs_replicas",
                     "Current DFS replicas by lifecycle status", {"status"}),
+      dfs_replica_skipped_total_(
+          "master_dfs_replica_skipped_total",
+          "DFS replicas skipped after allocation failure with memory fallback",
+          {"reason"}),
       dfs_bucket_ready_count_("dfs_bucket_ready_count",
                               "Current number of ready DFS buckets"),
       dfs_bucket_create_inflight_(
@@ -378,6 +384,12 @@ MasterMetricManager::MasterMetricManager()
           "Total number of DFS bucket eviction attempts"),
       dfs_bucket_evictions_("master_dfs_bucket_evictions_total",
                             "Total number of DFS buckets evicted"),
+      dfs_bucket_low_utilization_eviction_attempts_(
+          "master_dfs_bucket_low_utilization_eviction_attempts_total",
+          "Total low-utilization DFS bucket eviction attempts"),
+      dfs_bucket_low_utilization_evictions_(
+          "master_dfs_bucket_low_utilization_evictions_total",
+          "Total low-utilization DFS buckets evicted"),
       dfs_bucket_evicted_replicas_(
           "master_dfs_bucket_evicted_replicas_total",
           "Total number of DFS replicas removed by bucket eviction"),
@@ -537,9 +549,151 @@ MasterMetricManager::MasterMetricManager()
           "Total number of MarkTaskToComplete requests received"),
       mark_task_to_complete_failures_(
           "master_update_task_failures_total",
-          "Total number of failed MarkTaskToComplete requests") {
+          "Total number of failed MarkTaskToComplete requests"),
+      service_dual_write_total_(
+          "mooncake_master_service_dual_write_total",
+          "Foreground dual-replica write outcomes by service endpoint",
+          {"service_endpoint", "outcome"}),
+      service_dual_write_pending_(
+          "mooncake_master_service_dual_write_pending",
+          "Foreground dual-replica writes waiting for physical DFS completion",
+          {"service_endpoint"}),
+      service_read_failures_total_(
+          "mooncake_master_service_read_failures_total",
+          "Foreground key transfer failures by selected replica tier",
+          {"service_endpoint", "replica_type"}) {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
+}
+
+tl::expected<void, ErrorCode> MasterMetricManager::ReportServiceMetrics(
+    const UUID& client_id, const ServiceMetricsSnapshot& snapshot) {
+    if (snapshot.service_endpoint.empty() || snapshot.sequence == 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const std::array<uint64_t, 4> dual_write{
+        snapshot.dual_write_both_success,
+        snapshot.dual_write_memory_only,
+        snapshot.dual_write_dfs_only,
+        snapshot.dual_write_neither_success};
+    const std::array<uint64_t, 2> read_failures{
+        snapshot.read_failures_memory, snapshot.read_failures_dfs};
+    const std::array<const char*, 4> outcomes{
+        "both_success", "memory_only", "dfs_only", "neither_success"};
+    const std::array<const char*, 2> replica_types{"memory", "dfs"};
+
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    auto client_it = service_metric_clients_.find(client_id);
+    const ServiceMetricClientState* previous =
+        client_it == service_metric_clients_.end() ? nullptr : &client_it->second;
+    if (previous && previous->endpoint != snapshot.service_endpoint) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (previous && snapshot.sequence == previous->sequence) {
+        if (dual_write != previous->dual_write ||
+            read_failures != previous->read_failures ||
+            snapshot.dual_write_pending != previous->pending) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    if (previous && snapshot.sequence < previous->sequence) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::array<uint64_t, 4> dual_delta{};
+    std::array<uint64_t, 2> read_delta{};
+    for (size_t i = 0; i < dual_write.size(); ++i) {
+        const uint64_t old_value = previous ? previous->dual_write[i] : 0;
+        if (dual_write[i] < old_value ||
+            dual_write[i] - old_value >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        dual_delta[i] = dual_write[i] - old_value;
+    }
+    for (size_t i = 0; i < read_failures.size(); ++i) {
+        const uint64_t old_value = previous ? previous->read_failures[i] : 0;
+        if (read_failures[i] < old_value ||
+            read_failures[i] - old_value >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        read_delta[i] = read_failures[i] - old_value;
+    }
+
+    if (snapshot.dual_write_pending >
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto& endpoint_pending =
+        service_pending_by_endpoint_[snapshot.service_endpoint];
+    const int64_t old_client_pending =
+        previous && previous->pending_active
+            ? static_cast<int64_t>(previous->pending)
+            : 0;
+    const int64_t new_client_pending =
+        static_cast<int64_t>(snapshot.dual_write_pending);
+    if (endpoint_pending < old_client_pending ||
+        new_client_pending >
+            std::numeric_limits<int64_t>::max() -
+                (endpoint_pending - old_client_pending)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const int64_t new_endpoint_pending = endpoint_pending - old_client_pending +
+                                        new_client_pending;
+
+    // Initialize every outcome series on the first accepted report for an
+    // endpoint so zero-count outcomes remain visible in Prometheus output.
+    for (const char* outcome : outcomes) {
+        service_dual_write_total_.inc({snapshot.service_endpoint, outcome}, 0);
+    }
+    for (const char* replica_type : replica_types) {
+        service_read_failures_total_.inc(
+            {snapshot.service_endpoint, replica_type}, 0);
+    }
+    for (size_t i = 0; i < dual_delta.size(); ++i) {
+        if (dual_delta[i] != 0) {
+            service_dual_write_total_.inc(
+                {snapshot.service_endpoint, outcomes[i]},
+                static_cast<int64_t>(dual_delta[i]));
+        }
+    }
+    for (size_t i = 0; i < read_delta.size(); ++i) {
+        if (read_delta[i] != 0) {
+            service_read_failures_total_.inc(
+                {snapshot.service_endpoint, replica_types[i]},
+                static_cast<int64_t>(read_delta[i]));
+        }
+    }
+    endpoint_pending = new_endpoint_pending;
+    service_dual_write_pending_.update({snapshot.service_endpoint},
+                                       new_endpoint_pending);
+
+    ServiceMetricClientState state;
+    state.endpoint = snapshot.service_endpoint;
+    state.sequence = snapshot.sequence;
+    state.dual_write = dual_write;
+    state.pending = snapshot.dual_write_pending;
+    state.read_failures = read_failures;
+    state.last_report = std::chrono::steady_clock::now();
+    service_metric_clients_[client_id] = std::move(state);
+    return {};
+}
+
+void MasterMetricManager::ExpireServiceMetricsPending(
+    std::chrono::steady_clock::time_point now) {
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    for (auto& [client_id, state] : service_metric_clients_) {
+        if (!state.pending_active ||
+            now - state.last_report < std::chrono::seconds(30)) {
+            continue;
+        }
+        auto& pending = service_pending_by_endpoint_.at(state.endpoint);
+        pending -= static_cast<int64_t>(state.pending);
+        service_dual_write_pending_.update({state.endpoint}, pending);
+        state.pending_active = false;
+    }
 }
 
 // --- Metric Interface Methods ---
@@ -555,6 +709,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     dfs_capacity_unlimited_metric_.update(0);
     dfs_replicas_.update({"processing"}, 0);
     dfs_replicas_.update({"complete"}, 0);
+    dfs_replica_skipped_total_.inc({"FILE_OPEN_FAIL"}, 0);
+    dfs_replica_skipped_total_.inc({"FILE_WRITE_FAIL"}, 0);
+    dfs_replica_skipped_total_.inc({"NO_AVAILABLE_HANDLE"}, 0);
     dfs_bucket_ready_count_.update(0);
     dfs_bucket_create_inflight_.update(0);
     dfs_bucket_create_total_.inc({"success"}, 0);
@@ -697,6 +854,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     evicted_size_.inc(0);
     dfs_bucket_eviction_attempts_.inc(0);
     dfs_bucket_evictions_.inc(0);
+    dfs_bucket_low_utilization_eviction_attempts_.inc(0);
+    dfs_bucket_low_utilization_evictions_.inc(0);
     dfs_bucket_evicted_replicas_.inc(0);
     dfs_bucket_evicted_bytes_.inc(0);
 
@@ -926,6 +1085,11 @@ void MasterMetricManager::transition_dfs_replica(const std::string& from,
                                                  const std::string& to) {
     dfs_replicas_.dec({from});
     dfs_replicas_.inc({to});
+}
+
+void MasterMetricManager::inc_dfs_replica_skipped_total(
+    const std::string& reason) {
+    dfs_replica_skipped_total_.inc({reason});
 }
 
 void MasterMetricManager::set_dfs_bucket_pool_state(
@@ -1682,6 +1846,16 @@ void MasterMetricManager::inc_dfs_bucket_evictions(int64_t val) {
     dfs_bucket_evictions_.inc(val);
 }
 
+void MasterMetricManager::inc_dfs_bucket_low_utilization_eviction_attempts(
+    int64_t val) {
+    dfs_bucket_low_utilization_eviction_attempts_.inc(val);
+}
+
+void MasterMetricManager::inc_dfs_bucket_low_utilization_evictions(
+    int64_t val) {
+    dfs_bucket_low_utilization_evictions_.inc(val);
+}
+
 void MasterMetricManager::inc_dfs_bucket_evicted_replicas(int64_t val) {
     dfs_bucket_evicted_replicas_.inc(val);
 }
@@ -1959,6 +2133,8 @@ int64_t MasterMetricManager::get_update_task_failures() {
 
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
+    // Report liveness also covers zero-segment clients without storage pings.
+    ExpireServiceMetricsPending();
     // Note: Following Prometheus style, metrics with value 0 that haven't
     // changed will not be included in the output. If all metrics are 0 and
     // unchanged, this function will return an empty string.
@@ -1986,6 +2162,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(dfs_used_bytes_);
     serialize_metric(dfs_capacity_unlimited_metric_);
     serialize_metric(dfs_replicas_);
+    serialize_metric(dfs_replica_skipped_total_);
     serialize_metric(dfs_bucket_ready_count_);
     serialize_metric(dfs_bucket_create_inflight_);
     serialize_metric(dfs_bucket_create_latency_us_);
@@ -2136,6 +2313,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_evicted_size_);
     serialize_metric(dfs_bucket_eviction_attempts_);
     serialize_metric(dfs_bucket_evictions_);
+    serialize_metric(dfs_bucket_low_utilization_eviction_attempts_);
+    serialize_metric(dfs_bucket_low_utilization_evictions_);
     serialize_metric(dfs_bucket_evicted_replicas_);
     serialize_metric(dfs_bucket_evicted_bytes_);
 
@@ -2168,6 +2347,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(snapshot_duration_ms_);
     serialize_metric(snapshot_success_);
     serialize_metric(snapshot_fail_);
+
+    // Serialize per-service physical I/O metrics.
+    serialize_metric(service_dual_write_total_);
+    serialize_metric(service_dual_write_pending_);
+    serialize_metric(service_read_failures_total_);
 
     return ss.str();
 }

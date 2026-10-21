@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -35,6 +37,14 @@ struct DistributedStorageConfig {
     bool eviction_enabled = true;
     double eviction_high_watermark = 0.9;
     double eviction_low_watermark = 0.7;
+    // BUCKET mode only: reclaim sealed buckets whose live utilization is below
+    // this threshold. A value of 0 disables low-utilization cleanup.
+    double low_utilization_threshold = 0.05;
+    // Maximum number of low-utilization buckets reclaimed per maintenance tick.
+    int low_utilization_evictions_per_tick = 1;
+    // Maximum number of low-utilization candidates inspected per maintenance
+    // tick. This bounds work when candidates are rejected by the Master.
+    int low_utilization_eviction_attempts_per_tick = 8;
     std::chrono::seconds deferred_free_duration{30};
     std::chrono::seconds eviction_check_interval{5};
 
@@ -43,6 +53,9 @@ struct DistributedStorageConfig {
     DfsAllocatorType allocator_type = DfsAllocatorType::SHARD;
     // BUCKET mode only: size of each append-only bucket data file.
     uint64_t bucket_capacity = 256ULL * 1024 * 1024;
+    // When false, retain old bucket files without recovering their replicas.
+    // max_bucket_count then budgets only buckets created by this process.
+    bool bucket_recovery_enabled = true;
     // BUCKET mode only: upper bound on live buckets. Also the fixed
     // denominator for eviction watermarks, so it must be > 0.
     int64_t max_bucket_count = 256;
@@ -102,6 +115,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter);
+    DistributedStorageBackend(
+        const FileStorageConfig& file_storage_config,
+        const DistributedStorageConfig& distributed_config,
+        std::unique_ptr<FileSystemAdapter> fs_adapter,
+        std::string expected_root_identity);
     ~DistributedStorageBackend() override;
 
     // Exactly one adapter must be non-null.
@@ -109,7 +127,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter,
-        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter);
+        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter,
+        std::string expected_root_identity = {});
 
     DistributedStorageMode GetStorageMode() const { return storage_mode_; }
 
@@ -118,6 +137,28 @@ class DistributedStorageBackend : public StorageBackendInterface {
     }
 
     tl::expected<void, ErrorCode> Init() override;
+
+    // Retry a previously failed initialization. EnsureInitialized waits for
+    // the initializer; TryEnsureInitialized returns unavailable immediately
+    // when another read/write probe is initializing the shared backend.
+    tl::expected<void, ErrorCode> EnsureInitialized();
+    tl::expected<void, ErrorCode> TryEnsureInitialized();
+
+    // Configure before initialization/probes start. Only an empty startup
+    // identity is refreshed; an established identity remains pinned.
+    void SetRootIdentityProvider(
+        std::function<tl::expected<std::string, ErrorCode>()> provider) {
+        root_identity_provider_ = std::move(provider);
+    }
+
+    // Minimal adapter-level probes used by SGLang's health state machine.
+    // These methods never touch business keys.
+    tl::expected<void, ErrorCode> ProbeRead();
+    tl::expected<void, ErrorCode> ProbeWrite();
+
+    [[nodiscard]] bool IsInitialized() const {
+        return initialized_.load(std::memory_order_acquire);
+    }
 
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -156,10 +197,16 @@ class DistributedStorageBackend : public StorageBackendInterface {
         return distributed_config_.allocator_type;
     }
 
+    tl::expected<size_t, ErrorCode> InvalidateAllBucketFds();
+    tl::expected<size_t, ErrorCode> CleanupStaleBucketFds(
+        const std::vector<int64_t>& active_bucket_ids);
+    tl::expected<bool, ErrorCode> CleanupBucketFd(int64_t bucket_id);
+
    private:
     struct ShardFile {
         std::string path;
-        int fd = -1;
+        int read_fd = -1;
+        std::atomic<int> write_fd{-1};
         std::mutex mutex;
     };
 
@@ -279,7 +326,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
+    std::string expected_root_identity_;
+    std::function<tl::expected<std::string, ErrorCode>()> root_identity_provider_;
     std::string root_dir_;
+    std::string health_probe_path_prefix_;
+    std::string active_health_probe_path_;
+    uint64_t health_probe_generation_{0};
+    std::mutex health_probe_write_mutex_;
     // Canonical form of root_dir_, used to reject descriptor paths that try to
     // escape the configured DFS root.
     std::string canonical_root_dir_;
@@ -296,7 +349,12 @@ class DistributedStorageBackend : public StorageBackendInterface {
         bucket_id_direct_cache_;
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
-    bool initialized_ = false;
+    tl::expected<void, ErrorCode> InitLocked();
+    tl::expected<void, ErrorCode> ValidateRootIdentity() const;
+    void ResetFailedInitializationLocked();
+
+    mutable std::mutex init_mutex_;
+    std::atomic<bool> initialized_{false};
 };
 
 }  // namespace mooncake

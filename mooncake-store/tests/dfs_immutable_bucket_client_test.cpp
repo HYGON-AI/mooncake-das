@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <glog/logging.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -21,6 +22,7 @@
 #include "client_service.h"
 #include "crc_checksum.h"
 #include "environ.h"
+#include "master_metric_manager.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
@@ -90,6 +92,14 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     int WriteCalls() const { return write_calls_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
     void FailAllWrites(bool fail) { fail_all_writes_.store(fail); }
+    void FailAllOpens(bool fail) { fail_all_opens_.store(fail); }
+    tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
+        const std::string& path) override {
+        if (fail_all_opens_.load()) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        return PosixFsAdapter::OpenFileReadWriteExisting(path);
+    }
     void BlockWrites() {
         std::lock_guard<std::mutex> lock(mutex_);
         blocked_ = true;
@@ -118,10 +128,63 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
     std::atomic<int> write_calls_{0};
     std::atomic<int> fail_write_call_{-1};
     std::atomic<bool> fail_all_writes_{false};
+    std::atomic<bool> fail_all_opens_{false};
     std::mutex mutex_;
     std::condition_variable cv_;
     bool blocked_ = false;
 };
+
+std::string NextServiceEndpoint() {
+    static std::atomic<int> next_port{41200};
+    return "192.0.2.42:" + std::to_string(next_port.fetch_add(1));
+}
+
+std::optional<double> FindServiceMetricValue(
+    const std::string& metric_name, const std::string& service_endpoint,
+    const std::string& extra_label = "") {
+    const std::string serialized =
+        MasterMetricManager::instance().serialize_metrics();
+    const std::string metric_prefix = metric_name + "{";
+    const std::string endpoint_label =
+        "service_endpoint=\"" + service_endpoint + "\"";
+    size_t line_start = 0;
+    while (line_start < serialized.size()) {
+        const size_t line_end = serialized.find('\n', line_start);
+        const auto line = serialized.substr(
+            line_start, line_end == std::string::npos
+                            ? std::string::npos
+                            : line_end - line_start);
+        if (line.compare(0, metric_prefix.size(), metric_prefix) == 0 &&
+            line.find(endpoint_label) != std::string::npos &&
+            (extra_label.empty() ||
+             line.find(extra_label) != std::string::npos)) {
+            const size_t value_start = line.find_last_of(' ');
+            if (value_start == std::string::npos) return std::nullopt;
+            try {
+                return std::stod(line.substr(value_start + 1));
+            } catch (const std::exception&) {
+                return std::nullopt;
+            }
+        }
+        if (line_end == std::string::npos) break;
+        line_start = line_end + 1;
+    }
+    return std::nullopt;
+}
+
+std::optional<double> WaitForServiceMetricValue(
+    const std::string& metric_name, const std::string& service_endpoint,
+    const std::string& extra_label, double minimum_value,
+    std::chrono::milliseconds timeout = std::chrono::seconds(8)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto value = FindServiceMetricValue(metric_name, service_endpoint,
+                                           extra_label);
+        if (value.has_value() && *value >= minimum_value) return value;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return FindServiceMetricValue(metric_name, service_endpoint, extra_label);
+}
 
 }  // namespace
 
@@ -177,7 +240,8 @@ class DfsBucketClientTest : public ::testing::Test {
         auto adapter = std::make_unique<FailingBucketFsAdapter>();
         adapter_ = adapter.get();
         backend_ = std::make_shared<DistributedStorageBackend>(
-            file_config, distributed_config_, std::move(adapter));
+            file_config, distributed_config_, std::move(adapter),
+            writer_->GetDfsRootIdentity());
         ASSERT_TRUE(backend_->Init().has_value());
         writer_->SetDfsStorageBackend(backend_);
     }
@@ -339,6 +403,74 @@ TEST_F(DfsBucketClientTest, PutThenGetRoundTrip) {
     std::vector<Slice> read_slices{{out.data(), out.size()}};
     ASSERT_TRUE(writer_->Get(key, *query, read_slices).has_value());
     EXPECT_EQ(out, value);
+}
+
+TEST_F(DfsBucketClientTest, EmptyStartupIdentityRecoversFromMasterWithoutRestart) {
+    ASSERT_TRUE(provider_->UnmountSegment(segment_, segment_size_).has_value());
+    writer_.reset();
+    provider_.reset();
+    backend_.reset();
+    adapter_ = nullptr;
+    const int rpc_port = master_.rpc_port();
+    const auto master_config =
+        InProcMasterConfigBuilder().set_rpc_port(rpc_port).build();
+    master_.Stop();
+    SetEnv("MOONCAKE_ENABLE_DFS", "0");
+    ASSERT_TRUE(master_.Start(master_config));
+    writer_ = CreateClient("127.0.0.1:18201");
+    ASSERT_NE(writer_, nullptr);
+    ASSERT_TRUE(writer_->GetDfsRootIdentity().empty());
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root_;
+    // Keep this client and backend alive across the master's DFS recovery.
+    auto recovering = std::make_shared<DistributedStorageBackend>(
+        file_config, distributed_config_, std::make_unique<PosixFsAdapter>());
+    ASSERT_FALSE(recovering->Init().has_value());
+    recovering->SetRootIdentityProvider(
+        [weak_client = std::weak_ptr<Client>(writer_)]()
+            -> tl::expected<std::string, ErrorCode> {
+            auto client = weak_client.lock();
+            if (!client) {
+                return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            }
+            return client->FetchDfsRootIdentity();
+        });
+    writer_->SetDfsStorageBackend(recovering);
+    ASSERT_FALSE(recovering->ProbeWrite().has_value());
+    master_.Stop();
+    SetEnv("MOONCAKE_ENABLE_DFS", "1");
+    ASSERT_TRUE(master_.Start(master_config));
+    // A pooled connection can see EOF on the first probe after restart.
+    const auto recovery_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(5);
+    while (!recovering->ProbeWrite() &&
+           std::chrono::steady_clock::now() < recovery_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_TRUE(recovering->ProbeWrite().has_value());
+    ASSERT_TRUE(recovering->ProbeRead().has_value());
+
+    provider_ = CreateClient("127.0.0.1:18202");
+    ASSERT_NE(provider_, nullptr);
+    ASSERT_TRUE(provider_->MountSegment(segment_, segment_size_, "tcp")
+                    .has_value());
+
+    const std::string key = "recovered_startup_identity";
+    std::string value(4096, 'r');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    std::string output(value.size(), '\0');
+    auto read = recovering->BatchRead(
+        {{key, query->replicas[0].get_dfs_descriptor(),
+          {{output.data(), output.size()}}}});
+    ASSERT_EQ(read.size(), 1u);
+    ASSERT_TRUE(read[0].has_value());
+    EXPECT_EQ(output, value);
 }
 
 TEST_F(DfsBucketClientTest, BatchPutWritesEveryKeyAndKeepsBatchContiguous) {
@@ -571,6 +703,181 @@ TEST_F(DfsBucketClientTest, FailedAsyncWriteRevokesOnlyTheDfsReplica) {
         EXPECT_FALSE(replica.is_dfs_replica())
             << "a failed DFS write must not leave a DFS replica behind";
     }
+}
+
+TEST_F(DfsBucketClientTest,
+       ServiceMetricsSynchronousDualWriteReportsPhysicalPartialOutcome) {
+    const auto endpoint = NextServiceEndpoint();
+    ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+    adapter_->FailAllWrites(true);
+
+    const std::string key = "service_metric_sync_partial";
+    std::string value(4096, 'M');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    // The public Put result may follow the existing finalize/revoke contract;
+    // the metric records the physical memory and DFS transfers independently.
+    (void)writer_->Put(key, slices, DfsConfig());
+    writer_.reset();  // Flush the cumulative client snapshot to the master.
+
+    auto memory_only = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_total", endpoint,
+        "outcome=\"memory_only\"");
+    ASSERT_TRUE(memory_only.has_value());
+    EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+}
+
+TEST_F(DfsBucketClientTest,
+       ServiceMetricsAsyncWriteMovesFromPendingToPhysicalOutcome) {
+    const auto endpoint = NextServiceEndpoint();
+    ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+    adapter_->FailAllWrites(true);
+    adapter_->BlockWrites();
+
+    const std::string key = "service_metric_async_pending";
+    std::vector<std::string> values{std::string(4096, 'A')};
+    auto slices = MakeSlices(values);
+    auto results = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results.front().has_value());
+    const auto write_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (adapter_->WriteCalls() == 0 &&
+           std::chrono::steady_clock::now() < write_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_GT(adapter_->WriteCalls(), 0);
+
+    auto pending = WaitForServiceMetricValue(
+        "mooncake_master_service_dual_write_pending", endpoint, "", 1.0);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_DOUBLE_EQ(*pending, 1.0);
+
+    adapter_->ReleaseWrites();
+    ASSERT_TRUE(WaitForKeyGone(key));
+    writer_.reset();  // Drains the async DFS task, then flushes its result.
+
+    auto settled_pending = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_pending", endpoint);
+    auto memory_only = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_total", endpoint,
+        "outcome=\"memory_only\"");
+    ASSERT_TRUE(settled_pending.has_value());
+    ASSERT_TRUE(memory_only.has_value());
+    EXPECT_DOUBLE_EQ(*settled_pending, 0.0);
+    EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+}
+
+TEST_F(DfsBucketClientTest,
+       ServiceMetricsCountBatchReadFailuresOncePerKeyAndReplicaTier) {
+    const auto endpoint = NextServiceEndpoint();
+    ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+
+    const std::string memory_key = "service_metric_read_memory_failure";
+    const std::string dfs_key = "service_metric_read_dfs_failure";
+    std::vector<std::string> values{std::string(4096, 'm'),
+                                    std::string(4096, 'd')};
+    auto write_slices = MakeSlices(values);
+    auto put_results = writer_->BatchPut({memory_key, dfs_key}, write_slices,
+                                         DfsConfig());
+    ASSERT_EQ(put_results.size(), 2u);
+    for (const auto& result : put_results) ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(WaitForDfsReplica(memory_key));
+    ASSERT_TRUE(WaitForDfsReplica(dfs_key));
+
+    auto memory_query_all = writer_->Query(memory_key);
+    ASSERT_TRUE(memory_query_all.has_value());
+    std::vector<Replica::Descriptor> memory_replicas;
+    for (auto replica : memory_query_all->replicas) {
+        if (!replica.is_memory_replica()) continue;
+        // Force this selected memory-tier read to fail during submit/connect.
+        replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_ =
+            "127.0.0.1:1";
+        memory_replicas.emplace_back(std::move(replica));
+    }
+    ASSERT_EQ(memory_replicas.size(), 1u);
+    QueryResult memory_query(std::move(memory_replicas),
+                             memory_query_all->lease_timeout,
+                             memory_query_all->object_checksum);
+
+    auto dfs_query = QueryDfsOnly(dfs_key);
+    ASSERT_TRUE(dfs_query.has_value());
+    const auto& dfs_descriptor =
+        dfs_query->replicas.front().get_dfs_descriptor();
+    const auto bucket_path =
+        std::filesystem::path(root_) /
+        ("bucket_" +
+         ImmutableBucketAllocator::FormatBucketId(dfs_descriptor.shard_idx) +
+         ".data");
+    ASSERT_TRUE(std::filesystem::remove(bucket_path));
+
+    std::vector<QueryResult> queries;
+    queries.emplace_back(std::move(memory_query));
+    queries.emplace_back(std::move(*dfs_query));
+    std::unordered_map<std::string, std::vector<Slice>> output_slices;
+    std::string memory_output(4096, '\0');
+    std::string dfs_output(4096, '\0');
+    output_slices[memory_key] = {{memory_output.data(), memory_output.size()}};
+    output_slices[dfs_key] = {{dfs_output.data(), dfs_output.size()}};
+
+    auto get_results = writer_->BatchGet({memory_key, dfs_key}, queries,
+                                         output_slices);
+    ASSERT_EQ(get_results.size(), 2u);
+    EXPECT_FALSE(get_results[0].has_value());
+    EXPECT_FALSE(get_results[1].has_value());
+    writer_.reset();  // Flush both per-key counters.
+
+    auto memory_failures = FindServiceMetricValue(
+        "mooncake_master_service_read_failures_total", endpoint,
+        "replica_type=\"memory\"");
+    auto dfs_failures = FindServiceMetricValue(
+        "mooncake_master_service_read_failures_total", endpoint,
+        "replica_type=\"dfs\"");
+    ASSERT_TRUE(memory_failures.has_value());
+    ASSERT_TRUE(dfs_failures.has_value());
+    EXPECT_DOUBLE_EQ(*memory_failures, 1.0);
+    EXPECT_DOUBLE_EQ(*dfs_failures, 1.0);
+}
+
+TEST_F(DfsBucketClientTest, OpenFailuresAreRateLimitedAndRevokeEveryDfsReplica) {
+    struct Capture : google::LogSink {
+        Capture() { google::AddLogSink(this); }
+        ~Capture() override { google::RemoveLogSink(this); }
+        std::atomic<int> opens{0}, writes{0};
+        void send(google::LogSeverity, const char*, const char*, int,
+                  const struct ::tm*, const char* message, size_t length) override {
+            const std::string text(message, length);
+            if (text.find("Failed to open DFS bucket file") != std::string::npos) {
+                ++opens;
+                EXPECT_NE(text.find("suppressed="), std::string::npos);
+            }
+            if (text.find("Async DFS write failed for key") != std::string::npos) {
+                ++writes;
+                EXPECT_NE(text.find("suppressed="), std::string::npos);
+            }
+        }
+    } capture;
+    adapter_->FailAllOpens(true);
+    std::vector<std::string> keys;
+    std::vector<std::string> values(32, std::string(4096, 'F'));
+    for (int i = 0; i < 32; ++i) {
+        keys.push_back("open_failure_" + std::to_string(i));
+    }
+    auto slices = MakeSlices(values);
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(results[i].has_value());
+        ASSERT_TRUE(WaitForKeyGone(keys[i]));
+        auto query = writer_->Query(keys[i]);
+        ASSERT_TRUE(query.has_value());
+        for (const auto& replica : query->replicas) {
+            EXPECT_TRUE(replica.is_memory_replica());
+        }
+    }
+    // Earlier tests can consume these process-wide log quotas. The limiter
+    // unit tests verify first-log and suppressed-count behavior independently.
+    EXPECT_LE(capture.opens.load(), 1);
+    EXPECT_LE(capture.writes.load(), 1);
 }
 
 TEST_F(DfsBucketClientTest, BatchIoFailureRevokesAllKeysInMergedRun) {

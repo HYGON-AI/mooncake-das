@@ -434,6 +434,32 @@ class MooncakeStorePyWrapper {
         return store_->health_check();
     }
 
+    std::vector<int> probe_dfs_health() {
+        if (!store_) {
+            const int error = toInt(ErrorCode::INVALID_PARAMS);
+            return {error, error, 0};
+        }
+        py::gil_scoped_release release;
+        return store_->probe_dfs_health();
+    }
+
+    int probe_dfs_read() {
+        if (!store_) return toInt(ErrorCode::INVALID_PARAMS);
+        py::gil_scoped_release release;
+        return store_->probe_dfs_read();
+    }
+
+    int probe_dfs_write() {
+        if (!store_) return toInt(ErrorCode::INVALID_PARAMS);
+        py::gil_scoped_release release;
+        return store_->probe_dfs_write();
+    }
+
+    int set_dfs_access_policy(bool allow_read, bool allow_write) {
+        if (!store_) return toInt(ErrorCode::INVALID_PARAMS);
+        return store_->set_dfs_access_policy(allow_read, allow_write);
+    }
+
     py::dict mount_segment(const std::string &path, size_t size, size_t offset,
                            const std::string &protocol,
                            const std::string &location) {
@@ -2478,6 +2504,26 @@ PYBIND11_MODULE(store, m) {
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
              "2 if master unreachable.")
+        .def("probe_dfs_health", &MooncakeStorePyWrapper::probe_dfs_health,
+             "Probe DFS read/write health. Returns "
+             "[read_error_code, write_error_code, backend_ready].")
+        .def("probe_dfs_read", &MooncakeStorePyWrapper::probe_dfs_read,
+             "Probe DFS read capability and return an error code.")
+        .def("probe_dfs_write", &MooncakeStorePyWrapper::probe_dfs_write,
+             "Probe DFS write capability and return an error code.")
+        .def(
+            "set_service_endpoint",
+            [](MooncakeStorePyWrapper &self, const std::string &endpoint) {
+                if (!self.store_) return toInt(ErrorCode::INVALID_PARAMS);
+                py::gil_scoped_release release;
+                return self.store_->set_service_endpoint(endpoint);
+            },
+            py::arg("endpoint"),
+            "Enable master-reported service metrics for this immutable service endpoint.")
+        .def("set_dfs_access_policy",
+             &MooncakeStorePyWrapper::set_dfs_access_policy,
+             py::arg("allow_read"), py::arg("allow_write"),
+             "Atomically update DFS read/write access policy.")
         .def("get_size",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;
@@ -3167,8 +3213,8 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"),
             "Refresh leases for active get sessions while preserving cached "
-            "session objects; incompatible refreshed replicas fail. "
-            "Reads also repair leases on demand while the session is active.")
+            "session objects; incompatible refreshed replicas fail and "
+            "invalidate that session")
         .def(
             "batch_get_session_start_with_sources",
             [](MooncakeStorePyWrapper &self,
@@ -3214,6 +3260,15 @@ PYBIND11_MODULE(store, m) {
             "(MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES). When false every DFS "
             "prefetch read fails, so callers should not submit prefetches.")
         .def(
+            "disable_dfs_prefetch",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.is_client_initialized()) return false;
+                py::gil_scoped_release release;
+                return self.store_->disable_dfs_prefetch();
+            },
+            "Startup-only: disable DFS prefetch and release its unused arena. "
+            "Returns false if a session or arena allocation is active.")
+        .def(
             "dfs_prefetch_arena_status",
             [](MooncakeStorePyWrapper &self) {
                 if (!self.is_client_initialized()) {
@@ -3249,11 +3304,7 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("all_src_offsets"),
-            "Ranged get into multiple buffers using an active get session, "
-            "repairing missing or expiring leases on demand. "
-            "MC_STORE_GET_SESSION_MIN_REMAINING_MS controls the safety margin "
-            "in milliseconds (default 1000, range 0..3600000), read once when "
-            "the client is created. Zero still rejects expired leases.")
+            "Ranged get into multiple buffers using a get session")
         .def(
             "batch_get_session_end",
             [](MooncakeStorePyWrapper &self,

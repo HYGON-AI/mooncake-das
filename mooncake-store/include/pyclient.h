@@ -20,19 +20,6 @@
 
 namespace mooncake {
 
-// Identity survives lease expiry, but never an explicit end/start.
-struct GetSessionLifetime {
-    bool ready{false};  // Protected by RealClient::session_mutex_.
-    // Ordinary layer-wise range calls also must not mix content after reading.
-    std::optional<QueryResult> read_snapshot;
-};
-struct GetSessionReadSnapshot {
-    std::shared_ptr<GetSessionLifetime> lifetime;
-    QueryResult query;
-};
-using GetSessionReadSnapshots =
-    std::unordered_map<std::string, GetSessionReadSnapshot>;
-
 #define MOONCAKE_SHM_NAME "mooncake_shm"
 
 // IPC request type discriminator (sent as first 4 bytes on each connection)
@@ -332,15 +319,6 @@ class PyClient {
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
 
-    // Internal read preparation: renew only when necessary and bind the read
-    // to a caller-owned lifetime and a compatible content snapshot.
-    virtual std::vector<int> prepare_get_session_read(
-        const std::vector<std::string> &keys,
-        GetSessionReadSnapshots & /*snapshots*/) {
-        return std::vector<int>(
-            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
-    }
-
     virtual GetSessionStartResult
     batch_get_session_start_with_sources(const std::vector<std::string> &keys) {
         return {batch_get_session_start(keys),
@@ -367,6 +345,11 @@ class PyClient {
     // Whether batch_get_session_prefetch() has a staging arena for DFS reads.
     virtual bool dfs_prefetch_arena_available() const { return false; }
 
+    // Startup-only: disable DFS prefetch and release its unused arena. The
+    // caller must serialize this with session creation before request traffic.
+    // Unsupported clients must return false.
+    virtual bool disable_dfs_prefetch() { return false; }
+
     virtual std::string dfs_prefetch_arena_status() const {
         return "unsupported";
     }
@@ -377,8 +360,7 @@ class PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> & /*all_buffers*/,
         const std::vector<std::vector<size_t>> & /*all_sizes*/,
-        const std::vector<std::vector<size_t>> & /*all_src_offsets*/,
-        const GetSessionReadSnapshots * /*snapshots*/ = nullptr) {
+        const std::vector<std::vector<size_t>> & /*all_src_offsets*/) {
         return std::vector<int>(
             keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
     }
@@ -489,6 +471,28 @@ class PyClient {
     virtual int tearDownAll() = 0;
 
     virtual int health_check() = 0;
+
+    // DFS health/policy control. The probe result is
+    // [read_error_code, write_error_code, backend_ready].
+    virtual int probe_dfs_read() {
+        return toInt(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual int probe_dfs_write() {
+        return toInt(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual std::vector<int> probe_dfs_health() {
+        const int read_error = probe_dfs_read();
+        const int write_error = probe_dfs_write();
+        return {read_error, write_error,
+                read_error == 0 || write_error == 0 ? 1 : 0};
+    }
+    virtual int set_dfs_access_policy(bool /*allow_read*/,
+                                      bool /*allow_write*/) {
+        return toInt(ErrorCode::NOT_SUPPORTED);
+    }
+    virtual int set_service_endpoint(const std::string& /*endpoint*/) {
+        return toInt(ErrorCode::NOT_SUPPORTED);
+    }
 
     virtual tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets) = 0;

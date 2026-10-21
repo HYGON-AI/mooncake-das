@@ -359,6 +359,7 @@ struct FileStorageConfig {
     // Interval between heartbeats sent to the control plane (in seconds)
     uint32_t heartbeat_interval_seconds = 10;
 
+
     // Interval between client_buffer_gc (in seconds)
     uint32_t client_buffer_gc_interval_seconds = 1;
     uint64_t client_buffer_gc_ttl_ms = 5000;
@@ -377,7 +378,7 @@ struct FileStorageConfig {
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
-    bool ValidatePath(std::string path) const;
+    bool ValidatePath(std::string path, bool require_available = true) const;
 
     /**
      * @brief Creates a config instance by reading values from environment
@@ -1725,6 +1726,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config);
+CreateStorageBackend(const FileStorageConfig& config,
+                     const std::string& dfs_root_identity = {});
 
 }  // namespace mooncake

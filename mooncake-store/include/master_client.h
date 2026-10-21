@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <memory>
 #include <string>
@@ -70,13 +71,38 @@ inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
     }
 }
 
-inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
+inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
+    bool ha_enabled = false) {
     RpcClientPool::PoolConfig config;
+    // The outer heartbeat/reconnect loops own recovery in both HA and
+    // non-HA modes. Avoid pool-level retries and waits so every Master RPC
+    // returns connection failures to its caller promptly.
+    config.connect_retry_count = 0;
+    config.reconnect_wait_time = std::chrono::milliseconds(0);
+    config.client_config.connect_timeout_duration =
+        std::chrono::seconds(1);
+    // Keep the parameter to preserve the HA/non-HA policy construction API;
+    // both modes currently use the same bounded connection policy.
+    (void)ha_enabled;
     const char* value = std::getenv("MC_RPC_PROTOCOL");
+    if (const char* retry_count = std::getenv("MC_RPC_CONNECT_RETRY_COUNT")) {
+        const auto parsed = std::atoll(retry_count);
+        config.connect_retry_count =
+            parsed > 0 ? static_cast<decltype(config.connect_retry_count)>(
+                            parsed)
+                       : 0;
+    }
+    if (const char* wait_ms = std::getenv("MC_RPC_RECONNECT_WAIT_MS")) {
+        const auto parsed = std::atoll(wait_ms);
+        config.reconnect_wait_time =
+            std::chrono::milliseconds(parsed > 0 ? parsed : 0);
+    }
     if (value && std::string_view(value) == "rdma") {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
+    // Unset MC_RPC_* variables keep the configured pool defaults; explicit
+    // values override those defaults for both HA and non-HA pools.
     ApplyRpcTimeoutEnvOverrides(config.client_config);
     return config;
 }
@@ -87,15 +113,25 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
  * @brief Client for interacting with the mooncake master service
  */
 class MasterClient {
+    friend class MasterClientTestPeer;
+
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(),
                            detail::MakeMasterRpcClientPoolConfig()),
+          ha_control_client_accessor_(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
+          ha_probe_client_accessor_(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
           client_id_(client_id),
           tenant_id_(std::move(tenant_id)),
           metrics_(metrics) {}
     ~MasterClient();
+
+    void EnableHaConnectionPolicy();
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
 
@@ -108,7 +144,8 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] ErrorCode Connect(
-        const std::string& master_addr = kDefaultMasterAddress);
+        const std::string& master_addr = kDefaultMasterAddress,
+        bool force_recreate = false);
 
     /**
      * @brief Checks if an object exists
@@ -125,6 +162,12 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
+
+    // Read-only typed existence check; does not grant leases, update
+    // get/cache-hit metrics, or trigger promotion or dynamic replication.
+    [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>>
+    BatchExistKeyByReplicaType(const std::vector<std::string>& object_keys,
+                               ReplicaType replica_type);
 
     /**
      * @brief Calculate Store-observed cache reuse metrics
@@ -421,6 +464,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
 
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportServiceMetrics(
+        const ServiceMetricsSnapshot& snapshot);
+
     /**
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
@@ -443,6 +489,10 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    [[nodiscard]] tl::expected<DfsBucketSnapshotResponse, ErrorCode>
+    GetDfsBucketSnapshot(const UUID& client_id, const UUID& last_epoch,
+                         uint64_t last_version);
 
     /**
      * @brief Poll whether master has requested a full SSD clear.
@@ -694,6 +744,16 @@ class MasterClient {
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
         Args&&... args);
 
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_pool(
+        RpcClientPool& client_accessor, Args&&... args);
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode>
+    invoke_rpc_with_client_pool(
+        const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
+        Args&&... args);
+
     /**
      * @brief Generic RPC invocation helper for batch operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -708,6 +768,9 @@ class MasterClient {
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
     RpcClientPool client_accessor_;
+    RpcClientPool ha_control_client_accessor_;
+    RpcClientPool ha_probe_client_accessor_;
+    RpcDrainGuard rpc_drain_;
 
     // The client identification.
     const UUID client_id_;
@@ -721,6 +784,7 @@ class MasterClient {
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
+    std::atomic<bool> ha_connection_policy_enabled_{false};
 };
 
 }  // namespace mooncake

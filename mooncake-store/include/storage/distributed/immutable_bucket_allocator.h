@@ -249,7 +249,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     };
 
     /**
-     * @brief Freeze the coldest evictable bucket and return its live entries.
+     * @brief Freeze an eligible bucket and return its live entries.
+     *
+     * When watermark eviction is active, low-utilization buckets are preferred
+     * before falling back to the coldest eligible bucket.
      * Returns an empty transaction when nothing can be evicted.
      */
     PendingEviction PrepareEviction();
@@ -265,11 +268,29 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     PendingEviction PrepareEvictionForAllocationFailure();
 
     /**
+     * @brief Freeze one non-active bucket whose live utilization is below the
+     * supplied threshold.
+     *
+     * The caller must still validate the returned candidates with the master
+     * before committing the eviction.
+     */
+    PendingEviction PrepareEvictionForLowUtilization(double threshold);
+
+    /**
      * @brief Freeze one specific bucket after its data file is confirmed missing.
      */
     PendingEviction PrepareInvalidation(int64_t bucket_id);
 
     bool HasBucket(int64_t bucket_id) const;
+
+    /**
+     * @brief Check whether the bucket data file exists on the master's DFS.
+     *
+     * The error result is preserved so callers can ask the client to retry
+     * instead of treating an inconclusive check as a missing file.
+     */
+    tl::expected<bool, ErrorCode> IsBucketDataFilePresent(
+        int64_t bucket_id) const;
 
     /**
      * @brief Accept the eviction: drop the bucket and delete its files.
@@ -308,6 +329,12 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
      */
     size_t GetBucketCount() const;
 
+    struct BucketIdSnapshot {
+        uint64_t version = 0;
+        std::vector<int64_t> bucket_ids;
+    };
+    std::shared_ptr<const BucketIdSnapshot> GetBucketIdSnapshot() const;
+
     /**
      * @brief Bucket id an existing key currently lives in, if any.
      */
@@ -318,10 +345,14 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
    private:
     friend class PendingEviction;
 
+    void PublishBucketIdSnapshotLocked();
+
     // Shared implementation for watermark-driven and allocation-failure-driven
     // eviction. The latter bypasses only the watermark gate and still observes
     // active/frozen state plus the master's full validation protocol.
-    PendingEviction PrepareEvictionInternal(bool force_one);
+    PendingEviction PrepareEvictionInternal(
+        bool force_one, double low_utilization_threshold = -1.0,
+        bool low_utilization_only = false);
     PendingEviction PrepareInvalidationInternal(int64_t bucket_id);
 
     // Shared implementation of AbortEviction. `demote` distinguishes an
@@ -344,8 +375,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         uint64_t capacity = 0;
         uint64_t append_offset = 0;
         // Bytes reserved by entries that are still live (PENDING or
-        // COMMITTED). Drives the "is this bucket worth evicting" decision.
+        // COMMITTED). A failed PutStart must Free() its PENDING entry before
+        // this value can represent reclaimable live capacity.
         uint64_t live_bytes = 0;
+        uint64_t pending_entries = 0;
         int64_t last_access_ns = 0;
         // Set between PrepareEviction and Commit/Abort. A frozen bucket
         // accepts no new allocations and cannot be selected again.
@@ -408,9 +441,16 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     BucketPtr PromoteReadyBucketLocked();
     bool ActiveBucketHasSpaceLocked(uint64_t required,
                                     BucketPtr* bucket = nullptr) const;
-    void RequestRefillLocked(bool urgent = false);
+    void RequestRefillLocked();
+    void RecordBucketCreationFailureLocked(ErrorCode error);
     void BucketCreateWorker();
     void StopBucketWorkers();
+
+    // One-shot background sweep that reclaims the bucket files recorded by the
+    // disabled-recovery scan. Their ids are all below `next_bucket_id_`, so no
+    // bucket this process creates reuses a name in the list. Joined by
+    // StopBucketWorkers() before the fs adapter shuts down.
+    void LegacyCleanupWorker(std::vector<int64_t> bucket_ids);
     std::vector<int64_t> DetachReadyBucketsLocked();
     void UpdateBucketPoolMetricsLocked() const;
 
@@ -438,7 +478,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
                                          const DistributedFSDescriptor& desc,
                                          BucketPtr* out_bucket);
 
-    tl::expected<void, ErrorCode> RecoverFromDisk();
+    tl::expected<void, ErrorCode> RecoverFromDisk(bool recover_metadata);
 
     void DeleteBucketFiles(int64_t bucket_id);
 
@@ -472,11 +512,14 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     bool stop_bucket_workers_ = false;
     size_t initialization_creations_remaining_ = 0;
     uint64_t bucket_creation_failure_sequence_ = 0;
-    uint64_t last_urgent_refill_sequence_ = static_cast<uint64_t>(-1);
     ErrorCode last_bucket_creation_error_ = ErrorCode::OK;
     std::chrono::steady_clock::time_point bucket_creation_retry_after_{};
+    std::chrono::seconds bucket_creation_retry_delay_{1};
     std::condition_variable bucket_pool_cv_;
     std::vector<std::thread> bucket_create_workers_;
+    // One-shot sweep of legacy bucket files, spawned only when metadata
+    // recovery is disabled. Joined by StopBucketWorkers().
+    std::thread legacy_cleanup_worker_;
     std::unordered_map<int64_t, BucketPtr> buckets_;
     std::unordered_map<std::string, int64_t> key_index_;
     int64_t next_bucket_id_ = 0;
@@ -491,6 +534,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::unordered_map<int64_t, std::list<int64_t>::iterator> lru_index_;
 
     std::vector<RecoveredReplica> recovered_replicas_;
+
+    std::shared_ptr<const BucketIdSnapshot> bucket_id_snapshot_;
+    std::atomic<uint64_t> bucket_snapshot_version_{0};
 
     std::atomic<bool> initialized_{false};
 };

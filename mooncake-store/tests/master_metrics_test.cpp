@@ -2,9 +2,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -18,6 +21,7 @@
 #include "types.h"
 #include "master_config.h"
 #include "master_metric_manager.h"
+#include "rpc_types.h"
 
 namespace mooncake::test {
 
@@ -44,6 +48,164 @@ class MasterMetricsTest : public ::testing::Test {
         return {result.status, std::string(result.resp_body)};
     }
 };
+
+namespace {
+
+std::optional<double> FindServiceMetricValue(
+    const std::string& serialized, const std::string& metric_name,
+    const std::string& service_endpoint, const std::string& extra_label = "") {
+    const std::string metric_prefix = metric_name + "{";
+    const std::string endpoint_label =
+        "service_endpoint=\"" + service_endpoint + "\"";
+    size_t line_start = 0;
+    while (line_start < serialized.size()) {
+        const size_t line_end = serialized.find('\n', line_start);
+        const auto line = serialized.substr(
+            line_start, line_end == std::string::npos
+                            ? std::string::npos
+                            : line_end - line_start);
+        if (line.compare(0, metric_prefix.size(), metric_prefix) == 0 &&
+            line.find(endpoint_label) != std::string::npos &&
+            (extra_label.empty() ||
+             line.find(extra_label) != std::string::npos)) {
+            const size_t value_start = line.find_last_of(' ');
+            if (value_start == std::string::npos) return std::nullopt;
+            try {
+                return std::stod(line.substr(value_start + 1));
+            } catch (const std::exception&) {
+                return std::nullopt;
+            }
+        }
+        if (line_end == std::string::npos) break;
+        line_start = line_end + 1;
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+TEST_F(MasterMetricsTest,
+       ServiceMetricsAggregateClientsAndApplyCumulativeSnapshotsOnce) {
+    auto& metrics = MasterMetricManager::instance();
+    static std::atomic<int> next_port{45100};
+    const std::string endpoint =
+        "198.51.100.24:" + std::to_string(next_port.fetch_add(1));
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+    const auto outcome_metric =
+        "mooncake_master_service_dual_write_total";
+    const auto pending_metric =
+        "mooncake_master_service_dual_write_pending";
+    const auto read_metric =
+        "mooncake_master_service_read_failures_total";
+    auto value = [&](const std::string& name, const std::string& label = "") {
+        return FindServiceMetricValue(metrics.serialize_metrics(), name,
+                                      endpoint, label);
+    };
+    auto expect_value = [&](const std::string& name,
+                            const std::string& label, double expected) {
+        const auto actual = value(name, label);
+        EXPECT_TRUE(actual.has_value()) << name << " " << label;
+        EXPECT_DOUBLE_EQ(actual.value_or(-1.0), expected);
+    };
+
+    ServiceMetricsSnapshot snapshot_a;
+    snapshot_a.service_endpoint = endpoint;
+    snapshot_a.sequence = 1;
+    snapshot_a.dual_write_both_success = 3;
+    snapshot_a.dual_write_pending = 2;
+    snapshot_a.read_failures_memory = 4;
+    snapshot_a.read_failures_dfs = 1;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client_a, snapshot_a));
+    // An identical retry must not double-apply any cumulative counter.
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client_a, snapshot_a));
+
+    ServiceMetricsSnapshot snapshot_b;
+    snapshot_b.service_endpoint = endpoint;
+    snapshot_b.sequence = 1;
+    snapshot_b.dual_write_memory_only = 2;
+    snapshot_b.dual_write_pending = 1;
+    snapshot_b.read_failures_dfs = 2;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client_b, snapshot_b));
+
+    expect_value(outcome_metric, "outcome=\"both_success\"", 3.0);
+    expect_value(outcome_metric, "outcome=\"memory_only\"", 2.0);
+    expect_value(pending_metric, "", 3.0);
+    expect_value(read_metric, "replica_type=\"memory\"", 4.0);
+    expect_value(read_metric, "replica_type=\"dfs\"", 3.0);
+
+    auto updated_a = snapshot_a;
+    updated_a.sequence = 2;
+    updated_a.dual_write_both_success = 5;
+    updated_a.dual_write_pending = 0;
+    updated_a.read_failures_memory = 6;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client_a, updated_a));
+    expect_value(outcome_metric, "outcome=\"both_success\"", 5.0);
+    expect_value(pending_metric, "", 1.0);
+    expect_value(read_metric, "replica_type=\"memory\"", 6.0);
+
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client_a, snapshot_a));
+    auto decreasing_a = updated_a;
+    decreasing_a.sequence = 3;
+    decreasing_a.dual_write_both_success = 4;
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client_a, decreasing_a));
+    auto conflicting_a = updated_a;
+    conflicting_a.dual_write_both_success++;
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client_a, conflicting_a));
+    auto changed_endpoint = updated_a;
+    changed_endpoint.sequence = 3;
+    changed_endpoint.service_endpoint = "198.51.100.25:45199";
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client_a, changed_endpoint));
+    expect_value(outcome_metric, "outcome=\"both_success\"", 5.0);
+
+    snapshot_b.sequence = 2;
+    snapshot_b.dual_write_pending = 0;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client_b, snapshot_b));
+    expect_value(pending_metric, "", 0.0);
+}
+
+TEST_F(MasterMetricsTest, ServiceMetricsExpirePendingWithoutRecountingOnResume) {
+    auto& metrics = MasterMetricManager::instance();
+    const std::string endpoint = "198.51.100.24:45200";
+    const UUID client = generate_uuid();
+    ServiceMetricsSnapshot snapshot;
+    snapshot.service_endpoint = endpoint;
+    snapshot.sequence = 1;
+    snapshot.dual_write_both_success = 5;
+    snapshot.dual_write_pending = 3;
+    snapshot.read_failures_dfs = 2;
+    auto value = [&](const std::string& name, const std::string& label = "") {
+        return FindServiceMetricValue(metrics.serialize_metrics(), name,
+                                      endpoint, label).value_or(-1);
+    };
+    const std::string pending = "mooncake_master_service_dual_write_pending";
+    const std::string total = "mooncake_master_service_dual_write_total";
+    const std::string failures = "mooncake_master_service_read_failures_total";
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client, snapshot));
+    EXPECT_EQ(value(pending), 3);
+    const auto now = std::chrono::steady_clock::now();
+    metrics.ExpireServiceMetricsPending(now + std::chrono::seconds(29));
+    EXPECT_EQ(value(pending), 3);
+    metrics.ExpireServiceMetricsPending(now + std::chrono::seconds(31));
+    metrics.ExpireServiceMetricsPending(now + std::chrono::seconds(32));
+    EXPECT_EQ(value(pending), 0);
+    // Identical retries revive liveness without replaying cumulative counts.
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client, snapshot));
+    EXPECT_EQ(value(pending), 3);
+    EXPECT_EQ(value(total, "outcome=\"both_success\""), 5);
+    EXPECT_EQ(value(failures, "replica_type=\"dfs\""), 2);
+    metrics.ExpireServiceMetricsPending(now + std::chrono::seconds(31));
+    ++snapshot.sequence;
+    snapshot.dual_write_both_success = 7;
+    snapshot.dual_write_pending = 1;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client, snapshot));
+    EXPECT_EQ(value(pending), 1);
+    EXPECT_EQ(value(total, "outcome=\"both_success\""), 7);
+    EXPECT_EQ(value(failures, "replica_type=\"dfs\""), 2);
+    --snapshot.sequence;
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client, snapshot));
+    EXPECT_EQ(value(pending), 1);
+}
 
 TEST_F(MasterMetricsTest, InitialStatusTest) {
     auto& metrics = MasterMetricManager::instance();

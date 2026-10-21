@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <utility>
 
 #include "types.h"
 #include "replica.h"
@@ -18,6 +19,16 @@ struct DfsMissingBucketReport {
     int64_t bucket_id = -1;
 };
 YLT_REFL(DfsMissingBucketReport, bucket_id);
+
+struct DfsBucketSnapshotResponse {
+    UUID epoch{};
+    uint64_t version = 0;
+    bool unchanged = false;
+    uint32_t heartbeat_interval_seconds = 300;
+    std::vector<int64_t> bucket_ids;
+};
+YLT_REFL(DfsBucketSnapshotResponse, epoch, version, unchanged,
+         heartbeat_interval_seconds, bucket_ids);
 
 enum class ReplicaActionType {
     ADD = 0,
@@ -76,6 +87,26 @@ struct PingResponse {
 };
 YLT_REFL(PingResponse, view_version_id, client_status);
 
+// Cumulative, per-client service-level I/O metrics. Reports are sent from a
+// background thread so they do not add RPCs to foreground data operations or
+// the heartbeat path. The master deduplicates reports by client UUID and
+// sequence number.
+struct ServiceMetricsSnapshot {
+    std::string service_endpoint;
+    uint64_t sequence = 0;
+    uint64_t dual_write_both_success = 0;
+    uint64_t dual_write_memory_only = 0;
+    uint64_t dual_write_dfs_only = 0;
+    uint64_t dual_write_neither_success = 0;
+    uint64_t dual_write_pending = 0;
+    uint64_t read_failures_memory = 0;
+    uint64_t read_failures_dfs = 0;
+};
+YLT_REFL(ServiceMetricsSnapshot, service_endpoint, sequence,
+         dual_write_both_success, dual_write_memory_only,
+         dual_write_dfs_only, dual_write_neither_success,
+         dual_write_pending, read_failures_memory, read_failures_dfs);
+
 /**
  * @brief Response structure for GetReplicaList operation
  */
@@ -116,15 +147,23 @@ struct GetStorageConfigResponse {
     std::string fsdir;
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+    std::string dfs_fsdir;
+    std::string dfs_root_identity;
 
-    GetStorageConfigResponse() : enable_disk_eviction(true), quota_bytes(0) {}
+    GetStorageConfigResponse()
+        : enable_disk_eviction(true), quota_bytes(0) {}
     GetStorageConfigResponse(const std::string& fsdir_param,
-                             bool enable_eviction, uint64_t quota)
+                             bool enable_eviction, uint64_t quota,
+                             std::string dfs_fsdir_param = {},
+                             std::string dfs_root_identity_param = {})
         : fsdir(fsdir_param),
           enable_disk_eviction(enable_eviction),
-          quota_bytes(quota) {}
+          quota_bytes(quota),
+          dfs_fsdir(std::move(dfs_fsdir_param)),
+          dfs_root_identity(std::move(dfs_root_identity_param)) {}
 };
-YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes,
+         dfs_fsdir, dfs_root_identity);
 
 struct NoFSegmentOwnerInfo {
     UUID segment_id;

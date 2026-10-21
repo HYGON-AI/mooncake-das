@@ -8,6 +8,7 @@
 namespace mooncake {
 
 struct SsdMetric;
+class DistributedStorageBackend;
 
 class FileStorage {
    public:
@@ -17,6 +18,10 @@ class FileStorage {
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
+
+    tl::expected<void, ErrorCode> ProbeDfsRead();
+    tl::expected<void, ErrorCode> ProbeDfsWrite();
+    [[nodiscard]] bool IsDfsBackendReady() const;
 
     void RemoveAll();
 
@@ -107,6 +112,10 @@ class FileStorage {
 
     [[nodiscard]] offset_allocator::OffsetAllocStorageReport
     PinnedPrefetchArenaReport() const;
+
+    // Release the startup-allocated arena only when no suballocations remain.
+    // The caller must serialize this with DFS prefetch allocations.
+    [[nodiscard]] bool ReleasePinnedPrefetchArena();
 
     FileStorageConfig config_;
 
@@ -216,7 +225,10 @@ class FileStorage {
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
         bool prefer_pinned);
 
+    tl::expected<void, ErrorCode> InitDfs();
+
     void ClientBufferGCThreadFunc();
+    void DfsHeartbeatThreadFunc();
 
     /**
      * @brief Re-registers all offloaded objects with the master.
@@ -238,8 +250,10 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     PinnedBufferPool::Buffer pinned_prefetch_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_prefetch_arena_allocator_;
+    uint64_t pinned_prefetch_arena_full_free_bytes_{0};
     std::string pinned_prefetch_arena_status_ = "not configured";
     std::shared_ptr<StorageBackendInterface> storage_backend_;
+    std::shared_ptr<DistributedStorageBackend> distributed_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
@@ -252,6 +266,11 @@ class FileStorage {
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
+    std::atomic<bool> dfs_heartbeat_running_{false};
+    std::thread dfs_heartbeat_thread_;
+    std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{300};
+    uint64_t dfs_snapshot_version_ = 0;
+    UUID dfs_snapshot_epoch_{};
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
     // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the

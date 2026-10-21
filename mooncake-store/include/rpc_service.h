@@ -46,6 +46,12 @@ class WrappedMasterService {
         const std::vector<std::string>& keys,
         const std::string& tenant_id = "default");
 
+    // Read-only typed existence check; does not grant leases, update
+    // get/cache-hit metrics, or trigger promotion or dynamic replication.
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyByReplicaType(
+        const std::vector<std::string>& keys,
+        const std::string& tenant_id, ReplicaType replica_type);
+
     tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>
@@ -187,6 +193,9 @@ class WrappedMasterService {
 
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
+    tl::expected<void, ErrorCode> ReportServiceMetrics(
+        const UUID& client_id, const ServiceMetricsSnapshot& snapshot);
+
     tl::expected<std::string, ErrorCode> ServiceReady();
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
@@ -209,6 +218,8 @@ class WrappedMasterService {
      */
     tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
         int64_t new_max_bucket_count);
+    tl::expected<uint32_t, ErrorCode> SetDfsHeartbeatInterval(
+        uint32_t new_interval_seconds);
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
@@ -228,6 +239,9 @@ class WrappedMasterService {
 
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    tl::expected<DfsBucketSnapshotResponse, ErrorCode> GetDfsBucketSnapshot(
+        const UUID& client_id, const UUID& last_epoch, uint64_t last_version);
 
     tl::expected<bool, ErrorCode> PollRemoveAll(const UUID& client_id);
 

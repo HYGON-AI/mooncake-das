@@ -6,8 +6,10 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstring>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "types.h"
@@ -34,6 +36,13 @@ class FileSystemAdapter {
 
     virtual tl::expected<size_t, ErrorCode> WriteFile(
         const std::string& path, std::span<const char> data) = 0;
+
+    // Overwrite a stable file in place. Unlike WriteFile, implementations
+    // should not unlink the previous contents when a write fails.
+    virtual tl::expected<size_t, ErrorCode> OverwriteFile(
+        const std::string& path, std::span<const char> data) {
+        return WriteFile(path, data);
+    }
 
     // Read file into a pre-allocated buffer (zero-copy into Slice.ptr)
     virtual tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
@@ -103,6 +112,16 @@ class FileSystemAdapter {
     // === fd-based I/O for shard-offset DFS mode ===
 
     virtual tl::expected<int, ErrorCode> OpenFile(const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    virtual tl::expected<int, ErrorCode> OpenFileReadOnly(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    virtual tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
+        const std::string& /*path*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
@@ -224,5 +243,37 @@ class FileSystemAdapter {
 
     virtual const char* GetName() const = 0;
 };
+
+// Created by the master when DFS is initialized. Clients use this stable,
+// read-only marker for health probes instead of depending on a client-created
+// probe file. A valid marker is left untouched, which keeps restart safe when
+// the filesystem is full.
+inline constexpr char kDfsRootMarkerFileName[] = ".mooncake_dfs_root_marker";
+inline constexpr char kDfsRootMarkerPayload[] = "mooncake-dfs-root-v1\n";
+
+inline tl::expected<void, ErrorCode> EnsureDfsRootMarker(
+    FileSystemAdapter& adapter, const std::string& path) {
+    auto exists = adapter.FileExists(path);
+    if (exists && *exists) {
+        char payload[sizeof(kDfsRootMarkerPayload)] = {};
+        auto read = adapter.ReadFile(path, payload, sizeof(payload));
+        if (read && *read == sizeof(kDfsRootMarkerPayload) - 1 &&
+            std::memcmp(payload, kDfsRootMarkerPayload,
+                        sizeof(kDfsRootMarkerPayload) - 1) == 0) {
+            return {};
+        }
+    } else if (!exists && exists.error() != ErrorCode::FILE_NOT_FOUND) {
+        return tl::make_unexpected(exists.error());
+    }
+
+    auto write = adapter.WriteFile(
+        path, std::span<const char>(kDfsRootMarkerPayload,
+                                    sizeof(kDfsRootMarkerPayload) - 1));
+    if (!write) return tl::make_unexpected(write.error());
+    if (*write != sizeof(kDfsRootMarkerPayload) - 1) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return adapter.SyncFile(path);
+}
 
 }  // namespace mooncake

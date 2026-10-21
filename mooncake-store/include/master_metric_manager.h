@@ -1,12 +1,16 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
 
+#include "types.h"
+#include "ylt/util/tl/expected.hpp"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
@@ -14,6 +18,7 @@
 namespace mooncake {
 
 struct TieredStorageUsageSnapshot;
+struct ServiceMetricsSnapshot;
 
 class MasterMetricManager {
    public:
@@ -67,6 +72,17 @@ class MasterMetricManager {
      * snapshots directly and must not read the resulting gauges.
      */
     void project_storage_usage(const TieredStorageUsageSnapshot& snapshot);
+
+    // Apply a cumulative per-client report exactly once. Repeated identical
+    // sequence numbers are accepted for retry idempotency; stale or conflicting
+    // reports and endpoint changes are rejected.
+    tl::expected<void, ErrorCode> ReportServiceMetrics(
+        const UUID& client_id, const ServiceMetricsSnapshot& snapshot);
+    // Expire pending contributions after 30 seconds without a valid report.
+    // Retain cumulative baselines so reconnects cannot count old I/O twice.
+    void ExpireServiceMetricsPending(
+        std::chrono::steady_clock::time_point now =
+            std::chrono::steady_clock::now());
 
     enum class CacheHitStat {
         MEMORY_HITS,
@@ -129,6 +145,7 @@ class MasterMetricManager {
     void inc_dfs_replica(const std::string& status, int64_t val = 1);
     void dec_dfs_replica(const std::string& status, int64_t val = 1);
     void transition_dfs_replica(const std::string& from, const std::string& to);
+    void inc_dfs_replica_skipped_total(const std::string& reason);
     void set_dfs_bucket_pool_state(uint64_t ready_count,
                                    uint64_t create_inflight,
                                    uint64_t ready_reserved_bytes);
@@ -301,6 +318,8 @@ class MasterMetricManager {
     // DFS bucket eviction metrics
     void inc_dfs_bucket_eviction_attempts(int64_t val = 1);
     void inc_dfs_bucket_evictions(int64_t val = 1);
+    void inc_dfs_bucket_low_utilization_eviction_attempts(int64_t val = 1);
+    void inc_dfs_bucket_low_utilization_evictions(int64_t val = 1);
     void inc_dfs_bucket_evicted_replicas(int64_t val = 1);
     void inc_dfs_bucket_evicted_bytes(int64_t val = 1);
 
@@ -554,6 +573,16 @@ class MasterMetricManager {
         SummaryCounters counters;
     };
 
+    struct ServiceMetricClientState {
+        std::string endpoint;
+        uint64_t sequence = 0;
+        std::array<uint64_t, 4> dual_write{};
+        uint64_t pending = 0;
+        std::array<uint64_t, 2> read_failures{};
+        bool pending_active = true;
+        std::chrono::steady_clock::time_point last_report;
+    };
+
     // --- Metric Members ---
     std::mutex summary_snapshot_mutex_;
     SummarySnapshot summary_snapshot_;
@@ -561,6 +590,10 @@ class MasterMetricManager {
     std::mutex storage_projection_mutex_;
     std::set<std::string> projected_mem_segments_;
     std::set<std::string> projected_nof_segments_;
+
+    std::mutex service_metrics_mutex_;
+    std::map<UUID, ServiceMetricClientState> service_metric_clients_;
+    std::map<std::string, int64_t> service_pending_by_endpoint_;
 
     // Memory Storage Metrics
     ylt::metric::gauge_t
@@ -593,6 +626,7 @@ class MasterMetricManager {
     ylt::metric::gauge_t dfs_used_bytes_;
     ylt::metric::gauge_t dfs_capacity_unlimited_metric_;
     ylt::metric::dynamic_gauge_1t dfs_replicas_;
+    ylt::metric::dynamic_counter_1t dfs_replica_skipped_total_;
     ylt::metric::gauge_t dfs_bucket_ready_count_;
     ylt::metric::gauge_t dfs_bucket_create_inflight_;
     ylt::metric::histogram_t dfs_bucket_create_latency_us_;
@@ -732,6 +766,8 @@ class MasterMetricManager {
     // DFS bucket eviction metrics
     ylt::metric::counter_t dfs_bucket_eviction_attempts_;
     ylt::metric::counter_t dfs_bucket_evictions_;
+    ylt::metric::counter_t dfs_bucket_low_utilization_eviction_attempts_;
+    ylt::metric::counter_t dfs_bucket_low_utilization_evictions_;
     ylt::metric::counter_t dfs_bucket_evicted_replicas_;
     ylt::metric::counter_t dfs_bucket_evicted_bytes_;
 
@@ -794,6 +830,10 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    ylt::metric::dynamic_counter_2t service_dual_write_total_;
+    ylt::metric::dynamic_gauge_1t service_dual_write_pending_;
+    ylt::metric::dynamic_counter_2t service_read_failures_total_;
 };
 
 }  // namespace mooncake

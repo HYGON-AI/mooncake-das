@@ -148,7 +148,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     return config;
 }
 
-bool FileStorageConfig::ValidatePath(std::string path) const {
+bool FileStorageConfig::ValidatePath(std::string path,
+                                     bool require_available) const {
     if (path.empty()) {
         LOG(ERROR) << "FileStorageConfig: storage_filepath is invalid";
         return false;
@@ -173,10 +174,36 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
         }
     }
 
+    // Reject an existing symlink even when runtime availability checks are
+    // deferred for distributed storage.
+    struct stat lstat_buf;
+    if (::lstat(path.c_str(), &lstat_buf) == 0 && S_ISLNK(lstat_buf.st_mode)) {
+        LOG(ERROR) << "FileStorageConfig: symbolic link is not allowed: "
+                   << path;
+        return false;
+    }
+
     struct stat stat_buf;
+    const bool path_exists = ::stat(path.c_str(), &stat_buf) == 0;
+    if (!require_available) {
+        if (path_exists && !S_ISDIR(stat_buf.st_mode)) {
+            LOG(ERROR)
+                << "FileStorageConfig: storage_filepath is not a directory: "
+                << path;
+            return false;
+        }
+        if (!path_exists || ::access(path.c_str(), W_OK) != 0) {
+            LOG(WARNING)
+                << "FileStorageConfig: distributed storage_filepath is not "
+                   "currently writable; deferring availability to DFS "
+                   "backend initialization and health probes: "
+                << path;
+        }
+        return true;
+    }
 
     // 3. Use stat() to check if the path exists
-    if (::stat(path.c_str(), &stat_buf) != 0) {
+    if (!path_exists) {
         LOG(ERROR) << "FileStorageConfig: storage_filepath does not exist: "
                    << path;
         return false;
@@ -195,22 +222,13 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
         return false;
     }
 
-    // 4. Additional security: prevent symlink bypass (optional)
-    // Use lstat to avoid automatic dereferencing of symbolic links
-    struct stat lstat_buf;
-    if (::lstat(path.c_str(), &lstat_buf) == 0) {
-        if (S_ISLNK(lstat_buf.st_mode)) {
-            LOG(ERROR) << "FileStorageConfig: symbolic link is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
     return true;
 }
 
 bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
+    const bool require_storage_path_available =
+        storage_backend_type != StorageBackendType::kDistributed;
+    if (!ValidatePath(storage_filepath, require_storage_path_available)) {
         return false;
     }
     if (total_keys_limit <= 0) {

@@ -43,7 +43,6 @@ struct SessionRangeReadRequest {
     std::vector<size_t> sizes;
     std::vector<size_t> src_offsets;
     std::chrono::steady_clock::time_point lease_deadline;
-    std::shared_ptr<GetSessionLifetime> lifetime;
 };
 
 using NonMemReadEntry = SessionRangeReadRequest;
@@ -64,7 +63,6 @@ struct SessionRangeReadContext {
     uint64_t trace_id{0};
     size_t cache_evicted_count{0};
     std::vector<std::string> access_sources;
-    std::vector<std::shared_ptr<GetSessionLifetime>> access_lifetimes;
     std::chrono::steady_clock::time_point timing_start;
     std::chrono::steady_clock::time_point cache_gc_done;
     std::chrono::steady_clock::time_point memory_done;
@@ -299,10 +297,6 @@ class RealClient : public PyClient {
     std::vector<int> batch_get_session_refresh(
         const std::vector<std::string> &keys) override;
 
-    std::vector<int> prepare_get_session_read(
-        const std::vector<std::string> &keys,
-        GetSessionReadSnapshots &snapshots) override;
-
     GetSessionStartResult
     batch_get_session_start_with_sources(
         const std::vector<std::string> &keys) override;
@@ -322,6 +316,11 @@ class RealClient : public PyClient {
     // would fail.
     bool dfs_prefetch_arena_available() const override;
 
+    // Startup-only. The caller must serialize this with request/session
+    // creation and call it before request traffic begins. Returns false if a
+    // session or a borrowed arena region is still active.
+    bool disable_dfs_prefetch() override;
+
     // "ready" or the reason the prefetch arena is unavailable.
     std::string dfs_prefetch_arena_status() const override;
 
@@ -331,8 +330,7 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const std::vector<std::vector<size_t>> &all_src_offsets,
-        const GetSessionReadSnapshots *snapshots = nullptr) override;
+        const std::vector<std::vector<size_t>> &all_src_offsets) override;
 
     int batch_get_session_end(const std::vector<std::string> &keys) override;
 
@@ -347,8 +345,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const std::vector<std::vector<size_t>> &all_src_offsets,
-        std::vector<int> &results, SessionRangeReadContext &context,
-        const GetSessionReadSnapshots *snapshots);
+        std::vector<int> &results, SessionRangeReadContext &context);
 
     SessionRangeReadPlan classify_session_range_read_requests(
         std::vector<SessionRangeReadRequest> requests,
@@ -466,6 +463,13 @@ class RealClient : public PyClient {
     int tearDownAll();
 
     int health_check() override;
+    int probe_dfs_read() override;
+    int probe_dfs_write() override;
+    async_simple::coro::Lazy<int> probe_dfs_read_rpc();
+    async_simple::coro::Lazy<int> probe_dfs_write_rpc();
+    std::vector<int> probe_dfs_health() override;
+    int set_dfs_access_policy(bool allow_read, bool allow_write) override;
+    int set_service_endpoint(const std::string& endpoint) override;
 
     /**
      * @brief Check if an object exists
@@ -1099,8 +1103,8 @@ class RealClient : public PyClient {
 
     // KV transfer sessions (process-local; not shared with DummyClient).
     // get_sessions_ stores a FilterQueryResult'd QueryResult (one complete
-    // MEMORY or DFS replica plus its lease). Expired snapshots are retained
-    // until repair/end so compatible prefetched bytes can survive renewal.
+    // MEMORY or DFS replica plus its lease). Range reads only compare the
+    // lease locally and do not query the Master again.
     // Put sessions track writable + inflight so end/revoke can seal the
     // session and wait for outstanding range writes before finalize/free.
     struct PutSessionEntry {
@@ -1112,21 +1116,7 @@ class RealClient : public PyClient {
     };
     mutable std::mutex session_mutex_;
     std::condition_variable session_cv_;
-    // Read once at client creation; shared by every on-demand lease check.
-    std::chrono::milliseconds get_session_min_remaining_{1000};
     std::unordered_map<std::string, QueryResult> get_sessions_;
-    std::unordered_map<std::string, std::shared_ptr<GetSessionLifetime>>
-        get_session_lifetimes_;
-    struct GetSessionRepair {
-        bool done{false};
-        int result{static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))};
-    };
-    std::unordered_map<std::string, std::shared_ptr<GetSessionRepair>>
-        get_session_repairs_;
-    void cancel_get_session_repair(const std::string &key);
-    std::vector<int> ensure_get_sessions(
-        const std::vector<std::string> &keys,
-        GetSessionReadSnapshots &snapshots, bool force_refresh = false);
     struct GetSessionAccessRecord {
         std::string source;
         bool success{true};
@@ -1235,6 +1225,10 @@ class RealClient : public PyClient {
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     int start_http_server(int port);
     void stop_http_server();
+    void handle_get_logging(coro_http::coro_http_request& req,
+                            coro_http::coro_http_response& resp);
+    void handle_update_logging(coro_http::coro_http_request& req,
+                               coro_http::coro_http_response& resp);
 
     void handle_ipc_shm_register(UdsConnection &connection);
     void handle_ipc_shm_fd_request(UdsConnection &connection);
@@ -1244,6 +1238,12 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    void execute_session_dfs_range_reads_batch(
+        std::vector<SessionRangeReadRequest *> &entries,
+        std::vector<int> &results, uint64_t trace_id, bool prefetch_only,
+        size_t chunk_index, size_t chunk_count, size_t chunk_limit_bytes,
+        size_t request_planned_bytes);
+
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;

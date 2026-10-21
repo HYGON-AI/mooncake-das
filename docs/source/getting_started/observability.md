@@ -166,6 +166,93 @@ The admin HTTP server is configured in the master config file (`master.json` or 
 
 Set `enable_metric_reporting` to `false` to disable the periodic metrics log. HTTP endpoints (`/metrics`, `/health`, etc.) remain available regardless of this setting.
 
+## Service replica I/O metrics on the master
+
+You can aggregate foreground replica I/O results from all Mooncake clients of
+one SGLang service at the master's `/metrics` endpoint. Use the SGLang service
+IP and business port as `service_endpoint`, shared by every TP/DP worker.
+Client transfer ports and client HTTP metrics ports identify different things.
+
+With the updated SGLang and Mooncake packages, reporting starts automatically
+for the Mooncake direct linker with memory and DFS, and for HiCache storage.
+You do not need a new CLI flag, storage extra-config field, or an enabled
+HiCache tier. SGLang uses its existing business `--host` and `--port` settings.
+It resolves hostnames to IP addresses. For wildcard binds (`0.0.0.0` or `::`),
+single-node services reuse SGLang's local IP discovery; multi-node services
+use the shared leader IP from the existing `--dist-init-addr`, combined with
+the business port rather than the distributed initialization port. IPv6 labels
+use `[IP]:port` format.
+
+The endpoint is only a metrics label; it does not change keys or replica
+placement. A process without SGLang serving arguments, or one whose service
+IP cannot be discovered, logs a warning and leaves cache I/O available.
+It never labels a wildcard address as the service IP.
+
+For a programmatic client, enable reporting after `setup` and before I/O:
+
+```python
+if store.set_service_endpoint("10.0.0.20:30000") != 0:
+    raise RuntimeError("Could not configure service metrics")
+```
+
+Once configured, the endpoint cannot change for that client. Reporting runs
+every five seconds on a separate thread, independently of the client HTTP
+server and `MC_STORE_CLIENT_METRIC`. Each report contains cumulative counters;
+the master applies only the increase for each client UUID. A failed report can
+be retried without counting completed operations again. Reporting does not
+add an RPC to each read or write or change their success/revoke behavior.
+If you use `setup_dummy`, all callers of the shared RealClient daemon must
+belong to the same service endpoint; use separate daemons for different
+services.
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `mooncake_master_service_dual_write_total` | `service_endpoint`, `outcome` | Completed foreground key writes requesting both memory and DFS replicas |
+| `mooncake_master_service_dual_write_pending` | `service_endpoint` | Such writes still waiting for their physical transfer result |
+| `mooncake_master_service_read_failures_total` | `service_endpoint`, `replica_type` | Failed key read attempts on `memory` or `dfs` |
+
+Write outcomes are `both_success`, `memory_only`, `dfs_only`, and
+`neither_success`. A tier succeeds only when all requested replicas in that
+tier finish transferring. `neither_success` can include partial success within
+a tier. Memory success with DFS allocation fallback counts as `memory_only`.
+An existing-key no-op does not count as a new write. An asynchronous DFS write
+remains pending until its result is available; background backfill does not
+count as a second foreground write.
+
+These counters describe physical transfer results, not committed or currently
+live replicas. A later metadata RPC failure, revoke, eviction, or backfill
+does not rewrite a previously recorded transfer outcome. Read failures count
+key access attempts, so a failed memory read followed by a successful DFS
+fallback still contributes one memory failure. Cache misses before choosing
+a replica are outside the per-tier read counters.
+
+You can compare incomplete and successful dual writes per service:
+
+```promql
+sum by (service_endpoint, outcome) (
+  rate(mooncake_master_service_dual_write_total[5m])
+)
+```
+
+To aggregate read failures across services while keeping the replica type:
+
+```promql
+sum by (replica_type) (
+  rate(mooncake_master_service_read_failures_total[5m])
+)
+```
+
+These metrics are best-effort process state. Abrupt client termination can lose
+results since its last successful report. Master restart or leader replacement
+resets its aggregate/deduplication state; reporting clients repopulate it from
+their lifetime snapshots. Do not treat a replay after restart as new I/O.
+Pending values exclude clients that have not sent a valid metrics report for
+30 seconds, evaluated when the metrics are scraped. This also covers clients
+without storage segments or storage heartbeats. A fresh report restores its
+pending contribution. Cumulative per-client baselines are retained for
+deduplication across reconnects; this change does not reclaim that state.
+Pending expiry is not proof that a client or an individual write has failed.
+
 ## Client Metrics Endpoint
 
 Mooncake clients can also expose a client-local HTTP endpoint for health checks
@@ -192,6 +279,15 @@ For `mooncake.mooncake_store_service`, set
 `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER=true` and optionally
 `MOONCAKE_CLIENT_HTTP_PORT=<port>`. For the standalone `mooncake_client`, use
 `--enable_http_server=true --http_port=<port>`.
+
+In SGLang, `--enable-metrics` also enables the Mooncake Client HTTP server.
+By default each Client binds port `0`, so the OS assigns a free port even when
+several TP/DP services share one host. The startup log prints the actual port
+as `Client HTTP server started on port <port>`. SGLang's own metrics endpoint
+and the Master's service-level metrics keep their existing ports.
+An explicitly configured positive `MOONCAKE_CLIENT_METRICS_PORT_BASE` retains
+the fixed base-plus-rank allocation; separate services must then use disjoint
+ranges. Programmatic Mooncake clients can also pass `client_http_port=0`.
 
 | Endpoint | Content-Type | Description |
 |----------|--------------|-------------|
