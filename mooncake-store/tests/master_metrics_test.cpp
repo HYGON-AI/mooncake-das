@@ -164,6 +164,49 @@ TEST_F(MasterMetricsTest,
     expect_value(pending_metric, "", 0.0);
 }
 
+TEST_F(MasterMetricsTest, ServiceMetricsExpirePendingWithoutRecountingOnResume) {
+    auto& metrics = MasterMetricManager::instance();
+    const std::string endpoint = "198.51.100.24:45200";
+    const UUID client = generate_uuid();
+    ServiceMetricsSnapshot snapshot;
+    snapshot.service_endpoint = endpoint;
+    snapshot.sequence = 1;
+    snapshot.dual_write_both_success = 5;
+    snapshot.dual_write_pending = 3;
+    snapshot.read_failures_dfs = 2;
+    auto value = [&](const std::string& name, const std::string& label = "") {
+        return FindServiceMetricValue(metrics.serialize_metrics(), name,
+                                      endpoint, label).value_or(-1);
+    };
+    const std::string pending = "mooncake_master_service_dual_write_pending";
+    const std::string total = "mooncake_master_service_dual_write_total";
+    const std::string failures = "mooncake_master_service_read_failures_total";
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client, snapshot));
+    EXPECT_EQ(value(pending), 3);
+    const auto now = std::chrono::steady_clock::now();
+    metrics.ExpireServiceMetricsPending(now + std::chrono::seconds(29));
+    EXPECT_EQ(value(pending), 3);
+    metrics.ExpireServiceMetricsPending(now + std::chrono::seconds(31));
+    metrics.ExpireServiceMetricsPending(now + std::chrono::seconds(32));
+    EXPECT_EQ(value(pending), 0);
+    // Identical retries revive liveness without replaying cumulative counts.
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client, snapshot));
+    EXPECT_EQ(value(pending), 3);
+    EXPECT_EQ(value(total, "outcome=\"both_success\""), 5);
+    EXPECT_EQ(value(failures, "replica_type=\"dfs\""), 2);
+    metrics.ExpireServiceMetricsPending(now + std::chrono::seconds(31));
+    ++snapshot.sequence;
+    snapshot.dual_write_both_success = 7;
+    snapshot.dual_write_pending = 1;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client, snapshot));
+    EXPECT_EQ(value(pending), 1);
+    EXPECT_EQ(value(total, "outcome=\"both_success\""), 7);
+    EXPECT_EQ(value(failures, "replica_type=\"dfs\""), 2);
+    --snapshot.sequence;
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client, snapshot));
+    EXPECT_EQ(value(pending), 1);
+}
+
 TEST_F(MasterMetricsTest, InitialStatusTest) {
     auto& metrics = MasterMetricManager::instance();
 

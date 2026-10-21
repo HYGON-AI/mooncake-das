@@ -591,12 +591,11 @@ tl::expected<void, ErrorCode> MasterMetricManager::ReportServiceMetrics(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (previous && snapshot.sequence == previous->sequence) {
-        if (dual_write == previous->dual_write &&
-            read_failures == previous->read_failures &&
-            snapshot.dual_write_pending == previous->pending) {
-            return {};
+        if (dual_write != previous->dual_write ||
+            read_failures != previous->read_failures ||
+            snapshot.dual_write_pending != previous->pending) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (previous && snapshot.sequence < previous->sequence) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -630,7 +629,9 @@ tl::expected<void, ErrorCode> MasterMetricManager::ReportServiceMetrics(
     auto& endpoint_pending =
         service_pending_by_endpoint_[snapshot.service_endpoint];
     const int64_t old_client_pending =
-        previous ? static_cast<int64_t>(previous->pending) : 0;
+        previous && previous->pending_active
+            ? static_cast<int64_t>(previous->pending)
+            : 0;
     const int64_t new_client_pending =
         static_cast<int64_t>(snapshot.dual_write_pending);
     if (endpoint_pending < old_client_pending ||
@@ -675,8 +676,24 @@ tl::expected<void, ErrorCode> MasterMetricManager::ReportServiceMetrics(
     state.dual_write = dual_write;
     state.pending = snapshot.dual_write_pending;
     state.read_failures = read_failures;
+    state.last_report = std::chrono::steady_clock::now();
     service_metric_clients_[client_id] = std::move(state);
     return {};
+}
+
+void MasterMetricManager::ExpireServiceMetricsPending(
+    std::chrono::steady_clock::time_point now) {
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    for (auto& [client_id, state] : service_metric_clients_) {
+        if (!state.pending_active ||
+            now - state.last_report < std::chrono::seconds(30)) {
+            continue;
+        }
+        auto& pending = service_pending_by_endpoint_.at(state.endpoint);
+        pending -= static_cast<int64_t>(state.pending);
+        service_dual_write_pending_.update({state.endpoint}, pending);
+        state.pending_active = false;
+    }
 }
 
 // --- Metric Interface Methods ---
@@ -2116,6 +2133,8 @@ int64_t MasterMetricManager::get_update_task_failures() {
 
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
+    // Report liveness also covers zero-segment clients without storage pings.
+    ExpireServiceMetricsPending();
     // Note: Following Prometheus style, metrics with value 0 that haven't
     // changed will not be included in the output. If all metrics are 0 and
     // unchanged, this function will return an empty string.
