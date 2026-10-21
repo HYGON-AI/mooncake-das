@@ -224,6 +224,14 @@ class MasterService {
         int64_t new_max_bucket_count);
     tl::expected<uint32_t, ErrorCode> SetDfsHeartbeatInterval(
         uint32_t new_interval_seconds);
+
+    // 0 keeps DFS allocation and reads enabled; 1 filters both.
+    uint8_t GetDfsFilterMode() const {
+        return dfs_filter_mode_.load(std::memory_order_acquire);
+    }
+    tl::expected<uint8_t, ErrorCode> SetDfsFilterMode(
+        uint8_t new_filter_mode);
+
     bool UsesDfsBucketAllocator() const {
         return bucket_allocator_.get() != nullptr;
     }
@@ -1045,7 +1053,8 @@ class MasterService {
         const ReplicateConfig& config,
         const std::optional<DistributedFSDescriptor>& preallocated_dfs,
         bool skip_dfs_replica = false,
-        std::optional<ErrorCode> dfs_fallback_reason = std::nullopt)
+        std::optional<ErrorCode> dfs_fallback_reason = std::nullopt,
+        std::optional<bool> dfs_allocation_allowed_snapshot = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // Restore master state
@@ -2099,7 +2108,8 @@ class MasterService {
         const std::optional<DistributedFSDescriptor>& preallocated_dfs =
             std::nullopt,
         bool skip_dfs_replica = false,
-        std::optional<ErrorCode>* dfs_allocation_error = nullptr)
+        std::optional<ErrorCode>* dfs_allocation_error = nullptr,
+        std::optional<bool> dfs_allocation_allowed_snapshot = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -2828,6 +2838,7 @@ class MasterService {
 
     bool use_disk_replica_{false};
     std::atomic<bool> enable_dfs_{false};
+    std::atomic<uint8_t> dfs_filter_mode_{0};
     bool enable_dfs_bucket_recovery_{true};
     bool dfs_restore_from_bucket_metadata_{true};
     double dfs_bucket_low_utilization_threshold_{0.05};
@@ -3032,6 +3043,7 @@ class MasterService {
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
     bool IsReplicaReadable(const Replica& replica) const;
+    bool IsDfsReadFilteredOnly(const ObjectMetadata& metadata) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyInternal(

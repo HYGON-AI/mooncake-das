@@ -246,6 +246,18 @@ struct HttpDfsHeartbeatIntervalResponse {
 };
 YLT_REFL(HttpDfsHeartbeatIntervalResponse, success, old_value, new_value);
 
+struct HttpDfsFilterModeRequest {
+    std::optional<uint32_t> filter_mode;
+};
+YLT_REFL(HttpDfsFilterModeRequest, filter_mode);
+
+struct HttpDfsFilterModeResponse {
+    bool success{true};
+    uint32_t old_value{0};
+    uint32_t new_value{0};
+};
+YLT_REFL(HttpDfsFilterModeResponse, success, old_value, new_value);
+
 struct HttpLoggingUpdateRequest {
     std::optional<std::string> minloglevel;
     std::optional<int> vlog_level;
@@ -337,6 +349,24 @@ ParseDfsHeartbeatIntervalBody(coro_http::coro_http_request& req) {
     }
     if (request.interval_seconds == 0) {
         return tl::make_unexpected("interval_seconds must be positive (>0)");
+    }
+    return request;
+}
+
+tl::expected<HttpDfsFilterModeRequest, std::string> ParseDfsFilterModeBody(
+    coro_http::coro_http_request& req) {
+    HttpDfsFilterModeRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(std::string("Invalid JSON body: ") +
+                                   e.what());
+    }
+    if (!request.filter_mode.has_value()) {
+        return tl::make_unexpected("filter_mode is required");
+    }
+    if (*request.filter_mode > 1) {
+        return tl::make_unexpected("filter_mode must be 0 or 1");
     }
     return request;
 }
@@ -1379,6 +1409,39 @@ void MasterAdminServer::HandleSetDfsHeartbeatInterval(
     });
 }
 
+void MasterAdminServer::HandleGetDfsFilterMode(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        const auto current = service->GetDfsFilterMode();
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpDfsFilterModeResponse{.old_value = current,
+                                                    .new_value = current});
+    });
+}
+
+void MasterAdminServer::HandleSetDfsFilterMode(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto body_result = ParseDfsFilterModeBody(req);
+    if (!body_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, body_result.error());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->SetDfsFilterMode(*body_result->filter_mode);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(
+            resp, coro_http::status_type::ok,
+            HttpDfsFilterModeResponse{.old_value = result.value(),
+                                      .new_value = *body_result->filter_mode});
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1491,6 +1554,16 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/dfs/heartbeat_interval",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSetDfsHeartbeatInterval(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/dfs/filter_mode",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetDfsFilterMode(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/dfs/filter_mode",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetDfsFilterMode(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/api/v1/logging",

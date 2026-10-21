@@ -1668,6 +1668,15 @@ WrappedMasterService::SetDfsHeartbeatInterval(uint32_t new_interval_seconds) {
     return master_service_.SetDfsHeartbeatInterval(new_interval_seconds);
 }
 
+tl::expected<uint8_t, ErrorCode> WrappedMasterService::SetDfsFilterMode(
+    uint8_t new_filter_mode) {
+    return master_service_.SetDfsFilterMode(new_filter_mode);
+}
+
+uint8_t WrappedMasterService::GetDfsFilterMode() const {
+    return master_service_.GetDfsFilterMode();
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::GetAllKeysForAdmin() {
     // Compatibility endpoint: /get_all_keys historically listed only the

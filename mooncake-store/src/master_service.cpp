@@ -352,8 +352,9 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 // revoked), not at the allocation stage for memory-only configs.
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
-                                  size_t allocated_nof_replicas) {
-    if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
+                                  size_t allocated_nof_replicas,
+                                  size_t expected_dfs_replicas) {
+    if (config.nof_replica_num == 0 && expected_dfs_replicas == 0) {
         return allocated_memory_replicas > 0;
     }
     if (DetermineReplicaWriteMode(config) ==
@@ -1944,6 +1945,18 @@ tl::expected<uint32_t, ErrorCode> MasterService::SetDfsHeartbeatInterval(
     }
     return dfs_heartbeat_interval_seconds_.exchange(
         new_interval_seconds, std::memory_order_acq_rel);
+}
+
+tl::expected<uint8_t, ErrorCode> MasterService::SetDfsFilterMode(
+    uint8_t new_filter_mode) {
+    if (new_filter_mode > 1) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const uint8_t old_value = dfs_filter_mode_.exchange(
+        new_filter_mode, std::memory_order_acq_rel);
+    LOG(INFO) << "action=set_dfs_filter_mode, old_value=" << old_value
+              << ", new_value=" << new_filter_mode;
+    return old_value;
 }
 
 void MasterService::RecomputeTenantEffectiveQuotas() {
@@ -4040,6 +4053,10 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
         replica.has_invalid_mem_handle() || replica.has_invalid_nof_handle()) {
         return false;
     }
+    if (replica.is_dfs_replica() &&
+        (dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0) {
+        return false;
+    }
     const auto descriptor = replica.get_descriptor();
     std::optional<std::string> endpoint;
     if (descriptor.is_memory_replica()) {
@@ -4052,6 +4069,23 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
         endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
     }
     return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
+}
+
+bool MasterService::IsDfsReadFilteredOnly(
+    const ObjectMetadata& metadata) const {
+    if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0) {
+        return false;
+    }
+    const bool has_completed_dfs = metadata.HasReplica([](const Replica& replica) {
+        return replica.is_dfs_replica() && replica.is_completed();
+    });
+    if (!has_completed_dfs) {
+        return false;
+    }
+    return !metadata.HasReplica([](const Replica& replica) {
+        return !replica.is_dfs_replica() &&
+               (replica.is_completed() || replica.is_processing());
+    });
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
@@ -4100,6 +4134,12 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                     });
 
                 if (replica_list.empty()) {
+                    if (IsDfsReadFilteredOnly(metadata) ||
+                        metadata.AllReplicas([](const Replica& replica) {
+                            return replica.status() == ReplicaStatus::REMOVED;
+                        })) {
+                        continue;
+                    }
                     LOG(WARNING)
                         << "key=" << key
                         << " matched by regex, but has no complete replicas.";
@@ -4149,7 +4189,8 @@ auto MasterService::GetReplicaList(const std::string& key,
             });
 
         if (replica_list.empty()) {
-            if (metadata.AllReplicas([](const Replica& replica) {
+            if (IsDfsReadFilteredOnly(metadata) ||
+                metadata.AllReplicas([](const Replica& replica) {
                     return replica.status() == ReplicaStatus::REMOVED;
                 })) {
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -4340,7 +4381,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     });
 
                 if (replica_list.empty()) {
-                    if (metadata.AllReplicas([](const Replica& replica) {
+                    if (IsDfsReadFilteredOnly(metadata) ||
+                        metadata.AllReplicas([](const Replica& replica) {
                             return replica.status() == ReplicaStatus::REMOVED;
                         })) {
                         results[original_idx] =
@@ -4528,7 +4570,8 @@ auto MasterService::AllocateAndInsertMetadata(
     std::optional<std::chrono::system_clock::time_point>
         committed_soft_pin_timeout,
     const std::optional<DistributedFSDescriptor>& preallocated_dfs,
-    bool skip_dfs_replica, std::optional<ErrorCode>* dfs_allocation_error)
+    bool skip_dfs_replica, std::optional<ErrorCode>* dfs_allocation_error,
+    std::optional<bool> dfs_allocation_allowed_snapshot)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     if (dfs_allocation_error != nullptr) {
         dfs_allocation_error->reset();
@@ -4559,6 +4602,12 @@ auto MasterService::AllocateAndInsertMetadata(
 
     std::vector<Replica> replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
+    const bool dfs_allocation_allowed =
+        preallocated_dfs.has_value() ||
+        dfs_allocation_allowed_snapshot.value_or(
+            (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0);
+    const size_t expected_dfs_replicas =
+        dfs_allocation_allowed ? config.dfs_replica_num : 0;
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     bool has_enough_memory_segments = false;
@@ -4661,7 +4710,8 @@ auto MasterService::AllocateAndInsertMetadata(
 #endif
 
     if (!HasExpectedReplicaAllocation(config, allocated_memory_replicas,
-                                      allocated_nof_replicas)) {
+                                      allocated_nof_replicas,
+                                      expected_dfs_replicas)) {
         if ((config.replica_num > 0 &&
              allocated_memory_replicas != config.replica_num) ||
             (config.nof_replica_num > 0 &&
@@ -4708,7 +4758,8 @@ auto MasterService::AllocateAndInsertMetadata(
                               ReplicaStatus::PROCESSING);
     }
 
-    if (config.dfs_replica_num > 0 && !skip_dfs_replica) {
+    if (config.dfs_replica_num > 0 && !skip_dfs_replica &&
+        dfs_allocation_allowed) {
         if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
             static DfsLogLimiter log_limiter;
             if (auto suppressed = log_limiter.ShouldLog()) {
@@ -4812,7 +4863,8 @@ auto MasterService::AllocateAndInsertMetadata(
     }
     RegisterGroupMember(tenant_state, tenant_id, key, group_id);
     tenant_state.processing_keys.insert(key);
-    if (config.dfs_replica_num > 0) {
+    if (config.dfs_replica_num > 0 &&
+        (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0) {
         tenant_state.dfs_backfill[key] = {};
     }
 
@@ -4832,7 +4884,8 @@ auto MasterService::PutStartInternal(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const uint64_t slice_length, const ReplicateConfig& config,
     const std::optional<DistributedFSDescriptor>& preallocated_dfs,
-    bool skip_dfs_replica, std::optional<ErrorCode> dfs_fallback_reason)
+    bool skip_dfs_replica, std::optional<ErrorCode> dfs_fallback_reason,
+    std::optional<bool> dfs_allocation_allowed_snapshot)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
@@ -5010,7 +5063,8 @@ auto MasterService::PutStartInternal(
                         writer_host_id, group_id, object_id.tenant_id, now,
                         *soft_pin_request, quota_deficit_bytes, std::nullopt,
                         preallocated_dfs, skip_dfs_replica,
-                        &dfs_allocation_error);
+                        &dfs_allocation_error,
+                        dfs_allocation_allowed_snapshot);
                 }
             }
         }
@@ -5029,7 +5083,8 @@ auto MasterService::PutStartInternal(
             shard, client_id, key, slice_length, config, writer_host_id,
             group_id, object_id.tenant_id, now, *soft_pin_request,
             quota_deficit_bytes, std::nullopt, preallocated_dfs,
-            skip_dfs_replica, &dfs_allocation_error);
+            skip_dfs_replica, &dfs_allocation_error,
+            dfs_allocation_allowed_snapshot);
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
@@ -5156,14 +5211,20 @@ MasterService::BatchPutStart(const UUID& client_id,
         return results;
     }
 
+    const uint8_t dfs_filter_mode =
+        dfs_filter_mode_.load(std::memory_order_acquire);
+    const bool dfs_allocation_allowed_snapshot =
+        (dfs_filter_mode & 1) == 0;
     // Batch preallocation is a BUCKET-only optimization. SHARD allocation and
     // requests without DFS replicas retain the original per-key allocation,
     // failure, and rollback behavior of PutStart.
-    if (bucket_allocator_ == nullptr || config.dfs_replica_num == 0) {
+    if (bucket_allocator_ == nullptr || config.dfs_replica_num == 0 ||
+        !dfs_allocation_allowed_snapshot) {
         for (size_t i = 0; i < keys.size(); ++i) {
-            results.emplace_back(PutStart(client_id, keys[i], tenant_id,
-                                          slice_lengths[i],
-                                          config.ForSingleKey(i)));
+            results.emplace_back(PutStartInternal(
+                client_id, keys[i], tenant_id, slice_lengths[i],
+                config.ForSingleKey(i), std::nullopt, /*skip_dfs_replica=*/false,
+                std::nullopt, dfs_allocation_allowed_snapshot));
         }
         return results;
     }
@@ -5201,12 +5262,16 @@ MasterService::BatchPutStart(const UUID& client_id,
                 const ErrorCode error = error_it != reservation_errors.end()
                                             ? error_it->second
                                             : ErrorCode::NO_AVAILABLE_HANDLE;
-                if (error_it != reservation_errors.end() &&
-                    IsDfsReplicaFallbackError(error)) {
+                if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
+                    results.emplace_back(PutStart(
+                        client_id, keys[i], tenant_id, slice_lengths[i],
+                        key_config));
+                } else if (error_it != reservation_errors.end() &&
+                           IsDfsReplicaFallbackError(error)) {
                     results.emplace_back(PutStartInternal(
                         client_id, keys[i], tenant_id, slice_lengths[i],
                         key_config, std::nullopt, /*skip_dfs_replica=*/true,
-                        error));
+                        error, std::nullopt));
                 } else {
                     results.emplace_back(tl::make_unexpected(error));
                 }
@@ -5216,7 +5281,9 @@ MasterService::BatchPutStart(const UUID& client_id,
 
         auto result =
             PutStartInternal(client_id, keys[i], tenant_id, slice_lengths[i],
-                             key_config, preallocated);
+                             key_config, preallocated,
+                             /*skip_dfs_replica=*/false, std::nullopt,
+                             dfs_allocation_allowed_snapshot);
         if (!result && preallocated.has_value()) {
             // PutStart rejected this key (duplicate, quota, ...) after we had
             // already reserved its space; give the reservation back.
@@ -5736,6 +5803,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 0 &&
+        (dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0) {
+        LOG(INFO) << "key=" << key
+                  << ", error=dfs_upsert_disabled_by_filter_mode";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    if (config.dfs_replica_num > 0 &&
+        (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0 &&
         (!enable_dfs_ || dfs_allocator_ == nullptr ||
          !dfs_allocator_->IsInitialized())) {
         LOG(ERROR) << "key=" << key
@@ -5986,9 +6060,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 &Replica::fn_is_memory_replica);
                         const size_t existing_nof_replicas =
                             metadata.CountReplicas(&Replica::fn_is_nof_replica);
+                        const size_t expected_dfs_replicas =
+                            (dfs_filter_mode_.load(std::memory_order_acquire) & 1) !=
+                                    0
+                                ? 0
+                                : config.dfs_replica_num;
                         if (existing_memory_replicas != config.replica_num ||
                             existing_nof_replicas != config.nof_replica_num ||
-                            existing_dfs_replicas != config.dfs_replica_num) {
+                            existing_dfs_replicas != expected_dfs_replicas) {
                             LOG(ERROR)
                                 << "key=" << key
                                 << ", error=dfs_upsert_topology_mismatch"
@@ -6008,10 +6087,20 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 const bool has_bucket_dfs_replica =
                     bucket_allocator_ != nullptr &&
                     metadata.HasReplica(&Replica::fn_is_dfs_replica);
+                if (has_bucket_dfs_replica && config.dfs_replica_num > 0 &&
+                    (dfs_filter_mode_.load(std::memory_order_acquire) & 1) !=
+                        0) {
+                    LOG(INFO) << "key=" << key
+                              << ", info=object_already_exists";
+                    return tl::make_unexpected(
+                        ErrorCode::OBJECT_ALREADY_EXISTS);
+                }
                 if (metadata.size == slice_length && !has_bucket_dfs_replica) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
-                    if (config.dfs_replica_num > 0) {
+                    if (config.dfs_replica_num > 0 &&
+                        (dfs_filter_mode_.load(std::memory_order_acquire) & 1) ==
+                            0) {
                         tenant_state.dfs_backfill[key] = {};
                     } else {
                         tenant_state.dfs_backfill.erase(key);
@@ -6689,6 +6778,9 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::DfsBackfillStart(
         segment_manager_.getSegmentAccess().GetClientIdBySegmentName(
             src_segment, owner) != ErrorCode::OK || owner != client_id) {
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
+    }
+    if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -10541,7 +10633,10 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
 }
 
 void MasterService::RunDfsBackfill() {
-    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) return;
+    if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0 ||
+        !dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+        return;
+    }
     // Bound recovery traffic and rotate shards so a large degraded workload
     // cannot monopolize scheduling. Failed attempts wait before reallocation.
     constexpr size_t kBatchSize = 256;

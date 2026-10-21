@@ -220,6 +220,9 @@ class WrappedMasterService {
         int64_t new_max_bucket_count);
     tl::expected<uint32_t, ErrorCode> SetDfsHeartbeatInterval(
         uint32_t new_interval_seconds);
+    tl::expected<uint8_t, ErrorCode> SetDfsFilterMode(
+        uint8_t new_filter_mode);
+    uint8_t GetDfsFilterMode() const;
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 

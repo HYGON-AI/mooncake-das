@@ -40,6 +40,13 @@ struct HttpErrorResponse {
 };
 YLT_REFL(HttpErrorResponse, success, error_code, error_message);
 
+struct HttpDfsFilterModeResponse {
+    bool success{true};
+    uint32_t old_value{0};
+    uint32_t new_value{0};
+};
+YLT_REFL(HttpDfsFilterModeResponse, success, old_value, new_value);
+
 struct HttpCreateDrainJobResponse {
     bool success{false};
     std::string job_id;
@@ -203,6 +210,38 @@ class MasterAdminServerTest : public ::testing::Test {
         return {result.status, std::string(result.resp_body)};
     }
 };
+
+TEST_F(MasterAdminServerTest, DfsFilterModeRejectsMissingOrInvalidField) {
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 5000;
+    config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(config);
+
+    const int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto response = HttpPutJson(
+        port, "/api/v1/dfs/filter_mode", R"({"filter_mode":1})");
+    ASSERT_EQ(response.http_status, 200);
+
+    for (const std::string& body : {R"({})", R"({"mode":1})",
+                                    R"({"filter_mode":2})"}) {
+        response = HttpPutJson(port, "/api/v1/dfs/filter_mode", body);
+        EXPECT_EQ(response.http_status, 400) << body;
+    }
+
+    response = HttpGet(port, "/api/v1/dfs/filter_mode");
+    ASSERT_EQ(response.http_status, 200);
+    HttpDfsFilterModeResponse current;
+    struct_json::from_json(current, response.body);
+    EXPECT_EQ(current.old_value, 1u);
+    EXPECT_EQ(current.new_value, 1u);
+    admin.Stop();
+}
 
 TEST_F(MasterAdminServerTest, LoggingEndpointUpdatesRuntimeConfig) {
     const auto original = GetRuntimeLogConfig();
