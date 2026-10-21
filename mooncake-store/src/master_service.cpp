@@ -726,6 +726,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
+    // DFS initialization may succeed later on the allocator retry thread.
+    dfs_eviction_thread_ =
+        std::thread(&MasterService::DfsEvictionThreadFunc, this);
+    VLOG(1) << "action=start_dfs_eviction_thread";
 
     // Start client monitor thread in all modes so TTL/heartbeat works
     client_monitor_running_ = true;
@@ -1101,6 +1105,9 @@ MasterService::~MasterService() {
 
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
+    }
+    if (dfs_eviction_thread_.joinable()) {
+        dfs_eviction_thread_.join();
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
@@ -4028,8 +4035,8 @@ auto MasterService::BatchReplicaClear(
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
-    if (!replica.is_completed() || replica.has_invalid_mem_handle() ||
-        replica.has_invalid_nof_handle()) {
+    if (!replica.is_completed() || replica.is_eviction_pending() ||
+        replica.has_invalid_mem_handle() || replica.has_invalid_nof_handle()) {
         return false;
     }
     const auto descriptor = replica.get_descriptor();
@@ -8011,8 +8018,8 @@ bool MasterService::RunBucketDfsEvictionInternal(
             continue;
         }
 
-        // Phase 1 (validate): decide every candidate without mutating any
-        // metadata. Group by shard first and always take shard locks in
+        // Phase 1 (validate and freeze reads): mark accepted replicas before
+        // releasing their shard lock. Always take shard locks in
         // ascending index order so concurrent evictions cannot deadlock.
         std::map<size_t, std::vector<size_t>> indexes_by_shard;
         for (size_t i = 0; i < candidates.size(); ++i) {
@@ -8035,6 +8042,34 @@ bool MasterService::RunBucketDfsEvictionInternal(
                        desc.aligned_size == candidate.descriptor.aligned_size &&
                        desc.file_path == candidate.descriptor.file_path;
             };
+
+        auto clear_eviction_pending = [&] {
+            for (const auto& [shard_idx, indexes] : indexes_by_shard) {
+                std::shared_lock<std::shared_mutex> snapshot_lock(
+                    snapshot_mutex_);
+                SharedMutexLocker shard_lock(
+                    &metadata_shards_[shard_idx].mutex);
+                auto tenant_it =
+                    metadata_shards_[shard_idx].tenants.find(tenant_id);
+                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
+                    continue;
+                }
+                for (const size_t i : indexes) {
+                    const auto& candidate = candidates[i];
+                    auto metadata_it =
+                        tenant_it->second.metadata.find(candidate.key);
+                    if (metadata_it == tenant_it->second.metadata.end())
+                        continue;
+                    metadata_it->second.VisitReplicas(
+                        [&](const Replica& replica) {
+                            return matches_candidate(replica, candidate);
+                        },
+                        [](Replica& replica) {
+                            replica.set_eviction_pending(false);
+                        });
+                }
+            }
+        };
 
         bool all_accepted = true;
         auto now = std::chrono::system_clock::now();
@@ -8073,15 +8108,23 @@ bool MasterService::RunBucketDfsEvictionInternal(
                      (!metadata.IsHardPinned() && metadata.IsLeaseExpired(now)));
                 if (!acceptable) {
                     // Whole-bucket eviction is all-or-nothing: one protected
-                    // entry vetoes the bucket, and no metadata was touched.
+                    // entry vetoes the bucket; undo earlier read barriers.
                     all_accepted = false;
                     break;
                 }
+                metadata.VisitReplicas(
+                    [&](const Replica& replica) {
+                        return matches_candidate(replica, candidate);
+                    },
+                    [](Replica& replica) {
+                        replica.set_eviction_pending(true);
+                    });
             }
         }
 
         if (!all_accepted) {
             if (low_utilization_eviction) ++low_utilization_rejections;
+            clear_eviction_pending();
             bucket_allocator_->AbortEviction(std::move(pending));
             if (invalidating_missing_bucket) return false;
             continue;
@@ -8153,6 +8196,7 @@ bool MasterService::RunBucketDfsEvictionInternal(
         }
         if (!phase2_accepted) {
             if (low_utilization_eviction) ++low_utilization_rejections;
+            clear_eviction_pending();
             bucket_allocator_->AbortEviction(std::move(pending));
             if (invalidating_missing_bucket) return false;
             continue;
@@ -10320,8 +10364,6 @@ void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
-    auto next_dfs_eviction_time = std::chrono::steady_clock::now();
-    auto next_dfs_root_guard_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
@@ -10370,6 +10412,23 @@ void MasterService::EvictionThreadFunc() {
         }
 #endif
 
+        if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
+            RunPromotionCandidateRetry();
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kEvictionThreadSleepMs));
+    }
+
+    VLOG(1) << "action=eviction_thread_stopped";
+}
+
+void MasterService::DfsEvictionThreadFunc() {
+    VLOG(1) << "action=dfs_eviction_thread_started";
+
+    auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_dfs_root_guard_time = std::chrono::steady_clock::now();
+    while (eviction_running_) {
         if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
             ProcessInvalidatedDfsBuckets();
             const auto steady_now = std::chrono::steady_clock::now();
@@ -10392,10 +10451,6 @@ void MasterService::EvictionThreadFunc() {
             }
         }
 
-        if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
-            RunPromotionCandidateRetry();
-        }
-
         const auto guard_now = std::chrono::steady_clock::now();
         if (guard_now >= next_dfs_root_guard_time) {
             ReconcileDfsRootFiles();
@@ -10406,7 +10461,7 @@ void MasterService::EvictionThreadFunc() {
             std::chrono::milliseconds(kEvictionThreadSleepMs));
     }
 
-    VLOG(1) << "action=eviction_thread_stopped";
+    VLOG(1) << "action=dfs_eviction_thread_stopped";
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
