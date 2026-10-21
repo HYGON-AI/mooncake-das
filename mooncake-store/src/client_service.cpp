@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <numeric>
 #ifdef USE_NOF
 #include <numa.h>
@@ -4201,10 +4202,17 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
 std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     const std::vector<PutOperation>& ops) {
+    constexpr size_t kMaxFailureSamplesPerError = 3;
+    struct FailureSummary {
+        size_t count = 0;
+        std::vector<std::string> key_samples;
+    };
+
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(ops.size());
 
     int no_available_handle_count = 0;
+    std::map<ErrorCode, FailureSummary> failures;
     for (const auto& op : ops) {
         // With the new structure, result is always set (never nullopt)
         results.emplace_back(op.result);
@@ -4221,11 +4229,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
             if (op.result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
                 no_available_handle_count++;
             } else {
-                LOG(ERROR) << "Operation for key " << op.key
-                           << " failed: " << toString(op.result.error())
-                           << (op.failure_context
-                                   ? (" (" + *op.failure_context + ")")
-                                   : "");
+                auto& summary = failures[op.result.error()];
+                ++summary.count;
+                if (summary.key_samples.size() < kMaxFailureSamplesPerError) {
+                    summary.key_samples.push_back(
+                        op.key + (op.failure_context
+                                      ? " (" + *op.failure_context + ")"
+                                      : ""));
+                }
             }
         } else {
             VLOG(1) << "Operation for key " << op.key
@@ -4235,6 +4246,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     if (no_available_handle_count > 0) {
         LOG(WARNING) << "BatchPut failed for " << no_available_handle_count
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
+    }
+    for (const auto& [error, summary] : failures) {
+        LOG(ERROR) << "BatchPut failed for " << summary.count
+                   << " keys, error=" << toString(error) << ", sample_keys="
+                   << boost::algorithm::join(summary.key_samples, ",");
     }
 
     return results;

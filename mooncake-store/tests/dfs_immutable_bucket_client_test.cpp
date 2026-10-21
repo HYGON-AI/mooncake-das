@@ -589,18 +589,16 @@ TEST_F(DfsBucketClientSlotTimeoutTest,
     ASSERT_TRUE(results[0].has_value());
     ASSERT_TRUE(results[1].has_value());
 
-    auto query = writer_->Query(keys[0]);
-    ASSERT_TRUE(query.has_value());
-    ASSERT_EQ(query->replicas.size(), 1u);
-    EXPECT_TRUE(query->replicas[0].is_memory_replica());
-    query = writer_->Query(keys[1]);
-    ASSERT_TRUE(query.has_value());
-    ASSERT_EQ(query->replicas.size(), 1u);
-    EXPECT_TRUE(query->replicas[0].is_memory_replica());
+    for (const auto& key : keys) {
+        auto query = writer_->Query(key);
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query->replicas.size(), 1u);
+        EXPECT_TRUE(query->replicas[0].is_memory_replica());
+    }
 
     adapter_->ReleaseWrites();
     ASSERT_TRUE(WaitForDfsReplica(keys[0]));
-    query = writer_->Query(keys[1]);
+    auto query = writer_->Query(keys[1]);
     ASSERT_TRUE(query.has_value());
     ASSERT_EQ(query->replicas.size(), 1u);
     EXPECT_TRUE(query->replicas[0].is_memory_replica());
