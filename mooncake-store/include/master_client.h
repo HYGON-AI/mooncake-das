@@ -113,6 +113,8 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
  * @brief Client for interacting with the mooncake master service
  */
 class MasterClient {
+    friend class MasterClientTestPeer;
+
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")

@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <csignal>
+#include <sys/stat.h>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog.hpp>
@@ -20,7 +21,104 @@
 #include "default_config.h"
 
 namespace mooncake {
+
+class MasterClientTestPeer {
+   public:
+    static auto Pool(const Client& client) {
+        return client.master_client_.client_accessor_.GetClientPool();
+    }
+};
+
 namespace testing {
+
+TEST(NonHAReconnectTest, ClientRecoversAfterEstablishedConnectionBlackhole) {
+    // Firewall changes are permitted only in an explicitly isolated network
+    // namespace. Ordinary CI runs skip this privileged fault-injection test.
+    const char* iptables = std::getenv("MOONCAKE_TEST_IPTABLES");
+    struct stat current_net {}, init_net {};
+    if (!iptables || stat("/proc/self/ns/net", &current_net) != 0 ||
+        stat("/proc/1/ns/net", &init_net) != 0 ||
+        current_net.st_ino == init_net.st_ino) {
+        GTEST_SKIP() << "Requires a fresh network namespace and "
+                        "MOONCAKE_TEST_IPTABLES";
+    }
+    struct RequestTimeout {
+        std::optional<std::string> previous;
+        RequestTimeout() {
+            if (const char* value = std::getenv("MC_RPC_TIMEOUT_MS")) {
+                previous = value;
+            }
+            setenv("MC_RPC_TIMEOUT_MS", "1000", 1);
+        }
+        ~RequestTimeout() {
+            if (previous) {
+                setenv("MC_RPC_TIMEOUT_MS", previous->c_str(), 1);
+            } else {
+                unsetenv("MC_RPC_TIMEOUT_MS");
+            }
+        }
+    } request_timeout;
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder().build()));
+    const std::string hostname = "127.0.0.1:18013";
+    auto created = Client::Create(hostname, "P2PHANDSHAKE", "tcp", std::nullopt,
+                                  master.master_address());
+    ASSERT_TRUE(created);
+    auto client = *created;
+    constexpr size_t size = 16 * 1024 * 1024;
+    std::unique_ptr<void, decltype(&free)> segment(
+        allocate_buffer_allocator_memory(size), &free);
+    ASSERT_NE(segment, nullptr);
+    ASSERT_TRUE(client->MountSegment(segment.get(), size));
+    const auto pool = MasterClientTestPeer::Pool(*client);
+    ASSERT_NE(pool, nullptr);
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    const auto initial_pings =
+        MasterMetricManager::instance().get_ping_requests();
+
+    struct DropRule {
+        std::string command;
+        bool active = false;
+        ~DropRule() {
+            if (active &&
+                std::system((command + " -D OUTPUT " + rule).c_str()) != 0) {
+                LOG(ERROR) << "Failed to remove test DROP rule";
+            }
+        }
+        std::string rule;
+    } drop{iptables, false,
+           "-p tcp -d 127.0.0.1 --dport " +
+               std::to_string(master.rpc_port()) + " -j DROP"};
+    ASSERT_EQ(std::system((drop.command + " -I OUTPUT " + drop.rule).c_str()), 0);
+    drop.active = true;
+    // No FIN/RST is sent: the connected socket must time out and recover.
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    const auto blocked_pings =
+        MasterMetricManager::instance().get_ping_requests();
+    std::this_thread::sleep_for(std::chrono::seconds(11));
+    EXPECT_EQ(MasterMetricManager::instance().get_ping_requests(),
+              blocked_pings);
+    EXPECT_EQ(MasterClientTestPeer::Pool(*client), pool);
+    EXPECT_EQ(std::system((drop.command + " -L OUTPUT -nvx").c_str()), 0);
+    ASSERT_EQ(std::system((drop.command + " -D OUTPUT " + drop.rule).c_str()), 0);
+    drop.active = false;
+    bool recovered = false;
+    for (int i = 0; i < 30; ++i) {
+        if (MasterMetricManager::instance().get_ping_requests() >
+            blocked_pings) {
+            auto visible = CheckSegmentVisible(master, hostname);
+            if (visible && *visible) {
+                recovered = true;
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    EXPECT_GE(blocked_pings, initial_pings);
+    EXPECT_TRUE(recovered) << "Heartbeat/remount did not recover after DROP";
+    EXPECT_EQ(MasterClientTestPeer::Pool(*client), pool);
+    ASSERT_TRUE(client->UnmountSegment(segment.get(), size));
+}
 
 TEST(NonHAReconnectTest, ZeroSegmentClientStartsHeartbeatOnlyAfterMount) {
     InProcMaster master;
@@ -120,6 +218,8 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     ASSERT_NE(seg_ptr, nullptr);
     auto mount_res = client->MountSegment(seg_ptr, ram_buffer_size);
     ASSERT_TRUE(mount_res.has_value()) << toString(mount_res.error());
+    const auto pool = MasterClientTestPeer::Pool(*client);
+    ASSERT_NE(pool, nullptr);
 
     // Verify segment is visible via helper (expected-based)
     {
@@ -132,7 +232,9 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
 
     // Stop master, wait for ping failures to accumulate
     master.Stop();
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    std::this_thread::sleep_for(std::chrono::seconds(6));
+    EXPECT_EQ(MasterClientTestPeer::Pool(*client), pool)
+        << "failed heartbeats must not retire a new pool on every reconnect";
 
     auto vis_result = CheckSegmentVisible(master, local_hostname);
     ASSERT_FALSE(vis_result.has_value())
@@ -158,6 +260,7 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     ASSERT_TRUE(found) << "Client did not reconnect and remount in time";
+    EXPECT_EQ(MasterClientTestPeer::Pool(*client), pool);
 
     // Cleanup
     auto unmount_res = client->UnmountSegment(seg_ptr, ram_buffer_size);
