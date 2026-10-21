@@ -62,10 +62,11 @@ starting the process.
 
 ### Clients
 
-Every client that may read or write DFS replicas must use the same root,
-adapter, shard count, shard capacity, and alignment. The DFS root must be an
-absolute path and use the same path string in every process. For the standalone
-store service:
+Every client that may read or write DFS replicas must access the same shared
+directory and use matching adapter, shard count, shard capacity, and alignment.
+The DFS root must be an absolute path. Bucket mode allows different mount paths
+on the master and clients; shard mode requires the same path string in every
+process. For the standalone store service:
 
 ```bash
 export MOONCAKE_OFFLOAD_ENABLED=true

@@ -96,13 +96,6 @@ bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
            layout->aligned_size <= kMaxFileOffset - layout->offset;
 }
 
-/**
- * @brief Canonicalize `path` without requiring it to exist yet.
- *
- * `weakly_canonical` collapses `..` and resolves the existing prefix through
- * symlinks, which is what we need to reject descriptor paths pointing outside
- * the configured DFS root.
- */
 std::string CanonicalizePath(const std::string& path) {
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(path, ec);
@@ -434,7 +427,8 @@ DistributedStorageBackend::DistributedStorageBackend(
       object_storage_adapter_(std::move(object_storage_adapter)),
       distributed_config_(distributed_config),
       expected_root_identity_(std::move(expected_root_identity)),
-      root_dir_(distributed_config.fsdir) {
+      root_dir_(distributed_config.fsdir),
+      descriptor_root_dir_(distributed_config.fsdir) {
     CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
         << "DistributedStorageBackend: exactly one I/O adapter is required";
     if (object_storage_adapter_) {
@@ -956,6 +950,18 @@ DistributedStorageBackend::ResolveTarget(
     if (descriptor.shard_idx < 0) {
         LOG(ERROR) << "Invalid DFS bucket id " << descriptor.shard_idx
                    << " for key " << key;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const std::string expected_path =
+        descriptor_root_dir_ + "/" + kBucketFilePrefix +
+        ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
+        kBucketDataSuffix;
+    // The master's mount path may not exist on this client.
+    if (std::filesystem::path(descriptor.file_path).lexically_normal() !=
+        std::filesystem::path(expected_path).lexically_normal()) {
+        LOG(ERROR) << "DFS bucket path mismatch for key " << key
+                   << ", descriptor=" << descriptor.file_path
+                   << ", expected=" << expected_path;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!IsBucketDescriptorRangeValid(descriptor, key, distributed_config_)) {

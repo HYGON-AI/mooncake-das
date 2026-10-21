@@ -1126,6 +1126,7 @@ class Client {
     std::shared_ptr<DfsWriteStagingPool> dfs_write_staging_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
+    std::string master_dfs_root_dir_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
     // Native memory holders need not attach a foreground DFS backend.
     std::mutex dfs_backfill_backend_mutex_;

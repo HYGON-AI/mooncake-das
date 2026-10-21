@@ -1395,6 +1395,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     } else {
         auto config = config_response.value();
         client->dfs_root_identity_ = config.dfs_root_identity;
+        client->master_dfs_root_dir_ = config.dfs_fsdir;
         WarnOnClientDfsPathMismatch(config.dfs_fsdir);
         if (config.fsdir.empty()) {
             LOG(INFO)
@@ -4941,6 +4942,9 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
 
 void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
+    if (backend && !master_dfs_root_dir_.empty()) {
+        backend->SetDescriptorRootDir(master_dfs_root_dir_);
+    }
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
 }

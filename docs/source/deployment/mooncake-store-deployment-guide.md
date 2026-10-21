@@ -781,9 +781,14 @@ the reclaimed buckets: only buckets written after re-enabling are eligible.
 
 Every client that may read or write a DFS replica must initialize
 `FileStorage` and select the distributed backend. Use an absolute DFS root path;
-the root string, shard count, shard capacity, and alignment must match the
-master configuration. Select an adapter that can access the same underlying
-shared files; the examples use the same adapter in every process.
+the shard count, shard capacity, and alignment must match the master
+configuration. Select an adapter that can access the same underlying shared
+files; the examples use the same adapter in every process.
+
+In bucket mode, the master and clients may use different absolute mount paths
+to the same shared directory. Descriptor paths are checked against the root
+advertised by the master; bucket files open under the client's local root.
+Shard mode still requires the same root path string in every process.
 
 ```bash
 export MOONCAKE_OFFLOAD_ENABLED=true
@@ -822,7 +827,7 @@ is required.
 | Variable | Scope | Default | Description |
 |----------|-------|---------|-------------|
 | `MOONCAKE_ENABLE_DFS` | Master | `false` | Enable master-side DFS allocation. `MOONCAKE_DFS_ENABLED` is accepted as a compatibility fallback. |
-| `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared shard root; use the same path string in every process. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
+| `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared DFS root. Bucket mode allows different mount paths to the same directory; shard mode requires the same path string. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
 | `MOONCAKE_DFS_FS_ADAPTER` | Master and clients | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. Falls back to `MOONCAKE_DISTRIBUTED_FS_TYPE`. |
 | `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Number of DFS shard files. |
 | `MOONCAKE_DFS_SHARD_CAPACITY` | Master and clients | `4294967296` (4 GiB) | Logical file capacity of each shard in bytes. Each object is allocated wholly within one shard. |
