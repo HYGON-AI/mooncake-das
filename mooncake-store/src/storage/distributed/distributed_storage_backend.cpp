@@ -1010,17 +1010,6 @@ DistributedStorageBackend::ResolveTarget(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const std::string expected_path =
-        canonical_root_dir_ + "/" + kBucketFilePrefix +
-        ImmutableBucketAllocator::FormatBucketId(descriptor.shard_idx) +
-        kBucketDataSuffix;
-    if (CanonicalizePath(descriptor.file_path) != expected_path) {
-        LOG(ERROR) << "DFS bucket path mismatch for key " << key
-                   << ", descriptor=" << descriptor.file_path
-                   << ", expected=" << expected_path;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
     auto handle = read_only ? GetOrOpenBucketDirect(descriptor.shard_idx)
                             : GetOrOpenBucket(descriptor.shard_idx);
     if (!handle && read_only) {
