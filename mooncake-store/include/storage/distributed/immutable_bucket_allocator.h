@@ -249,7 +249,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     };
 
     /**
-     * @brief Freeze the coldest evictable bucket and return its live entries.
+     * @brief Freeze an eligible bucket and return its live entries.
+     *
+     * When watermark eviction is active, low-utilization buckets are preferred
+     * before falling back to the coldest eligible bucket.
      * Returns an empty transaction when nothing can be evicted.
      */
     PendingEviction PrepareEviction();
@@ -348,7 +351,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // eviction. The latter bypasses only the watermark gate and still observes
     // active/frozen state plus the master's full validation protocol.
     PendingEviction PrepareEvictionInternal(
-        bool force_one, double low_utilization_threshold = -1.0);
+        bool force_one, double low_utilization_threshold = -1.0,
+        bool low_utilization_only = false);
     PendingEviction PrepareInvalidationInternal(int64_t bucket_id);
 
     // Shared implementation of AbortEviction. `demote` distinguishes an
@@ -374,6 +378,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // COMMITTED). A failed PutStart must Free() its PENDING entry before
         // this value can represent reclaimable live capacity.
         uint64_t live_bytes = 0;
+        uint64_t pending_entries = 0;
         int64_t last_access_ns = 0;
         // Set between PrepareEviction and Commit/Abort. A frozen bucket
         // accepts no new allocations and cannot be selected again.
