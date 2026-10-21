@@ -251,8 +251,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     /**
      * @brief Freeze an eligible bucket and return its live entries.
      *
-     * When watermark eviction is active, low-utilization buckets are preferred
-     * before falling back to the coldest eligible bucket.
+     * Watermark eviction selects the coldest eligible bucket. The dedicated
+     * low-utilization entry point restricts selection to sparse buckets.
      * Returns an empty transaction when nothing can be evicted.
      */
     PendingEviction PrepareEviction();
@@ -351,8 +351,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // eviction. The latter bypasses only the watermark gate and still observes
     // active/frozen state plus the master's full validation protocol.
     PendingEviction PrepareEvictionInternal(
-        bool force_one, double low_utilization_threshold = -1.0,
-        bool low_utilization_only = false);
+        bool force_one, double low_utilization_threshold = -1.0);
     PendingEviction PrepareInvalidationInternal(int64_t bucket_id);
 
     // Shared implementation of AbortEviction. `demote` distinguishes an

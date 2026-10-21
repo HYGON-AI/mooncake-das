@@ -1790,13 +1790,12 @@ ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
     if (threshold <= 0.0 || threshold >= 1.0) {
         return {};
     }
-    return PrepareEvictionInternal(/*force_one=*/false, threshold,
-                                   /*low_utilization_only=*/true);
+    return PrepareEvictionInternal(/*force_one=*/false, threshold);
 }
 
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionInternal(
-    bool force_one, double low_utilization_threshold, bool low_utilization_only) {
+    bool force_one, double low_utilization_threshold) {
     PendingEviction pending;
     if (!initialized_.load(std::memory_order_acquire)) return pending;
 
@@ -1814,45 +1813,36 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         const bool prioritize_low_utilization =
             low_utilization_threshold > 0.0 &&
             low_utilization_threshold < 1.0;
-        if (!force_one && !low_utilization_only) {
+        if (!force_one && !prioritize_low_utilization) {
             if (usage >= eviction_high_watermark_) {
                 eviction_active_ = true;
             }
             if (!eviction_active_) return pending;
-            if (usage < eviction_low_watermark_) {
+            if (usage <= eviction_low_watermark_) {
                 eviction_active_ = false;
                 return pending;
             }
         }
 
-        // Walk the LRU from the cold end. Watermark eviction prefers low-
-        // utilization buckets, but falls back to any eligible bucket when a
-        // sparse bucket is protected by the master.
+        // Walk the LRU from the cold end. A low-utilization eviction pass
+        // restricts candidates to sparse buckets.
         BucketPtr victim;
-        const int eviction_passes =
-            prioritize_low_utilization && !low_utilization_only ? 2 : 1;
-        for (int pass = 0; pass < eviction_passes && !victim; ++pass) {
-            for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
-                const int64_t bucket_id = *it;
-                if (bucket_id == active_bucket_id_) continue;
-                auto bucket_it = buckets_.find(bucket_id);
-                if (bucket_it == buckets_.end()) continue;
-                if (bucket_it->second->frozen) continue;
-                const auto& candidate = bucket_it->second;
-                const bool is_low_utilization =
-                    candidate->capacity > 0 &&
-                    static_cast<double>(candidate->live_bytes) /
-                            static_cast<double>(candidate->capacity) <
-                        low_utilization_threshold;
-                if (prioritize_low_utilization &&
-                    ((pass == 0 && !is_low_utilization) ||
-                     (pass == 1 && is_low_utilization))) {
-                    continue;
-                }
-                if (candidate->pending_entries != 0) continue;
-                victim = candidate;
-                break;
-            }
+        for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
+            const int64_t bucket_id = *it;
+            if (bucket_id == active_bucket_id_) continue;
+            auto bucket_it = buckets_.find(bucket_id);
+            if (bucket_it == buckets_.end()) continue;
+            if (bucket_it->second->frozen) continue;
+            const auto& candidate = bucket_it->second;
+            const bool is_low_utilization =
+                candidate->capacity > 0 &&
+                static_cast<double>(candidate->live_bytes) /
+                        static_cast<double>(candidate->capacity) <
+                    low_utilization_threshold;
+            if (prioritize_low_utilization && !is_low_utilization) continue;
+            if (candidate->pending_entries != 0) continue;
+            victim = candidate;
+            break;
         }
         if (!victim) return pending;
 
