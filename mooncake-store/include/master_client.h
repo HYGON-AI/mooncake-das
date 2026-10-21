@@ -144,8 +144,7 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] ErrorCode Connect(
-        const std::string& master_addr = kDefaultMasterAddress,
-        bool force_recreate = false);
+        const std::string& master_addr = kDefaultMasterAddress);
 
     /**
      * @brief Checks if an object exists

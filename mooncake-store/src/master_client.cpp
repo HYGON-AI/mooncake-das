@@ -497,19 +497,15 @@ void MasterClient::EnableHaConnectionPolicy() {
     ha_connection_policy_enabled_.store(true, std::memory_order_release);
 }
 
-ErrorCode MasterClient::Connect(const std::string& master_addr,
-                                bool force_recreate) {
+ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
-    timer.LogRequest("master_addr=", master_addr,
-                     ", force_recreate=", force_recreate);
+    timer.LogRequest("master_addr=", master_addr);
 
     MutexLocker lock(&connect_mutex_);
     const bool use_ha_control_pool =
         ha_connection_policy_enabled_.load(std::memory_order_acquire);
     if (use_ha_control_pool) {
         ha_probe_client_accessor_.GetOrCreateClientPool(master_addr);
-    } else if (force_recreate || client_addr_param_ != master_addr) {
-        client_accessor_.RecreateClientPool(master_addr);
     } else {
         client_accessor_.GetOrCreateClientPool(master_addr);
     }

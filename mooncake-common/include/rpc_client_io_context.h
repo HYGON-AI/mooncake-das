@@ -11,7 +11,6 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/io_context_pool.hpp>
@@ -92,13 +91,6 @@ namespace detail {
 using MasterClientPool =
     coro_io::client_pool<coro_rpc::coro_rpc_client>;
 
-inline void KeepMasterPoolAlive(std::shared_ptr<MasterClientPool> pool) {
-    static std::mutex keep_mutex;
-    static std::vector<std::shared_ptr<MasterClientPool>> retired_pools;
-    std::lock_guard<std::mutex> lock(keep_mutex);
-    retired_pools.push_back(std::move(pool));
-}
-
 inline std::shared_ptr<MasterClientPool> SharedPoolRegistryImpl(
     std::string_view address, MasterClientPool::pool_config config,
     coro_io::io_context_pool& io_context_pool) {
@@ -152,16 +144,6 @@ class RpcClientPool {
                 address, config_, io_context_pool_);
             address_ = address;
         }
-        return client_pool_;
-    }
-
-    std::shared_ptr<ClientPool> RecreateClientPool(std::string_view address) {
-        std::lock_guard<std::shared_mutex> lock(mutex_);
-        if (client_pool_) {
-            detail::KeepMasterPoolAlive(client_pool_);
-        }
-        client_pool_ = ClientPool::create(address, config_, io_context_pool_);
-        address_ = address;
         return client_pool_;
     }
 
