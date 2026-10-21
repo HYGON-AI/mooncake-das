@@ -7616,7 +7616,7 @@ bool MasterService::RunBucketDfsEvictionInternal(
                 LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION] bucket_id="
                           << evicted_bucket_id << ", committed=true";
             }
-            evicted = committed;
+            if (committed) evicted = true;
             if (committed &&
                 (invalidating_missing_bucket || force_one ||
                  (low_utilization_eviction &&
@@ -7836,10 +7836,12 @@ bool MasterService::RunBucketDfsEvictionInternal(
             LOG(INFO) << "[DFS_LOW_UTILIZATION_EVICTION] bucket_id="
                       << evicted_bucket_id << ", committed=true";
         }
-        evicted = true;
-        if (force_one ||
-            (low_utilization_eviction && max_low_utilization_evictions >= 0 &&
-             low_utilization_evictions >= max_low_utilization_evictions)) {
+        if (committed) evicted = true;
+        if (committed &&
+            (invalidating_missing_bucket || force_one ||
+             (low_utilization_eviction &&
+              max_low_utilization_evictions >= 0 &&
+              low_utilization_evictions >= max_low_utilization_evictions))) {
             return true;
         }
     }
