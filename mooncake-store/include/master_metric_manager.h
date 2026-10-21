@@ -78,6 +78,11 @@ class MasterMetricManager {
     // reports and endpoint changes are rejected.
     tl::expected<void, ErrorCode> ReportServiceMetrics(
         const UUID& client_id, const ServiceMetricsSnapshot& snapshot);
+    // Expire pending contributions after 30 seconds without a valid report.
+    // Retain cumulative baselines so reconnects cannot count old I/O twice.
+    void ExpireServiceMetricsPending(
+        std::chrono::steady_clock::time_point now =
+            std::chrono::steady_clock::now());
 
     enum class CacheHitStat {
         MEMORY_HITS,
@@ -574,6 +579,8 @@ class MasterMetricManager {
         std::array<uint64_t, 4> dual_write{};
         uint64_t pending = 0;
         std::array<uint64_t, 2> read_failures{};
+        bool pending_active = true;
+        std::chrono::steady_clock::time_point last_report;
     };
 
     // --- Metric Members ---

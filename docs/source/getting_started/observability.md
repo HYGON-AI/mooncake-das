@@ -246,7 +246,12 @@ These metrics are best-effort process state. Abrupt client termination can lose
 results since its last successful report. Master restart or leader replacement
 resets its aggregate/deduplication state; reporting clients repopulate it from
 their lifetime snapshots. Do not treat a replay after restart as new I/O.
-Pending values are the latest reported client state, not a timeout detector.
+Pending values exclude clients that have not sent a valid metrics report for
+30 seconds, evaluated when the metrics are scraped. This also covers clients
+without storage segments or storage heartbeats. A fresh report restores its
+pending contribution. Cumulative per-client baselines are retained for
+deduplication across reconnects; this change does not reclaim that state.
+Pending expiry is not proof that a client or an individual write has failed.
 
 ## Client Metrics Endpoint
 
