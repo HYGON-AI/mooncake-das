@@ -28,6 +28,8 @@
 #include <unistd.h>
 
 #include "tenant_quota_policy_store.h"
+#include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/posix_fs_adapter.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/fs_adapter.h"
@@ -2211,6 +2213,7 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
     const auto root = MakeDfsTestRoot("retry_after_recovery");
     const auto saved_root = root + "_saved";
     ScopedBucketDfsEnv env(root, "1048576", "16");
+    std::filesystem::path persisted_meta;
 
     {
         MasterService initial_service;
@@ -2218,15 +2221,51 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.dfs_replica_num = 1;
-        ASSERT_TRUE(initial_service
-                        .PutStart(initial_context.client_id, "retry_existing",
-                                  TenantId::Default(), 4096, config)
-                        .has_value());
+        auto start = initial_service.PutStart(
+            initial_context.client_id, "retry_existing", TenantId::Default(),
+            4096, config);
+        ASSERT_TRUE(start.has_value());
+        const auto* dfs = FindDfsDescriptor(*start);
+        ASSERT_NE(dfs, nullptr);
+        auto storage = initial_service.GetStorageConfig();
+        ASSERT_TRUE(storage.has_value());
+        FileStorageConfig file_config;
+        file_config.storage_filepath = root;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        DistributedStorageBackend backend(
+            file_config, DistributedStorageConfig::FromEnvironment(),
+            std::make_unique<PosixFsAdapter>(), storage->dfs_root_identity);
+        ASSERT_TRUE(backend.Init());
+        std::string value(4096, 'R');
+        auto written = backend.BatchWrite({{"retry_existing",
+            dfs->get_dfs_descriptor(), {{value.data(), value.size()}}}});
+        ASSERT_EQ(written.size(), 1u);
+        ASSERT_TRUE(written.front());
         ASSERT_TRUE(initial_service
                         .PutEnd(initial_context.client_id, "retry_existing",
                                  TenantId::Default(), ReplicaType::ALL)
                         .has_value());
+        // Recovery deliberately ignores an active bucket without metadata.
+        // Roll over to persist the committed source bucket before restart.
+        auto rollover = initial_service.PutStart(
+            initial_context.client_id, "retry_rollover", TenantId::Default(),
+            1048576, config);
+        ASSERT_TRUE(rollover.has_value());
+        const auto* rollover_dfs = FindDfsDescriptor(*rollover);
+        ASSERT_NE(rollover_dfs, nullptr);
+        ASSERT_NE(rollover_dfs->get_dfs_descriptor().shard_idx,
+                  dfs->get_dfs_descriptor().shard_idx);
+        ASSERT_TRUE(initial_service.PutRevoke(
+            initial_context.client_id, "retry_rollover", TenantId::Default(),
+            ReplicaType::ALL));
+        persisted_meta = std::filesystem::path(
+            dfs->get_dfs_descriptor().file_path);
+        persisted_meta.replace_extension(".meta");
     }
+
+    // The clean shutdown flushes sealed metadata; consuming a preallocated
+    // bucket can defer that I/O until maintenance or shutdown.
+    ASSERT_TRUE(std::filesystem::exists(persisted_meta));
 
     std::filesystem::rename(root, saved_root);
     {
@@ -2247,6 +2286,17 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         ASSERT_TRUE(degraded.has_value()) << toString(degraded.error());
         ASSERT_EQ(degraded->size(), 1u);
         EXPECT_TRUE(degraded->front().is_memory_replica());
+        ASSERT_TRUE(service.PutEnd(context.client_id, "retry_degraded",
+                                   TenantId::Default(), ReplicaType::MEMORY));
+        auto batch = service.BatchPutStart(
+            context.client_id, {"retry_batch_0", "retry_batch_1"},
+            TenantId::Default(), {4096, 4096}, config);
+        ASSERT_EQ(batch.size(), 2u);
+        for (const auto& result : batch) {
+            ASSERT_TRUE(result.has_value());
+            ASSERT_EQ(result->size(), 1u);
+            EXPECT_TRUE(result->front().is_memory_replica());
+        }
 
         std::error_code ec;
         ASSERT_TRUE(std::filesystem::remove(root, ec));
@@ -2267,6 +2317,39 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         ASSERT_TRUE(existing.has_value());
         ASSERT_EQ(existing->replicas.size(), 1u);
         EXPECT_TRUE(existing->replicas.front().is_dfs_replica());
+
+        std::optional<TaskAssignment> backfill;
+        const auto task_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(5);
+        while (!backfill && std::chrono::steady_clock::now() < task_deadline) {
+            auto tasks = service.FetchTasks(context.client_id, 16);
+            ASSERT_TRUE(tasks.has_value());
+            for (const auto& task : *tasks) {
+                if (task.type == TaskType::DFS_BACKFILL) backfill = task;
+            }
+            if (!backfill) std::this_thread::sleep_for(
+                std::chrono::milliseconds(20));
+        }
+        ASSERT_TRUE(backfill.has_value());
+        DfsBackfillPayload payload;
+        struct_json::from_json(payload, backfill->payload);
+        EXPECT_EQ(payload.key, "retry_degraded");
+        EXPECT_FALSE(service.DfsBackfillStart(
+            generate_uuid(), payload.key, TenantId::Default(),
+            payload.source, backfill->id));
+        auto copy = service.DfsBackfillStart(
+            context.client_id, payload.key, TenantId::Default(),
+            payload.source, backfill->id);
+        ASSERT_TRUE(copy.has_value());
+        ASSERT_EQ(copy->targets.size(), 1u);
+        EXPECT_TRUE(copy->targets.front().is_dfs_replica());
+        EXPECT_FALSE(service.CopyEnd(context.client_id, payload.key,
+                                     TenantId::Default(), generate_uuid()));
+        ASSERT_TRUE(service.CopyEnd(context.client_id, payload.key,
+                                    TenantId::Default(), backfill->id));
+        auto repaired = service.GetReplicaList(payload.key, TenantId::Default());
+        ASSERT_TRUE(repaired.has_value());
+        EXPECT_NE(FindDfsDescriptor(repaired->replicas), nullptr);
 
         auto recovered = service.PutStart(context.client_id, "retry_recovered",
                                           TenantId::Default(), 4096, config);

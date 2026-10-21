@@ -277,6 +277,16 @@ struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyStart> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::DfsBackfillStart> {
+    static constexpr const char* value = "DfsBackfillStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::DfsBackfillFinish> {
+    static constexpr const char* value = "DfsBackfillFinish";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CopyEnd> {
     static constexpr const char* value = "CopyEnd";
 };
@@ -1259,6 +1269,21 @@ tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(
             client_id_, key, tenant_id, src_segment, tgt_segments);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<CopyStartResponse, ErrorCode> MasterClient::DfsBackfillStart(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const UUID& task_id) {
+    return invoke_rpc<&WrappedMasterService::DfsBackfillStart,
+                      CopyStartResponse>(client_id_, key, tenant_id, source,
+                                         task_id);
+}
+
+tl::expected<void, ErrorCode> MasterClient::DfsBackfillFinish(
+    const std::string& key, const std::string& tenant_id,
+    const UUID& task_id, bool success) {
+    return invoke_rpc<&WrappedMasterService::DfsBackfillFinish, void>(
+        client_id_, key, tenant_id, task_id, success);
 }
 
 tl::expected<CopyStartResponse, ErrorCode>

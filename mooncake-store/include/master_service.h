@@ -678,6 +678,13 @@ class MasterService {
         const UUID& dynamic_replication_lease_id = UUID{},
         uint64_t dynamic_replication_version_epoch = 0);
 
+    // Backfill uses the copy lifecycle, including source pinning and timeout
+    // cleanup. The task ID fences stale workers after replacement/retry.
+    tl::expected<CopyStartResponse, ErrorCode> DfsBackfillStart(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, const std::string& src_segment,
+        const UUID& task_id);
+
     tl::expected<void, ErrorCode> CopyEnd(
         const UUID& client_id, const std::string& key,
         const TenantId& tenant_id,
@@ -1726,11 +1733,19 @@ class MasterService {
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
+    struct DfsBackfillState {
+        UUID task_id{};
+        std::chrono::steady_clock::time_point retry_after{};
+    };
+
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
         std::unordered_map<std::string, ObjectMetadata> metadata;
         std::unordered_set<std::string> processing_keys;
         std::unordered_map<std::string, ReplicationTask> replication_tasks;
+        // Only failed/degraded DFS writes enter this retry set. Capacity
+        // eviction of a successfully committed replica must not refill it.
+        std::unordered_map<std::string, DfsBackfillState> dfs_backfill;
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
         std::unordered_map<std::string, PromotionCandidate>
@@ -1748,7 +1763,8 @@ class MasterService {
 
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
-                   replication_tasks.empty() && offloading_tasks.empty() &&
+                   replication_tasks.empty() && dfs_backfill.empty() &&
+                   offloading_tasks.empty() &&
                    promotion_tasks.empty() && promotion_candidates.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
@@ -2131,6 +2147,8 @@ class MasterService {
     void RestoreRecoveredDfsReplicas(ImmutableBucketAllocator* allocator);
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();
+    void RunDfsBackfill();
+    size_t dfs_backfill_shard_{0};  // owned by the DFS eviction thread
     bool InitializeDfsRootGuard(const std::string& root,
                                 const std::string& identity);
     void ReconcileDfsRootFiles();

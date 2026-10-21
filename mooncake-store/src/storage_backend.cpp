@@ -5661,7 +5661,8 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config,
-                     const std::string& dfs_root_identity) {
+                     const std::string& dfs_root_identity,
+                     const std::string& dfs_fsdir) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
@@ -5698,6 +5699,9 @@ CreateStorageBackend(const FileStorageConfig& config,
         case StorageBackendType::kDistributed: {
             auto distributed_config =
                 DistributedStorageConfig::FromEnvironment();
+            if (!dfs_fsdir.empty()) {
+                distributed_config.fsdir = dfs_fsdir;
+            }
             if (!distributed_config.Validate()) {
                 throw std::invalid_argument(
                     "Invalid DistributedStorage configuration");

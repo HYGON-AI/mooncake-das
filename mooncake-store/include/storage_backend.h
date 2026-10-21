@@ -1725,8 +1725,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
    private:
 };
 
+// An explicit DFS directory overrides the local environment, e.g. when a
+// backfill-only client obtains the shared root and its identity from master.
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config,
-                     const std::string& dfs_root_identity = {});
+                     const std::string& dfs_root_identity = {},
+                     const std::string& dfs_fsdir = {});
 
 }  // namespace mooncake

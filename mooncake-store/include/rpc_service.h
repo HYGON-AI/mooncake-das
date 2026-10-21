@@ -317,6 +317,14 @@ class WrappedMasterService {
         const UUID& dynamic_replication_lease_id,
         uint64_t dynamic_replication_version_epoch);
 
+    tl::expected<CopyStartResponse, ErrorCode> DfsBackfillStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& source,
+        const UUID& task_id);
+    tl::expected<void, ErrorCode> DfsBackfillFinish(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& task_id, bool success);
+
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key,
                                           const std::string& tenant_id);

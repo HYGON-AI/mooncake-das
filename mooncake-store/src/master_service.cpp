@@ -2587,6 +2587,7 @@ MasterService::EraseMetadata(
     const std::string key = it->first;
     const std::string group_id = it->second.group_id;
     auto& metadata = it->second;
+    tenant_state.dfs_backfill.erase(key);
 
     // Clean up offloading_task + dec_refcnt before erasing metadata.
     // When BatchEvict deletes metadata, Store Worker may still have an
@@ -4715,6 +4716,9 @@ auto MasterService::AllocateAndInsertMetadata(
                            << ", error=dfs_allocator_not_initialized"
                            << ", suppressed=" << *suppressed;
             }
+            if (dfs_allocation_error != nullptr) {
+                *dfs_allocation_error = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+            }
             refund_pending_quota();
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
@@ -4808,6 +4812,9 @@ auto MasterService::AllocateAndInsertMetadata(
     }
     RegisterGroupMember(tenant_state, tenant_id, key, group_id);
     tenant_state.processing_keys.insert(key);
+    if (config.dfs_replica_num > 0) {
+        tenant_state.dfs_backfill[key] = {};
+    }
 
     return replica_list;
 }
@@ -5343,6 +5350,12 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         SettlePrimaryWriteQuotaIfReady(accessor.GetTenantState(), metadata);
     if (!settle_result) {
         return tl::make_unexpected(settle_result.error());
+    }
+
+    if (metadata.HasReplica([](const Replica& replica) {
+            return replica.is_dfs_replica() && replica.is_completed();
+        })) {
+        accessor.GetTenantState().dfs_backfill.erase(key);
     }
 
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
@@ -5989,6 +6002,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (metadata.size == slice_length && !has_bucket_dfs_replica) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
+                    if (config.dfs_replica_num > 0) {
+                        tenant_state.dfs_backfill[key] = {};
+                    } else {
+                        tenant_state.dfs_backfill.erase(key);
+                    }
 
                     // Mark COMPLETE → PROCESSING so readers won't see stale
                     // data mid-transfer.  The key becomes unreadable until
@@ -6625,10 +6643,99 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     return response;
 }
 
+tl::expected<CopyStartResponse, ErrorCode> MasterService::DfsBackfillStart(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    const std::string& src_segment, const UUID& task_id) {
+    auto tenant = ResolveTenantIdForWrite(tenant_id);
+    if (!tenant) return tl::make_unexpected(tenant.error());
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    MetadataAccessorRW accessor(this, ObjectIdentity{*tenant, key});
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& state = accessor.GetTenantState();
+    auto candidate = state.dfs_backfill.find(key);
+    if (candidate == state.dfs_backfill.end() || task_id == UUID{} ||
+        candidate->second.task_id != task_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    auto assignment = task_manager_.get_read_access().find_task_by_id(task_id);
+    if (!assignment || assignment->assigned_client != client_id ||
+        assignment->type != TaskType::DFS_BACKFILL ||
+        assignment->status != TaskStatus::PROCESSING) {
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+    auto& metadata = accessor.Get();
+    if (accessor.InProcessing() || accessor.HasReplicationTask() ||
+        state.dynamic_replication_pending.contains(key)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (metadata.HasReplica(&Replica::is_dfs_replica)) {
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    auto source = metadata.GetReplicaBySegmentName(src_segment);
+    UUID owner;
+    if (!source || !source->is_memory_replica() || !source->is_completed() ||
+        source->has_invalid_mem_handle() ||
+        segment_manager_.getSegmentAccess().GetClientIdBySegmentName(
+            src_segment, owner) != ErrorCode::OK || owner != client_id) {
+        return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
+    }
+    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    auto allocated = dfs_allocator_->Allocate(key, metadata.size);
+    if (!allocated) return tl::make_unexpected(allocated.error());
+    std::vector<Replica> replicas;
+    replicas.emplace_back(std::move(*allocated), ReplicaStatus::PROCESSING);
+    CopyStartResponse response;
+    response.source = source->get_descriptor();
+    response.targets.push_back(replicas.front().get_descriptor());
+    state.replication_tasks.emplace(
+        key, ReplicationTask{client_id, std::chrono::system_clock::now(),
+                             ReplicationTask::Type::COPY, source->id(),
+                             {replicas.front().id()}, 0, task_id, 0});
+    source->inc_refcnt();
+    metadata.AddReplicas(std::move(replicas));
+    return response;
+}
+
 tl::expected<void, ErrorCode> MasterService::CopyEnd(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const UUID& dynamic_replication_lease_id,
     uint64_t dynamic_replication_version_epoch) {
+    // Like PutEnd, mark bucket entries COMMITTED before publishing COMPLETE.
+    // Keep allocator calls outside the shard lock; only this copy's targets
+    // qualify. Sealed-bucket metadata follows the existing flush policy.
+    if (bucket_allocator_ != nullptr) {
+        std::vector<DistributedFSDescriptor> pending;
+        {
+            std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+            MetadataAccessorRW probe(
+                this, MakeObjectIdentityForRequest(key, tenant_id));
+            if (probe.Exists() && probe.HasReplicationTask()) {
+                const auto& task = probe.GetReplicationTask();
+                if (task.client_id == client_id &&
+                    task.dynamic_replication_lease_id ==
+                        dynamic_replication_lease_id &&
+                    task.dynamic_replication_version_epoch ==
+                        dynamic_replication_version_epoch) {
+                    for (auto id : task.replica_ids) {
+                        auto replica = probe.Get().GetReplicaByID(id);
+                        if (replica && replica->is_dfs_replica() &&
+                            replica->is_processing()) {
+                            pending.push_back(replica->get_dfs_descriptor());
+                        }
+                    }
+                }
+            }
+        }
+        for (const auto& descriptor : pending) {
+            if (!bucket_allocator_->MarkCommitted(key, descriptor)) {
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+        }
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
@@ -6732,8 +6839,14 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         auto replica = metadata.GetReplicaByID(replica_id);
         if (replica != nullptr) {
             replica->mark_complete();
-            completed_quota_charge = SaturatingAdd(
-                completed_quota_charge, static_cast<uint64_t>(metadata.size));
+            if (replica->is_memory_replica()) {
+                completed_quota_charge = SaturatingAdd(
+                    completed_quota_charge,
+                    static_cast<uint64_t>(metadata.size));
+            }
+            if (replica->is_dfs_replica()) {
+                accessor.GetTenantState().dfs_backfill.erase(key);
+            }
         }
     }
 
@@ -10418,6 +10531,73 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     return {};
 }
 
+void MasterService::RunDfsBackfill() {
+    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) return;
+    // Bound recovery traffic and rotate shards so a large degraded workload
+    // cannot monopolize scheduling. Failed attempts wait before reallocation.
+    constexpr size_t kBatchSize = 256;
+    size_t attempted = 0;
+    const auto now = std::chrono::steady_clock::now();
+    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+    for (size_t visited = 0; visited < kNumShards; ++visited) {
+        const size_t index = dfs_backfill_shard_;
+        dfs_backfill_shard_ = (dfs_backfill_shard_ + 1) % kNumShards;
+        MetadataShardAccessorRW shard(this, index);
+        for (auto& [tenant_id, state] : shard->tenants) {
+            for (auto it = state.dfs_backfill.begin();
+                 it != state.dfs_backfill.end();) {
+                auto object = state.metadata.find(it->first);
+                if (object == state.metadata.end() ||
+                    object->second.HasReplica([](const Replica& replica) {
+                        return replica.is_dfs_replica() &&
+                               replica.is_completed();
+                    })) {
+                    it = state.dfs_backfill.erase(it);
+                    continue;
+                }
+                auto& retry = it->second;
+                auto& metadata = object->second;
+                const auto& key = it->first;
+                ++it;
+                if (retry.retry_after > now ||
+                    state.processing_keys.contains(key) ||
+                    state.replication_tasks.contains(key) ||
+                    metadata.HasReplica(&Replica::is_dfs_replica)) continue;
+                if (retry.task_id != UUID{}) {
+                    auto task = task_manager_.get_read_access()
+                                    .find_task_by_id(retry.task_id);
+                    if (task && !task->is_finished()) continue;
+                }
+                retry.retry_after = now + std::chrono::seconds(5);
+                ++attempted;
+                const auto sources = metadata.GetReplicaSegmentNames();
+                for (const auto& source : sources) {
+                    auto replica = metadata.GetReplicaBySegmentName(source);
+                    if (!replica || !replica->is_memory_replica() ||
+                        !replica->is_completed() ||
+                        replica->has_invalid_mem_handle()) continue;
+                    UUID owner;
+                    if (segment_manager_.getSegmentAccess()
+                            .GetClientIdBySegmentName(source, owner) !=
+                        ErrorCode::OK) continue;
+                    auto task = task_manager_.get_write_access()
+                                    .submit_task_typed<TaskType::DFS_BACKFILL>(
+                                        owner, {tenant_id.value(), key, source});
+                    if (task) {
+                        retry.task_id = *task;
+                    } else if (task.error() ==
+                               ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+                        // Capacity is global: scanning more keys cannot help.
+                        return;
+                    }
+                    break;
+                }
+                if (attempted >= kBatchSize) return;
+            }
+        }
+    }
+}
+
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
@@ -10485,6 +10665,7 @@ void MasterService::DfsEvictionThreadFunc() {
     VLOG(1) << "action=dfs_eviction_thread_started";
 
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_dfs_backfill_time = std::chrono::steady_clock::now();
     auto next_dfs_root_guard_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
@@ -10513,6 +10694,12 @@ void MasterService::DfsEvictionThreadFunc() {
         if (guard_now >= next_dfs_root_guard_time) {
             ReconcileDfsRootFiles();
             next_dfs_root_guard_time = guard_now + dfs_root_guard_interval_;
+        }
+
+        if (std::chrono::steady_clock::now() >= next_dfs_backfill_time) {
+            RunDfsBackfill();
+            next_dfs_backfill_time = std::chrono::steady_clock::now() +
+                                     std::chrono::seconds(1);
         }
 
         std::this_thread::sleep_for(
