@@ -78,6 +78,14 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 
 namespace {
+UUID DfsSessionEpoch(const std::vector<Replica::Descriptor> &replicas) {
+    for (const auto &replica : replicas) {
+        if (replica.is_dfs_replica())
+            return replica.get_dfs_descriptor().MasterEpoch();
+    }
+    return {};
+}
+
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 std::atomic<uint64_t> g_dfs_read_trace_id{0};
 
@@ -499,7 +507,8 @@ inline bool SameReplicaForSessionCache(const Replica::Descriptor &lhs,
                left.offset == right.offset &&
                left.object_size == right.object_size &&
                left.aligned_size == right.aligned_size &&
-               left.shard_idx == right.shard_idx;
+               left.shard_idx == right.shard_idx &&
+               left.MasterEpoch() == right.MasterEpoch();
     }
     return false;
 }
@@ -8113,6 +8122,7 @@ std::vector<int> RealClient::batch_put_session_start(
     auto start_responses =
         client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
     std::vector<std::string> keys_to_revoke;
+    std::vector<UUID> revoke_epochs;
     std::vector<std::string> hot_keys_to_remove;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -8127,6 +8137,7 @@ std::vector<int> RealClient::batch_put_session_start(
             if (!HasMemoryReplica(replicas)) {
                 hot_keys_to_remove.push_back(keys[i]);
                 keys_to_revoke.push_back(keys[i]);
+                revoke_epochs.push_back(DfsSessionEpoch(replicas));
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
                 continue;
@@ -8143,7 +8154,8 @@ std::vector<int> RealClient::batch_put_session_start(
         client_->GetHotCache()->RemoveHotKeys(hot_keys_to_remove);
     }
     if (!keys_to_revoke.empty()) {
-        (void)client_->BatchPutRevoke(keys_to_revoke);
+        (void)client_->BatchPutRevoke(keys_to_revoke, ReplicaType::ALL,
+                                      revoke_epochs);
     }
     return results;
 }
@@ -8266,6 +8278,7 @@ std::vector<int> RealClient::batch_put_session_end(
     // Reliable configs with NoF are rejected at session start.
     std::vector<std::string> end_keys;
     std::vector<size_t> end_indices;
+    std::vector<UUID> end_epochs;
     std::vector<char> has_nof;  // parallel to end_keys
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
@@ -8295,6 +8308,7 @@ std::vector<int> RealClient::batch_put_session_end(
                 continue;
             }
             end_keys.push_back(keys[i]);
+            end_epochs.push_back(DfsSessionEpoch(it->second.replicas));
             end_indices.push_back(i);
             has_nof.push_back(static_cast<char>(nof));
         }
@@ -8321,7 +8335,8 @@ std::vector<int> RealClient::batch_put_session_end(
     for (const auto &key : end_keys) {
         end_metas.emplace_back(ObjectMeta{key, std::nullopt});
     }
-    auto end_responses = client_->BatchPutEnd(end_metas, ReplicaType::MEMORY);
+    auto end_responses =
+        client_->BatchPutEnd(end_metas, ReplicaType::MEMORY, end_epochs);
     if (end_responses.size() != end_keys.size()) {
         // Ambiguous Master state: keep sessions so caller can retry end/revoke.
         for (size_t j = 0; j < end_keys.size(); ++j) {
@@ -8333,6 +8348,7 @@ std::vector<int> RealClient::batch_put_session_end(
 
     std::vector<std::string> nof_revoke_keys;
     std::vector<size_t> nof_revoke_end_indices;
+    std::vector<UUID> nof_revoke_epochs;
     nof_revoke_keys.reserve(end_keys.size());
     nof_revoke_end_indices.reserve(end_keys.size());
     for (size_t j = 0; j < end_keys.size(); ++j) {
@@ -8344,6 +8360,7 @@ std::vector<int> RealClient::batch_put_session_end(
         }
         if (has_nof[j]) {
             nof_revoke_keys.push_back(end_keys[j]);
+            nof_revoke_epochs.push_back(end_epochs[j]);
             nof_revoke_end_indices.push_back(j);
             continue;
         }
@@ -8358,8 +8375,8 @@ std::vector<int> RealClient::batch_put_session_end(
         return results;
     }
 
-    auto nof_revoke_responses =
-        client_->BatchPutRevoke(nof_revoke_keys, ReplicaType::NOF_SSD);
+    auto nof_revoke_responses = client_->BatchPutRevoke(
+        nof_revoke_keys, ReplicaType::NOF_SSD, nof_revoke_epochs);
     if (nof_revoke_responses.size() != nof_revoke_keys.size()) {
         for (size_t k = 0; k < nof_revoke_keys.size(); ++k) {
             const size_t j = nof_revoke_end_indices[k];
@@ -8399,6 +8416,7 @@ std::vector<int> RealClient::batch_put_session_revoke(
 
     std::vector<std::string> revoke_keys;
     std::vector<size_t> revoke_indices;
+    std::vector<UUID> revoke_epochs;
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -8410,6 +8428,7 @@ std::vector<int> RealClient::batch_put_session_revoke(
             // Seal session and wait for outstanding range writes before free.
             it->second.writable = false;
             revoke_keys.push_back(keys[i]);
+            revoke_epochs.push_back(DfsSessionEpoch(it->second.replicas));
             revoke_indices.push_back(i);
         }
         if (!revoke_keys.empty()) {
@@ -8434,7 +8453,7 @@ std::vector<int> RealClient::batch_put_session_revoke(
         client_->GetHotCache()->RemoveHotKeys(revoke_keys);
     }
     auto revoke_responses =
-        client_->BatchPutRevoke(revoke_keys, ReplicaType::ALL);
+        client_->BatchPutRevoke(revoke_keys, ReplicaType::ALL, revoke_epochs);
     std::lock_guard<std::mutex> lock(session_mutex_);
     if (revoke_responses.size() != revoke_keys.size()) {
         // Ambiguous Master state: keep sessions so caller can retry revoke.

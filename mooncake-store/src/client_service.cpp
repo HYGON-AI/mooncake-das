@@ -99,6 +99,41 @@ struct BatchLeaseExpirySummary {
     }
 };
 
+UUID DfsWriteEpoch(const std::vector<Replica::Descriptor>& replicas) {
+    for (const auto& replica : replicas) {
+        if (replica.is_dfs_replica()) {
+            return replica.get_dfs_descriptor().MasterEpoch();
+        }
+    }
+    return {};
+}
+
+template <typename Item, typename Rpc>
+std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
+    const std::vector<Item>& items, const std::vector<UUID>& epochs,
+    Rpc&& rpc) {
+    if (epochs.empty()) return rpc(items, UUID{});
+    std::vector<tl::expected<void, ErrorCode>> results(
+        items.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (epochs.size() != items.size()) return results;
+    std::map<UUID, std::vector<size_t>> groups;
+    for (size_t i = 0; i < items.size(); ++i) groups[epochs[i]].push_back(i);
+    for (const auto& [epoch, indices] : groups) {
+        std::vector<Item> group;
+        group.reserve(indices.size());
+        for (auto i : indices) group.push_back(items[i]);
+        auto responses = rpc(group, epoch);
+        for (size_t i = 0; i < indices.size(); ++i) {
+            results[indices[i]] =
+                responses.size() == indices.size()
+                    ? std::move(responses[i])
+                    : tl::expected<void, ErrorCode>(
+                          tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+    }
+    return results;
+}
+
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr size_t kDefaultDfsWriteChunkSize = 256ULL * 1024 * 1024;
 constexpr size_t kDefaultDfsWriteArenaCount = 2;
@@ -1542,6 +1577,34 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     return client;
 }
 
+tl::expected<QueryResult, ErrorCode> Client::PrepareDfsReadRetry(
+    const QueryResult& original, const QueryResult& refreshed) {
+    Replica::Descriptor selected;
+    if (FindFirstCompleteReplica(original.replicas, selected) !=
+            ErrorCode::OK ||
+        !selected.is_dfs_replica()) {
+        return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    // The caller still owns buffers and session state based on the old query.
+    // Only retry the same replica type, size and checksum view. If the caller
+    // omitted a checksum, do not silently introduce one from a new query.
+    if (original.object_checksum != refreshed.object_checksum) {
+        return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
+    }
+    for (const auto& replica : refreshed.replicas) {
+        if (!replica.is_dfs_replica() ||
+            replica.status != ReplicaStatus::COMPLETE) {
+            continue;
+        }
+        if (calculate_total_size(replica) != calculate_total_size(selected)) {
+            return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
+        }
+        return QueryResult({replica}, refreshed.lease_timeout,
+                           original.object_checksum);
+    }
+    return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
+}
+
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           std::vector<Slice>& slices) {
     auto query_result = Query(object_key);
@@ -1759,6 +1822,19 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    auto result = GetImpl(object_key, query_result, slices);
+    if (result || result.error() != ErrorCode::DFS_STALE_HANDLE) return result;
+    auto refreshed = Query(object_key);
+    if (!refreshed) return tl::make_unexpected(refreshed.error());
+    auto retry = PrepareDfsReadRetry(query_result, *refreshed);
+    if (!retry) return tl::unexpected(retry.error());
+    // Exactly one retry with a fresh lease, preserving the caller's read view.
+    return GetImpl(object_key, *retry, slices);
+}
+
+tl::expected<void, ErrorCode> Client::GetImpl(const std::string& object_key,
+                                              const QueryResult& query_result,
+                                              std::vector<Slice>& slices) {
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -2037,6 +2113,55 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
+    const std::vector<std::string>& object_keys,
+    const std::vector<QueryResult>& query_results,
+    std::unordered_map<std::string, std::vector<Slice>>& slices,
+    bool prefer_alloc_in_same_node) {
+    auto results = BatchGetImpl(object_keys, query_results, slices,
+                                prefer_alloc_in_same_node);
+    std::vector<std::string> retry_keys;
+    std::vector<size_t> retry_indices;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i] && results[i].error() == ErrorCode::DFS_STALE_HANDLE) {
+            retry_keys.push_back(object_keys[i]);
+            retry_indices.push_back(i);
+        }
+    }
+    if (retry_keys.empty()) return results;
+    auto refreshed = BatchQuery(retry_keys);
+    if (refreshed.size() != retry_keys.size()) {
+        for (auto i : retry_indices)
+            results[i] = tl::unexpected(ErrorCode::RPC_FAIL);
+        return results;
+    }
+    std::vector<std::string> valid_keys;
+    std::vector<QueryResult> valid_queries;
+    std::vector<size_t> valid_indices;
+    for (size_t i = 0; i < refreshed.size(); ++i) {
+        if (!refreshed[i]) {
+            results[retry_indices[i]] = tl::unexpected(refreshed[i].error());
+            continue;
+        }
+        auto retry =
+            PrepareDfsReadRetry(query_results[retry_indices[i]], *refreshed[i]);
+        if (!retry) {
+            results[retry_indices[i]] = tl::unexpected(retry.error());
+            continue;
+        }
+        valid_keys.push_back(retry_keys[i]);
+        valid_queries.push_back(std::move(*retry));
+        valid_indices.push_back(retry_indices[i]);
+    }
+    if (!valid_keys.empty()) {
+        auto retried = BatchGetImpl(valid_keys, valid_queries, slices,
+                                    prefer_alloc_in_same_node);
+        for (size_t i = 0; i < retried.size(); ++i)
+            results[valid_indices[i]] = std::move(retried[i]);
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
@@ -2533,7 +2658,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     std::optional<ErrorCode> finalize_error;
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type,
+            DfsWriteEpoch(*start_result));
         if (!end_result) {
             finalize_error = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << *finalize_error;
@@ -2541,8 +2667,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.PutRevoke(
+            key, *finalize_decision.revoke_type, DfsWriteEpoch(*start_result));
         if (!revoke_result) {
             if (!finalize_error.has_value()) {
                 finalize_error = revoke_result.error();
@@ -2693,15 +2819,16 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     std::optional<ErrorCode> finalize_error;
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.UpsertEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type,
+            DfsWriteEpoch(*start_result));
         if (!end_result) {
             finalize_error = end_result.error();
             LOG(ERROR) << "Failed to end upsert operation: " << *finalize_error;
         }
     }
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.UpsertRevoke(
+            key, *finalize_decision.revoke_type, DfsWriteEpoch(*start_result));
         if (!revoke_result) {
             if (!finalize_error.has_value()) {
                 finalize_error = revoke_result.error();
@@ -3522,15 +3649,20 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
                 completion = context->is_upsert
                                  ? master_client_.UpsertEnd(
                                        ObjectMeta{key, object_checksum},
-                                       ReplicaType::DFS)
+                                       ReplicaType::DFS,
+                                       context->descriptors[i].MasterEpoch())
                                  : master_client_.PutEnd(
                                        ObjectMeta{key, object_checksum},
-                                       ReplicaType::DFS);
+                                       ReplicaType::DFS,
+                                       context->descriptors[i].MasterEpoch());
             } else {
-                completion =
-                    context->is_upsert
-                        ? master_client_.UpsertRevoke(key, ReplicaType::DFS)
-                        : master_client_.PutRevoke(key, ReplicaType::DFS);
+                completion = context->is_upsert
+                                 ? master_client_.UpsertRevoke(
+                                       key, ReplicaType::DFS,
+                                       context->descriptors[i].MasterEpoch())
+                                 : master_client_.PutRevoke(
+                                       key, ReplicaType::DFS,
+                                       context->descriptors[i].MasterEpoch());
             }
             if (completion) break;
             // OBJECT_NOT_FOUND / INVALID_WRITE mean the object already moved on
@@ -3905,6 +4037,17 @@ void Client::DrainAsyncDfsWrites() {
 
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
                               bool allow_memory_only_fallback) {
+    // All allocations in this Start batch came from the same master. Fence
+    // finalization even when a group contains memory-only objects as well.
+    UUID dfs_epoch{};
+    for (const auto& op : ops) {
+        const auto epoch = DfsWriteEpoch(op.replicas);
+        if (epoch != UUID{}) {
+            dfs_epoch = epoch;
+            break;
+        }
+    }
+
     struct BatchFinalizeGroup {
         std::vector<std::string> keys;
         std::vector<size_t> indices;
@@ -4010,7 +4153,8 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
             object_metas.emplace_back(ObjectMeta{
                 group.keys[i], ops[group.indices[i]].object_checksum});
         }
-        auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
+        auto responses =
+            master_client_.BatchPutEnd(object_metas, replica_type, dfs_epoch);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -4037,7 +4181,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
             return;
         }
         auto responses =
-            master_client_.BatchPutRevoke(group.keys, replica_type);
+            master_client_.BatchPutRevoke(group.keys, replica_type, dfs_epoch);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -4118,6 +4262,17 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
 }
 
 void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
+    // All allocations in this Start batch came from the same master. Fence
+    // finalization even when a group contains memory-only objects as well.
+    UUID dfs_epoch{};
+    for (const auto& op : ops) {
+        const auto epoch = DfsWriteEpoch(op.replicas);
+        if (epoch != UUID{}) {
+            dfs_epoch = epoch;
+            break;
+        }
+    }
+
     std::vector<ObjectMeta> successful_object_metas;
     std::vector<size_t> successful_indices;
     std::vector<std::string> failed_keys;
@@ -4160,7 +4315,7 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
     if (!successful_object_metas.empty()) {
         finalized_keys.reserve(successful_object_metas.size());
         auto end_responses =
-            master_client_.BatchUpsertEnd(successful_object_metas);
+            master_client_.BatchUpsertEnd(successful_object_metas, dfs_epoch);
         if (end_responses.size() != successful_object_metas.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
                        << successful_object_metas.size() << ", got "
@@ -4199,7 +4354,8 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
     // Process failed operations that need cleanup
     if (!failed_keys.empty()) {
-        auto revoke_responses = master_client_.BatchUpsertRevoke(failed_keys);
+        auto revoke_responses =
+            master_client_.BatchUpsertRevoke(failed_keys, dfs_epoch);
         if (revoke_responses.size() != failed_keys.size()) {
             LOG(ERROR) << "BatchUpsertRevoke response size mismatch: expected "
                        << failed_keys.size() << ", got "
@@ -4538,13 +4694,21 @@ Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPutEnd(
-    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
-    return master_client_.BatchPutEnd(object_metas, replica_type);
+    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type,
+    const std::vector<UUID>& dfs_epochs) {
+    return FinalizeSessionsByEpoch(
+        object_metas, dfs_epochs, [&](const auto& group, const UUID& epoch) {
+            return master_client_.BatchPutEnd(group, replica_type, epoch);
+        });
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
-    const std::vector<std::string>& keys, ReplicaType replica_type) {
-    return master_client_.BatchPutRevoke(keys, replica_type);
+    const std::vector<std::string>& keys, ReplicaType replica_type,
+    const std::vector<UUID>& dfs_epochs) {
+    return FinalizeSessionsByEpoch(
+        keys, dfs_epochs, [&](const auto& group, const UUID& epoch) {
+            return master_client_.BatchPutRevoke(group, replica_type, epoch);
+        });
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
@@ -5095,6 +5259,10 @@ void Client::SetDfsStorageBackend(
         LOG(INFO) << "Initialized DFS write staging arenas: count="
                   << dfs_write_arena_count_ << ", size="
                   << dfs_write_chunk_size_;
+    }
+    if (backend) {
+        backend->SetMasterEpochProvider(
+            master_client_.MakeDfsMasterEpochProvider());
     }
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
@@ -5939,6 +6107,11 @@ Client::GetDfsBackfillBackend() {
     if (!backend) return tl::make_unexpected(backend.error());
     dfs_backfill_backend_ =
         std::dynamic_pointer_cast<DistributedStorageBackend>(*backend);
+    if (dfs_backfill_backend_) {
+        dfs_backfill_backend_->SetDescriptorRootDir(storage->dfs_fsdir);
+        dfs_backfill_backend_->SetMasterEpochProvider(
+            master_client_.MakeDfsMasterEpochProvider());
+    }
     // The executor checks initialization before acquiring a source pin.
     return dfs_backfill_backend_;
 }

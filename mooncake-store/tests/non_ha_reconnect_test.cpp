@@ -25,7 +25,7 @@ namespace mooncake {
 class MasterClientTestPeer {
    public:
     static auto Pool(const Client& client) {
-        return client.master_client_.client_accessor_.GetClientPool();
+        return client.master_client_.client_accessor_->GetClientPool();
     }
 };
 

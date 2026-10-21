@@ -1952,8 +1952,8 @@ tl::expected<uint8_t, ErrorCode> MasterService::SetDfsFilterMode(
     if (new_filter_mode > 1) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    const uint8_t old_value = dfs_filter_mode_.exchange(
-        new_filter_mode, std::memory_order_acq_rel);
+    const uint8_t old_value =
+        dfs_filter_mode_.exchange(new_filter_mode, std::memory_order_acq_rel);
     LOG(INFO) << "action=set_dfs_filter_mode, old_value=" << old_value
               << ", new_value=" << new_filter_mode;
     return old_value;
@@ -4076,9 +4076,10 @@ bool MasterService::IsDfsReadFilteredOnly(
     if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0) {
         return false;
     }
-    const bool has_completed_dfs = metadata.HasReplica([](const Replica& replica) {
-        return replica.is_dfs_replica() && replica.is_completed();
-    });
+    const bool has_completed_dfs =
+        metadata.HasReplica([](const Replica& replica) {
+            return replica.is_dfs_replica() && replica.is_completed();
+        });
     if (!has_completed_dfs) {
         return false;
     }
@@ -5063,8 +5064,7 @@ auto MasterService::PutStartInternal(
                         writer_host_id, group_id, object_id.tenant_id, now,
                         *soft_pin_request, quota_deficit_bytes, std::nullopt,
                         preallocated_dfs, skip_dfs_replica,
-                        &dfs_allocation_error,
-                        dfs_allocation_allowed_snapshot);
+                        &dfs_allocation_error, dfs_allocation_allowed_snapshot);
                 }
             }
         }
@@ -5213,8 +5213,7 @@ MasterService::BatchPutStart(const UUID& client_id,
 
     const uint8_t dfs_filter_mode =
         dfs_filter_mode_.load(std::memory_order_acquire);
-    const bool dfs_allocation_allowed_snapshot =
-        (dfs_filter_mode & 1) == 0;
+    const bool dfs_allocation_allowed_snapshot = (dfs_filter_mode & 1) == 0;
     // Batch preallocation is a BUCKET-only optimization. SHARD allocation and
     // requests without DFS replicas retain the original per-key allocation,
     // failure, and rollback behavior of PutStart.
@@ -5223,8 +5222,9 @@ MasterService::BatchPutStart(const UUID& client_id,
         for (size_t i = 0; i < keys.size(); ++i) {
             results.emplace_back(PutStartInternal(
                 client_id, keys[i], tenant_id, slice_lengths[i],
-                config.ForSingleKey(i), std::nullopt, /*skip_dfs_replica=*/false,
-                std::nullopt, dfs_allocation_allowed_snapshot));
+                config.ForSingleKey(i), std::nullopt,
+                /*skip_dfs_replica=*/false, std::nullopt,
+                dfs_allocation_allowed_snapshot));
         }
         return results;
     }
@@ -5263,9 +5263,9 @@ MasterService::BatchPutStart(const UUID& client_id,
                                             ? error_it->second
                                             : ErrorCode::NO_AVAILABLE_HANDLE;
                 if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
-                    results.emplace_back(PutStart(
-                        client_id, keys[i], tenant_id, slice_lengths[i],
-                        key_config));
+                    results.emplace_back(PutStart(client_id, keys[i], tenant_id,
+                                                  slice_lengths[i],
+                                                  key_config));
                 } else if (error_it != reservation_errors.end() &&
                            IsDfsReplicaFallbackError(error)) {
                     results.emplace_back(PutStartInternal(
@@ -6061,8 +6061,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         const size_t existing_nof_replicas =
                             metadata.CountReplicas(&Replica::fn_is_nof_replica);
                         const size_t expected_dfs_replicas =
-                            (dfs_filter_mode_.load(std::memory_order_acquire) & 1) !=
-                                    0
+                            (dfs_filter_mode_.load(std::memory_order_acquire) &
+                             1) != 0
                                 ? 0
                                 : config.dfs_replica_num;
                         if (existing_memory_replicas != config.replica_num ||
@@ -6090,8 +6090,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (has_bucket_dfs_replica && config.dfs_replica_num > 0 &&
                     (dfs_filter_mode_.load(std::memory_order_acquire) & 1) !=
                         0) {
-                    LOG(INFO) << "key=" << key
-                              << ", info=object_already_exists";
+                    LOG(INFO)
+                        << "key=" << key << ", info=object_already_exists";
                     return tl::make_unexpected(
                         ErrorCode::OBJECT_ALREADY_EXISTS);
                 }
@@ -6099,8 +6099,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
                     if (config.dfs_replica_num > 0 &&
-                        (dfs_filter_mode_.load(std::memory_order_acquire) & 1) ==
-                            0) {
+                        (dfs_filter_mode_.load(std::memory_order_acquire) &
+                         1) == 0) {
                         tenant_state.dfs_backfill[key] = {};
                     } else {
                         tenant_state.dfs_backfill.erase(key);

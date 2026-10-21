@@ -91,12 +91,12 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
@@ -107,12 +107,12 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
@@ -122,12 +122,12 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> UpsertEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
     tl::expected<void, ErrorCode> UpsertRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
     BatchUpsertStart(const UUID& client_id,
@@ -138,11 +138,11 @@ class WrappedMasterService {
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
     tl::expected<void, ErrorCode> Remove(
         const std::string& key, bool force = false,
@@ -220,8 +220,7 @@ class WrappedMasterService {
         int64_t new_max_bucket_count);
     tl::expected<uint32_t, ErrorCode> SetDfsHeartbeatInterval(
         uint32_t new_interval_seconds);
-    tl::expected<uint8_t, ErrorCode> SetDfsFilterMode(
-        uint8_t new_filter_mode);
+    tl::expected<uint8_t, ErrorCode> SetDfsFilterMode(uint8_t new_filter_mode);
     uint8_t GetDfsFilterMode() const;
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
@@ -242,6 +241,8 @@ class WrappedMasterService {
 
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    tl::expected<UUID, ErrorCode> GetDfsMasterEpoch();
 
     tl::expected<DfsBucketSnapshotResponse, ErrorCode> GetDfsBucketSnapshot(
         const UUID& client_id, const UUID& last_epoch, uint64_t last_version);

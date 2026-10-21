@@ -229,8 +229,7 @@ class MasterService {
     uint8_t GetDfsFilterMode() const {
         return dfs_filter_mode_.load(std::memory_order_acquire);
     }
-    tl::expected<uint8_t, ErrorCode> SetDfsFilterMode(
-        uint8_t new_filter_mode);
+    tl::expected<uint8_t, ErrorCode> SetDfsFilterMode(uint8_t new_filter_mode);
 
     bool UsesDfsBucketAllocator() const {
         return bucket_allocator_.get() != nullptr;
@@ -849,6 +848,10 @@ class MasterService {
     auto GetDfsBucketSnapshot(
         const UUID& client_id, const UUID& last_epoch, uint64_t last_version)
         -> tl::expected<DfsBucketSnapshotResponse, ErrorCode>;
+
+    UUID GetDfsMasterEpoch() const {
+        return bucket_allocator_.get() ? dfs_snapshot_epoch_ : UUID{};
+    }
 
     /**
      * @brief Client polls whether master has requested a full SSD clear

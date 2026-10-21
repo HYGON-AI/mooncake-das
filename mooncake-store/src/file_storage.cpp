@@ -1345,24 +1345,13 @@ void FileStorage::DfsHeartbeatThreadFunc() {
                               << previous_interval << "s to "
                               << heartbeat_interval << "s";
                 }
-                const bool master_restarted =
-                    dfs_snapshot_epoch_ != UUID{} &&
-                    dfs_snapshot_epoch_ != snapshot->epoch;
-                if (master_restarted) {
-                    auto result =
-                        distributed_backend_->InvalidateAllBucketFds();
-                    if (!result) {
-                        LOG(WARNING)
-                            << "Failed to invalidate DFS bucket FDs after "
-                               "Master epoch changed: "
-                            << result.error();
-                    } else if (*result > 0) {
-                        LOG(INFO) << "Invalidated " << *result
-                                  << " DFS bucket handles after Master epoch "
-                                     "changed";
-                    }
-                }
-                if (!snapshot->unchanged) {
+                auto epoch_guard =
+                    distributed_backend_->AcquireBucketEpoch(snapshot->epoch);
+                if (!epoch_guard) {
+                    LOG(WARNING) << "Ignoring DFS snapshot from an unavailable "
+                                    "or superseded Master epoch: "
+                                 << epoch_guard.error();
+                } else if (!snapshot->unchanged) {
                     dfs_snapshot_epoch_ = snapshot->epoch;
                     dfs_snapshot_version_ = snapshot->version;
                     auto result = distributed_backend_->CleanupStaleBucketFds(

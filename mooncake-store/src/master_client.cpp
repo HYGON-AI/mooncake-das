@@ -426,7 +426,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_pool(
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     return invoke_rpc_with_pool<ServiceMethod, ReturnType>(
-        client_accessor_, std::forward<Args>(args)...);
+        *client_accessor_, std::forward<Args>(args)...);
 }
 
 template <auto ServiceMethod, typename ResultType, typename... Args>
@@ -437,7 +437,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         return std::vector<tl::expected<ResultType, ErrorCode>>(
             input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
     }
-    auto pool = client_accessor_.GetClientPool();
+    auto pool = client_accessor_->GetClientPool();
     if (metrics_) {
         metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
     }
@@ -507,7 +507,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     if (use_ha_control_pool) {
         ha_probe_client_accessor_.GetOrCreateClientPool(master_addr);
     } else {
-        client_accessor_.GetOrCreateClientPool(master_addr);
+        client_accessor_->GetOrCreateClientPool(master_addr);
     }
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
@@ -516,7 +516,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
             ? invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
                                    std::string>(ha_probe_client_accessor_)
             : invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
-                                   std::string>(client_accessor_);
+                                   std::string>(*client_accessor_);
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
         return result.error();
@@ -532,7 +532,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     }
     if (use_ha_control_pool) {
         // Only move foreground traffic after the control-plane probe is ready.
-        client_accessor_.GetOrCreateClientPool(master_addr);
+        client_accessor_->GetOrCreateClientPool(master_addr);
         ha_control_client_accessor_.GetOrCreateClientPool(master_addr);
     }
     client_addr_param_ = master_addr;
@@ -709,46 +709,51 @@ MasterClient::BatchPutStart(
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutEnd(
-    const ObjectMeta& object_meta, ReplicaType replica_type) {
+    const ObjectMeta& object_meta, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", object_meta.key);
 
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, object_meta, replica_type, tenant_id_.value());
+        client_id_, object_meta, replica_type, tenant_id_.value(), dfs_epoch);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
-    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
+    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
     timer.LogRequest("keys_count=", object_metas.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
         object_metas.size(), client_id_, object_metas, replica_type,
-        tenant_id_.value());
+        tenant_id_.value(), dfs_epoch);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::PutRevoke(
-    const std::string& key, ReplicaType replica_type) {
+tl::expected<void, ErrorCode> MasterClient::PutRevoke(const std::string& key,
+                                                      ReplicaType replica_type,
+                                                      const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
     auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
-        client_id_, key, replica_type, tenant_id_.value());
+        client_id_, key, replica_type, tenant_id_.value(), dfs_epoch);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
-    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    const std::vector<std::string>& keys, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
-        keys.size(), client_id_, keys, replica_type, tenant_id_.value());
+        keys.size(), client_id_, keys, replica_type, tenant_id_.value(),
+        dfs_epoch);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -799,46 +804,48 @@ MasterClient::BatchUpsertStart(
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
-    const ObjectMeta& object_meta, ReplicaType replica_type) {
+    const ObjectMeta& object_meta, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertEnd");
     timer.LogRequest("key=", object_meta.key);
 
     auto result = invoke_rpc<&WrappedMasterService::UpsertEnd, void>(
-        client_id_, object_meta, replica_type, tenant_id_.value());
+        client_id_, object_meta, replica_type, tenant_id_.value(), dfs_epoch);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
-    const std::vector<ObjectMeta>& object_metas) {
+    const std::vector<ObjectMeta>& object_metas, const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertEnd");
     timer.LogRequest("keys_count=", object_metas.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
-        object_metas.size(), client_id_, object_metas, tenant_id_.value());
+        object_metas.size(), client_id_, object_metas, tenant_id_.value(),
+        dfs_epoch);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertRevoke(
-    const std::string& key, ReplicaType replica_type) {
+    const std::string& key, ReplicaType replica_type, const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertRevoke");
     timer.LogRequest("key=", key);
 
     auto result = invoke_rpc<&WrappedMasterService::UpsertRevoke, void>(
-        client_id_, key, replica_type, tenant_id_.value());
+        client_id_, key, replica_type, tenant_id_.value(), dfs_epoch);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys, const UUID& dfs_epoch) {
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertRevoke");
     timer.LogRequest("keys_count=", keys.size());
 
     auto result =
         invoke_batch_rpc<&WrappedMasterService::BatchUpsertRevoke, void>(
-            keys.size(), client_id_, keys, tenant_id_.value());
+            keys.size(), client_id_, keys, tenant_id_.value(), dfs_epoch);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -1004,7 +1011,7 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
         ping_pool =
             ha_connection_policy_enabled_.load(std::memory_order_acquire)
                 ? ha_control_client_accessor_.GetClientPool()
-                : client_accessor_.GetClientPool();
+                : client_accessor_->GetClientPool();
     }
     auto result =
         invoke_rpc_with_client_pool<&WrappedMasterService::Ping, PingResponse>(
@@ -1123,6 +1130,39 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
         invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
                    std::vector<OffloadTaskItem>>(client_id, enable_offloading);
     return result;
+}
+
+std::function<tl::expected<UUID, ErrorCode>()>
+MasterClient::MakeDfsMasterEpochProvider() {
+    return [accessor = client_accessor_]() -> tl::expected<UUID, ErrorCode> {
+        const auto pool = accessor->GetClientPool();
+        if (!pool) return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        return async_simple::coro::syncAwait(
+            [&]() -> async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>> {
+                auto response = co_await pool->send_request(
+                    [&](coro_rpc::coro_rpc_client& client)
+                        -> async_simple::coro::Lazy<
+                            tl::expected<UUID, ErrorCode>> {
+                        auto result = co_await client.call_for<
+                            &WrappedMasterService::GetDfsMasterEpoch>(
+                            std::chrono::seconds(2));
+                        if (!result) {
+                            co_return tl::make_unexpected(
+                                result.error().code == coro_rpc::errc::timed_out
+                                    ? ErrorCode::RPC_TIMEOUT
+                                    : ErrorCode::RPC_FAIL);
+                        }
+                        if (!*result) {
+                            co_return tl::make_unexpected(result->error());
+                        }
+                        co_return result->value();
+                    });
+                if (!response) {
+                    co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+                }
+                co_return std::move(*response);
+            }());
+    };
 }
 
 tl::expected<DfsBucketSnapshotResponse, ErrorCode>

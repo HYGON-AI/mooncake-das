@@ -224,12 +224,12 @@ TEST_F(MasterAdminServerTest, DfsFilterModeRejectsMissingOrInvalidField) {
     admin.SetServiceDelegate(service);
     admin.SetServiceAvailable(true);
 
-    auto response = HttpPutJson(
-        port, "/api/v1/dfs/filter_mode", R"({"filter_mode":1})");
+    auto response =
+        HttpPutJson(port, "/api/v1/dfs/filter_mode", R"({"filter_mode":1})");
     ASSERT_EQ(response.http_status, 200);
 
-    for (const std::string& body : {R"({})", R"({"mode":1})",
-                                    R"({"filter_mode":2})"}) {
+    for (const std::string& body :
+         {R"({})", R"({"mode":1})", R"({"filter_mode":2})"}) {
         response = HttpPutJson(port, "/api/v1/dfs/filter_mode", body);
         EXPECT_EQ(response.http_status, 400) << body;
     }

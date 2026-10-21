@@ -1290,9 +1290,10 @@ TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
 #endif
 
 TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
-    const auto dfs_root = (std::filesystem::temp_directory_path() /
-                           ("master_dfs_backfill_" + std::to_string(::getpid())))
-                              .string();
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_backfill_" + std::to_string(::getpid())))
+            .string();
     std::filesystem::create_directories(dfs_root);
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
@@ -1324,22 +1325,24 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
 
         service.RunBatchEvictForTesting(1.0, 1.0);
         ASSERT_TRUE(service.SetDfsFilterMode(1).has_value());
-        auto hidden = service.GetReplicaList("dfs_backfill", TenantId::Default());
+        auto hidden =
+            service.GetReplicaList("dfs_backfill", TenantId::Default());
         ASSERT_FALSE(hidden.has_value());
 
-        auto backfill = service.PutStart(
-            context.client_id, "dfs_backfill", TenantId::Default(), 4096, config);
+        auto backfill = service.PutStart(context.client_id, "dfs_backfill",
+                                         TenantId::Default(), 4096, config);
         ASSERT_FALSE(backfill.has_value());
         EXPECT_EQ(backfill.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
         ASSERT_TRUE(service.SetDfsFilterMode(0).has_value());
-        auto visible = service.GetReplicaList("dfs_backfill", TenantId::Default());
+        auto visible =
+            service.GetReplicaList("dfs_backfill", TenantId::Default());
         ASSERT_TRUE(visible.has_value());
         ASSERT_EQ(visible->replicas.size(), 1u);
         EXPECT_TRUE(visible->replicas.front().is_dfs_replica());
 
-        auto admin = service.GetReplicaListForAdmin("dfs_backfill",
-                                                    TenantId::Default());
+        auto admin =
+            service.GetReplicaListForAdmin("dfs_backfill", TenantId::Default());
         ASSERT_TRUE(admin.has_value());
         ASSERT_EQ(admin->replicas.size(), 1u);
         EXPECT_TRUE(admin->replicas.front().is_dfs_replica());
@@ -1349,10 +1352,10 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
 }
 
 TEST_F(MasterServiceTest, DfsReadFilterReportsDfsOnlyAsNotFound) {
-    const auto dfs_root = (std::filesystem::temp_directory_path() /
-                           ("master_dfs_filtered_not_found_" +
-                            std::to_string(::getpid())))
-                              .string();
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_filtered_not_found_" + std::to_string(::getpid())))
+            .string();
     std::filesystem::create_directories(dfs_root);
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
@@ -1385,8 +1388,8 @@ TEST_F(MasterServiceTest, DfsReadFilterReportsDfsOnlyAsNotFound) {
         ASSERT_FALSE(single.has_value());
         EXPECT_EQ(single.error(), ErrorCode::OBJECT_NOT_FOUND);
 
-        auto batch = service.BatchGetReplicaList(
-            {"dfs_filtered_only"}, TenantId::Default());
+        auto batch = service.BatchGetReplicaList({"dfs_filtered_only"},
+                                                 TenantId::Default());
         ASSERT_EQ(batch.size(), 1u);
         ASSERT_FALSE(batch.front().has_value());
         EXPECT_EQ(batch.front().error(), ErrorCode::OBJECT_NOT_FOUND);
@@ -2460,10 +2463,11 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         EXPECT_EQ(payload.key, "retry_degraded");
         ASSERT_TRUE(service.SetDfsFilterMode(1).has_value());
         auto filtered_copy = service.DfsBackfillStart(
-            context.client_id, payload.key, TenantId::Default(),
-            payload.source, backfill->id);
+            context.client_id, payload.key, TenantId::Default(), payload.source,
+            backfill->id);
         ASSERT_FALSE(filtered_copy.has_value());
-        EXPECT_EQ(filtered_copy.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        EXPECT_EQ(filtered_copy.error(),
+                  ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
         ASSERT_TRUE(service.SetDfsFilterMode(0).has_value());
         EXPECT_FALSE(service.DfsBackfillStart(
             generate_uuid(), payload.key, TenantId::Default(),
@@ -2771,13 +2775,13 @@ TEST_F(MasterServiceTest, DfsBucketPutRevokeRejectsCompletedReplica) {
                                 TenantId::Default(), ReplicaType::MEMORY)
                         .has_value());
 
-        auto revoke = service.PutRevoke(
-            context.client_id, "partial_revoke", TenantId::Default(),
-            ReplicaType::ALL);
+        auto revoke = service.PutRevoke(context.client_id, "partial_revoke",
+                                        TenantId::Default(), ReplicaType::ALL);
         ASSERT_FALSE(revoke.has_value());
         EXPECT_EQ(revoke.error(), ErrorCode::INVALID_WRITE);
 
-        auto query = service.GetReplicaList("partial_revoke", TenantId::Default());
+        auto query =
+            service.GetReplicaList("partial_revoke", TenantId::Default());
         ASSERT_TRUE(query.has_value());
         ASSERT_EQ(query->replicas.size(), 1u);
         EXPECT_TRUE(query->replicas.front().is_memory_replica());
@@ -2811,9 +2815,9 @@ TEST_F(MasterServiceTest, DfsBucketUpsertFilterPreservesOldReplica) {
                         .has_value());
 
         ASSERT_TRUE(service.SetDfsFilterMode(1).has_value());
-        auto new_key_upsert = service.UpsertStart(
-            context.client_id, "new_upsert_filter", TenantId::Default(), 4096,
-            config);
+        auto new_key_upsert =
+            service.UpsertStart(context.client_id, "new_upsert_filter",
+                                TenantId::Default(), 4096, config);
         ASSERT_FALSE(new_key_upsert.has_value());
         EXPECT_EQ(new_key_upsert.error(),
                   ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -2823,8 +2827,8 @@ TEST_F(MasterServiceTest, DfsBucketUpsertFilterPreservesOldReplica) {
         ASSERT_FALSE(upsert.has_value());
         EXPECT_EQ(upsert.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 
-        auto query = service.GetReplicaListForAdmin(
-            "upsert_filter", TenantId::Default());
+        auto query = service.GetReplicaListForAdmin("upsert_filter",
+                                                    TenantId::Default());
         ASSERT_TRUE(query.has_value());
         ASSERT_EQ(query->replicas.size(), 2u);
         for (const auto& replica : query->replicas) {
@@ -2950,6 +2954,17 @@ TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
             ASSERT_NE(dfs, nullptr);
             before.push_back(dfs->get_dfs_descriptor());
         }
+        // Active buckets are intentionally not persisted. Seal the source
+        // bucket so this fixture exercises durable metadata recovery.
+        auto rollover = service.PutStart(context.client_id, "restart_rollover",
+                                         TenantId::Default(), 1048576, config);
+        ASSERT_TRUE(rollover.has_value());
+        const auto* rollover_dfs = FindDfsDescriptor(*rollover);
+        ASSERT_NE(rollover_dfs, nullptr);
+        ASSERT_NE(rollover_dfs->get_dfs_descriptor().shard_idx,
+                  before.front().shard_idx);
+        ASSERT_TRUE(service.PutRevoke(context.client_id, "restart_rollover",
+                                      TenantId::Default(), ReplicaType::ALL));
     }
 
     {

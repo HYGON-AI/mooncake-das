@@ -6,6 +6,9 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -203,6 +206,17 @@ class DistributedStorageBackend : public StorageBackendInterface {
     }
 
     tl::expected<size_t, ErrorCode> InvalidateAllBucketFds();
+    // Configured before I/O starts; consulted on epoch changes and cache
+    // misses.
+    void SetMasterEpochProvider(
+        std::function<tl::expected<UUID, ErrorCode>()> provider) {
+        std::unique_lock lock(bucket_epoch_mutex_);
+        master_epoch_provider_ = std::move(provider);
+    }
+    // Observe an epoch before using its bucket locations. The returned guard
+    // keeps a heartbeat or another request from changing epochs during I/O.
+    tl::expected<std::shared_lock<std::shared_mutex>, ErrorCode>
+    AcquireBucketEpoch(const UUID& epoch);
     tl::expected<size_t, ErrorCode> CleanupStaleBucketFds(
         const std::vector<int64_t>& active_bucket_ids);
     tl::expected<bool, ErrorCode> CleanupBucketFd(int64_t bucket_id);
@@ -269,7 +283,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const std::vector<DfsWriteRequest>& requests);
 
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> GetOrOpenBucket(
-        int64_t bucket_id);
+        int64_t bucket_id, const UUID& epoch);
 
     /**
      * @brief Open/cache the direct (page-cache-bypassing) read handle for a
@@ -277,7 +291,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
      * read path; callers then fall back to the regular handle.
      */
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode>
-    GetOrOpenBucketDirect(int64_t bucket_id);
+    GetOrOpenBucketDirect(int64_t bucket_id, const UUID& epoch);
 
     /**
      * @brief One contiguous read scheduled as a single task.
@@ -336,6 +350,15 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
 
+    std::shared_mutex bucket_epoch_mutex_;
+    std::mutex bucket_epoch_confirmation_mutex_;
+    // Protected by the confirmation mutex; current-epoch cache hits bypass it.
+    std::optional<ErrorCode> bucket_epoch_confirmation_error_;
+    std::chrono::steady_clock::time_point
+        bucket_epoch_confirmation_retry_after_{};
+    UUID bucket_epoch_{};
+    std::set<UUID> retired_bucket_epochs_;
+    std::function<tl::expected<UUID, ErrorCode>()> master_epoch_provider_;
     mutable std::mutex bucket_cache_mutex_;
     // bucket id -> handle. The int key replaces a string-keyed lookup so the
     // common PrepareReadTasks path avoids a hash + lock per request.

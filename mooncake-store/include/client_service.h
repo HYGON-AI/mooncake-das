@@ -812,10 +812,12 @@ class Client {
     // without touching Client internals. Same RPC path as FinalizeBatchPut.
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const std::vector<ObjectMeta>& object_metas,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::vector<UUID>& dfs_epochs = {});
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::vector<UUID>& dfs_epochs = {});
 
    protected:
     /**
@@ -839,6 +841,17 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    tl::expected<QueryResult, ErrorCode> PrepareDfsReadRetry(
+        const QueryResult& original, const QueryResult& refreshed);
+    tl::expected<void, ErrorCode> GetImpl(const std::string& object_key,
+                                          const QueryResult& query_result,
+                                          std::vector<Slice>& slices);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetImpl(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        bool prefer_same_node);
+
     friend class test::DfsBucketClientTest;
 
     /**
