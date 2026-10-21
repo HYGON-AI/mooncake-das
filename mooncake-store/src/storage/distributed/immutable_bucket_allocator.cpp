@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <exception>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -20,7 +19,6 @@
 
 #include "crc32c.h"
 #include "master_metric_manager.h"
-#include "thread_pool.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #ifdef USE_3FS
@@ -91,19 +89,6 @@ std::optional<int64_t> ParseBucketFileName(const std::string& name,
     }
 }
 
-/**
- * @brief Resolve the configured recovery worker count.
- *
- * A configured value of 0 means auto: min(8, hardware_concurrency()), clamped
- * to at least one so recovery always makes progress on a host whose hardware
- * concurrency cannot be determined.
- */
-size_t ResolveRecoveryWorkerCount(int configured) {
-    if (configured > 0) return static_cast<size_t>(configured);
-    const unsigned hw = std::thread::hardware_concurrency();
-    return std::max<size_t>(1, std::min<size_t>(8, hw));
-}
-
 }  // namespace
 
 ImmutableBucketAllocator::PendingEviction::~PendingEviction() {
@@ -166,11 +151,6 @@ ImmutableBucketAllocator::~ImmutableBucketAllocator() {
     for (const int64_t bucket_id : ready_bucket_ids) {
         DeleteBucketFiles(bucket_id);
     }
-    // The cleanup thread deletes files through `fs_adapter_`, so it must finish
-    // before the adapter is shut down.
-    if (recovery_cleanup_thread_.joinable()) {
-        recovery_cleanup_thread_.join();
-    }
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
 
@@ -209,10 +189,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     ready_bucket_target_ = static_cast<size_t>(config.ready_bucket_target);
     bucket_create_concurrency_ =
         static_cast<size_t>(config.bucket_create_concurrency);
-    recovery_worker_count_ = ResolveRecoveryWorkerCount(
-        config.recovery_worker_count);
-    recovery_max_buckets_ = static_cast<size_t>(config.recovery_max_buckets);
-    recovery_max_duration_seconds_ = config.recovery_max_duration_seconds;
     eviction_enabled_ = config.eviction_enabled;
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
@@ -260,99 +236,14 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return marker_result;
     }
 
-    // Enumerate bucket files by name only and defer their `.meta` contents to
-    // RecoverBucketsProgressively(). Parsing later, one bucket at a time, is
-    // what keeps recovery temporary memory bounded by the worker count instead
-    // of the total key count.
-    {
-        auto files = fs_adapter_->ListFiles(fsdir_);
-        if (!files) {
-            if (files.error() != ErrorCode::FILE_NOT_FOUND) {
-                LOG(ERROR) << "Failed to list DFS bucket directory " << fsdir_
-                           << ", error=" << files.error();
-                fs_adapter_->Shutdown();
-                fs_adapter_.reset();
-                return tl::make_unexpected(files.error());
-            }
-            // No directory yet: there is nothing to recover.
-        } else {
-            pending_recovery_meta_ids_.clear();
-            pending_recovery_data_ids_.clear();
-            for (const auto& name : *files) {
-                if (auto id = ParseBucketFileName(name, kBucketMetaSuffix)) {
-                    pending_recovery_meta_ids_.push_back(*id);
-                } else if (auto data_id =
-                               ParseBucketFileName(name, kBucketDataSuffix)) {
-                    pending_recovery_data_ids_.push_back(*data_id);
-                }
-                // Anything else - including `.meta.0`/`.meta.1` snapshot slots,
-                // `.meta.log` and `.meta.tmp.*` leftovers from older layouts -
-                // is deliberately ignored.
-            }
-            // Recover newest buckets first: a higher id means the bucket was
-            // sealed later, so its entries are newer. If the recovery budget
-            // cuts this short, the buckets most likely to hold current data
-            // have already been restored.
-            std::sort(pending_recovery_meta_ids_.begin(),
-                      pending_recovery_meta_ids_.end(),
-                      std::greater<int64_t>());
-            std::sort(pending_recovery_data_ids_.begin(),
-                      pending_recovery_data_ids_.end());
-        }
-
-        // The ready pool creates new buckets from next_bucket_id_ before
-        // recovery publishes any recovered bucket, so it must be advanced past
-        // every id seen on disk here.
-        int64_t max_seen_id = -1;
-        for (const int64_t id : pending_recovery_meta_ids_) {
-            max_seen_id = std::max(max_seen_id, id);
-        }
-        for (const int64_t id : pending_recovery_data_ids_) {
-            max_seen_id = std::max(max_seen_id, id);
-        }
-        next_bucket_id_ = max_seen_id + 1;
-
-        if (!config.bucket_recovery_enabled) {
-            // Recovery is disabled: the files found above are invisible to
-            // this process's allocation and eviction state, so nothing would
-            // ever reclaim them and they would keep occupying the DFS
-            // directory. Delete exactly the scanned ids off the startup path
-            // so a large legacy directory does not stall initialization.
-            std::unordered_set<int64_t> legacy_ids(
-                pending_recovery_meta_ids_.begin(),
-                pending_recovery_meta_ids_.end());
-            legacy_ids.insert(pending_recovery_data_ids_.begin(),
-                              pending_recovery_data_ids_.end());
-            std::vector<int64_t> sweep(legacy_ids.begin(), legacy_ids.end());
-            pending_recovery_meta_ids_.clear();
-            pending_recovery_data_ids_.clear();
-            if (sweep.empty()) {
-                LOG(INFO) << "DFS bucket recovery disabled; no legacy bucket "
-                             "files to delete, next_bucket_id="
-                          << next_bucket_id_;
-            } else {
-                LOG(INFO) << "DFS bucket recovery disabled; deleting "
-                          << sweep.size()
-                          << " legacy bucket(s) in the background, next_bucket_id="
-                          << next_bucket_id_;
-                try {
-                    // `sweep` is passed as an lvalue so the catch block below
-                    // can still reclaim the files if the worker thread cannot
-                    // be started.
-                    legacy_cleanup_worker_ = std::thread(
-                        &ImmutableBucketAllocator::LegacyCleanupWorker, this,
-                        sweep);
-                } catch (const std::system_error& e) {
-                    LOG(WARNING)
-                        << "Failed to start DFS legacy bucket cleanup worker: "
-                        << e.what() << ", deleting synchronously";
-                    for (const int64_t bucket_id : sweep) {
-                        DeleteBucketFiles(bucket_id);
-                    }
-                }
-            }
-        }
+    auto recovered = RecoverFromDisk(config.bucket_recovery_enabled);
+    if (!recovered) {
+        fs_adapter_->Shutdown();
+        fs_adapter_.reset();
+        return recovered;
     }
+
+    const size_t recovered_bucket_count = buckets_.size();
     size_t initial_ready_target = 0;
     ErrorCode initial_creation_error = ErrorCode::OK;
     if (ready_bucket_target_ > 0) {
@@ -361,11 +252,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
             stop_bucket_workers_ = false;
             bucket_creation_retry_after_ =
                 std::chrono::steady_clock::time_point::min();
-            // Recovery has not published any bucket into `buckets_` yet, so
-            // fold the pending count in explicitly. Discarded buckets only ever
-            // shrink the target, which is the safe direction.
-            initial_ready_target =
-                EffectiveReadyTargetLocked(pending_recovery_meta_ids_.size());
+            initial_ready_target = EffectiveReadyTargetLocked();
             initialization_creations_remaining_ = initial_ready_target;
             UpdateBucketPoolMetricsLocked();
         }
@@ -453,10 +340,11 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
 
     initialized_.store(true, std::memory_order_release);
 
-    // Bucket metadata is only read in RecoverBucketsProgressively(), which runs
-    // after this returns. Any state it rewrites (PENDING entries demoted to
-    // tombstones, duplicate losers demoted) is persisted at the end of that
-    // pass, so Init itself performs no recovery I/O and needs no flush.
+    // Recovery may have rewritten in-memory state (legacy format upgrade,
+    // PENDING entries demoted to tombstones). Persist that immediately so the
+    // next start reads exactly what this process believes.
+    const size_t rewritten = FlushDirtyMetadata();
+
     size_t ready_bucket_count = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -468,11 +356,10 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
               << ", max_bucket_count=" << max_bucket_count_
               << ", ready_bucket_target=" << ready_bucket_target_
               << ", bucket_create_concurrency=" << bucket_create_concurrency_
-              << ", recovery_workers=" << recovery_worker_count_
-              << ", recovery_pending_buckets="
-              << pending_recovery_meta_ids_.size()
-              << ", next_bucket_id=" << next_bucket_id_
-              << ", ready_buckets=" << ready_bucket_count;
+              << ", recovered_buckets=" << recovered_bucket_count
+              << ", ready_buckets=" << ready_bucket_count
+              << ", recovered_replicas=" << recovered_replicas_.size()
+              << ", rewritten_buckets=" << rewritten;
     return {};
 }
 
@@ -484,32 +371,17 @@ PersistedBucketMetadata ImmutableBucketAllocator::SnapshotLocked(
     snapshot.capacity = bucket.capacity;
     snapshot.alignment = alignment_;
     snapshot.append_offset = bucket.append_offset;
-    // `placed` is in append order, so the last reservation for a key is the
-    // current one and any earlier one is dead: they collapse to a single entry
-    // exactly as the old per-key map did by overwriting.
-    snapshot.entries.reserve(bucket.placed.size());
-    std::unordered_map<std::string, size_t> slot_of_key;
-    for (const auto& placed : bucket.placed) {
+    snapshot.entries.reserve(bucket.entries.size());
+    for (const auto& [key, entry] : bucket.entries) {
         PersistedBucketEntry persisted;
-        persisted.key = placed.key;
-        persisted.entry_offset = placed.entry_offset;
-        persisted.key_size = placed.key.size();
-        persisted.value_size = placed.object_size;
-        persisted.reserved_size = placed.reserved_size;
-        persisted.generation = placed.generation;
-        auto index_it = key_index_.find(placed.key);
-        persisted.state =
-            (index_it != key_index_.end() &&
-             index_it->second.bucket_id == bucket.bucket_id)
-                ? static_cast<int32_t>(index_it->second.state)
-                : static_cast<int32_t>(BucketEntryState::TOMBSTONE);
-        auto slot_it = slot_of_key.find(placed.key);
-        if (slot_it == slot_of_key.end()) {
-            slot_of_key.emplace(placed.key, snapshot.entries.size());
-            snapshot.entries.push_back(std::move(persisted));
-        } else {
-            snapshot.entries[slot_it->second] = std::move(persisted);
-        }
+        persisted.key = key;
+        persisted.entry_offset = entry.entry_offset;
+        persisted.key_size = entry.key_size;
+        persisted.value_size = entry.value_size;
+        persisted.reserved_size = entry.reserved_size;
+        persisted.generation = entry.generation;
+        persisted.state = static_cast<int32_t>(entry.state);
+        snapshot.entries.push_back(std::move(persisted));
     }
     // Deterministic order keeps the serialized bytes (and hence the checksum)
     // stable for identical logical state, which makes tests reproducible.
@@ -523,119 +395,6 @@ PersistedBucketMetadata ImmutableBucketAllocator::SnapshotLocked(
         });
     snapshot.checksum = ComputeMetadataChecksum(snapshot);
     return snapshot;
-}
-
-std::optional<PersistedBucketMetadata>
-ImmutableBucketAllocator::ReadBucketMetadata(int64_t bucket_id) const {
-    if (!fs_adapter_) return std::nullopt;
-    const std::string meta_path = BucketMetaPath(bucket_id);
-    auto file_size = fs_adapter_->GetFileSize(meta_path);
-    if (!file_size) return std::nullopt;
-    std::string payload(*file_size, '\0');
-    if (*file_size > 0) {
-        auto read =
-            fs_adapter_->ReadFile(meta_path, payload.data(), payload.size());
-        if (!read || *read != payload.size()) return std::nullopt;
-    }
-    PersistedBucketMetadata snapshot;
-    try {
-        struct_pb::from_pb(snapshot, payload);
-    } catch (...) {
-        return std::nullopt;
-    }
-    if (snapshot.version != kBucketMetadataVersion) return std::nullopt;
-    if (snapshot.bucket_id != bucket_id) return std::nullopt;
-    if (ComputeMetadataChecksum(snapshot) != snapshot.checksum) {
-        return std::nullopt;
-    }
-    return snapshot;
-}
-
-void ImmutableBucketAllocator::ApplyKeyIndexStatesLocked(
-    PersistedBucketMetadata& snapshot) const {
-    // Offsets and sizes are immutable once an entry is placed, so only the
-    // three-state field can differ between the file and memory. A key not live
-    // in this bucket (freed, reallocated elsewhere, or never committed) is
-    // recorded as a tombstone so recovery will not revive it.
-    for (auto& entry : snapshot.entries) {
-        auto index_it = key_index_.find(entry.key);
-        entry.state =
-            (index_it != key_index_.end() &&
-             index_it->second.bucket_id == snapshot.bucket_id)
-                ? static_cast<int32_t>(index_it->second.state)
-                : static_cast<int32_t>(BucketEntryState::TOMBSTONE);
-    }
-    snapshot.checksum = ComputeMetadataChecksum(snapshot);
-}
-
-std::optional<DfsAllocatorInterface::EvictionCandidate>
-ImmutableBucketAllocator::MakeEvictionCandidate(int64_t bucket_id,
-                                                const std::string& key,
-                                                uint64_t entry_offset,
-                                                uint64_t value_size) const {
-    auto layout =
-        RebuildBucketEntryLayout(entry_offset, value_size, alignment_);
-    if (!layout) return std::nullopt;
-    DfsAllocatorInterface::EvictionCandidate candidate;
-    candidate.key = key;
-    candidate.shard_idx = static_cast<int>(bucket_id);
-    candidate.offset = layout->offset;
-    candidate.descriptor =
-        MakeBucketDescriptor(BucketDataPath(bucket_id), *layout, bucket_id);
-    return candidate;
-}
-
-bool ImmutableBucketAllocator::CollectCandidatesFromPlacedLocked(
-    const BucketState& bucket,
-    std::vector<DfsAllocatorInterface::EvictionCandidate>& candidates) const {
-    // Fold duplicate keys the same way SnapshotLocked does: the last
-    // reservation for a key is the one that can still be live.
-    std::unordered_map<std::string, const PlacedEntry*> latest;
-    for (const auto& placed : bucket.placed) {
-        latest[placed.key] = &placed;
-    }
-    for (const auto& [key, placed] : latest) {
-        auto index_it = key_index_.find(key);
-        if (index_it == key_index_.end() ||
-            index_it->second.bucket_id != bucket.bucket_id ||
-            !IsLive(index_it->second.state)) {
-            continue;  // dead or owned by another bucket: nothing to validate
-        }
-        auto candidate = MakeEvictionCandidate(
-            bucket.bucket_id, key, placed->entry_offset, placed->object_size);
-        if (!candidate) {
-            LOG(ERROR) << "Skipping DFS eviction of bucket " << bucket.bucket_id
-                       << ": entry for key " << key
-                       << " has an inconsistent layout";
-            return false;
-        }
-        candidates.push_back(std::move(*candidate));
-    }
-    return true;
-}
-
-bool ImmutableBucketAllocator::CollectCandidatesFromSnapshotLocked(
-    int64_t bucket_id, const PersistedBucketMetadata& snapshot,
-    std::vector<DfsAllocatorInterface::EvictionCandidate>& candidates) const {
-    for (const auto& persisted : snapshot.entries) {
-        auto index_it = key_index_.find(persisted.key);
-        if (index_it == key_index_.end() ||
-            index_it->second.bucket_id != bucket_id ||
-            !IsLive(index_it->second.state)) {
-            continue;  // tombstoned or reallocated: nothing to evict
-        }
-        auto candidate = MakeEvictionCandidate(
-            bucket_id, persisted.key, persisted.entry_offset,
-            persisted.value_size);
-        if (!candidate) {
-            LOG(ERROR) << "Skipping DFS eviction of bucket " << bucket_id
-                       << ": entry for key " << persisted.key
-                       << " has an inconsistent layout";
-            return false;
-        }
-        candidates.push_back(std::move(*candidate));
-    }
-    return true;
 }
 
 void ImmutableBucketAllocator::MarkMetaDirtyLocked(BucketState& bucket) {
@@ -759,17 +518,8 @@ void ImmutableBucketAllocator::DeleteBucketFiles(int64_t bucket_id) {
 // === bucket lifecycle ===
 
 size_t ImmutableBucketAllocator::EffectiveReadyTargetLocked() const {
-    return EffectiveReadyTargetLocked(0);
-}
-
-size_t ImmutableBucketAllocator::EffectiveReadyTargetLocked(
-    size_t recovered_count) const {
     const size_t ready_count = ready_bucket_ids_.size();
-    // `recovered_count` folds in buckets that are still on disk and about to be
-    // published by RecoverBucketsProgressively(), so the ready pool does not
-    // over-create during startup and leave the allocator above its budget.
-    const size_t non_ready_count =
-        buckets_.size() - ready_count + recovered_count;
+    const size_t non_ready_count = buckets_.size() - ready_count;
     if (max_bucket_count_ > 0 &&
         non_ready_count >= static_cast<size_t>(max_bucket_count_)) {
         return 0;
@@ -1341,28 +1091,38 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
-    // A live entry for this key already sits somewhere - either in this bucket
-    // or in another one. key_index_ is the single source of truth for liveness,
-    // so one lookup rejects both cases and no orphan can be created: the guard
-    // must live here because a concurrent batch can reserve the key during an
-    // EnsureActiveBucket unlock window.
-    if (key_index_.find(key) != key_index_.end()) {
+    BucketEntry entry;
+    entry.entry_offset = layout->offset;
+    entry.key_size = key.size();
+    entry.value_size = size;
+    entry.reserved_size = layout->aligned_size;
+    entry.generation = next_generation_++;
+    entry.state = BucketEntryState::PENDING;
+
+    // A live entry for this key already sits somewhere. Assigning to
+    // bucket.entries[key] here would either drop the prior allocation in this
+    // bucket (no Free, no unreserve, no space reclaimed) or, if the prior
+    // entry is in another bucket, create an orphan that key_index_ will point
+    // away from. The per-key dedup above is meant to keep this from happening,
+    // but key_index_ and bucket.entries can disagree across an
+    // EnsureActiveBucket unlock window, so the guard must live here too.
+    auto existing_it = bucket.entries.find(key);
+    if (existing_it != bucket.entries.end() && IsLive(existing_it->second.state)) {
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    auto existing_index_it = key_index_.find(key);
+    if (existing_index_it != key_index_.end() &&
+        existing_index_it->second != bucket.bucket_id) {
+        // The key already belongs to a different bucket. Reserving here would
+        // overwrite key_index_ and leave the prior bucket holding an orphan.
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
-    PlacedEntry placed;
-    placed.key = key;
-    placed.entry_offset = layout->offset;
-    placed.object_size = size;
-    placed.reserved_size = layout->aligned_size;
-    placed.generation = next_generation_++;
-
-    bucket.placed.push_back(std::move(placed));
+    bucket.entries[key] = entry;
     bucket.append_offset = layout->end();
-    ++bucket.pending_count;
     bucket.live_bytes += layout->aligned_size;
-    key_index_[key] =
-        LiveKeyRecord{bucket.bucket_id, BucketEntryState::PENDING};
+    ++bucket.pending_entries;
+    key_index_[key] = bucket.bucket_id;
 
     // Reservations in the active bucket touch no file at all. A reservation in
     // an already sealed bucket cannot happen (it accepts no allocations), but
@@ -1377,64 +1137,46 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
 void ImmutableBucketAllocator::UnreserveInBucketLocked(
     BucketState& bucket, const std::string& key,
     const DistributedFSDescriptor& descriptor) {
-    auto matches = [&key, &descriptor](const PlacedEntry& placed) {
-        return placed.key == key &&
-               placed.object_size == descriptor.object_size &&
-               placed.reserved_size == descriptor.aligned_size;
-    };
-    // BatchAllocate unwinds in reverse order, so the reservation being undone
-    // is normally the most recent placement and the reverse scan below matches
-    // on its first step. A concurrent batch can interleave its own reservation
-    // into the same bucket during an EnsureActiveBucket unlock window, though;
-    // silently skipping a non-tail unreserve would leak a PENDING index record
-    // and strand the bucket's pending_count forever. Scanning from the back
-    // also picks the live placement when a key was freed and re-placed.
-    auto placed_it = bucket.placed.end();
-    for (auto rit = bucket.placed.rbegin(); rit != bucket.placed.rend();
-         ++rit) {
-        if (matches(*rit)) {
-            placed_it = std::prev(rit.base());
-            break;
-        }
-    }
-    if (placed_it == bucket.placed.end()) return;
-
-    const uint64_t reserved_size = placed_it->reserved_size;
-    const uint64_t entry_end = placed_it->entry_offset + reserved_size;
-    if (std::next(placed_it) == bucket.placed.end() &&
-        bucket.append_offset == entry_end) {
-        // Only the most recent reservation can give its space back; an entry
-        // erased from the middle stays reserved (the bucket is append-only).
-        bucket.append_offset = placed_it->entry_offset;
+    auto entry_it = bucket.entries.find(key);
+    if (entry_it == bucket.entries.end()) return;
+    const auto& entry = entry_it->second;
+    if (entry.value_size != descriptor.object_size ||
+        entry.reserved_size != descriptor.aligned_size) {
+        return;
     }
 
-    // The reservation existed only in memory, so undoing it means dropping the
-    // placement and its index record. If the bucket happens to be sealed
-    // already, its `.meta` file has to be rewritten without this entry.
-    MarkMetaDirtyLocked(bucket);
-
-    bucket.placed.erase(placed_it);
-    if (bucket.pending_count > 0) --bucket.pending_count;
-    // The reservation no longer holds live bytes. The space itself stays
-    // reserved in the append-only bucket until the whole bucket is evicted.
-    if (bucket.live_bytes >= reserved_size) {
-        bucket.live_bytes -= reserved_size;
+    const uint64_t entry_end = entry.entry_offset + entry.reserved_size;
+    if (bucket.append_offset == entry_end) {
+        // Only the most recent reservation can give its space back, which is
+        // exactly how BatchAllocate unwinds (reverse order).
+        bucket.append_offset = entry.entry_offset;
+    }
+    if (bucket.live_bytes >= entry.reserved_size) {
+        bucket.live_bytes -= entry.reserved_size;
     } else {
         bucket.live_bytes = 0;
     }
 
+    if (bucket.pending_entries > 0) --bucket.pending_entries;
+
+    // The reservation existed only in memory, so undoing it is just erasing it.
+    // If the bucket happens to be sealed already, its `.meta` file has to be
+    // rewritten without this entry.
+    MarkMetaDirtyLocked(bucket);
+
+    bucket.entries.erase(entry_it);
+
     auto index_it = key_index_.find(key);
-    if (index_it != key_index_.end() &&
-        index_it->second.bucket_id == bucket.bucket_id) {
+    if (index_it != key_index_.end() && index_it->second == bucket.bucket_id) {
         key_index_.erase(index_it);
     }
 }
 
-ImmutableBucketAllocator::LiveKeyRecord*
+ImmutableBucketAllocator::BucketEntry*
 ImmutableBucketAllocator::FindMatchingEntryLocked(
     const std::string& key, const DistributedFSDescriptor& desc,
-    bool verify_placement_offset, BucketPtr* out_bucket) {
-    auto fail = [&key, &desc](const char* reason) -> LiveKeyRecord* {
+    BucketPtr* out_bucket) {
+    auto fail = [&key, &desc](const char* reason) -> BucketEntry* {
         LOG(ERROR) << "DFS entry match failed: reason=" << reason
                    << ", key=" << key << ", bucket_id=" << desc.shard_idx
                    << ", offset=" << desc.offset;
@@ -1444,61 +1186,32 @@ ImmutableBucketAllocator::FindMatchingEntryLocked(
     if (desc.shard_idx < 0) return fail("invalid_bucket_id");
     const int64_t bucket_id = static_cast<int64_t>(desc.shard_idx);
 
-    // Identity check only: the key must be live and owned by the bucket the
-    // descriptor names. A durable bucket no longer keeps its per-key layout in
-    // memory, so the descriptor's own fields are the only reference left.
     auto index_it = key_index_.find(key);
     if (index_it == key_index_.end()) return fail("key_not_indexed");
-    if (index_it->second.bucket_id != bucket_id) {
-        return fail("key_index_bucket_mismatch");
-    }
+    if (index_it->second != bucket_id) return fail("key_index_bucket_mismatch");
     auto bucket_it = buckets_.find(bucket_id);
     if (bucket_it == buckets_.end()) return fail("bucket_not_found");
 
-    // Reject a descriptor whose size/offset are internally inconsistent, so a
-    // truncated or superseded descriptor cannot address a valid entry.
-    auto layout =
-        RebuildBucketEntryLayout(desc.offset, desc.object_size, alignment_);
-    if (!layout) return fail("invalid_descriptor_layout");
-    if (layout->aligned_size != desc.aligned_size) {
-        return fail("aligned_size_mismatch");
-    }
-    if (layout->end() > bucket_it->second->capacity) {
-        return fail("offset_out_of_bounds");
-    }
+    auto entry_it = bucket_it->second->entries.find(key);
+    if (entry_it == bucket_it->second->entries.end())
+        return fail("bucket_entry_not_found");
 
-    // Stale-descriptor guard: a key can only be re-placed into the same bucket
-    // while that bucket is still active, and for such a bucket the placements
-    // are still in memory, so a superseded generation's descriptor can be told
-    // apart by its offset. Once the bucket is durable the re-placement window
-    // is closed and the identity check alone is sufficient. Mutation callers
-    // (commit/free) must enable this; read-only callers may skip it.
-    if (verify_placement_offset && !bucket_it->second->placed_durable) {
-        // The last placement for a key is the live one; duplicates arise when
-        // a key is freed and re-placed before the first snapshot.
-        const PlacedEntry* live_placement = nullptr;
-        for (const auto& placed : bucket_it->second->placed) {
-            if (placed.key == key) live_placement = &placed;
-        }
-        if (live_placement == nullptr) {
-            return fail("stale_descriptor_no_placement");
-        }
-        if (live_placement->entry_offset != desc.offset) {
-            return fail("stale_descriptor_offset");
-        }
-        // The offset alone does not identify a placement: a descriptor whose
-        // size fields were tampered with (or carried over from a superseded
-        // operation) must not address the live entry either.
-        if (live_placement->object_size != desc.object_size) {
-            return fail("object_size_mismatch");
-        }
-        if (live_placement->reserved_size != desc.aligned_size) {
-            return fail("aligned_size_mismatch");
-        }
-    }
+    // Match on every layout-defining field so a descriptor from a superseded
+    // allocation cannot address the current one.
+    auto& entry = entry_it->second;
+    if (entry.value_size != desc.object_size)
+        return fail("object_size_mismatch");
+    if (entry.reserved_size != desc.aligned_size)
+        return fail("aligned_size_mismatch");
+    if (entry.key_size != key.size()) return fail("key_size_mismatch");
+    auto layout = RebuildBucketEntryLayout(entry.entry_offset, entry.value_size,
+                                           alignment_);
+    if (!layout) return fail("invalid_entry_layout");
+    if (layout->offset != desc.offset)
+        return fail("offset_mismatch");
 
     if (out_bucket) *out_bucket = bucket_it->second;
-    return &index_it->second;
+    return &entry;
 }
 
 // === allocation ===
@@ -1723,21 +1436,23 @@ bool ImmutableBucketAllocator::MarkCommitted(
 
     std::lock_guard<std::mutex> lock(mutex_);
     BucketPtr bucket;
-    auto* record = FindMatchingEntryLocked(
-        key, descriptor, /*verify_placement_offset=*/true, &bucket);
-    if (record == nullptr) return false;
-    if (record->state == BucketEntryState::COMMITTED) {
+    auto* entry = FindMatchingEntryLocked(key, descriptor, &bucket);
+    if (entry == nullptr) return false;
+    if (entry->state == BucketEntryState::COMMITTED) {
         // Idempotent: a duplicate PutEnd for the same generation succeeds.
         return true;
     }
-    if (record->state != BucketEntryState::PENDING) {
+    if (entry->state != BucketEntryState::PENDING) {
         LOG(ERROR) << "DFS commit rejected: reason=invalid_entry_state"
                    << ", key=" << key << ", bucket_id=" << descriptor.shard_idx
-                   << ", state=" << static_cast<int32_t>(record->state);
+                   << ", state=" << static_cast<int32_t>(entry->state);
         return false;
     }
-    record->state = BucketEntryState::COMMITTED;
-    if (bucket->pending_count > 0) --bucket->pending_count;
+    if (entry->state == BucketEntryState::PENDING &&
+        bucket->pending_entries > 0) {
+        --bucket->pending_entries;
+    }
+    entry->state = BucketEntryState::COMMITTED;
     // PutEnd never touches a file. For the active bucket the transition is
     // simply part of the state that gets written when the bucket is sealed; for
     // an already sealed bucket (a reservation that committed after the switch)
@@ -1752,32 +1467,32 @@ void ImmutableBucketAllocator::Free(const std::string& key,
 
     std::lock_guard<std::mutex> lock(mutex_);
     BucketPtr bucket;
-    auto* record = FindMatchingEntryLocked(
-        key, descriptor, /*verify_placement_offset=*/true, &bucket);
-    if (record == nullptr) {
-        // Stale Free from a superseded generation: the placement offset check
-        // rejects it whenever the replacement could have landed in the same
-        // bucket, so it cannot drop the allocation that replaced it.
+    auto* entry = FindMatchingEntryLocked(key, descriptor, &bucket);
+    if (entry == nullptr) {
+        // Stale Free from a superseded generation: ignore it so it cannot
+        // drop the allocation that replaced it.
         return;
     }
-    if (!IsLive(record->state)) return;
+    if (!IsLive(entry->state)) return;
 
-    // Buckets are append-only, so freeing never reclaims the middle of the
-    // file. Dropping the key from key_index_ is what turns it into a TOMBSTONE
-    // in the next snapshot; the space comes back only when the whole bucket is
-    // evicted.
-    if (record->state == BucketEntryState::PENDING &&
-        bucket->pending_count > 0) {
-        --bucket->pending_count;
+    // Buckets are append-only, so freeing leaves a tombstone rather than
+    // reclaiming the middle of the file. Space comes back only when the
+    // whole bucket is evicted.
+    if (entry->state == BucketEntryState::PENDING &&
+        bucket->pending_entries > 0) {
+        --bucket->pending_entries;
     }
-    // The entry stops counting as live; the descriptor's aligned slot size is
-    // exactly the `reserved_size` recorded when it was placed.
-    if (bucket->live_bytes >= descriptor.aligned_size) {
-        bucket->live_bytes -= descriptor.aligned_size;
+    entry->state = BucketEntryState::TOMBSTONE;
+    ++bucket->tombstones;
+    if (bucket->live_bytes >= entry->reserved_size) {
+        bucket->live_bytes -= entry->reserved_size;
     } else {
         bucket->live_bytes = 0;
     }
-    key_index_.erase(key);
+    auto index_it = key_index_.find(key);
+    if (index_it != key_index_.end() && index_it->second == bucket->bucket_id) {
+        key_index_.erase(index_it);
+    }
     // The tombstone must survive a restart so the key cannot come back, but the
     // master calls Free() while holding a metadata shard lock, so no I/O may
     // happen here. Mark the bucket instead and let FlushDirtyMetadata() rewrite
@@ -1798,11 +1513,7 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
     struct PendingWrite {
         int64_t bucket_id = -1;
         BucketPtr bucket_identity;
-        // Set when the bucket's placements have never been written: the
-        // snapshot is built entirely from memory and no read-back is needed.
-        // Empty when the rewrite must merge the on-disk snapshot with the
-        // current key states instead.
-        std::optional<PersistedBucketMetadata> in_memory_snapshot;
+        PersistedBucketMetadata snapshot;
     };
     std::vector<PendingWrite> pending;
     {
@@ -1811,13 +1522,7 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
             // An unsealed bucket is deliberately never written: it is still
             // being appended to, and its data is discarded on the next start.
             if (!bucket->sealed || !bucket->meta_dirty) continue;
-            PendingWrite write;
-            write.bucket_id = bucket_id;
-            write.bucket_identity = bucket;
-            if (!bucket->placed_durable) {
-                write.in_memory_snapshot = SnapshotLocked(*bucket);
-            }
-            pending.push_back(std::move(write));
+            pending.push_back({bucket_id, bucket, SnapshotLocked(*bucket)});
             // Clear the flag together with taking the snapshot. A change that
             // lands while we are unlocked sets it again and is picked up by the
             // next flush, instead of being swallowed by a late clear. It also
@@ -1835,16 +1540,8 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
               });
 
     size_t flushed = 0;
-    for (auto& item : pending) {
+    for (const auto& item : pending) {
         std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
-        auto mark_dirty_again = [&]() {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = buckets_.find(item.bucket_id);
-            if (it != buckets_.end() &&
-                it->second.get() == item.bucket_identity.get()) {
-                it->second->meta_dirty = true;
-            }
-        };
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = buckets_.find(item.bucket_id);
@@ -1853,46 +1550,9 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
                 continue;
             }
         }
-
-        PersistedBucketMetadata snapshot;
-        if (item.in_memory_snapshot) {
-            snapshot = std::move(*item.in_memory_snapshot);
-        } else {
-            // The bucket's per-key layout now lives only on disk, so the
-            // rewrite starts from the existing `.meta` and refreshes the states
-            // from key_index_. Offsets are immutable, so nothing else changes.
-            auto loaded = ReadBucketMetadata(item.bucket_id);
-            if (!loaded) {
-                LOG(WARNING) << "Cannot rewrite DFS bucket metadata, bucket_id="
-                             << item.bucket_id
-                             << ": existing .meta is missing or invalid";
-                mark_dirty_again();
-                continue;
-            }
-            snapshot = std::move(*loaded);
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = buckets_.find(item.bucket_id);
-            if (it == buckets_.end() ||
-                it->second.get() != item.bucket_identity.get()) {
-                continue;
-            }
-            ApplyKeyIndexStatesLocked(snapshot);
-        }
-
-        auto persisted = PersistMetadata(snapshot);
+        auto persisted = PersistMetadata(item.snapshot);
         if (persisted) {
             ++flushed;
-            if (item.in_memory_snapshot) {
-                // The first durable snapshot now holds every placement, so the
-                // in-memory list is redundant and later rewrites read the file.
-                std::lock_guard<std::mutex> lock(mutex_);
-                auto it = buckets_.find(item.bucket_id);
-                if (it != buckets_.end() &&
-                    it->second.get() == item.bucket_identity.get()) {
-                    it->second->placed.clear();
-                    it->second->placed_durable = true;
-                }
-            }
             continue;
         }
         static DfsLogLimiter log_limiter;
@@ -1903,7 +1563,12 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
         }
         // Put the flag back so the next maintenance tick retries, unless the
         // bucket changed identity meanwhile - then it is not ours to mark.
-        mark_dirty_again();
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = buckets_.find(item.bucket_id);
+        if (it != buckets_.end() &&
+            it->second.get() == item.bucket_identity.get()) {
+            it->second->meta_dirty = true;
+        }
     }
     return flushed;
 }
@@ -1914,8 +1579,7 @@ void ImmutableBucketAllocator::UpdateAccess(
 
     std::lock_guard<std::mutex> lock(mutex_);
     BucketPtr bucket;
-    auto* entry = FindMatchingEntryLocked(
-        key, descriptor, /*verify_placement_offset=*/false, &bucket);
+    auto* entry = FindMatchingEntryLocked(key, descriptor, &bucket);
     if (entry == nullptr || !IsLive(entry->state)) return;
     // A frozen bucket is mid-eviction; refreshing it would fight the
     // transaction the master is currently resolving.
@@ -2017,7 +1681,13 @@ std::optional<int64_t> ImmutableBucketAllocator::GetBucketIdForKey(
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = key_index_.find(key);
     if (it == key_index_.end()) return std::nullopt;
-    return it->second.bucket_id;
+    return it->second;
+}
+
+std::vector<ImmutableBucketAllocator::RecoveredReplica>
+ImmutableBucketAllocator::TakeRecoveredReplicas() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::move(recovered_replicas_);
 }
 
 // === eviction ===
@@ -2058,7 +1728,6 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         return pending;
     }
 
-    bool need_disk_candidates = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto bucket_it = buckets_.find(bucket_id);
@@ -2067,15 +1736,26 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         }
         const bool was_active = active_bucket_id_ == bucket_id;
         const BucketPtr& victim = bucket_it->second;
-        if (victim->pending_count != 0) return pending;
+        if (victim->pending_entries != 0) return pending;
 
         std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
-        if (!victim->placed_durable) {
-            if (!CollectCandidatesFromPlacedLocked(*victim, candidates)) {
+        for (const auto& [key, entry] : victim->entries) {
+            if (!IsLive(entry.state)) continue;
+            auto layout = RebuildBucketEntryLayout(entry.entry_offset,
+                                                   entry.value_size, alignment_);
+            if (!layout) {
+                LOG(ERROR) << "Skipping DFS invalidation of bucket " << bucket_id
+                           << ": entry for key " << key
+                           << " has an inconsistent layout";
                 return pending;
             }
-        } else {
-            need_disk_candidates = true;
+            DfsAllocatorInterface::EvictionCandidate candidate;
+            candidate.key = key;
+            candidate.shard_idx = static_cast<int>(bucket_id);
+            candidate.offset = layout->offset;
+            candidate.descriptor =
+                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout, bucket_id);
+            candidates.push_back(std::move(candidate));
         }
 
         victim->frozen = true;
@@ -2092,32 +1772,6 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         pending.bucket_id_ = bucket_id;
         pending.bucket_identity_ = victim;
         pending.candidates_ = std::move(candidates);
-    }
-
-    if (need_disk_candidates) {
-        // The per-key layout lives only in the durable `.meta`; rebuild
-        // the candidate list from it, keeping only keys still live.
-        auto loaded = ReadBucketMetadata(bucket_id);
-        bool usable = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = buckets_.find(bucket_id);
-            if (loaded && it != buckets_.end() &&
-                it->second.get() == pending.bucket_identity_.get()) {
-                std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
-                if (CollectCandidatesFromSnapshotLocked(bucket_id, *loaded,
-                                                        candidates)) {
-                    pending.candidates_ = std::move(candidates);
-                    usable = true;
-                }
-            }
-        }
-        if (!usable) {
-            // The bucket's entries cannot be enumerated safely. Abandon the
-            // transaction (the destructor restores the bucket to service)
-            // rather than reporting it as having no live entries.
-            return PendingEviction{};
-        }
     }
 
     return pending;
@@ -2142,7 +1796,6 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
     PendingEviction pending;
     if (!initialized_.load(std::memory_order_acquire)) return pending;
 
-    bool need_disk_candidates = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
 
@@ -2168,9 +1821,8 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             }
         }
 
-        // Walk the LRU from the cold end and take the first bucket that is
-        // neither active, frozen, nor still waiting for an async write to
-        // finish.
+        // Walk the LRU from the cold end. A low-utilization eviction pass
+        // restricts candidates to sparse buckets.
         BucketPtr victim;
         for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
             const int64_t bucket_id = *it;
@@ -2185,21 +1837,35 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
                         static_cast<double>(candidate->capacity) <
                     low_utilization_threshold;
             if (prioritize_low_utilization && !is_low_utilization) continue;
-            if (candidate->pending_count != 0) continue;
+            if (candidate->pending_entries != 0) continue;
             victim = candidate;
             break;
         }
         if (!victim) return pending;
 
         std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
-        if (!victim->placed_durable) {
-            // Build from the in-memory placements before freezing. An
-            // inconsistent layout aborts without touching the bucket.
-            if (!CollectCandidatesFromPlacedLocked(*victim, candidates)) {
+        for (const auto& [key, entry] : victim->entries) {
+            // Tombstoned entries are already gone from the master's view; only
+            // live entries need validating.
+            if (!IsLive(entry.state)) continue;
+            auto layout = RebuildBucketEntryLayout(
+                entry.entry_offset, entry.value_size, alignment_);
+            if (!layout) {
+                LOG(ERROR) << "Skipping DFS eviction of bucket "
+                           << victim->bucket_id << ": entry for key " << key
+                           << " has an inconsistent layout";
                 return pending;
             }
-        } else {
-            need_disk_candidates = true;
+            DfsAllocatorInterface::EvictionCandidate candidate;
+            candidate.key = key;
+            candidate.shard_idx = static_cast<int>(victim->bucket_id);
+            candidate.offset = layout->offset;
+            // Byte-identical to what Allocate handed out, so the master can
+            // match replica metadata field by field.
+            candidate.descriptor =
+                MakeBucketDescriptor(BucketDataPath(victim->bucket_id), *layout,
+                                     victim->bucket_id);
+            candidates.push_back(std::move(candidate));
         }
 
         victim->frozen = true;
@@ -2216,32 +1882,6 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         pending.bucket_id_ = victim->bucket_id;
         pending.bucket_identity_ = victim;
         pending.candidates_ = std::move(candidates);
-    }
-
-    if (need_disk_candidates) {
-        // The per-key layout lives only in the durable `.meta`; rebuild
-        // the candidate list from it, keeping only keys still live.
-        auto loaded = ReadBucketMetadata(pending.bucket_id_);
-        bool usable = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = buckets_.find(pending.bucket_id_);
-            if (loaded && it != buckets_.end() &&
-                it->second.get() == pending.bucket_identity_.get()) {
-                std::vector<DfsAllocatorInterface::EvictionCandidate> candidates;
-                if (CollectCandidatesFromSnapshotLocked(pending.bucket_id_,
-                                                        *loaded, candidates)) {
-                    pending.candidates_ = std::move(candidates);
-                    usable = true;
-                }
-            }
-        }
-        if (!usable) {
-            // The bucket's entries cannot be enumerated safely. Abandon the
-            // transaction (the destructor restores the bucket to service)
-            // rather than reporting it as having no live entries.
-            return PendingEviction{};
-        }
     }
 
     return pending;
@@ -2264,7 +1904,7 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
         if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
             return false;
         }
-        if (it->second->pending_count != 0) {
+        if (it->second->pending_entries != 0) {
             it->second->frozen = false;
             // Restore cold LRU position so the next round can reconsider it
             // after the pending write completes or times out.
@@ -2280,8 +1920,7 @@ bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
         // that list without reading or rewriting metadata at commit time.
         for (const auto& candidate : candidates) {
             auto index_it = key_index_.find(candidate.key);
-            if (index_it != key_index_.end() &&
-                index_it->second.bucket_id == bucket_id) {
+            if (index_it != key_index_.end() && index_it->second == bucket_id) {
                 key_index_.erase(index_it);
             }
         }
@@ -2342,555 +1981,367 @@ void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending,
 
 // === recovery ===
 
-ImmutableBucketAllocator::ParsedBucket ImmutableBucketAllocator::ParseBucketMeta(
-    int64_t bucket_id) {
-    ParsedBucket parsed;
-
-    // Reading through the shared helper keeps the version, bucket-id and
-    // checksum validation identical to every other metadata read. It performs
-    // DFS I/O only, so it is safe to run on a recovery worker.
-    auto loaded = ReadBucketMetadata(bucket_id);
-    if (!loaded) {
-        LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                   << ": no valid metadata snapshot, so none of its data can"
-                      " be proven correct";
-        parsed.discarded = true;
-        return parsed;
-    }
-    PersistedBucketMetadata snapshot = std::move(*loaded);
-
-    if (snapshot.alignment != alignment_) {
-        LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                   << ": metadata alignment " << snapshot.alignment
-                   << " does not match configured " << alignment_
-                   << ", so entry offsets cannot be recomputed";
-        parsed.discarded = true;
-        return parsed;
-    }
-    if (snapshot.capacity == 0 || snapshot.capacity > bucket_capacity_) {
-        LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                   << ": metadata capacity " << snapshot.capacity
-                   << " is incompatible with configured " << bucket_capacity_;
-        parsed.discarded = true;
-        return parsed;
-    }
-    if (snapshot.append_offset > snapshot.capacity) {
-        LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                   << ": append_offset " << snapshot.append_offset
-                   << " exceeds capacity " << snapshot.capacity;
-        parsed.discarded = true;
-        return parsed;
-    }
-    if (snapshot.evicting) {
-        // The marker says the data file was being deleted; finish the job
-        // rather than exposing entries whose data may already be gone.
-        LOG(INFO) << "Completing interrupted eviction of DFS bucket "
-                  << bucket_id;
-        parsed.discarded = true;
-        return parsed;
-    }
-
-    auto data_size = fs_adapter_->GetFileSize(BucketDataPath(bucket_id));
-    if (!data_size) {
-        // Either the data file is gone or it cannot even be sized. Both leave
-        // the metadata describing bytes nobody can verify, so the whole bucket
-        // goes away instead of being reported every restart.
-        LOG(WARNING) << "Discarding DFS bucket " << bucket_id
-                     << ": data file is missing or unreadable, error="
-                     << data_size.error();
-        parsed.discarded = true;
-        return parsed;
-    }
-    auto bucket = std::make_shared<BucketState>();
-    bucket->bucket_id = bucket_id;
-    bucket->capacity = snapshot.capacity;
-    bucket->append_offset = 0;
-    bucket->live_bytes = 0;
-    bucket->last_access_ns = CurrentTimeNs();
-    // Everything on disk was written at seal time, so a recovered bucket is
-    // sealed by definition, its `.meta` already matches this state and its
-    // per-key layout stays on disk rather than in memory.
-    bucket->sealed = true;
-    bucket->meta_dirty = false;
-    bucket->placed_durable = true;
-
-    bool bucket_ok = true;
-    // The largest end any entry implies. The persisted append_offset is
-    // authoritative when it is at least this large (it also covers rolled-back
-    // space), so both are combined below.
-    uint64_t implied_append_offset = 0;
-    // One candidate per key even if a snapshot repeated it: the layout of the
-    // last placement is the live one.
-    std::unordered_set<std::string> seen_keys;
-    for (const auto& persisted : snapshot.entries) {
-        // Accumulate even if this bucket is later rejected, matching the
-        // original single-pass recovery so next_generation_ still advances past
-        // every generation ever written to disk.
-        parsed.max_generation =
-            std::max(parsed.max_generation, persisted.generation + 1);
-        if (!IsKnownEntryState(persisted.state)) {
-            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                       << ": entry for key " << persisted.key
-                       << " has unknown state " << persisted.state;
-            bucket_ok = false;
-            break;
+tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
+    bool recover_metadata) {
+    auto files = fs_adapter_->ListFiles(fsdir_);
+    if (!files) {
+        if (recover_metadata && files.error() == ErrorCode::FILE_NOT_FOUND) {
+            return {};
         }
-        if (persisted.key.empty() ||
-            persisted.key_size != persisted.key.size()) {
-            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                       << ": entry key size mismatch";
-            bucket_ok = false;
-            break;
-        }
-        auto layout = RebuildBucketEntryLayout(
-            persisted.entry_offset, persisted.value_size, alignment_);
-        if (!layout || layout->aligned_size != persisted.reserved_size ||
-            layout->end() > snapshot.capacity) {
-            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                       << ": entry for key " << persisted.key
-                       << " has an out-of-range or inconsistent layout";
-            bucket_ok = false;
-            break;
-        }
-        implied_append_offset =
-            std::max(implied_append_offset, layout->end());
+        LOG(ERROR) << "Failed to list DFS bucket directory " << fsdir_
+                   << ", error=" << files.error();
+        return tl::make_unexpected(files.error());
+    }
 
-        if (persisted.state !=
-            static_cast<int32_t>(BucketEntryState::COMMITTED)) {
-            // A PENDING entry's data was never confirmed durable, so it must
-            // not come back as readable. The rewrite that records it as a
-            // TOMBSTONE happens at flush: the key is absent from key_index_,
-            // which is exactly what makes ApplyKeyIndexStatesLocked() demote it.
-            if (persisted.state ==
-                static_cast<int32_t>(BucketEntryState::PENDING)) {
-                bucket->meta_dirty = true;
+    std::vector<int64_t> meta_ids;
+    std::vector<int64_t> data_ids;
+    int64_t max_seen_id = -1;
+    for (const auto& name : *files) {
+        if (auto id = ParseBucketFileName(name, kBucketMetaSuffix)) {
+            meta_ids.push_back(*id);
+            max_seen_id = std::max(max_seen_id, *id);
+        } else if (auto data_id =
+                       ParseBucketFileName(name, kBucketDataSuffix)) {
+            data_ids.push_back(*data_id);
+            max_seen_id = std::max(max_seen_id, *data_id);
+        }
+        // Anything else - including `.meta.0`/`.meta.1` snapshot slots,
+        // `.meta.log` and `.meta.tmp.*` leftovers from older layouts - is
+        // deliberately ignored.
+    }
+    if (!recover_metadata) {
+        // Recovery is disabled: the files found above are invisible to this
+        // process's allocation and eviction state, so nothing would ever
+        // reclaim them and they would keep occupying the DFS directory. Record
+        // the id sequence, then delete exactly the scanned ids off the startup
+        // path so a large legacy directory does not stall initialization.
+        next_bucket_id_ = max_seen_id + 1;
+        std::unordered_set<int64_t> legacy_ids(meta_ids.begin(), meta_ids.end());
+        legacy_ids.insert(data_ids.begin(), data_ids.end());
+        std::vector<int64_t> sweep(legacy_ids.begin(), legacy_ids.end());
+        if (sweep.empty()) {
+            LOG(INFO) << "DFS bucket recovery disabled; no legacy bucket files "
+                         "to delete, next_bucket_id="
+                      << next_bucket_id_;
+            return {};
+        }
+        LOG(INFO) << "DFS bucket recovery disabled; deleting " << sweep.size()
+                  << " legacy bucket(s) in the background, next_bucket_id="
+                  << next_bucket_id_;
+        try {
+            // `sweep` is passed by value so the catch block below can still
+            // reclaim the files if the worker thread cannot be started.
+            legacy_cleanup_worker_ = std::thread(
+                &ImmutableBucketAllocator::LegacyCleanupWorker, this, sweep);
+        } catch (const std::system_error& e) {
+            LOG(WARNING) << "Failed to start DFS legacy bucket cleanup worker: "
+                         << e.what() << ", deleting synchronously";
+            for (const int64_t bucket_id : sweep) {
+                DeleteBucketFiles(bucket_id);
             }
-            continue;
         }
-        if (layout->end() > static_cast<uint64_t>(*data_size)) {
-            LOG(ERROR) << "Dropping committed DFS entry for key "
-                       << persisted.key << " in bucket " << bucket_id
-                       << ": it extends past the data file end";
-            bucket->meta_dirty = true;
-            continue;
-        }
-
-        // A surviving COMMITTED entry is a candidate winner. Which duplicate
-        // actually wins is decided under `mutex_` at commit time, so the worker
-        // stays free of allocator state. Building the descriptor here spreads
-        // that work across the worker pool instead of doing it at commit.
-        if (seen_keys.insert(persisted.key).second) {
-            // Count the slot as live; a duplicate that loses the cross-bucket
-            // race is subtracted again in ResolveRecoveryConflicts().
-            bucket->live_bytes += persisted.reserved_size;
-            parsed.candidates.push_back(RecoveryCandidate{
-                RecoveredReplica{persisted.key,
-                                 MakeBucketDescriptor(
-                                     BucketDataPath(bucket_id), *layout,
-                                     bucket_id)},
-                persisted.generation, persisted.entry_offset});
-        }
+        return {};
     }
-    if (!bucket_ok) {
-        parsed.discarded = true;
-        return parsed;
-    }
+    std::sort(meta_ids.begin(), meta_ids.end());
 
-    bucket->append_offset =
-        std::max(snapshot.append_offset, implied_append_offset);
-    if (bucket->append_offset > bucket->capacity) {
-        LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                   << ": recovered append_offset " << bucket->append_offset
-                   << " exceeds capacity " << bucket->capacity;
-        parsed.discarded = true;
-        return parsed;
-    }
-
-    parsed.bucket = std::move(bucket);
-    return parsed;
-}
-
-void ImmutableBucketAllocator::CommitParsedBucketLocked(
-    int64_t bucket_id, ParsedBucket& parsed,
-    std::vector<RecoveredReplica>& winners) {
-    for (auto& candidate : parsed.candidates) {
-        const std::string& key = candidate.replica.key;
-        auto index_it = key_index_.find(key);
-        if (index_it == key_index_.end()) {
-            // First bucket to claim the key: it is the running winner and its
-            // replica is streamed at once. keep-max is commutative, so a later
-            // bucket only ever replaces it by re-streaming a greater tuple.
-            key_index_[key] =
-                LiveKeyRecord{bucket_id, BucketEntryState::COMMITTED};
-            winners.push_back(std::move(candidate.replica));
-            continue;
-        }
-
-        // A duplicate. This model keeps no per-bucket entry table, so the
-        // running winner's generation and offset cannot be read here to decide
-        // keep-max. Record the pair instead and settle every duplicate in one
-        // final pass; both buckets are marked dirty so the loser's `.meta` gets
-        // rewritten (a key not live in its bucket is written back as TOMBSTONE).
-        recovery_conflicts_.push_back(RecoveryConflict{key, bucket_id});
-        auto winner_it = buckets_.find(index_it->second.bucket_id);
-        if (winner_it != buckets_.end()) winner_it->second->meta_dirty = true;
-        parsed.bucket->meta_dirty = true;
-    }
-
-    buckets_.emplace(bucket_id, std::move(parsed.bucket));
-}
-
-void ImmutableBucketAllocator::ResolveRecoveryConflicts(
-    const RecoveredBatchConsumer& consumer) {
-    if (recovery_conflicts_.empty()) return;
-
-    struct Group {
-        std::vector<int64_t> bucket_ids;
-        int64_t first_bucket_id = -1;
+    uint64_t max_generation = 0;
+    // Buckets already reclaimed by this pass: their metadata could not be
+    // trusted, so both files were deleted. A cache entry that cannot be proven
+    // correct is worse than a miss - the reader would recompute it anyway,
+    // while serving unverifiable bytes would silently corrupt the result.
+    // Tracked only so the orphan sweep below does not report them a second
+    // time.
+    std::unordered_set<int64_t> discarded_ids;
+    struct RecoveryWinner {
+        uint64_t generation = 0;
+        int64_t bucket_id = -1;
+        uint64_t entry_offset = 0;
     };
-    std::unordered_map<std::string, Group> groups;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& conflict : recovery_conflicts_) {
-            auto& group = groups[conflict.key];
-            group.bucket_ids.push_back(conflict.bucket_id);
-            auto it = key_index_.find(conflict.key);
-            if (it != key_index_.end()) {
-                group.first_bucket_id = it->second.bucket_id;
+    // Resolve duplicates by the lexicographically greatest
+    // (generation, bucket_id, entry_offset). The location tie-breaker makes the
+    // result independent of unordered_map and filesystem traversal order.
+    std::unordered_map<std::string, RecoveryWinner> winners;
+
+    for (const int64_t bucket_id : meta_ids) {
+        const std::string meta_path = BucketMetaPath(bucket_id);
+        PersistedBucketMetadata snapshot;
+        bool valid = false;
+        auto file_size = fs_adapter_->GetFileSize(meta_path);
+        if (file_size) {
+            std::string payload(*file_size, '\0');
+            bool read_ok = true;
+            if (*file_size > 0) {
+                auto read = fs_adapter_->ReadFile(meta_path, payload.data(),
+                                                  payload.size());
+                read_ok = read && *read == payload.size();
+            }
+            if (read_ok) {
+                try {
+                    struct_pb::from_pb(snapshot, payload);
+                    valid =
+                        snapshot.version == kBucketMetadataVersion &&
+                        ComputeMetadataChecksum(snapshot) == snapshot.checksum;
+                } catch (...) {
+                    valid = false;
+                }
             }
         }
-    }
-
-    for (auto& [key, group] : groups) {
-        // The bucket key_index_ still points at claimed the key first, so its
-        // replica already reached the consumer. Include it among the candidates
-        // so the true winner can be found, but remember it to avoid re-emitting
-        // an unchanged winner.
-        if (group.first_bucket_id >= 0 &&
-            std::find(group.bucket_ids.begin(), group.bucket_ids.end(),
-                      group.first_bucket_id) == group.bucket_ids.end()) {
-            group.bucket_ids.push_back(group.first_bucket_id);
+        if (!valid || snapshot.bucket_id != bucket_id) {
+            LOG(ERROR)
+                << "Discarding DFS bucket " << bucket_id
+                << ": no valid metadata snapshot, so none of its data can"
+                   " be proven correct";
+            DeleteBucketFiles(bucket_id);
+            discarded_ids.insert(bucket_id);
+            continue;
         }
 
-        // Decide by the stored (generation, bucket_id, entry_offset) tuple,
-        // re-read from each member bucket's `.meta` because this model keeps no
-        // per-bucket entry table in memory. The location tie-breaker keeps the
-        // outcome independent of traversal order.
-        uint64_t best_generation = 0;
-        uint64_t best_entry_offset = 0;
-        uint64_t best_value_size = 0;
-        int64_t best_bucket_id = -1;
-        bool have_best = false;
-        // Slot size each member bucket counted as live for this key; every
-        // member but the winner has to give it back.
-        std::unordered_map<int64_t, uint64_t> member_live_bytes;
-        for (const int64_t member : group.bucket_ids) {
-            auto snapshot = ReadBucketMetadata(member);
-            if (!snapshot) continue;
-            for (const auto& entry : snapshot->entries) {
-                if (entry.key != key) continue;
-                if (entry.state !=
-                    static_cast<int32_t>(BucketEntryState::COMMITTED)) {
-                    continue;
-                }
+        if (snapshot.alignment != alignment_) {
+            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
+                       << ": metadata alignment " << snapshot.alignment
+                       << " does not match configured " << alignment_
+                       << ", so entry offsets cannot be recomputed";
+            DeleteBucketFiles(bucket_id);
+            discarded_ids.insert(bucket_id);
+            continue;
+        }
+        if (snapshot.capacity == 0 || snapshot.capacity > bucket_capacity_) {
+            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
+                       << ": metadata capacity " << snapshot.capacity
+                       << " is incompatible with configured "
+                       << bucket_capacity_;
+            DeleteBucketFiles(bucket_id);
+            discarded_ids.insert(bucket_id);
+            continue;
+        }
+        if (snapshot.append_offset > snapshot.capacity) {
+            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
+                       << ": append_offset " << snapshot.append_offset
+                       << " exceeds capacity " << snapshot.capacity;
+            DeleteBucketFiles(bucket_id);
+            discarded_ids.insert(bucket_id);
+            continue;
+        }
+        if (snapshot.evicting) {
+            // The marker says the data file was being deleted; finish the job
+            // rather than exposing entries whose data may already be gone.
+            LOG(INFO) << "Completing interrupted eviction of DFS bucket "
+                      << bucket_id;
+            DeleteBucketFiles(bucket_id);
+            discarded_ids.insert(bucket_id);
+            continue;
+        }
+
+        auto data_size = fs_adapter_->GetFileSize(BucketDataPath(bucket_id));
+        if (!data_size) {
+            // Either the data file is gone or it cannot even be sized. Both
+            // leave the metadata describing bytes nobody can verify, so the
+            // whole bucket goes away instead of being reported every restart.
+            LOG(WARNING) << "Discarding DFS bucket " << bucket_id
+                         << ": data file is missing or unreadable, error="
+                         << data_size.error();
+            DeleteBucketFiles(bucket_id);
+            discarded_ids.insert(bucket_id);
+            continue;
+        }
+
+        auto bucket = std::make_shared<BucketState>();
+        bucket->bucket_id = bucket_id;
+        bucket->capacity = snapshot.capacity;
+        bucket->append_offset = 0;
+        bucket->live_bytes = 0;
+        bucket->last_access_ns = CurrentTimeNs();
+        // Everything on disk was written at seal time, so a recovered bucket is
+        // sealed by definition and its `.meta` already matches this state.
+        bucket->sealed = true;
+        bucket->meta_dirty = false;
+
+        bool bucket_ok = true;
+        for (const auto& persisted : snapshot.entries) {
+            max_generation = std::max(max_generation, persisted.generation + 1);
+            if (!IsKnownEntryState(persisted.state)) {
+                LOG(ERROR) << "Discarding DFS bucket " << bucket_id
+                           << ": entry for key " << persisted.key
+                           << " has unknown state " << persisted.state;
+                bucket_ok = false;
+                break;
+            }
+            if (persisted.key.empty() ||
+                persisted.key_size != persisted.key.size()) {
+                LOG(ERROR) << "Discarding DFS bucket " << bucket_id
+                           << ": entry key size mismatch";
+                bucket_ok = false;
+                break;
+            }
+            auto layout = RebuildBucketEntryLayout(
+                persisted.entry_offset, persisted.value_size, alignment_);
+            if (!layout || layout->aligned_size != persisted.reserved_size ||
+                layout->end() > snapshot.capacity) {
+                LOG(ERROR) << "Discarding DFS bucket " << bucket_id
+                           << ": entry for key " << persisted.key
+                           << " has an out-of-range or inconsistent layout";
+                bucket_ok = false;
+                break;
+            }
+
+            BucketEntry entry;
+            entry.entry_offset = persisted.entry_offset;
+            entry.key_size = persisted.key_size;
+            entry.value_size = persisted.value_size;
+            entry.reserved_size = persisted.reserved_size;
+            entry.generation = persisted.generation;
+            entry.state = static_cast<BucketEntryState>(persisted.state);
+
+            // Keep the space reserved even for dead entries: the offsets of
+            // later entries depend on it.
+            bucket->append_offset =
+                std::max(bucket->append_offset, layout->end());
+            bucket->entries[persisted.key] = entry;
+            if (entry.state == BucketEntryState::PENDING) {
+                ++bucket->pending_entries;
+            }
+        }
+        if (!bucket_ok) {
+            DeleteBucketFiles(bucket_id);
+            discarded_ids.insert(bucket_id);
+            continue;
+        }
+
+        // The persisted append_offset is authoritative when it is at least as
+        // large as what the entries imply (it also covers rolled-back space).
+        bucket->append_offset =
+            std::max(bucket->append_offset, snapshot.append_offset);
+
+        if (bucket->append_offset > bucket->capacity) {
+            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
+                       << ": persisted append_offset " << bucket->append_offset
+                       << " exceeds capacity " << bucket->capacity;
+            DeleteBucketFiles(bucket_id);
+            discarded_ids.insert(bucket_id);
+            continue;
+        }
+
+        // Settle the final state of every entry. A PENDING entry's data was
+        // never confirmed durable, so it must not come back as readable; only
+        // COMMITTED entries survive.
+        for (auto& [key, entry] : bucket->entries) {
+            if (entry.state == BucketEntryState::COMMITTED) {
                 auto layout = RebuildBucketEntryLayout(
                     entry.entry_offset, entry.value_size, alignment_);
-                if (!layout) continue;
-                member_live_bytes[member] = entry.reserved_size;
-                if (!have_best ||
-                    std::tie(entry.generation, member, entry.entry_offset) >
-                        std::tie(best_generation, best_bucket_id,
-                                 best_entry_offset)) {
-                    best_generation = entry.generation;
-                    best_entry_offset = entry.entry_offset;
-                    best_value_size = entry.value_size;
-                    best_bucket_id = member;
-                    have_best = true;
+                if (!layout ||
+                    layout->end() > static_cast<uint64_t>(*data_size)) {
+                    LOG(ERROR) << "Dropping committed DFS entry for key " << key
+                               << " in bucket " << bucket_id
+                               << ": it extends past the data file end";
+                    entry.state = BucketEntryState::TOMBSTONE;
+                    ++bucket->tombstones;
+                    bucket->meta_dirty = true;
+                    continue;
                 }
-            }
-        }
-        if (!have_best) continue;
-
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            key_index_[key] =
-                LiveKeyRecord{best_bucket_id, BucketEntryState::COMMITTED};
-            auto it = buckets_.find(best_bucket_id);
-            if (it != buckets_.end()) it->second->meta_dirty = true;
-            // Only the winner's bucket keeps these bytes counted as live.
-            for (const auto& [member, bytes] : member_live_bytes) {
-                if (member == best_bucket_id) continue;
-                auto loser_it = buckets_.find(member);
-                if (loser_it == buckets_.end()) continue;
-                if (loser_it->second->live_bytes >= bytes) {
-                    loser_it->second->live_bytes -= bytes;
-                } else {
-                    loser_it->second->live_bytes = 0;
-                }
-            }
-        }
-
-        // Only a change of winner needs a corrected batch. The master applies
-        // recovery batches last-wins, so the corrected replica overrides the
-        // one streamed when the key was first claimed.
-        if (best_bucket_id == group.first_bucket_id) continue;
-        auto layout = RebuildBucketEntryLayout(best_entry_offset,
-                                               best_value_size, alignment_);
-        if (!layout) continue;
-        std::vector<RecoveredReplica> corrected;
-        corrected.push_back(RecoveredReplica{
-            key, MakeBucketDescriptor(BucketDataPath(best_bucket_id), *layout,
-                                      best_bucket_id)});
-        if (consumer) consumer(std::move(corrected));
-    }
-
-    recovery_conflicts_.clear();
-}
-
-tl::expected<void, ErrorCode>
-ImmutableBucketAllocator::RecoverBucketsProgressively(
-    const RecoveredBatchConsumer& consumer) {
-    if (!fs_adapter_) {
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    }
-
-    // Take ownership of the ids Init discovered, so the members stop pinning
-    // this memory once recovery has consumed them.
-    std::vector<int64_t> meta_ids = std::move(pending_recovery_meta_ids_);
-    std::vector<int64_t> data_ids = std::move(pending_recovery_data_ids_);
-    pending_recovery_meta_ids_.clear();
-    pending_recovery_data_ids_.clear();
-    recovery_conflicts_.clear();
-
-    const size_t workers = std::max<size_t>(1, recovery_worker_count_);
-
-    // Recovery stops at the first batch boundary where either budget is spent,
-    // so a huge backlog cannot stall startup; a zero value disables that
-    // dimension.
-    const bool has_deadline = recovery_max_duration_seconds_ > 0;
-    const auto deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::seconds(recovery_max_duration_seconds_);
-    // Ids the budget left unparsed, and where the cut happened. The cut index
-    // is kept so a failed cleanup-thread start can still delete them here.
-    std::unordered_set<int64_t> skipped_ids;
-    size_t skip_start = meta_ids.size();
-    const char* limit_reason = nullptr;
-
-    std::unordered_set<int64_t> discarded_ids;
-    uint64_t max_generation = 0;
-    size_t recovered_bucket_count = 0;
-    size_t recovered_replica_count = 0;
-    size_t discarded_count = 0;
-
-    const size_t total = meta_ids.size();
-    ThreadPool pool(workers);
-    const size_t max_buckets = recovery_max_buckets_;
-    for (size_t batch_start = 0; batch_start < total; batch_start += workers) {
-        // Cut over only at a batch boundary and only once at least one batch
-        // has committed, so even a tiny budget still restores the newest
-        // buckets and an in-flight batch is never left half-published.
-        const bool bucket_limit_reached =
-            max_buckets > 0 && recovered_bucket_count >= max_buckets;
-        const bool time_limit_reached =
-            has_deadline && std::chrono::steady_clock::now() >= deadline;
-        if (batch_start > 0 && (bucket_limit_reached || time_limit_reached)) {
-            limit_reason = bucket_limit_reached ? "bucket_limit" : "time_limit";
-            skip_start = batch_start;
-            break;
-        }
-        const size_t batch_end = std::min(total, batch_start + workers);
-        const size_t batch_size = batch_end - batch_start;
-
-        // One parsed bucket per worker in flight: this bounds recovery memory
-        // by `workers`, not by the total key count.
-        std::vector<ParsedBucket> parsed(batch_size);
-        std::atomic<size_t> remaining{batch_size};
-        std::mutex batch_mutex;
-        std::condition_variable batch_cv;
-        std::exception_ptr worker_error;
-
-        for (size_t i = 0; i < batch_size; ++i) {
-            const int64_t bucket_id = meta_ids[batch_start + i];
-            pool.enqueue([this, bucket_id, &parsed, i, &remaining, &batch_mutex,
-                          &batch_cv, &worker_error]() {
-                // Parsing runs on a pool thread, so an exception here would
-                // otherwise terminate the process. Capture it and rethrow on
-                // the committing thread, preserving the single-threaded
-                // behaviour where it propagated to the caller.
-                try {
-                    parsed[i] = ParseBucketMeta(bucket_id);
-                } catch (...) {
-                    std::lock_guard<std::mutex> lock(batch_mutex);
-                    if (!worker_error) worker_error = std::current_exception();
-                }
-                {
-                    std::lock_guard<std::mutex> lock(batch_mutex);
-                    --remaining;
-                }
-                batch_cv.notify_one();
-            });
-        }
-        {
-            std::unique_lock<std::mutex> lock(batch_mutex);
-            batch_cv.wait(lock,
-                          [&remaining] { return remaining.load() == 0; });
-        }
-        if (worker_error) {
-            std::rethrow_exception(worker_error);
-        }
-
-        // Commit serially, in ascending bucket_id order. The consumer is
-        // invoked with the allocator mutex released, so the allocator mutex and
-        // the master's metadata shard mutex are never nested.
-        for (size_t i = 0; i < batch_size; ++i) {
-            ParsedBucket& pb = parsed[i];
-            max_generation = std::max(max_generation, pb.max_generation);
-            const int64_t bucket_id = meta_ids[batch_start + i];
-            if (pb.discarded) {
-                DeleteBucketFiles(bucket_id);
-                discarded_ids.insert(bucket_id);
-                ++discarded_count;
+                bucket->live_bytes += entry.reserved_size;
                 continue;
             }
-
-            std::vector<RecoveredReplica> winners;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                CommitParsedBucketLocked(bucket_id, pb, winners);
+            if (entry.state == BucketEntryState::PENDING) {
+                --bucket->pending_entries;
             }
-            ++recovered_bucket_count;
-            recovered_replica_count += winners.size();
-            if (consumer) consumer(std::move(winners));
+            entry.state = BucketEntryState::TOMBSTONE;
+            ++bucket->tombstones;
+            bucket->meta_dirty = true;
         }
-        // `parsed` is destroyed here, releasing this batch before the next.
+
+        for (const auto& [key, entry] : bucket->entries) {
+            if (entry.state != BucketEntryState::COMMITTED) continue;
+            auto winner_it = winners.find(key);
+            const auto candidate =
+                std::tie(entry.generation, bucket_id, entry.entry_offset);
+            if (winner_it == winners.end()) {
+                winners[key] = {entry.generation, bucket_id,
+                                entry.entry_offset};
+            } else if (candidate > std::tie(winner_it->second.generation,
+                                            winner_it->second.bucket_id,
+                                            winner_it->second.entry_offset)) {
+                LOG(WARNING)
+                    << "DFS key " << key << " found in buckets "
+                    << winner_it->second.bucket_id << " and " << bucket_id
+                    << "; keeping the greater generation/location "
+                       "tuple";
+                winner_it->second = {entry.generation, bucket_id,
+                                     entry.entry_offset};
+            } else {
+                LOG(WARNING) << "DFS key " << key << " in bucket " << bucket_id
+                             << " is superseded by bucket "
+                             << winner_it->second.bucket_id;
+            }
+        }
+
+        buckets_.emplace(bucket_id, std::move(bucket));
     }
 
-    // Buckets the budget cut off keep their files for now; an asynchronous
-    // cleanup thread removes them so a large backlog never delays startup.
-    if (limit_reason != nullptr) {
-        for (size_t i = skip_start; i < meta_ids.size(); ++i) {
-            skipped_ids.insert(meta_ids[i]);
-        }
-        LOG(WARNING) << "DFS bucket recovery stopped early (" << limit_reason
-                     << "), recovered=" << recovered_bucket_count
-                     << ", skipped=" << skipped_ids.size()
-                     << ", max_buckets=" << recovery_max_buckets_
-                     << ", max_duration_seconds="
-                     << recovery_max_duration_seconds_;
-    }
+    // Drop entries that lost the duplicate-key race, then index the winners.
+    for (auto& [bucket_id, bucket] : buckets_) {
+        for (auto& [key, entry] : bucket->entries) {
+            if (entry.state != BucketEntryState::COMMITTED) continue;
+            auto winner_it = winners.find(key);
+            if (winner_it == winners.end() ||
+                winner_it->second.bucket_id != bucket_id ||
+                winner_it->second.entry_offset != entry.entry_offset) {
+                entry.state = BucketEntryState::TOMBSTONE;
+                ++bucket->tombstones;
+                bucket->meta_dirty = true;
+                if (bucket->live_bytes >= entry.reserved_size) {
+                    bucket->live_bytes -= entry.reserved_size;
+                } else {
+                    bucket->live_bytes = 0;
+                }
+                continue;
+            }
+            key_index_[key] = bucket_id;
 
-    // Settle every duplicated key. The running winner's replica was already
-    // streamed; a corrected one is streamed only when the true winner differs.
-    ResolveRecoveryConflicts(consumer);
+            auto layout = RebuildBucketEntryLayout(
+                entry.entry_offset, entry.value_size, alignment_);
+            if (!layout) continue;
+            recovered_replicas_.push_back(RecoveredReplica{
+                key, MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
+                                          bucket_id)});
+        }
+    }
 
     // A data file with no `.meta` at all is the signature of a crash while the
     // bucket was still active: its metadata only lived in memory, so nothing
     // can ever address the data again. Reclaim it. Buckets rejected above were
     // already deleted, so they are skipped here to avoid a duplicate log line.
-    // Ready-pool workers may still be running, so decide under `mutex_` and do
-    // the file I/O outside it.
-    std::vector<int64_t> orphan_data_ids;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const int64_t data_id : data_ids) {
-            if (buckets_.count(data_id) > 0) continue;
-            if (discarded_ids.count(data_id) > 0) continue;
-            // Skipped buckets belong to the cleanup thread; deleting them here
-            // as well would race with it.
-            if (skipped_ids.count(data_id) > 0) continue;
-            orphan_data_ids.push_back(data_id);
-        }
-    }
-    for (const int64_t data_id : orphan_data_ids) {
+    for (const int64_t data_id : data_ids) {
+        if (buckets_.count(data_id) > 0) continue;
+        if (discarded_ids.count(data_id) > 0) continue;
         LOG(WARNING) << "Removing orphaned DFS bucket data file for bucket_id="
                      << data_id << " (no metadata, lost on an unclean restart)";
         DeleteBucketFiles(data_id);
     }
 
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        next_generation_ = std::max<uint64_t>(1, max_generation);
+    next_bucket_id_ = max_seen_id + 1;
+    next_generation_ = std::max<uint64_t>(1, max_generation);
 
-        // Every recovered bucket is sealed, so none of them is resumed: the
-        // next allocation opens a fresh bucket. This is what keeps a sealed
-        // bucket's `.meta` final, written once when the bucket stopped growing.
-        active_bucket_id_ = -1;
+    // Every recovered bucket is sealed, so none of them is resumed: the next
+    // allocation opens a fresh bucket. This is what keeps a sealed bucket's
+    // `.meta` final, written once when the bucket stopped growing. The cost is
+    // the unused tail of the bucket that was active before the restart.
+    active_bucket_id_ = -1;
 
-        // Seed the LRU newest-first so recovered buckets have a defined order.
-        // Ready (preallocated, never used) buckets stay out of the LRU, exactly
-        // as they do when the pool creates them.
-        std::vector<int64_t> ordered;
-        ordered.reserve(buckets_.size());
-        for (const auto& [bucket_id, bucket] : buckets_) {
-            if (bucket->ready) continue;
-            ordered.push_back(bucket_id);
-        }
-        std::sort(ordered.begin(), ordered.end());
-        for (const int64_t bucket_id : ordered) {
-            lru_list_.push_front(bucket_id);
-            lru_index_[bucket_id] = lru_list_.begin();
-        }
-
-        // The ready pool reads the published id set, so publish it while the
-        // lock guarding `buckets_` is still held.
-        PublishBucketIdSnapshotLocked();
+    // Seed the LRU newest-first so recovered buckets have a defined order.
+    std::vector<int64_t> ordered;
+    ordered.reserve(buckets_.size());
+    for (const auto& [bucket_id, bucket] : buckets_) {
+        (void)bucket;
+        ordered.push_back(bucket_id);
+    }
+    std::sort(ordered.begin(), ordered.end());
+    for (const int64_t bucket_id : ordered) {
+        lru_list_.push_front(bucket_id);
+        lru_index_[bucket_id] = lru_list_.begin();
     }
 
-    // Recovery may have rewritten in-memory state (PENDING entries demoted to
-    // tombstones, duplicate losers demoted). Persist that now so the next start
-    // reads exactly what this process believes.
-    const size_t rewritten = FlushDirtyMetadata();
-
-    // Delete the skipped buckets off the startup path. `skipped_ids` is moved
-    // into the thread; `meta_ids`/`skip_start` still let the catch fall back to
-    // deleting here if the thread cannot start.
-    const size_t skipped_count = skipped_ids.size();
-    if (skipped_count > 0) {
-        // The cleanup worker takes a plain vector; `skipped_ids` stays a set
-        // for the orphan dedup above, so hand it a converted copy.
-        std::vector<int64_t> skipped(skipped_ids.begin(), skipped_ids.end());
-        bool cleanup_started = false;
-        try {
-            std::thread cleanup(
-                &ImmutableBucketAllocator::CleanupSkippedBuckets, this,
-                std::move(skipped));
-            recovery_cleanup_thread_ = std::move(cleanup);
-            cleanup_started = true;
-        } catch (const std::system_error& e) {
-            LOG(WARNING) << "Failed to start skipped-bucket cleanup thread: "
-                         << e.what() << "; deleting skipped buckets synchronously";
-            for (size_t i = skip_start; i < meta_ids.size(); ++i) {
-                DeleteBucketFiles(meta_ids[i]);
-            }
-        }
-        if (cleanup_started) {
-            LOG(INFO) << "DFS bucket recovery started asynchronous cleanup for "
-                      << skipped_count << " skipped buckets";
-        }
-    }
-
-    LOG(INFO) << "DFS bucket recovery complete, buckets="
-              << recovered_bucket_count << ", replicas="
-              << recovered_replica_count << ", discarded=" << discarded_count
-              << ", skipped=" << skipped_count
-              << ", workers=" << workers
-              << ", next_bucket_id=" << next_bucket_id_
-              << ", next_generation=" << next_generation_
-              << ", rewritten_buckets=" << rewritten;
+    PublishBucketIdSnapshotLocked();
     return {};
-}
-
-void ImmutableBucketAllocator::CleanupSkippedBuckets(
-    std::vector<int64_t> skipped_ids) {
-    size_t deleted = 0;
-    for (const int64_t bucket_id : skipped_ids) {
-        LOG(WARNING) << "Deleting DFS bucket skipped by the recovery budget, "
-                     << "bucket_id=" << bucket_id;
-        DeleteBucketFiles(bucket_id);
-        ++deleted;
-    }
-    LOG(INFO) << "DFS skipped-bucket cleanup complete, deleted=" << deleted;
 }
 
 }  // namespace mooncake
