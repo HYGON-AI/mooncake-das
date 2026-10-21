@@ -217,6 +217,22 @@ std::shared_ptr<DistributedStorageBackend> MakeTestBackend(
         kTestDfsRootIdentity);
 }
 
+// Drains the streaming recovery API into a single vector. Recovery of a
+// restarted allocator must run exactly once, before any recovered-state
+// assertion.
+std::vector<ImmutableBucketAllocator::RecoveredReplica> RecoverAll(
+    ImmutableBucketAllocator& allocator) {
+    std::vector<ImmutableBucketAllocator::RecoveredReplica> all;
+    auto consumer =
+        [&all](std::vector<ImmutableBucketAllocator::RecoveredReplica>&&
+                   batch) {
+            for (auto& replica : batch) all.push_back(std::move(replica));
+        };
+    auto result = allocator.RecoverBucketsProgressively(consumer);
+    EXPECT_TRUE(result.has_value());
+    return all;
+}
+
 }  // namespace
 
 class DfsBucketBackendTest : public ::testing::Test {
@@ -1081,7 +1097,7 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
 
     ImmutableBucketAllocator recovered;
     ASSERT_TRUE(recovered.Init(config).has_value());
-    auto replicas = recovered.TakeRecoveredReplicas();
+    auto replicas = RecoverAll(recovered);
     ASSERT_EQ(replicas.size(), keys.size());
 
     for (const auto& replica : replicas) {

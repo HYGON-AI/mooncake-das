@@ -65,6 +65,23 @@ struct DistributedStorageConfig {
     int ready_bucket_target = 4;
     // BUCKET mode only: maximum number of concurrent bucket preallocations.
     int bucket_create_concurrency = 2;
+    // BUCKET mode only: number of worker threads used to parse bucket
+    // metadata concurrently during startup recovery. 0 means auto, resolved at
+    // recovery time to min(8, hardware_concurrency()). Must be in
+    // [0, 64]; see MOONCAKE_DFS_RECOVERY_WORKERS.
+    int recovery_worker_count = 0;
+    // BUCKET mode only: give up restoring replicas once this many buckets have
+    // been recovered, so the restart peak stays bounded when a huge number of
+    // buckets is found on disk. The remaining buckets are skipped and their
+    // files are deleted asynchronously. 0 means no bucket-count limit. See
+    // MOONCAKE_DFS_RECOVERY_MAX_BUCKETS.
+    int recovery_max_buckets = 1000;
+    // BUCKET mode only: give up restoring replicas once this many seconds have
+    // elapsed since recovery started, so a slow disk cannot stall startup
+    // indefinitely. The remaining buckets are skipped and their files are
+    // deleted asynchronously. 0 means no time limit. See
+    // MOONCAKE_DFS_RECOVERY_MAX_DURATION_SECONDS.
+    int recovery_max_duration_seconds = 20;
     // BUCKET mode only: number of threads for parallel batch reads across
     // buckets. Set to 1 to disable parallelism. Must be in
     // [1, kMaxBatchReadThreads].
