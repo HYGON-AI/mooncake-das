@@ -1227,8 +1227,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRemovesOrphanDataFiles) {
 
 TEST(ImmutableBucketAllocatorTest, RecoveryContinuesInterruptedEviction) {
     TempDir tmp("bucket_recover_evicting");
-    // Build a bucket, then rewrite its metadata with the evicting marker set,
-    // simulating a crash between the marker and the file deletes.
+    // Older versions wrote an eviction marker. Continue honoring those files
+    // when recovering after an upgrade, although new evictions write no marker.
     std::string meta_path;
     std::string data_path;
     {
@@ -1626,6 +1626,47 @@ TEST(ImmutableBucketAllocatorTest, CommitEvictionDeletesBucketAndFrees) {
     EXPECT_TRUE(alloc.GetBucketIdForKey("k2").has_value());
 }
 
+TEST(ImmutableBucketAllocatorTest, EvictionDoesNotRewriteMetadata) {
+    for (const bool invalidate : {false, true}) {
+        SCOPED_TRACE(invalidate);
+        TempDir tmp("bucket_evict_no_metadata_write");
+        auto config = MakeEvictionConfig(tmp.path(), kAlignment, 4);
+        config.ready_bucket_target = 0;
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(config));
+
+        auto victim = alloc.Allocate("victim", 100);
+        ASSERT_TRUE(victim.has_value());
+        // Seal the victim while its entry is still PENDING, then dirty its
+        // metadata by committing. Prepare must not flush that change.
+        auto active = alloc.Allocate("active", 100);
+        ASSERT_TRUE(active.has_value());
+        ASSERT_GE(alloc.FlushDirtyMetadata(), 1u);
+        ASSERT_TRUE(alloc.MarkCommitted("victim", *victim));
+        const auto meta_path = BucketMetaFile(tmp, victim->shard_idx);
+        const auto saved_path = tmp.file("saved_metadata");
+        // Retain the inode after deletion so a marker rewrite stays observable.
+        std::filesystem::create_hard_link(meta_path, saved_path);
+        const auto read_saved = [&]() {
+            std::ifstream input(saved_path, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(input),
+                               std::istreambuf_iterator<char>());
+        };
+        const auto original = read_saved();
+        ASSERT_FALSE(original.empty());
+
+        auto pending = invalidate ? alloc.PrepareInvalidation(victim->shard_idx)
+                                  : alloc.PrepareEviction();
+        ASSERT_EQ(pending.bucket_id(), victim->shard_idx);
+        EXPECT_EQ(read_saved(), original);
+        ASSERT_TRUE(alloc.CommitEviction(std::move(pending)));
+        EXPECT_EQ(read_saved(), original);
+        EXPECT_FALSE(std::filesystem::exists(meta_path));
+        EXPECT_FALSE(std::filesystem::exists(victim->file_path));
+        EXPECT_EQ(alloc.GetBucketCount(), 1u);
+    }
+}
+
 TEST(ImmutableBucketAllocatorTest, AbortEvictionRestoresBucketUnchanged) {
     TempDir tmp("bucket_evict_abort");
     const uint64_t capacity = kAlignment;
@@ -1946,9 +1987,8 @@ TEST(ImmutableBucketAllocatorTest, MetadataFlushCannotOutliveEvictedBucket) {
     const std::string data_path = victim_desc->file_path;
     const std::string meta_path = BucketMetaFile(tmp, 0);
 
-    // Dirty the frozen bucket after Prepare's sealing flush, then race a new
-    // flush against marker publication and deletion. A captured flush must not
-    // recreate normal metadata after this exact BucketState is removed.
+    // Dirty the frozen bucket, then race a new flush against deletion. A
+    // captured flush must not recreate metadata after this BucketState is gone.
     alloc.Free("victim", *victim_desc);
     std::atomic<bool> start{false};
     std::thread flusher([&]() {

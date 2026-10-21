@@ -69,8 +69,8 @@ struct PersistedBucketMetadata {
     uint64_t capacity = 0;
     uint64_t alignment = 0;
     uint64_t append_offset = 0;
-    // Set when the bucket has been chosen for eviction and its data file is
-    // being deleted. Recovery treats such a bucket as gone rather than live.
+    // Legacy marker: new writes leave this false, but recovery still discards
+    // buckets marked for eviction by older versions.
     bool evicting = false;
     std::vector<PersistedBucketEntry> entries;
     YLT_REFL(PersistedBucketMetadata, version, checksum, bucket_id, capacity,
@@ -114,6 +114,9 @@ enum class BucketEntryState : int32_t {
  *
  * `FlushDirtyMetadata()` performs the deferred writes for every bucket marked
  * dirty. It runs on the master's DFS maintenance tick and at shutdown.
+ * Preparing and committing eviction do not persist a marker or flush metadata.
+ * If deletion is interrupted and both files survive, recovery may restore the
+ * cached entries; they can be evicted again after restart.
  *
  * The accepted failure mode: if the master dies before a bucket is sealed, that
  * bucket has no `.meta` file and recovery deletes its `.data` file, so at most
@@ -455,7 +458,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // folding duplicate keys and taking every entry's state from key_index_.
     // Only valid while `placed_durable` is false. Taken under `mutex_`; the
     // file write happens outside it.
-    PersistedBucketMetadata SnapshotLocked(BucketState& bucket, bool evicting);
+    PersistedBucketMetadata SnapshotLocked(BucketState& bucket);
 
     // Reads and validates one bucket's `.meta` file. Performs DFS I/O, so it
     // must be called with `mutex_` released. Returns nullopt when the file is
