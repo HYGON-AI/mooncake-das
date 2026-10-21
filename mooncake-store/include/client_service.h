@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <boost/functional/hash.hpp>
 #include <condition_variable>
 #include <functional>
@@ -27,6 +28,7 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
+#include "dfs_write_staging_pool.h"
 
 namespace mooncake {
 
@@ -79,6 +81,8 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+    int SetServiceEndpoint(const std::string& endpoint);
+    void RecordServiceReadFailure(ReplicaType replica_type);
     const std::string& GetDfsRootIdentity() const {
         return dfs_root_identity_;
     }
@@ -935,7 +939,8 @@ class Client {
      */
     std::vector<PutOperation> CreatePutOperations(
         const std::vector<ObjectKey>& keys,
-        const std::vector<std::vector<Slice>>& batched_slices);
+        const std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config);
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
@@ -964,12 +969,17 @@ class Client {
      */
     void SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert = false,
                          bool allow_async = true);
+    void SubmitDfsWriteChunk(std::vector<PutOperation>& ops,
+                             const std::vector<size_t>& op_indices,
+                             bool is_upsert, bool allow_async,
+                             bool* slot_timed_out = nullptr);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
+    void RecordBatchServiceDualWriteMetrics(std::vector<PutOperation>& ops);
 
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
@@ -981,25 +991,32 @@ class Client {
      *
      * The background task must not reference the caller's CPU or GPU buffers,
      * which may be freed or overwritten as soon as BatchPut returns. All slice
-     * bytes are therefore copied into owned storage (pinned host memory when a
-     * GPU is involved, plain host memory otherwise) before the task is queued,
-     * and `slices` points into that storage.
+     * bytes are copied into one fixed-capacity arena slot before the task is
+     * queued, and `slices` points into that slot.
      *
-     * `backend` and `pinned_pool` are held by shared_ptr so the task keeps them
-     * alive even if the Client is torn down while the write is in flight.
+     * `backend` and `staging_pool` are held by shared_ptr so the task keeps
+     * them alive while the write is in flight.
      */
     struct AsyncDfsWriteContext {
+        struct ServiceDualWriteCompletion {
+            bool eligible = false;
+            bool memory_succeeded = false;
+            size_t requested_dfs_replicas = 0;
+        };
+
         std::vector<std::string> keys;
         std::vector<DistributedFSDescriptor> descriptors;
+        std::shared_ptr<DfsWriteStagingPool> staging_pool;
+        std::shared_ptr<DfsWriteStagingPool::Slot> staging_slot;
         std::vector<std::vector<Slice>> slices;
+        std::vector<ServiceDualWriteCompletion> service_dual_writes;
+        std::vector<bool> service_metrics_settled;
         // Ready before enqueue; every End retry uses the foreground checksum.
         std::vector<std::optional<uint64_t>> object_checksums;
-        std::vector<PinnedBufferPool::Buffer> staging;
-        std::vector<std::vector<char>> host_staging;
         std::shared_ptr<DistributedStorageBackend> backend;
-        std::shared_ptr<PinnedBufferPool> pinned_pool;
         bool is_upsert = false;
 
+        void ReleaseStagingSlot();
         ~AsyncDfsWriteContext();
     };
 
@@ -1023,6 +1040,13 @@ class Client {
      * Called from the destructor before the master client goes away.
      */
     void DrainAsyncDfsWrites();
+    void StopServiceMetricsReporter();
+    void ServiceMetricsReporterLoop();
+    void RecordServiceDualWrite(bool memory_succeeded, bool dfs_succeeded);
+    void BeginServiceDualWritePending();
+    void CancelServiceDualWritePending();
+    void CompleteServiceDualWrite(bool memory_succeeded,
+                                  bool dfs_succeeded);
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
         std::vector<PutOperation>& ops, bool is_upsert);
@@ -1077,12 +1101,20 @@ class Client {
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
+    const size_t dfs_write_arena_count_;
+    const size_t dfs_write_chunk_size_;
 
-    // Client persistent thread pool for async operations
-    // Pinned host memory pool for GPU D2H staging. Held by shared_ptr so an
-    // in-flight async DFS write keeps it alive even while the Client is being
-    // destroyed.
+    // Explicitly enabled by the serving application after setup. This reporter
+    // has its own thread and cumulative snapshot, independent of local metrics.
+    mutable std::mutex service_metrics_mutex_;
+    ServiceMetricsSnapshot service_metrics_snapshot_;
+    std::atomic<bool> service_metrics_report_running_{false};
+    std::thread service_metrics_report_thread_;
+
+    // Pinned host memory pool for synchronous and fallback staging. The fixed
+    // asynchronous DFS arenas are owned by `dfs_write_staging_pool_`.
     std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    std::shared_ptr<DfsWriteStagingPool> dfs_write_staging_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;

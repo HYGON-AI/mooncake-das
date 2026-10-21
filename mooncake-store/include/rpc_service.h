@@ -193,6 +193,9 @@ class WrappedMasterService {
 
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
+    tl::expected<void, ErrorCode> ReportServiceMetrics(
+        const UUID& client_id, const ServiceMetricsSnapshot& snapshot);
+
     tl::expected<std::string, ErrorCode> ServiceReady();
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;

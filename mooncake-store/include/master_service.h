@@ -2118,7 +2118,9 @@ class MasterService {
     bool RunBucketDfsEvictionInternal(
         bool force_one,
         std::optional<int64_t> invalidated_bucket_id = std::nullopt,
-        double low_utilization_threshold = -1.0);
+        double low_utilization_threshold = -1.0,
+        int low_utilization_eviction_limit = -1,
+        int low_utilization_attempt_limit = -1);
     bool TryRecoverDfsSpaceAfterAllocationFailure();
     tl::expected<bool, ErrorCode> IsDfsBucketDataFilePresent(
         int64_t bucket_id) const;
@@ -2129,6 +2131,9 @@ class MasterService {
     void RestoreRecoveredDfsReplicas(ImmutableBucketAllocator* allocator);
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();
+    bool InitializeDfsRootGuard(const std::string& root,
+                                const std::string& identity);
+    void ReconcileDfsRootFiles();
     /**
      * @brief Helper to release space of expired discarded replicas.
      * @return Number of released objects that have memory replicas
@@ -2809,6 +2814,7 @@ class MasterService {
     bool dfs_restore_from_bucket_metadata_{true};
     double dfs_bucket_low_utilization_threshold_{0.05};
     int dfs_bucket_low_utilization_evictions_per_tick_{1};
+    int dfs_bucket_low_utilization_attempts_per_tick_{8};
     // Chosen by configuration at startup: DfsGlobalAllocator (SHARD, the
     // default) or ImmutableBucketAllocator (BUCKET). The master only ever talks
     // to it through DfsAllocatorInterface.
@@ -2826,6 +2832,13 @@ class MasterService {
     std::thread dfs_retry_thread_;
     std::mutex dfs_retry_mutex_;
     std::condition_variable dfs_retry_cv_;
+    std::mutex dfs_root_guard_mutex_;
+    std::string dfs_root_guard_path_;
+    std::string dfs_root_guard_identity_;
+    uint64_t dfs_root_guard_device_{0};
+    uint64_t dfs_root_guard_inode_{0};
+    bool dfs_root_guard_ready_{false};
+    std::chrono::seconds dfs_root_guard_interval_{5};
 
     // Segment management
     SegmentManager segment_manager_;

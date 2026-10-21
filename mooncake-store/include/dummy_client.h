@@ -191,6 +191,7 @@ class DummyClient : public PyClient {
     int probe_dfs_write() override;
     std::vector<int> probe_dfs_health() override;
     int set_dfs_access_policy(bool allow_read, bool allow_write) override;
+    int set_service_endpoint(const std::string& endpoint) override;
 
     tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets);

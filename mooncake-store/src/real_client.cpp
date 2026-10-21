@@ -24,6 +24,10 @@
 #include <optional>
 #include <vector>
 
+#include <ylt/reflection/user_reflect_macro.hpp>
+#include <ylt/struct_json/json_reader.h>
+#include <ylt/struct_json/json_writer.h>
+
 #include "real_client.h"
 #include "scatter_utils.h"
 #include "registered_pinned_memory.h"
@@ -43,6 +47,7 @@
 #include "environment_variables.h"
 #include "device/accelerator_registry.h"
 #include "default_config.h"
+#include "runtime_log_config.h"
 #include "uds_transport.h"
 #include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
@@ -75,6 +80,33 @@ namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 std::atomic<uint64_t> g_dfs_read_trace_id{0};
+
+struct HttpLoggingUpdateRequest {
+    std::optional<std::string> minloglevel;
+    std::optional<int> vlog_level;
+    std::optional<std::string> ylt_severity;
+    std::optional<bool> dfs_read_trace;
+};
+YLT_REFL(HttpLoggingUpdateRequest, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
+
+struct HttpLoggingResponse {
+    bool success{true};
+    std::string minloglevel;
+    int vlog_level{0};
+    std::string ylt_severity;
+    bool dfs_read_trace{false};
+};
+YLT_REFL(HttpLoggingResponse, success, minloglevel, vlog_level, ylt_severity,
+         dfs_read_trace);
+
+void FillLoggingResponse(HttpLoggingResponse* response) {
+    const auto config = GetRuntimeLogConfig();
+    response->minloglevel = config.minloglevel;
+    response->vlog_level = config.vlog_level;
+    response->ylt_severity = config.ylt_severity;
+    response->dfs_read_trace = config.dfs_read_trace;
+}
 
 uint64_t NextDfsReadTraceId() {
     uint64_t current = g_dfs_read_trace_id.load(std::memory_order_relaxed);
@@ -1970,7 +2002,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const int selected_http_port =
         enable_client_http_server ? client_http_port : FLAGS_http_port;
     if (should_start_http_server) {
-        if (selected_http_port <= 0 || selected_http_port > 65535) {
+        // Port zero asks the listening socket to allocate an available port.
+        // Independent SGLang instances can then enable HTTP metrics without
+        // sharing a rank-derived fixed port.
+        if (selected_http_port < 0 || selected_http_port > 65535) {
             LOG(ERROR) << "Invalid client HTTP server port: "
                        << selected_http_port;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2745,6 +2780,11 @@ int RealClient::set_dfs_access_policy(bool allow_read, bool allow_write) {
     return 0;
 }
 
+int RealClient::set_service_endpoint(const std::string& endpoint) {
+    if (!client_) return toInt(ErrorCode::INVALID_PARAMS);
+    return client_->SetServiceEndpoint(endpoint);
+}
+
 int RealClient::start_http_server(int port) {
     using namespace coro_http;
 
@@ -2817,14 +2857,68 @@ int RealClient::start_http_server(int port) {
             resp.set_status_and_content(status_type::ok, std::move(*result));
         });
 
+    http_server_->set_http_handler<GET>(
+        "/api/v1/logging",
+        [this](coro_http_request &req, coro_http_response &resp) {
+            handle_get_logging(req, resp);
+        });
+    http_server_->set_http_handler<PUT>(
+        "/api/v1/logging",
+        [this](coro_http_request &req, coro_http_response &resp) {
+            handle_update_logging(req, resp);
+        });
+
     auto ec = http_server_->async_start();
     if (ec.hasResult()) {
         LOG(WARNING) << "Failed to start HTTP server on port " << port;
         http_server_.reset();
         return -1;
     }
-    LOG(INFO) << "Client HTTP server started on port " << port;
+    LOG(INFO) << "Client HTTP server started on port " << http_server_->port();
     return 0;
+}
+
+void RealClient::handle_get_logging(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    HttpLoggingResponse response;
+    FillLoggingResponse(&response);
+    std::string body;
+    struct_json::to_json(response, body);
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
+    resp.set_status_and_content(coro_http::status_type::ok, std::move(body));
+}
+
+void RealClient::handle_update_logging(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    HttpLoggingUpdateRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        resp.set_status_and_content(
+            coro_http::status_type::bad_request,
+            std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+
+    RuntimeLogConfigUpdate update{
+        .minloglevel = request.minloglevel,
+        .vlog_level = request.vlog_level,
+        .ylt_severity = request.ylt_severity,
+        .dfs_read_trace = request.dfs_read_trace,
+    };
+    std::string error;
+    if (!UpdateRuntimeLogConfig(update, &error)) {
+        resp.set_status_and_content(coro_http::status_type::bad_request,
+                                    std::move(error));
+        return;
+    }
+
+    HttpLoggingResponse response;
+    FillLoggingResponse(&response);
+    std::string body;
+    struct_json::to_json(response, body);
+    resp.add_header("Content-Type", "application/json; charset=utf-8");
+    resp.set_status_and_content(coro_http::status_type::ok, std::move(body));
 }
 
 void RealClient::stop_http_server() {

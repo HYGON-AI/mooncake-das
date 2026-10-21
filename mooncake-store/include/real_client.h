@@ -469,6 +469,7 @@ class RealClient : public PyClient {
     async_simple::coro::Lazy<int> probe_dfs_write_rpc();
     std::vector<int> probe_dfs_health() override;
     int set_dfs_access_policy(bool allow_read, bool allow_write) override;
+    int set_service_endpoint(const std::string& endpoint) override;
 
     /**
      * @brief Check if an object exists
@@ -1224,6 +1225,10 @@ class RealClient : public PyClient {
     std::unique_ptr<coro_http::coro_http_server> http_server_;
     int start_http_server(int port);
     void stop_http_server();
+    void handle_get_logging(coro_http::coro_http_request& req,
+                            coro_http::coro_http_response& resp);
+    void handle_update_logging(coro_http::coro_http_request& req,
+                               coro_http::coro_http_response& resp);
 
     void handle_ipc_shm_register(UdsConnection &connection);
     void handle_ipc_shm_fd_request(UdsConnection &connection);

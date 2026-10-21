@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <limits>
@@ -28,6 +29,8 @@
 
 #include "tenant_quota_policy_store.h"
 #include "storage/distributed/dfs_allocator_interface.h"
+#include "storage/distributed/dfs_root_identity.h"
+#include "storage/distributed/fs_adapter.h"
 #include "types.h"
 #include "utils.h"
 
@@ -1639,6 +1642,8 @@ const std::vector<std::string>& DfsBucketEvictionMetricNames() {
     static const std::vector<std::string> names = {
         "master_dfs_bucket_eviction_attempts_total",
         "master_dfs_bucket_evictions_total",
+        "master_dfs_bucket_low_utilization_eviction_attempts_total",
+        "master_dfs_bucket_low_utilization_evictions_total",
         "master_dfs_bucket_evicted_replicas_total",
         "master_dfs_bucket_evicted_bytes_total",
         "master_attempted_evictions_total",
@@ -1663,7 +1668,7 @@ DfsBucketEvictionMetrics CaptureDfsBucketEvictionMetrics() {
     const auto serialized = MasterMetricManager::instance().serialize_metrics();
     DfsBucketEvictionMetrics metrics;
     const auto& names = DfsBucketEvictionMetricNames();
-    for (size_t i = 0; i < 4; ++i) {
+    for (size_t i = 0; i < 6; ++i) {
         const auto& name = names[i];
         const auto value = ReadPrometheusCounter(serialized, name);
         EXPECT_TRUE(value.has_value()) << "missing metric " << name;
@@ -1673,18 +1678,18 @@ DfsBucketEvictionMetrics CaptureDfsBucketEvictionMetrics() {
     // Read legacy counters through getters because not all of their series are
     // exported. Keep checking their values without changing their export.
     auto& manager = MasterMetricManager::instance();
-    metrics.emplace(names[4], manager.get_eviction_attempts());
-    metrics.emplace(names[5], manager.get_eviction_success());
-    metrics.emplace(names[6], manager.get_evicted_key_count());
-    metrics.emplace(names[7], manager.get_evicted_size());
-    metrics.emplace(names[8], manager.get_mem_eviction_attempts());
-    metrics.emplace(names[9], manager.get_mem_eviction_success());
-    metrics.emplace(names[10], manager.get_mem_evicted_key_count());
-    metrics.emplace(names[11], manager.get_mem_evicted_size());
-    metrics.emplace(names[12], manager.get_nof_eviction_attempts());
-    metrics.emplace(names[13], manager.get_nof_eviction_success());
-    metrics.emplace(names[14], manager.get_nof_evicted_key_count());
-    metrics.emplace(names[15], manager.get_nof_evicted_size());
+    metrics.emplace(names[6], manager.get_eviction_attempts());
+    metrics.emplace(names[7], manager.get_eviction_success());
+    metrics.emplace(names[8], manager.get_evicted_key_count());
+    metrics.emplace(names[9], manager.get_evicted_size());
+    metrics.emplace(names[10], manager.get_mem_eviction_attempts());
+    metrics.emplace(names[11], manager.get_mem_eviction_success());
+    metrics.emplace(names[12], manager.get_mem_evicted_key_count());
+    metrics.emplace(names[13], manager.get_mem_evicted_size());
+    metrics.emplace(names[14], manager.get_nof_eviction_attempts());
+    metrics.emplace(names[15], manager.get_nof_eviction_success());
+    metrics.emplace(names[16], manager.get_nof_evicted_key_count());
+    metrics.emplace(names[17], manager.get_nof_evicted_size());
     return metrics;
 }
 
@@ -2132,6 +2137,72 @@ TEST_F(MasterServiceTest, DfsRootIdentityRetriesAfterRootBecomesAvailable) {
         ASSERT_TRUE(service.UsesDfsBucketAllocator());
         EXPECT_EQ(storage->dfs_fsdir, root);
         EXPECT_FALSE(storage->dfs_root_identity.empty());
+    }
+    std::filesystem::remove_all(root);
+}
+
+TEST_F(MasterServiceTest, DfsRootGuardRecreatesMissingFilesWithPinnedContents) {
+    const auto root = MakeDfsTestRoot("root_guard_recreates_files");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
+                                "1");
+    {
+        MasterService service;
+        auto storage = service.GetStorageConfig();
+        ASSERT_TRUE(storage.has_value());
+        ASSERT_FALSE(storage->dfs_root_identity.empty());
+
+        const std::string identity_path =
+            root + "/" + kDfsRootIdentityFileName;
+        const std::string marker_path = root + "/" + kDfsRootMarkerFileName;
+        ASSERT_TRUE(std::filesystem::remove(identity_path));
+        ASSERT_TRUE(std::filesystem::remove(marker_path));
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(5);
+        while ((!std::filesystem::exists(identity_path) ||
+                !std::filesystem::exists(marker_path)) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+
+        std::ifstream identity_file(identity_path, std::ios::binary);
+        const std::string restored_identity(
+            (std::istreambuf_iterator<char>(identity_file)),
+            std::istreambuf_iterator<char>());
+        EXPECT_EQ(restored_identity, storage->dfs_root_identity);
+
+        std::ifstream marker_file(marker_path, std::ios::binary);
+        const std::string restored_marker(
+            (std::istreambuf_iterator<char>(marker_file)),
+            std::istreambuf_iterator<char>());
+        EXPECT_EQ(restored_marker, kDfsRootMarkerPayload);
+    }
+    std::filesystem::remove_all(root);
+}
+
+TEST_F(MasterServiceTest, DfsRootGuardDoesNotOverwriteMismatchedIdentity) {
+    const auto root = MakeDfsTestRoot("root_guard_rejects_mismatch");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
+                                "1");
+    const std::string invalid_identity = "not-the-pinned-identity\n";
+    {
+        MasterService service;
+        const std::string identity_path =
+            root + "/" + kDfsRootIdentityFileName;
+        {
+            std::ofstream identity_file(identity_path,
+                                        std::ios::binary | std::ios::trunc);
+            ASSERT_TRUE(identity_file.good());
+            identity_file << invalid_identity;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        std::ifstream identity_file(identity_path, std::ios::binary);
+        const std::string actual((std::istreambuf_iterator<char>(identity_file)),
+                                 std::istreambuf_iterator<char>());
+        EXPECT_EQ(actual, invalid_identity);
     }
     std::filesystem::remove_all(root);
 }
@@ -2743,7 +2814,7 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRemovesWholeBucket) {
         EXPECT_EQ(metrics_after.at("master_dfs_bucket_evicted_bytes_total"),
                   metrics_before.at("master_dfs_bucket_evicted_bytes_total") +
                       200);
-        for (size_t i = 4; i < DfsBucketEvictionMetricNames().size(); ++i) {
+        for (size_t i = 6; i < DfsBucketEvictionMetricNames().size(); ++i) {
             const auto& name = DfsBucketEvictionMetricNames()[i];
             EXPECT_EQ(metrics_after.at(name), metrics_before.at(name)) << name;
         }
@@ -2809,7 +2880,7 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRejectsLeasedBucketWithoutChanges) {
             metrics_before.at("master_dfs_bucket_evicted_replicas_total"));
         EXPECT_EQ(metrics_after.at("master_dfs_bucket_evicted_bytes_total"),
                   metrics_before.at("master_dfs_bucket_evicted_bytes_total"));
-        for (size_t i = 4; i < DfsBucketEvictionMetricNames().size(); ++i) {
+        for (size_t i = 6; i < DfsBucketEvictionMetricNames().size(); ++i) {
             const auto& name = DfsBucketEvictionMetricNames()[i];
             EXPECT_EQ(metrics_after.at(name), metrics_before.at(name)) << name;
         }
@@ -3113,7 +3184,7 @@ TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
         service.ProcessInvalidatedDfsBucketsForTesting();
         const auto metrics_after = CaptureDfsBucketEvictionMetrics();
 
-        for (size_t i = 0; i < 4; ++i) {
+        for (size_t i = 0; i < 6; ++i) {
             const auto& name = DfsBucketEvictionMetricNames()[i];
             EXPECT_EQ(metrics_after.at(name), metrics_before.at(name)) << name;
         }
