@@ -189,7 +189,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_enabled_ = config.eviction_enabled;
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
-    low_utilization_threshold_ = config.low_utilization_threshold;
     eviction_check_interval_ = config.eviction_check_interval;
 
     std::error_code ec;
@@ -1610,8 +1609,7 @@ ImmutableBucketAllocator::TakeRecoveredReplicas() {
 
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEviction() {
-    return PrepareEvictionInternal(/*force_one=*/false,
-                                   low_utilization_threshold_);
+    return PrepareEvictionInternal(/*force_one=*/false);
 }
 
 ImmutableBucketAllocator::PendingEviction

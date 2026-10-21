@@ -488,7 +488,6 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     bool eviction_enabled_ = true;
     double eviction_high_watermark_ = 0.9;
     double eviction_low_watermark_ = 0.7;
-    double low_utilization_threshold_ = 0.05;
     std::chrono::seconds eviction_check_interval_{5};
 
     mutable std::mutex mutex_;
