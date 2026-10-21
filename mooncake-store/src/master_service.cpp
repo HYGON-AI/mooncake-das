@@ -1954,8 +1954,10 @@ tl::expected<uint8_t, ErrorCode> MasterService::SetDfsFilterMode(
     }
     const uint8_t old_value =
         dfs_filter_mode_.exchange(new_filter_mode, std::memory_order_acq_rel);
-    LOG(INFO) << "action=set_dfs_filter_mode, old_value=" << old_value
-              << ", new_value=" << new_filter_mode;
+    LOG(INFO) << "action=set_dfs_filter_mode, old_value="
+              << static_cast<unsigned int>(old_value)
+              << ", new_value="
+              << static_cast<unsigned int>(new_filter_mode);
     return old_value;
 }
 
@@ -5019,7 +5021,7 @@ auto MasterService::PutStartInternal(
                         metadata.put_start_time +
                                 put_start_discard_timeout_sec_ >=
                             now) {
-                        LOG(INFO)
+                        VLOG(1)
                             << "key=" << key << ", info=object_already_exists";
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
