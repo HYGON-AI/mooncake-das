@@ -46,10 +46,18 @@ jobs:
           REPO: ${{ github.repository }}
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_LABEL: ${{ github.event.label.name || '' }}
-          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          # Do not use `head.repo.fork` here: this repository is itself a fork
+          # of kvcache-ai/Mooncake, so that field is true for every pull
+          # request, including same-repository ones.
+          IS_SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
           HAS_CI_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'run-hygon-ci') }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
-          ACTOR: ${{ github.actor }}
+          # `github.actor` stays the actor of the original run when a
+          # maintainer re-runs the workflow; `github.triggering_actor` is the
+          # person who actually asked for this attempt. Authorize the latter,
+          # otherwise the maintainer re-run path can never pass.
+          ACTOR: ${{ github.triggering_actor }}
+          INITIAL_ACTOR: ${{ github.actor }}
         run: |
           set -Eeuo pipefail
           CI_LABEL="run-hygon-ci"
@@ -77,7 +85,11 @@ jobs:
             if [ "${EVENT_LABEL}" = "${CI_LABEL}" ] && is_maintainer; then
               run_ci=true
             fi
-          elif [ "${IS_FORK}" = "true" ]; then
+          elif [ "${IS_SAME_REPO}" = "true" ]; then
+            # Same-repository PRs keep running automatically; only
+            # collaborators with write access can push to those branches.
+            run_ci=true
+          else
             # A fork author pushing new commits must not start a self-hosted
             # run; approval is bound to a maintainer action. Re-running a
             # workflow from the UI is also a maintainer action (and lets a
@@ -86,12 +98,9 @@ jobs:
             if { [ "${HAS_CI_LABEL}" = "true" ] || [ "${RUN_ATTEMPT}" -gt 1 ]; } && is_maintainer; then
               run_ci=true
             fi
-          else
-            # Same-repository PRs keep running automatically.
-            run_ci=true
           fi
 
-          echo "HCU CI requested: ${run_ci} (action=${EVENT_ACTION}, actor=${ACTOR}, fork=${IS_FORK})"
+          echo "HCU CI requested: ${run_ci} (action=${EVENT_ACTION}, actor=${INITIAL_ACTOR}, triggering_actor=${ACTOR}, same_repo=${IS_SAME_REPO})"
           echo "run_ci=${run_ci}" >> "${GITHUB_OUTPUT}"
 
   build-wheels:
@@ -105,7 +114,7 @@ jobs:
         include:
           - dtk_version: "26.10"
             py: "3.12"
-    runs-on: [self-hosted, Linux, X64, hcu, hcu-ci-pr]
+    runs-on: [self-hosted, Linux, X64, hcu1]
     timeout-minutes: 120
     container:
       # DTK is pre-installed in the base image; no DTK download is needed.
@@ -187,7 +196,7 @@ jobs:
   test-te-standard:
     name: TE-Cross-node test standard wheel
     needs: build-wheels
-    runs-on: [self-hosted, Linux, X64, hcu, hcu-ci-pr, bw1100, nmz4]
+    runs-on: [self-hosted, Linux, X64, hcu1]
     timeout-minutes: 30
     env:
       # Same DTK-bundled image as the build job: the test scripts detect
@@ -237,7 +246,7 @@ jobs:
   test-store:
     name: Test Mooncake Store with standard wheel
     needs: test-te-standard
-    runs-on: [self-hosted, Linux, X64, hcu, hcu-ci-pr, bw1100, nmz4]
+    runs-on: [self-hosted, Linux, X64, hcu1]
     timeout-minutes: 45
     env:
       HCU_TEST_IMAGE: "${{ vars.HARBOR_SITE }}/hcu/base/dtk:26.10-ubuntu22.04-py3.12"
