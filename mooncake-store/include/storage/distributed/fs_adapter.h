@@ -161,6 +161,14 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    // Health probes require strict page-cache bypass. Unlike OpenFileDirect,
+    // this operation must never fall back to buffered I/O and must reject
+    // symbolic links.
+    virtual tl::expected<int, ErrorCode> OpenFileDirectStrict(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     /**
      * @brief Scatter-read into `iov` from a handle opened by OpenFileDirect.
      *
@@ -244,10 +252,9 @@ class FileSystemAdapter {
     virtual const char* GetName() const = 0;
 };
 
-// Created by the master when DFS is initialized. Clients use this stable,
-// read-only marker for health probes instead of depending on a client-created
-// probe file. A valid marker is left untouched, which keeps restart safe when
-// the filesystem is full.
+// Created when the DFS allocator initializes and maintained by the master as a
+// stable format/version marker. Read health checks use the two dedicated
+// probe files under .health1 and .health2 instead.
 inline constexpr char kDfsRootMarkerFileName[] = ".mooncake_dfs_root_marker";
 inline constexpr char kDfsRootMarkerPayload[] = "mooncake-dfs-root-v1\n";
 
@@ -262,6 +269,10 @@ inline tl::expected<void, ErrorCode> EnsureDfsRootMarker(
                         sizeof(kDfsRootMarkerPayload) - 1) == 0) {
             return {};
         }
+        // Existing unexpected contents may identify another format or a
+        // damaged root. Never silently replace them during allocator startup.
+        return tl::make_unexpected(read ? ErrorCode::FILE_READ_FAIL
+                                        : read.error());
     } else if (!exists && exists.error() != ErrorCode::FILE_NOT_FOUND) {
         return tl::make_unexpected(exists.error());
     }

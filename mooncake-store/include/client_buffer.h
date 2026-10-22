@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -32,10 +33,13 @@ class ClientBufferAllocator
         size_t size, const std::string& protocol = "",
         bool use_hugepage = false, bool use_spdk_dma = false);
 
-    // Create for shared memory
+    // Create for external memory. An optional owner keeps the backing
+    // allocation alive until this allocator and every outstanding BufferHandle
+    // are gone.
     static std::shared_ptr<ClientBufferAllocator> create(
         void* addr, size_t size, const std::string& protocol = "",
-        void* device_addr = nullptr);
+        void* device_addr = nullptr,
+        std::shared_ptr<void> backing_owner = nullptr);
 
     ~ClientBufferAllocator();
 
@@ -81,6 +85,8 @@ class ClientBufferAllocator
     ClientBufferAllocator(size_t size, const std::string& protocol,
                           bool use_hugepage, bool use_spdk_dma);
 
+    // Declared before allocator_ so the backing outlives allocator teardown.
+    std::shared_ptr<void> backing_owner_;
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
     std::string protocol;

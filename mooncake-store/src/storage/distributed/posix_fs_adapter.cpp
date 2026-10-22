@@ -324,6 +324,24 @@ tl::expected<int, ErrorCode> PosixFsAdapter::OpenFileDirect(
     return fd;
 }
 
+tl::expected<int, ErrorCode> PosixFsAdapter::OpenFileDirectStrict(
+    const std::string& path) {
+#ifdef O_DIRECT
+    const int fd = ::open(path.c_str(),
+                          O_RDONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW);
+#else
+    errno = EOPNOTSUPP;
+    const int fd = -1;
+#endif
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+        }
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    return fd;
+}
+
 PosixFsAdapter::DirectStaging::~DirectStaging() { ::free(ptr); }
 
 PosixFsAdapter::DirectStaging* PosixFsAdapter::AcquireDirectStaging(

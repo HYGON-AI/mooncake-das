@@ -83,13 +83,16 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                 buffer = PinnedBufferPool::AllocatePinned(arena_size);
             }
             if (buffer.pinned_host.addr) {
-                pinned_restore_arena_ = std::move(buffer);
+                pinned_restore_arena_ =
+                    std::make_shared<PinnedBufferPool::Buffer>(
+                        std::move(buffer));
                 pinned_restore_arena_allocator_ = ClientBufferAllocator::create(
-                    pinned_restore_arena_.data, pinned_restore_arena_.capacity,
-                    client->GetProtocol(), pinned_restore_arena_.device_data);
+                    pinned_restore_arena_->data,
+                    pinned_restore_arena_->capacity, client->GetProtocol(),
+                    pinned_restore_arena_->device_data, pinned_restore_arena_);
                 LOG(INFO) << "Initialized pinned SSD restore arena, size="
-                          << pinned_restore_arena_.capacity
-                          << ", mapped=" << pinned_restore_arena_.mapped;
+                          << pinned_restore_arena_->capacity
+                          << ", mapped=" << pinned_restore_arena_->mapped;
             } else {
                 LOG(WARNING) << "Failed to allocate pinned SSD restore arena";
             }
@@ -198,10 +201,12 @@ void FileStorage::InitPinnedPrefetchArena(
                    (!buffer.mapped || buffer.device_data == nullptr)) {
             pinned_prefetch_arena_status_ = "mapped device alias unavailable";
         } else {
-            pinned_prefetch_arena_ = std::move(buffer);
+            pinned_prefetch_arena_ =
+                std::make_shared<PinnedBufferPool::Buffer>(std::move(buffer));
             pinned_prefetch_arena_allocator_ = ClientBufferAllocator::create(
-                pinned_prefetch_arena_.data, pinned_prefetch_arena_.capacity,
-                client->GetProtocol(), pinned_prefetch_arena_.device_data);
+                pinned_prefetch_arena_->data, pinned_prefetch_arena_->capacity,
+                client->GetProtocol(), pinned_prefetch_arena_->device_data,
+                pinned_prefetch_arena_);
             pinned_prefetch_arena_full_free_bytes_ =
                 pinned_prefetch_arena_allocator_->storageReport().totalFreeSpace;
             pinned_prefetch_arena_status_ = "ready";
@@ -216,12 +221,12 @@ void FileStorage::InitPinnedPrefetchArena(
     }
     if (HasPinnedPrefetchArena()) {
         LOG(INFO) << "Initialized pinned DFS prefetch arena, size="
-                  << pinned_prefetch_arena_.capacity
-                  << ", mapped=" << pinned_prefetch_arena_.mapped
+                  << pinned_prefetch_arena_->capacity
+                  << ", mapped=" << pinned_prefetch_arena_->mapped
                   << ", device_alias="
-                  << (pinned_prefetch_arena_.device_data != nullptr)
+                  << (pinned_prefetch_arena_->device_data != nullptr)
                   << ", device_id=" << device_id << ", addr="
-                  << static_cast<void*>(pinned_prefetch_arena_.data);
+                  << static_cast<void*>(pinned_prefetch_arena_->data);
     } else {
         LOG(ERROR) << "Pinned DFS prefetch arena unavailable ("
                    << pinned_prefetch_arena_status_
@@ -249,15 +254,14 @@ bool FileStorage::ReleasePinnedPrefetchArena() {
         if (report.totalFreeSpace != pinned_prefetch_arena_full_free_bytes_) {
             return false;
         }
-    } else if (pinned_prefetch_arena_.capacity != 0 ||
+    } else if (PinnedPrefetchArenaCapacity() != 0 ||
                pinned_prefetch_arena_full_free_bytes_ != 0) {
         return false;
     }
 
-    // The allocator uses external memory; drop it before its pinned backing
-    // buffer so no allocator can outlive the memory it manages.
+    // Outstanding handles also retain the backing through their allocator.
     pinned_prefetch_arena_allocator_.reset();
-    pinned_prefetch_arena_ = PinnedBufferPool::Buffer{};
+    pinned_prefetch_arena_.reset();
     pinned_prefetch_arena_full_free_bytes_ = 0;
     pinned_prefetch_arena_status_ = "disabled";
     return true;

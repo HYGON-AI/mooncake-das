@@ -54,6 +54,8 @@ class PosixFsAdapter : public FileSystemAdapter {
 
     tl::expected<int, ErrorCode> OpenFileDirect(
         const std::string& path) override;
+    tl::expected<int, ErrorCode> OpenFileDirectStrict(
+        const std::string& path) override;
 
     tl::expected<size_t, ErrorCode> DirectReadAt(int fd, iovec* iov, int iovcnt,
                                                  int64_t offset) override;

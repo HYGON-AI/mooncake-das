@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -80,6 +81,12 @@ struct DistributedStorageConfig {
     // (page-cache-bypassing where the adapter supports it, e.g. O_DIRECT on
     // POSIX). When false, reads go through the regular cached handles.
     bool direct_read_enabled = true;
+    // Baseline for the size-scaled DFS BatchGet deadline. Zero disables it.
+    uint64_t batch_get_timeout_ms = 10000;
+    // Bound DFS reads whose filesystem I/O has not actually completed. A
+    // timeout keeps both charges until the background read really returns.
+    uint64_t batch_get_max_inflight_batches = 2;
+    uint64_t batch_get_max_inflight_bytes = 2ULL * 1024 * 1024 * 1024;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
@@ -103,6 +110,10 @@ struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // Owns the allocation addressed by slices. A timed read copies this owner
+    // into its background context so the allocator cannot reuse the memory
+    // before the underlying preadv has really returned.
+    std::shared_ptr<void> buffer_owner;
 };
 
 /**
@@ -112,7 +123,9 @@ struct DfsReadRequest {
  * ObjectStorageAdapter for whole-object offload operations. Does not handle
  * eviction.
  */
-class DistributedStorageBackend : public StorageBackendInterface {
+class DistributedStorageBackend
+    : public StorageBackendInterface,
+      public std::enable_shared_from_this<DistributedStorageBackend> {
    public:
     DistributedStorageBackend(
         const FileStorageConfig& file_storage_config,
@@ -279,7 +292,13 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<tl::expected<void, ErrorCode>> BatchReadShard(
         const std::vector<DfsReadRequest>& requests);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchReadBlocking(
+        const std::vector<DfsReadRequest>& requests);
+
     std::vector<tl::expected<void, ErrorCode>> BatchWriteBucket(
+        const std::vector<DfsWriteRequest>& requests);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchWriteBlocking(
         const std::vector<DfsWriteRequest>& requests);
 
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> GetOrOpenBucket(
@@ -335,6 +354,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const std::vector<DfsReadRequest>& requests,
         std::vector<tl::expected<void, ErrorCode>>& results);
 
+    bool AcquireInflightReadUntil(
+        uint64_t bytes, std::chrono::steady_clock::time_point deadline);
+    void ReleaseInflightRead(uint64_t bytes);
+
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
@@ -345,6 +368,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::string health_probe_path_prefix_;
     std::string active_health_probe_path_;
     uint64_t health_probe_generation_{0};
+    std::atomic<bool> dfs_read_timed_out_{false};
+    mutable std::mutex inflight_read_mutex_;
+    std::condition_variable inflight_read_cv_;
+    uint64_t inflight_read_batches_{0};
+    uint64_t inflight_read_bytes_{0};
     std::mutex health_probe_write_mutex_;
     std::string canonical_root_dir_;
     std::vector<std::unique_ptr<ShardFile>> shard_files_;

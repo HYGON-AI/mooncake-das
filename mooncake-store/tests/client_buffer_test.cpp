@@ -60,6 +60,25 @@ TEST_F(ClientBufferTest, ZeroSizeAllocator) {
     EXPECT_FALSE(handle_opt.has_value());
 }
 
+TEST_F(ClientBufferTest, ExternalBackingOutlivesAllocatorReference) {
+    auto backing = std::make_shared<std::vector<char>>(16384);
+    std::weak_ptr<std::vector<char>> backing_lifetime = backing;
+    auto allocator = ClientBufferAllocator::create(
+        backing->data(), backing->size(), "", nullptr, backing);
+    auto handle = allocator->allocate_aligned(4096, 4096);
+    ASSERT_TRUE(handle.has_value());
+
+    // A timed-out DFS worker retains only its handle after the caller and
+    // FileStorage release their references to the backing and allocator.
+    backing.reset();
+    allocator.reset();
+    EXPECT_FALSE(backing_lifetime.expired());
+    VerifyBufferHandle(*handle, 4096);
+
+    handle.reset();
+    EXPECT_TRUE(backing_lifetime.expired());
+}
+
 #if defined(USE_NOF)
 TEST_F(ClientBufferTest, SpdkDmaAllocatorDestroysWithSpdkFree) {
     constexpr size_t buffer_size = 4096;

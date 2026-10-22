@@ -218,13 +218,17 @@ class Client {
      * @param object_keys Keys of the objects
      * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
+     * @param dfs_buffer_owners Optional owners that keep DFS destination
+     * buffers alive until timed-out filesystem reads actually complete
      * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool prefer_same_node = false,
+        const std::unordered_map<std::string, std::shared_ptr<void>>*
+            dfs_buffer_owners = nullptr);
 
     /**
      * @brief Stores data with replication
@@ -850,7 +854,9 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node);
+        bool prefer_same_node,
+        const std::unordered_map<std::string, std::shared_ptr<void>>*
+            dfs_buffer_owners);
 
     friend class test::DfsBucketClientTest;
 
@@ -993,7 +999,9 @@ class Client {
     void SubmitDfsWriteChunk(std::vector<PutOperation>& ops,
                              const std::vector<size_t>& op_indices,
                              bool is_upsert, bool allow_async,
-                             bool* slot_timed_out = nullptr);
+                             bool* slot_timed_out = nullptr,
+                             std::chrono::steady_clock::time_point deadline =
+                                 std::chrono::steady_clock::time_point::max());
     void FinalizeBatchPut(std::vector<PutOperation>& ops,
                           bool allow_memory_only_fallback);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
@@ -1038,6 +1046,8 @@ class Client {
         std::vector<std::optional<uint64_t>> object_checksums;
         std::shared_ptr<DistributedStorageBackend> backend;
         bool is_upsert = false;
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max();
 
         void ReleaseStagingSlot();
         ~AsyncDfsWriteContext();
@@ -1124,6 +1134,7 @@ class Client {
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
+    const uint64_t dfs_batch_put_timeout_ms_;
     const size_t dfs_write_arena_count_;
     const size_t dfs_write_chunk_size_;
     const std::chrono::milliseconds dfs_write_arena_wait_;

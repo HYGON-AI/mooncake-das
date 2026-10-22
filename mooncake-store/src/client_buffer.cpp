@@ -26,9 +26,12 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
-    void* addr, size_t size, const std::string& protocol, void* device_addr) {
-    return std::shared_ptr<ClientBufferAllocator>(
+    void* addr, size_t size, const std::string& protocol, void* device_addr,
+    std::shared_ptr<void> backing_owner) {
+    auto allocator = std::shared_ptr<ClientBufferAllocator>(
         new ClientBufferAllocator(addr, size, protocol, device_addr));
+    allocator->backing_owner_ = std::move(backing_owner);
+    return allocator;
 }
 
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
