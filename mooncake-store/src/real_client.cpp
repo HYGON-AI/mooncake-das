@@ -78,6 +78,14 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 
 namespace {
+UUID DfsSessionEpoch(const std::vector<Replica::Descriptor> &replicas) {
+    for (const auto &replica : replicas) {
+        if (replica.is_dfs_replica())
+            return replica.get_dfs_descriptor().MasterEpoch();
+    }
+    return {};
+}
+
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 std::atomic<uint64_t> g_dfs_read_trace_id{0};
 
@@ -147,17 +155,6 @@ std::string DirectSourceForReplica(const Replica::Descriptor &replica) {
         return DirectStorageMetricSource(ReplicaType::DFS);
     }
     return "unknown";
-}
-
-uint64_t SumSliceBytes(
-    const std::unordered_map<std::string, std::vector<Slice>> &objects) {
-    uint64_t total = 0;
-    for (const auto &[_, slices] : objects) {
-        for (const auto &slice : slices) {
-            total += slice.size;
-        }
-    }
-    return total;
 }
 
 bool IsHostStoreSegmentProtocol(const std::string &protocol) {
@@ -499,7 +496,8 @@ inline bool SameReplicaForSessionCache(const Replica::Descriptor &lhs,
                left.offset == right.offset &&
                left.object_size == right.object_size &&
                left.aligned_size == right.aligned_size &&
-               left.shard_idx == right.shard_idx;
+               left.shard_idx == right.shard_idx &&
+               left.MasterEpoch() == right.MasterEpoch();
     }
     return false;
 }
@@ -4157,14 +4155,14 @@ RealClient::batch_get_buffer_internal(
         size_t original_index;
         std::string key;
         QueryResult query_result;
-        std::unique_ptr<BufferHandle> buffer_handle;
+        std::shared_ptr<BufferHandle> buffer_handle;
         std::vector<Slice> slices;
     };
     struct DiskKeyOp {
         size_t original_index;
         std::string key;
         QueryResult query_result;
-        std::unique_ptr<BufferHandle> buffer_handle;
+        std::shared_ptr<BufferHandle> buffer_handle;
         uint64_t total_size;
     };
     std::vector<KeyOp> valid_ops;
@@ -4213,7 +4211,7 @@ RealClient::batch_get_buffer_internal(
         }
 
         auto buffer_handle =
-            std::make_unique<BufferHandle>(std::move(*alloc_result));
+            std::make_shared<BufferHandle>(std::move(*alloc_result));
         std::vector<Slice> slices;
         allocateSlices(slices, replica, buffer_handle->ptr());
 
@@ -4269,16 +4267,20 @@ RealClient::batch_get_buffer_internal(
             batch_slices[op.key] = op.slices;
         }
 
-        auto batch_get_results =
-            client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+        std::unordered_map<std::string, std::shared_ptr<void>>
+            batch_buffer_owners;
+        for (const auto &op : valid_ops) {
+            batch_buffer_owners.emplace(op.key, op.buffer_handle);
+        }
+        auto batch_get_results = client_->BatchGet(
+            batch_keys, batch_query_results, batch_slices, false,
+            &batch_buffer_owners);
 
         // 4. Process results and create BufferHandles
         for (size_t i = 0; i < valid_ops.size(); ++i) {
             if (batch_get_results[i]) {
                 auto &op = valid_ops[i];
-                final_results[op.original_index] =
-                    std::make_shared<BufferHandle>(
-                        std::move(*op.buffer_handle));
+                final_results[op.original_index] = op.buffer_handle;
             } else {
                 LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
                            << "': " << toString(batch_get_results[i].error());
@@ -4336,9 +4338,7 @@ RealClient::batch_get_buffer_internal(
                             << "': " << toString(checksum_result.error());
                         continue;
                     }
-                    final_results[op.original_index] =
-                        std::make_shared<BufferHandle>(
-                            std::move(*op.buffer_handle));
+                    final_results[op.original_index] = op.buffer_handle;
                 } else {
                     LOG(ERROR) << "SSD read failed for key '" << key
                                << "': " << toString(read_result.error());
@@ -6222,7 +6222,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         std::vector<QueryResult> disk_batch_qrs;
         std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
         std::vector<size_t> disk_batch_indices;
-        std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
+        std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
             disk_temp_handles;
 
         for (size_t di = 0; di < disk_operations.size(); ++di) {
@@ -6241,7 +6241,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 continue;
             }
             auto handle =
-                std::make_unique<BufferHandle>(std::move(*alloc_result));
+                std::make_shared<BufferHandle>(std::move(*alloc_result));
             std::vector<Slice> disk_slices;
             allocateSlices(disk_slices, replica, handle->ptr());
             disk_batch_keys.push_back(op.key);
@@ -6253,8 +6253,14 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         }
 
         if (!disk_batch_keys.empty()) {
+            std::unordered_map<std::string, std::shared_ptr<void>>
+                disk_buffer_owners;
+            for (const auto &[key, handle] : disk_temp_handles) {
+                disk_buffer_owners.emplace(key, handle);
+            }
             auto disk_results = client_->BatchGet(
-                disk_batch_keys, disk_batch_qrs, disk_batch_slices);
+                disk_batch_keys, disk_batch_qrs, disk_batch_slices, false,
+                &disk_buffer_owners);
 
             for (size_t di = 0; di < disk_batch_indices.size(); ++di) {
                 const auto &key = disk_batch_keys[di];
@@ -7308,6 +7314,25 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         return results;
     }
 
+    // A ReadPlan may have captured DFS sessions before the coordinated health
+    // policy disabled DFS reads. Re-query at the final range-read boundary so
+    // those sessions switch to a complete memory replica instead of entering
+    // the DFS path. Keys without a memory replica remain failed closed.
+    if (!client_->DfsReadAllowed() && !all_get_sessions_memory(keys)) {
+        const auto reselected = batch_get_session_start(keys);
+        if (reselected.size() != keys.size()) {
+            LOG(ERROR) << "ReadPlan session reselection result size mismatch: "
+                       << "expected=" << keys.size()
+                       << ", got=" << reselected.size();
+            return std::vector<int>(
+                keys.size(),
+                static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR)));
+        }
+        for (size_t i = 0; i < reselected.size(); ++i) {
+            if (reselected[i] != 0) results[i] = reselected[i];
+        }
+    }
+
     SessionRangeReadContext context;
     context.timing_start = std::chrono::steady_clock::now();
     context.cache_gc_done = context.timing_start;
@@ -7846,9 +7871,15 @@ void RealClient::execute_session_dfs_range_reads_batch(
     }
     auto t_io_done = std::chrono::steady_clock::now();
     if (!disk_batch_keys.empty()) {
+        std::unordered_map<std::string, std::shared_ptr<void>>
+            disk_buffer_owners;
+        for (const auto &[key, handle] : disk_temp_handles) {
+            disk_buffer_owners.emplace(key, handle);
+        }
         const auto io_start = std::chrono::steady_clock::now();
         auto disk_results = client_->BatchGet(disk_batch_keys, disk_batch_qrs,
-                                              disk_batch_slices);
+                                              disk_batch_slices, false,
+                                              &disk_buffer_owners);
         const double io_duration =
             std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                           io_start)
@@ -8113,6 +8144,7 @@ std::vector<int> RealClient::batch_put_session_start(
     auto start_responses =
         client_->StartBatchPutForSizes(start_keys, start_sizes, start_config);
     std::vector<std::string> keys_to_revoke;
+    std::vector<UUID> revoke_epochs;
     std::vector<std::string> hot_keys_to_remove;
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
@@ -8127,6 +8159,7 @@ std::vector<int> RealClient::batch_put_session_start(
             if (!HasMemoryReplica(replicas)) {
                 hot_keys_to_remove.push_back(keys[i]);
                 keys_to_revoke.push_back(keys[i]);
+                revoke_epochs.push_back(DfsSessionEpoch(replicas));
                 results[i] =
                     static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
                 continue;
@@ -8143,7 +8176,8 @@ std::vector<int> RealClient::batch_put_session_start(
         client_->GetHotCache()->RemoveHotKeys(hot_keys_to_remove);
     }
     if (!keys_to_revoke.empty()) {
-        (void)client_->BatchPutRevoke(keys_to_revoke);
+        (void)client_->BatchPutRevoke(keys_to_revoke, ReplicaType::ALL,
+                                      revoke_epochs);
     }
     return results;
 }
@@ -8266,6 +8300,7 @@ std::vector<int> RealClient::batch_put_session_end(
     // Reliable configs with NoF are rejected at session start.
     std::vector<std::string> end_keys;
     std::vector<size_t> end_indices;
+    std::vector<UUID> end_epochs;
     std::vector<char> has_nof;  // parallel to end_keys
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
@@ -8295,6 +8330,7 @@ std::vector<int> RealClient::batch_put_session_end(
                 continue;
             }
             end_keys.push_back(keys[i]);
+            end_epochs.push_back(DfsSessionEpoch(it->second.replicas));
             end_indices.push_back(i);
             has_nof.push_back(static_cast<char>(nof));
         }
@@ -8321,7 +8357,8 @@ std::vector<int> RealClient::batch_put_session_end(
     for (const auto &key : end_keys) {
         end_metas.emplace_back(ObjectMeta{key, std::nullopt});
     }
-    auto end_responses = client_->BatchPutEnd(end_metas, ReplicaType::MEMORY);
+    auto end_responses =
+        client_->BatchPutEnd(end_metas, ReplicaType::MEMORY, end_epochs);
     if (end_responses.size() != end_keys.size()) {
         // Ambiguous Master state: keep sessions so caller can retry end/revoke.
         for (size_t j = 0; j < end_keys.size(); ++j) {
@@ -8333,6 +8370,7 @@ std::vector<int> RealClient::batch_put_session_end(
 
     std::vector<std::string> nof_revoke_keys;
     std::vector<size_t> nof_revoke_end_indices;
+    std::vector<UUID> nof_revoke_epochs;
     nof_revoke_keys.reserve(end_keys.size());
     nof_revoke_end_indices.reserve(end_keys.size());
     for (size_t j = 0; j < end_keys.size(); ++j) {
@@ -8344,6 +8382,7 @@ std::vector<int> RealClient::batch_put_session_end(
         }
         if (has_nof[j]) {
             nof_revoke_keys.push_back(end_keys[j]);
+            nof_revoke_epochs.push_back(end_epochs[j]);
             nof_revoke_end_indices.push_back(j);
             continue;
         }
@@ -8358,8 +8397,8 @@ std::vector<int> RealClient::batch_put_session_end(
         return results;
     }
 
-    auto nof_revoke_responses =
-        client_->BatchPutRevoke(nof_revoke_keys, ReplicaType::NOF_SSD);
+    auto nof_revoke_responses = client_->BatchPutRevoke(
+        nof_revoke_keys, ReplicaType::NOF_SSD, nof_revoke_epochs);
     if (nof_revoke_responses.size() != nof_revoke_keys.size()) {
         for (size_t k = 0; k < nof_revoke_keys.size(); ++k) {
             const size_t j = nof_revoke_end_indices[k];
@@ -8399,6 +8438,7 @@ std::vector<int> RealClient::batch_put_session_revoke(
 
     std::vector<std::string> revoke_keys;
     std::vector<size_t> revoke_indices;
+    std::vector<UUID> revoke_epochs;
     {
         std::unique_lock<std::mutex> lock(session_mutex_);
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -8410,6 +8450,7 @@ std::vector<int> RealClient::batch_put_session_revoke(
             // Seal session and wait for outstanding range writes before free.
             it->second.writable = false;
             revoke_keys.push_back(keys[i]);
+            revoke_epochs.push_back(DfsSessionEpoch(it->second.replicas));
             revoke_indices.push_back(i);
         }
         if (!revoke_keys.empty()) {
@@ -8434,7 +8475,7 @@ std::vector<int> RealClient::batch_put_session_revoke(
         client_->GetHotCache()->RemoveHotKeys(revoke_keys);
     }
     auto revoke_responses =
-        client_->BatchPutRevoke(revoke_keys, ReplicaType::ALL);
+        client_->BatchPutRevoke(revoke_keys, ReplicaType::ALL, revoke_epochs);
     std::lock_guard<std::mutex> lock(session_mutex_);
     if (revoke_responses.size() != revoke_keys.size()) {
         // Ambiguous Master state: keep sessions so caller can retry revoke.
@@ -8829,7 +8870,7 @@ RealClient::batch_get_into_multi_buffers_internal(
             std::unordered_map<std::string, std::vector<Slice>>
                 disk_batch_slices;
             std::vector<std::string> disk_key_order;
-            std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
+            std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
                 temp_handles;
 
             for (auto &[key, op] : valid_local_disk_ops) {
@@ -8848,7 +8889,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                     continue;
                 }
                 auto handle =
-                    std::make_unique<BufferHandle>(std::move(*alloc_result));
+                    std::make_shared<BufferHandle>(std::move(*alloc_result));
                 std::vector<Slice> disk_slices;
                 allocateSlices(disk_slices, replica, handle->ptr());
                 disk_batch_keys.push_back(key);
@@ -8860,9 +8901,14 @@ RealClient::batch_get_into_multi_buffers_internal(
             }
 
             if (!disk_batch_keys.empty()) {
+                std::unordered_map<std::string, std::shared_ptr<void>>
+                    disk_buffer_owners;
+                for (const auto &[key, handle] : temp_handles) {
+                    disk_buffer_owners.emplace(key, handle);
+                }
                 auto disk_results = client_->BatchGet(
                     disk_batch_keys, disk_batch_qrs, disk_batch_slices,
-                    prefer_alloc_in_same_node);
+                    prefer_alloc_in_same_node, &disk_buffer_owners);
 
                 for (size_t di = 0; di < disk_key_order.size(); ++di) {
                     const auto &key = disk_key_order[di];

@@ -104,7 +104,7 @@ class FileStorage {
     }
 
     [[nodiscard]] size_t PinnedPrefetchArenaCapacity() const {
-        return pinned_prefetch_arena_.capacity;
+        return pinned_prefetch_arena_ ? pinned_prefetch_arena_->capacity : 0;
     }
 
     [[nodiscard]] std::optional<BufferHandle> AllocatePinnedPrefetchBuffer(
@@ -246,9 +246,11 @@ class FileStorage {
     std::string local_rpc_addr_;
     // Pinned memory for GPU staging and SSD/DFS-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
-    PinnedBufferPool::Buffer pinned_restore_arena_;
+    // Allocators also retain the backing so timed-out DFS reads may safely
+    // finish after FileStorage is destroyed.
+    std::shared_ptr<PinnedBufferPool::Buffer> pinned_restore_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
-    PinnedBufferPool::Buffer pinned_prefetch_arena_;
+    std::shared_ptr<PinnedBufferPool::Buffer> pinned_prefetch_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_prefetch_arena_allocator_;
     uint64_t pinned_prefetch_arena_full_free_bytes_{0};
     std::string pinned_prefetch_arena_status_ = "not configured";

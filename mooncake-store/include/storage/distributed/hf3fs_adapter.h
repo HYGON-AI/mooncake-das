@@ -45,6 +45,8 @@ class Hf3fsAdapter : public FileSystemAdapter {
         const std::string& path) override;
     tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
         const std::string& path) override;
+    tl::expected<int, ErrorCode> OpenFileDirectStrict(
+        const std::string& path) override;
 
     tl::expected<void, ErrorCode> CloseFile(int fd) override;
 

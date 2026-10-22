@@ -224,6 +224,13 @@ class MasterService {
         int64_t new_max_bucket_count);
     tl::expected<uint32_t, ErrorCode> SetDfsHeartbeatInterval(
         uint32_t new_interval_seconds);
+
+    // 0 keeps DFS allocation and reads enabled; 1 filters both.
+    uint8_t GetDfsFilterMode() const {
+        return dfs_filter_mode_.load(std::memory_order_acquire);
+    }
+    tl::expected<uint8_t, ErrorCode> SetDfsFilterMode(uint8_t new_filter_mode);
+
     bool UsesDfsBucketAllocator() const {
         return bucket_allocator_.get() != nullptr;
     }
@@ -678,6 +685,13 @@ class MasterService {
         const UUID& dynamic_replication_lease_id = UUID{},
         uint64_t dynamic_replication_version_epoch = 0);
 
+    // Backfill uses the copy lifecycle, including source pinning and timeout
+    // cleanup. The task ID fences stale workers after replacement/retry.
+    tl::expected<CopyStartResponse, ErrorCode> DfsBackfillStart(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, const std::string& src_segment,
+        const UUID& task_id);
+
     tl::expected<void, ErrorCode> CopyEnd(
         const UUID& client_id, const std::string& key,
         const TenantId& tenant_id,
@@ -834,6 +848,10 @@ class MasterService {
     auto GetDfsBucketSnapshot(
         const UUID& client_id, const UUID& last_epoch, uint64_t last_version)
         -> tl::expected<DfsBucketSnapshotResponse, ErrorCode>;
+
+    UUID GetDfsMasterEpoch() const {
+        return bucket_allocator_.get() ? dfs_snapshot_epoch_ : UUID{};
+    }
 
     /**
      * @brief Client polls whether master has requested a full SSD clear
@@ -1038,7 +1056,8 @@ class MasterService {
         const ReplicateConfig& config,
         const std::optional<DistributedFSDescriptor>& preallocated_dfs,
         bool skip_dfs_replica = false,
-        std::optional<ErrorCode> dfs_fallback_reason = std::nullopt)
+        std::optional<ErrorCode> dfs_fallback_reason = std::nullopt,
+        std::optional<bool> dfs_allocation_allowed_snapshot = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // Restore master state
@@ -1726,11 +1745,19 @@ class MasterService {
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
+    struct DfsBackfillState {
+        UUID task_id{};
+        std::chrono::steady_clock::time_point retry_after{};
+    };
+
     struct TenantState {
         TenantQuotaHandle quota_account{nullptr};
         std::unordered_map<std::string, ObjectMetadata> metadata;
         std::unordered_set<std::string> processing_keys;
         std::unordered_map<std::string, ReplicationTask> replication_tasks;
+        // Only failed/degraded DFS writes enter this retry set. Capacity
+        // eviction of a successfully committed replica must not refill it.
+        std::unordered_map<std::string, DfsBackfillState> dfs_backfill;
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
         std::unordered_map<std::string, PromotionCandidate>
@@ -1748,7 +1775,8 @@ class MasterService {
 
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
-                   replication_tasks.empty() && offloading_tasks.empty() &&
+                   replication_tasks.empty() && dfs_backfill.empty() &&
+                   offloading_tasks.empty() &&
                    promotion_tasks.empty() && promotion_candidates.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
@@ -2083,7 +2111,8 @@ class MasterService {
         const std::optional<DistributedFSDescriptor>& preallocated_dfs =
             std::nullopt,
         bool skip_dfs_replica = false,
-        std::optional<ErrorCode>* dfs_allocation_error = nullptr)
+        std::optional<ErrorCode>* dfs_allocation_error = nullptr,
+        std::optional<bool> dfs_allocation_allowed_snapshot = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -2126,11 +2155,23 @@ class MasterService {
         int64_t bucket_id) const;
     // Shard-mode per-key eviction (unchanged behaviour).
     void RunShardDfsEviction();
-    // Re-registers DFS replicas recovered from bucket metadata as COMPLETE so
-    // the master can serve them after startup or allocator recovery.
-    void RestoreRecoveredDfsReplicas(ImmutableBucketAllocator* allocator);
-    void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
+    enum class DfsInitResult {
+        kInitialized,
+        kDisabled,
+        kRetryableFailure,
+        kPermanentFailure,
+    };
+    // Rebuilds allocator state from bucket metadata and, when
+    // `rebuild_metadata` is true, re-registers the recovered DFS replicas as
+    // COMPLETE so a restarted master can serve them. Recovery always runs,
+    // including retry initialization and snapshot mode, because allocator
+    // state is required before allocation, free, or eviction can proceed.
+    void RestoreRecoveredDfsReplicas(bool rebuild_metadata);
+    DfsInitResult InitDfsAllocatorFromEnvironment(
+        const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();
+    void RunDfsBackfill();
+    size_t dfs_backfill_shard_{0};  // owned by the DFS eviction thread
     bool InitializeDfsRootGuard(const std::string& root,
                                 const std::string& identity);
     void ReconcileDfsRootFiles();
@@ -2810,6 +2851,7 @@ class MasterService {
 
     bool use_disk_replica_{false};
     std::atomic<bool> enable_dfs_{false};
+    std::atomic<uint8_t> dfs_filter_mode_{0};
     bool enable_dfs_bucket_recovery_{true};
     bool dfs_restore_from_bucket_metadata_{true};
     double dfs_bucket_low_utilization_threshold_{0.05};
@@ -3014,6 +3056,7 @@ class MasterService {
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
     bool IsReplicaReadable(const Replica& replica) const;
+    bool IsDfsReadFilteredOnly(const ObjectMetadata& metadata) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyInternal(

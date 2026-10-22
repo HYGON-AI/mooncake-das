@@ -1,4 +1,5 @@
 #include "task_manager.h"
+#include <algorithm>
 #include <glog/logging.h>
 #include <msgpack.hpp>
 #include "utils/zstd_util.h"
@@ -28,6 +29,22 @@ size_t ScopedTaskReadAccess::size() const {
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
     const UUID& client_id, TaskType type, const std::string& payload) {
+    if (type == TaskType::DFS_BACKFILL) {
+        // Backfill is best-effort recovery. Include processing tasks so moving
+        // a batch into a blocked executor cannot admit another wave. Normal
+        // tasks retain most capacity; a single-slot configuration can still
+        // make progress when there is no other work.
+        const size_t budget = std::min(
+            {size_t{256},
+             std::max(size_t{1}, manager_->max_total_pending_tasks_ / 4),
+             std::max(size_t{1}, manager_->max_total_processing_tasks_ / 4)});
+        if (manager_->total_pending_tasks_ >= budget ||
+            manager_->total_processing_tasks_ >=
+                budget - manager_->total_pending_tasks_) {
+            // Expected backpressure, not an error to log for every object.
+            return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+        }
+    }
     if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
         LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
                    << manager_->total_pending_tasks_ << "/"

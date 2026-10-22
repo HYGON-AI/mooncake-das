@@ -32,6 +32,10 @@
 
 namespace mooncake {
 
+namespace test {
+class DfsBucketClientTest;
+}
+
 class PutOperation;
 class DistributedStorageBackend;
 class RealClient;
@@ -214,13 +218,17 @@ class Client {
      * @param object_keys Keys of the objects
      * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
+     * @param dfs_buffer_owners Optional owners that keep DFS destination
+     * buffers alive until timed-out filesystem reads actually complete
      * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool prefer_same_node = false,
+        const std::unordered_map<std::string, std::shared_ptr<void>>*
+            dfs_buffer_owners = nullptr);
 
     /**
      * @brief Stores data with replication
@@ -808,10 +816,12 @@ class Client {
     // without touching Client internals. Same RPC path as FinalizeBatchPut.
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const std::vector<ObjectMeta>& object_metas,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::vector<UUID>& dfs_epochs = {});
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::vector<UUID>& dfs_epochs = {});
 
    protected:
     /**
@@ -835,6 +845,21 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    tl::expected<QueryResult, ErrorCode> PrepareDfsReadRetry(
+        const QueryResult& original, const QueryResult& refreshed);
+    tl::expected<void, ErrorCode> GetImpl(const std::string& object_key,
+                                          const QueryResult& query_result,
+                                          std::vector<Slice>& slices);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetImpl(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        bool prefer_same_node,
+        const std::unordered_map<std::string, std::shared_ptr<void>>*
+            dfs_buffer_owners);
+
+    friend class test::DfsBucketClientTest;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -974,8 +999,11 @@ class Client {
     void SubmitDfsWriteChunk(std::vector<PutOperation>& ops,
                              const std::vector<size_t>& op_indices,
                              bool is_upsert, bool allow_async,
-                             bool* slot_timed_out = nullptr);
-    void FinalizeBatchPut(std::vector<PutOperation>& ops);
+                             bool* slot_timed_out = nullptr,
+                             std::chrono::steady_clock::time_point deadline =
+                                 std::chrono::steady_clock::time_point::max());
+    void FinalizeBatchPut(std::vector<PutOperation>& ops,
+                          bool allow_memory_only_fallback);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
@@ -986,7 +1014,8 @@ class Client {
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
         const std::vector<const std::vector<Slice>*>& slice_lists,
-        const std::vector<DistributedFSDescriptor>& descriptors);
+        const std::vector<DistributedFSDescriptor>& descriptors,
+        std::shared_ptr<DistributedStorageBackend> backend = nullptr);
 
     /**
      * @brief Everything one asynchronous DFS write batch needs, owned outright.
@@ -1017,6 +1046,8 @@ class Client {
         std::vector<std::optional<uint64_t>> object_checksums;
         std::shared_ptr<DistributedStorageBackend> backend;
         bool is_upsert = false;
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max();
 
         void ReleaseStagingSlot();
         ~AsyncDfsWriteContext();
@@ -1103,8 +1134,10 @@ class Client {
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
+    const uint64_t dfs_batch_put_timeout_ms_;
     const size_t dfs_write_arena_count_;
     const size_t dfs_write_chunk_size_;
+    const std::chrono::milliseconds dfs_write_arena_wait_;
 
     // Explicitly enabled by the serving application after setup. This reporter
     // has its own thread and cumulative snapshot, independent of local metrics.
@@ -1119,7 +1152,15 @@ class Client {
     std::shared_ptr<DfsWriteStagingPool> dfs_write_staging_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
+    std::string master_dfs_root_dir_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+    // Native memory holders need not attach a foreground DFS backend.
+    std::mutex dfs_backfill_backend_mutex_;
+    std::shared_ptr<DistributedStorageBackend> dfs_backfill_backend_;
+    // Holder-wide I/O backoff, protected by dfs_backfill_backend_mutex_.
+    uint32_t dfs_backfill_failures_{0};
+    std::chrono::steady_clock::time_point dfs_backfill_retry_after_{};
+    UUID dfs_backfill_probe_task_{};
     // Preserve existing behavior for non-SGLang callers. SGLang explicitly
     // installs memory-only immediately after setup and before warmup.
     std::atomic<bool> dfs_read_allowed_{true};
@@ -1166,12 +1207,19 @@ class Client {
 
     void ExecuteTask(const ClientTask& client_task);
 
+    tl::expected<std::shared_ptr<DistributedStorageBackend>, ErrorCode>
+    GetDfsBackfillBackend();
+    bool BeginDfsBackfillAttempt(const UUID& task_id);
+    void FinishDfsBackfillAttempt(const UUID& task_id, ErrorCode result,
+                                 bool storage_failure);
+
     tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
         const std::string& key, const std::string& action_name,
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets);
+        const std::vector<Replica::Descriptor>& targets,
+        std::shared_ptr<DistributedStorageBackend> dfs_backend = nullptr);
 
     /**
      * @brief Copy an object's replica to target segments

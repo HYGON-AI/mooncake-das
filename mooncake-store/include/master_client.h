@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <csignal>
+#include <functional>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -118,8 +119,9 @@ class MasterClient {
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
-        : client_accessor_(GetStoreRpcClientIoContextPool(),
-                           detail::MakeMasterRpcClientPoolConfig()),
+        : client_accessor_(std::make_shared<RpcClientPool>(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig())),
           ha_control_client_accessor_(
               GetStoreRpcClientIoContextPool(),
               detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
@@ -144,8 +146,7 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] ErrorCode Connect(
-        const std::string& master_addr = kDefaultMasterAddress,
-        bool force_recreate = false);
+        const std::string& master_addr = kDefaultMasterAddress);
 
     /**
      * @brief Checks if an object exists
@@ -273,7 +274,8 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
-        const ObjectMeta& object_meta, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -282,7 +284,8 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const std::vector<ObjectMeta>& object_metas,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Revokes a put operation
@@ -291,7 +294,8 @@ class MasterClient {
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -300,7 +304,8 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL);
+        ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
 
     /**
      * @brief Starts an upsert operation (insert or update)
@@ -321,16 +326,19 @@ class MasterClient {
                      const ReplicateConfig& config);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
-        const ObjectMeta& object_meta, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const std::vector<ObjectMeta>& object_metas);
+        const std::vector<ObjectMeta>& object_metas,
+        const UUID& dfs_epoch = {});
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string>& keys, const UUID& dfs_epoch = {});
 
     /**
      * @brief Removes an object and all its replicas
@@ -490,6 +498,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    // Independent of Client/MasterClient lifetime; follows Connect() changes
+    // through the shared pool holder and remains safe during async DFS drain.
+    std::function<tl::expected<UUID, ErrorCode>()> MakeDfsMasterEpochProvider();
+
     [[nodiscard]] tl::expected<DfsBucketSnapshotResponse, ErrorCode>
     GetDfsBucketSnapshot(const UUID& client_id, const UUID& last_epoch,
                          uint64_t last_version);
@@ -589,6 +601,13 @@ class MasterClient {
      * @param key Object key
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode> DfsBackfillStart(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& source, const UUID& task_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DfsBackfillFinish(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& task_id, bool success);
+
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(
         const std::string& key, const std::string& tenant_id);
@@ -767,7 +786,7 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
-    RpcClientPool client_accessor_;
+    std::shared_ptr<RpcClientPool> client_accessor_;
     RpcClientPool ha_control_client_accessor_;
     RpcClientPool ha_probe_client_accessor_;
     RpcDrainGuard rpc_drain_;

@@ -474,7 +474,27 @@ tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFileReadWriteExisting(
     return fd;
 }
 
+tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFileDirectStrict(
+    const std::string& path) {
+#ifdef O_DIRECT
+    const int fd =
+        open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC | O_NOFOLLOW);
+#else
+    errno = EOPNOTSUPP;
+    const int fd = -1;
+#endif
+    if (fd < 0) {
+        return tl::make_unexpected(errno == ENOENT ? ErrorCode::FILE_NOT_FOUND
+                                                   : ErrorCode::FILE_OPEN_FAIL);
+    }
+    if (hf3fs_reg_fd(fd, 0) > 0) {
+        close(fd);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    return fd;
+}
 
+tl::expected<void, ErrorCode> Hf3fsAdapter::CloseFile(int fd) {
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_INVALID_HANDLE);
     hf3fs_dereg_fd(fd);
     if (close(fd) != 0) {

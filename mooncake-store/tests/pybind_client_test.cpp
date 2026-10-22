@@ -256,6 +256,17 @@ TEST_F(RealClientTest, SessionRangesReadDfs) {
     EXPECT_EQ(first, source.substr(127, first.size()));
     EXPECT_EQ(second, source.substr(2048, second.size()));
 
+    // Closing the DFS read policy after session admission must invalidate the
+    // captured DFS choice. The final range-read boundary re-queries replicas;
+    // this DFS-only object therefore fails closed instead of entering DFS.
+    ASSERT_EQ(py_client_->set_dfs_access_policy(false, true), 0);
+    results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data(), second.data()}}, {{first.size(), second.size()}},
+        {{127, 2048}});
+    EXPECT_EQ(results,
+              std::vector<int>{
+                  static_cast<int>(toInt(ErrorCode::INVALID_REPLICA))});
+
     EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
     EXPECT_EQ(py_client_->unregister_buffer(first.data()), 0);
     EXPECT_EQ(py_client_->unregister_buffer(second.data()), 0);

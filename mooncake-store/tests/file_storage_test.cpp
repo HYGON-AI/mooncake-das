@@ -89,7 +89,9 @@ class FileStorageTest : public ::testing::Test {
 
     void SetPinnedPrefetchArena(FileStorage& fileStorage, void* address,
                                 size_t size, void* device_address = nullptr) {
-        fileStorage.pinned_prefetch_arena_.capacity = size;
+        fileStorage.pinned_prefetch_arena_ =
+            std::make_shared<PinnedBufferPool::Buffer>();
+        fileStorage.pinned_prefetch_arena_->capacity = size;
         fileStorage.pinned_prefetch_arena_allocator_ =
             ClientBufferAllocator::create(address, size, "", device_address);
         fileStorage.pinned_prefetch_arena_status_ = "ready";

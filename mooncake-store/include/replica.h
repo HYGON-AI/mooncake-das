@@ -1,6 +1,7 @@
 #pragma once
 
 #include <glog/logging.h>
+#include <ylt/struct_pack/compatible.hpp>
 
 #include <boost/functional/hash.hpp>
 
@@ -247,8 +248,12 @@ struct DistributedFSDescriptor {
     uint64_t object_size = 0;
     uint64_t aligned_size = 0;
     int shard_idx = 0;
+    // Master incarnation that issued this location. Filled on RPC responses,
+    // including recovered locations; it is not the persistent bucket identity.
+    struct_pack::compatible<UUID, 2> master_epoch;
+    UUID MasterEpoch() const { return master_epoch.value_or(UUID{}); }
     YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
-             aligned_size, shard_idx);
+             aligned_size, shard_idx, master_epoch);
 };
 
 struct DfsReplicaData {

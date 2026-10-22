@@ -41,6 +41,68 @@ TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
     EXPECT_EQ(tasks[0].status, TaskStatus::PROCESSING);
 }
 
+TEST_F(ClientTaskManagerTest, BackfillReservesCapacityThroughProcessing) {
+    ClientTaskManager manager({100, 16, 16, 300, 300, 3});
+    const UUID client = generate_uuid();
+    const DfsBackfillPayload backfill{"default", "key", "seg1"};
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_TRUE(manager.get_write_access()
+                        .submit_task_typed<TaskType::DFS_BACKFILL>(client,
+                                                                 backfill));
+    }
+    auto rejected = manager.get_write_access()
+                        .submit_task_typed<TaskType::DFS_BACKFILL>(client,
+                                                                 backfill);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    auto tasks = manager.get_write_access().pop_tasks(client, 16);
+    ASSERT_EQ(tasks.size(), 4u);
+    // Moving work to the executor must not admit another wave of backfills.
+    EXPECT_FALSE(manager.get_write_access()
+                     .submit_task_typed<TaskType::DFS_BACKFILL>(client,
+                                                              backfill));
+    const ReplicaCopyPayload copy{
+        .key = "key", .source = "seg1", .targets = {"seg2"}};
+    EXPECT_TRUE(manager.get_write_access()
+                    .submit_task_typed<TaskType::REPLICA_COPY>(client, copy));
+    for (const auto& task : tasks) {
+        EXPECT_EQ(manager.get_write_access().complete_task(
+                      client, task.id, TaskStatus::SUCCESS, "done"),
+                  ErrorCode::OK);
+    }
+    EXPECT_TRUE(manager.get_write_access()
+                    .submit_task_typed<TaskType::DFS_BACKFILL>(client, backfill));
+}
+
+TEST_F(ClientTaskManagerTest, BackfillBudgetIsCappedAndYieldsToOtherTasks) {
+    ClientTaskManager manager({1000, 10000, 10000, 300, 300, 3});
+    const UUID client = generate_uuid();
+    const ReplicaCopyPayload copy{
+        .key = "key", .source = "seg1", .targets = {"seg2"}};
+    for (int i = 0; i < 256; ++i) {
+        ASSERT_TRUE(manager.get_write_access()
+                        .submit_task_typed<TaskType::REPLICA_COPY>(client, copy));
+    }
+    EXPECT_FALSE(manager.get_write_access()
+                     .submit_task_typed<TaskType::DFS_BACKFILL>(
+                         client, {"default", "key", "seg1"}));
+    EXPECT_TRUE(manager.get_write_access()
+                    .submit_task_typed<TaskType::REPLICA_COPY>(client, copy));
+    manager.get_write_access().clear_all();
+    for (int i = 0; i < 256; ++i) {
+        ASSERT_TRUE(manager.get_write_access()
+                        .submit_task_typed<TaskType::DFS_BACKFILL>(
+                            client, {"default", "key", "seg1"}));
+    }
+    EXPECT_FALSE(manager.get_write_access()
+                     .submit_task_typed<TaskType::DFS_BACKFILL>(
+                         client, {"default", "key", "seg1"}));
+    ClientTaskManager single_slot({100, 1, 1, 300, 300, 3});
+    EXPECT_TRUE(single_slot.get_write_access()
+                    .submit_task_typed<TaskType::DFS_BACKFILL>(
+                        client, {"default", "key", "seg1"}));
+}
+
 TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
     ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();

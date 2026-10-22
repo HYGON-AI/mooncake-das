@@ -66,8 +66,8 @@ struct PersistedBucketMetadata {
     uint64_t capacity = 0;
     uint64_t alignment = 0;
     uint64_t append_offset = 0;
-    // Set when the bucket has been chosen for eviction and its data file is
-    // being deleted. Recovery treats such a bucket as gone rather than live.
+    // Legacy marker: new writes leave this false, but recovery still discards
+    // buckets marked for eviction by older versions.
     bool evicting = false;
     std::vector<PersistedBucketEntry> entries;
     YLT_REFL(PersistedBucketMetadata, version, checksum, bucket_id, capacity,
@@ -111,6 +111,9 @@ enum class BucketEntryState : int32_t {
  *
  * `FlushDirtyMetadata()` performs the deferred writes for every bucket marked
  * dirty. It runs on the master's DFS maintenance tick and at shutdown.
+ * Preparing and committing eviction do not persist a marker or flush metadata.
+ * If deletion is interrupted and both files survive, recovery may restore the
+ * cached entries; they can be evicted again after restart.
  *
  * The accepted failure mode: if the master dies before a bucket is sealed, that
  * bucket has no `.meta` file and recovery deletes its `.data` file, so at most
@@ -251,8 +254,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     /**
      * @brief Freeze an eligible bucket and return its live entries.
      *
-     * When watermark eviction is active, low-utilization buckets are preferred
-     * before falling back to the coldest eligible bucket.
+     * Watermark eviction selects the coldest eligible bucket. The dedicated
+     * low-utilization entry point restricts selection to sparse buckets.
      * Returns an empty transaction when nothing can be evicted.
      */
     PendingEviction PrepareEviction();
@@ -351,8 +354,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // eviction. The latter bypasses only the watermark gate and still observes
     // active/frozen state plus the master's full validation protocol.
     PendingEviction PrepareEvictionInternal(
-        bool force_one, double low_utilization_threshold = -1.0,
-        bool low_utilization_only = false);
+        bool force_one, double low_utilization_threshold = -1.0);
     PendingEviction PrepareInvalidationInternal(int64_t bucket_id);
 
     // Shared implementation of AbortEviction. `demote` distinguishes an
@@ -412,7 +414,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     // Serializes `bucket` into a PersistedBucketMetadata snapshot. Taken under
     // `mutex_`; the file write happens outside it.
-    PersistedBucketMetadata SnapshotLocked(BucketState& bucket, bool evicting);
+    PersistedBucketMetadata SnapshotLocked(BucketState& bucket);
 
     // Overwrites `bucket_id`'s single `.meta` file in place and syncs it.
     tl::expected<void, ErrorCode> PersistMetadata(
