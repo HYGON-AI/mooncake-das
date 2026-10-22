@@ -85,8 +85,8 @@ struct DistributedStorageConfig {
     uint64_t batch_get_timeout_ms = 10000;
     // Bound DFS reads whose filesystem I/O has not actually completed. A
     // timeout keeps both charges until the background read really returns.
-    uint64_t batch_get_max_inflight_batches = 2;
-    uint64_t batch_get_max_inflight_bytes = 2ULL * 1024 * 1024 * 1024;
+    uint64_t batch_get_max_inflight_batches = 8;
+    uint64_t batch_get_max_inflight_bytes = 8ULL * 1024 * 1024 * 1024;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
