@@ -113,8 +113,8 @@ std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
 }
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteChunkSize = 256ULL * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteArenaCount = 2;
+constexpr size_t kDefaultDfsWriteChunkSize = 512ULL * 1024 * 1024;
+constexpr size_t kDefaultDfsWriteArenaCount = 16;
 
 size_t ReadDfsWriteChunkSize() {
     using Variables = FileStorageEnvironmentVariables;
@@ -651,6 +651,9 @@ Client::Client(const std::string& local_hostname,
     }
     LOG(INFO) << "DFS BatchPut timeout baseline: "
               << dfs_batch_put_timeout_ms_ << " ms (0 disables)";
+
+    LOG(INFO) << "DFS write buffer, chunk_size=" << dfs_write_chunk_size_
+              << ", chunk_count=" << dfs_write_arena_count_;
 
     if (metrics_) {
         if (metrics_->GetReportingInterval() > 0) {
