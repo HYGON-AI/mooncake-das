@@ -1270,6 +1270,8 @@ class Client {
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;
+    // Blocking DFS recovery must not occupy COPY/MOVE or unmount workers.
+    ThreadPool dfs_backfill_thread_pool_;
     std::atomic<bool> task_running_{true};
 
     // Task polling configuration

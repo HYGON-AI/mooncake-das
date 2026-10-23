@@ -637,7 +637,8 @@ Client::Client(const std::string& local_hostname,
               "MC_STORE_DFS_PINNED_POOL_BYTES",
               PinnedBufferPool::kDefaultMaxCachedBytes))),
       write_thread_pool_(2),
-      task_thread_pool_(4) {
+      task_thread_pool_(4),
+      dfs_backfill_thread_pool_(1) {
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
@@ -828,6 +829,7 @@ Client::~Client() {
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
     task_thread_pool_.stop();
+    dfs_backfill_thread_pool_.stop();
 
     // Make copies to avoid modifying while iterating
     std::vector<Segment> mounted_segments_copy;
@@ -6189,8 +6191,10 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
     client_task.assignment = assignment;
     client_task.retry_count = 0;
 
-    task_thread_pool_.enqueue(
-        [this, client_task]() { ExecuteTask(client_task); });
+    auto& executor = assignment.type == TaskType::DFS_BACKFILL
+                         ? dfs_backfill_thread_pool_
+                         : task_thread_pool_;
+    executor.enqueue([this, client_task]() { ExecuteTask(client_task); });
 }
 
 tl::expected<std::shared_ptr<DistributedStorageBackend>, ErrorCode>
