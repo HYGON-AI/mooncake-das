@@ -2852,7 +2852,7 @@ class MasterService {
     bool use_disk_replica_{false};
     std::atomic<bool> enable_dfs_{false};
     std::atomic<uint8_t> dfs_filter_mode_{0};
-    bool enable_dfs_bucket_recovery_{true};
+    bool enable_dfs_bucket_recovery_{false};
     bool dfs_restore_from_bucket_metadata_{true};
     double dfs_bucket_low_utilization_threshold_{0.05};
     int dfs_bucket_low_utilization_evictions_per_tick_{1};

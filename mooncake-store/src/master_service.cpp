@@ -610,7 +610,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     enable_dfs_bucket_recovery_ =
-        Environ::GetBool("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", true);
+        Environ::GetBool("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", false);
 
     const bool use_snapshot_backup_dir = !config.snapshot_backup_dir.empty();
     if (config.enable_snapshot || config.enable_snapshot_restore) {

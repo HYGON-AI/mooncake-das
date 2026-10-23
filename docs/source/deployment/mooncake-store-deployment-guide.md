@@ -753,7 +753,7 @@ metadata at startup. To ignore old DFS replicas and reclaim their files:
 
 ```bash
 export MOONCAKE_DFS_ALLOCATOR_TYPE=bucket
-export MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED=false  # default: true
+export MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED=false  # default: false
 export MOONCAKE_DFS_MAX_BUCKET_COUNT=100          # example budget for this run
 ```
 
