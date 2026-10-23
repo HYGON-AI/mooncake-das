@@ -554,10 +554,10 @@ MasterMetricManager::MasterMetricManager()
           "mooncake_master_service_dual_write_total",
           "Foreground dual-replica write outcomes by service endpoint",
           {"service_endpoint", "outcome"}),
-      service_dual_write_pending_(
-          "mooncake_master_service_dual_write_pending",
-          "Foreground dual-replica writes waiting for physical DFS completion",
-          {"service_endpoint"}),
+      service_dual_write_pending_("mooncake_master_service_dual_write_pending",
+                                  "Foreground dual-replica writes awaiting DFS "
+                                  "outcome or write deadline",
+                                  {"service_endpoint"}),
       service_read_failures_total_(
           "mooncake_master_service_read_failures_total",
           "Foreground key transfer failures by selected replica tier",

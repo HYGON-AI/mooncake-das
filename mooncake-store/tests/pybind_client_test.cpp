@@ -3,12 +3,15 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <barrier>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
+#include <future>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
@@ -27,6 +30,8 @@
 #include "read_plan.h"
 #include "pinned_buffer_pool.h"
 #include "real_client.h"
+#include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/posix_fs_adapter.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -111,6 +116,27 @@ TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
     EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
     EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
     EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
+}
+
+TEST(LeaseErrorCodeTest, StageValuesAndStringsRemainDistinct) {
+    const std::vector<std::pair<ErrorCode, std::string>> stages{
+        {ErrorCode::BATCH_GET_LEASE_EXPIRED, "BATCH_GET_LEASE_EXPIRED"},
+        {ErrorCode::SESSION_START_LEASE_EXPIRED, "SESSION_START_LEASE_EXPIRED"},
+        {ErrorCode::SESSION_REFRESH_QUERY_LEASE_EXPIRED,
+         "SESSION_REFRESH_QUERY_LEASE_EXPIRED"},
+        {ErrorCode::SESSION_REFRESH_COMMIT_LEASE_EXPIRED,
+         "SESSION_REFRESH_COMMIT_LEASE_EXPIRED"},
+        {ErrorCode::SESSION_PREFETCH_LEASE_EXPIRED,
+         "SESSION_PREFETCH_LEASE_EXPIRED"},
+        {ErrorCode::SESSION_RANGE_LEASE_EXPIRED, "SESSION_RANGE_LEASE_EXPIRED"},
+        {ErrorCode::SESSION_MEMORY_TRANSFER_LEASE_EXPIRED,
+         "SESSION_MEMORY_TRANSFER_LEASE_EXPIRED"}};
+    EXPECT_EQ(toInt(ErrorCode::LEASE_EXPIRED), -707);
+    EXPECT_EQ(toString(ErrorCode::LEASE_EXPIRED), "LEASE_EXPIRED");
+    for (size_t i = 0; i < stages.size(); ++i) {
+        EXPECT_EQ(toInt(stages[i].first), -715 - static_cast<int>(i));
+        EXPECT_EQ(toString(stages[i].first), stages[i].second);
+    }
 }
 class RealClientTest : public ::testing::Test {
    protected:
@@ -320,6 +346,17 @@ bool PinnedPrefetchMemorySupported() {
            (!kMappedRequired || probe.device_data != nullptr);
 }
 
+class CompletionReadAdapter : public PosixFsAdapter {
+   public:
+    std::function<void()> after_read;
+    tl::expected<size_t, ErrorCode> DirectReadAt(int fd, iovec* iov, int iovcnt,
+                                                 int64_t offset) override {
+        auto result = PosixFsAdapter::DirectReadAt(fd, iov, iovcnt, offset);
+        if (after_read) after_read();
+        return result;
+    }
+};
+
 class RealClientDfsPrefetchTest : public RealClientTest {
    protected:
     // Starts the in-proc master and a DFS-backed client whose DFS root is a
@@ -348,10 +385,34 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         ReplicateConfig config;
         config.replica_num = 1;
         config.dfs_replica_num = 1;
+        std::chrono::steady_clock::time_point read_lease_deadline{};
         for (size_t i = 0; i < keys.size(); ++i) {
             sources_.push_back(DfsPrefetchSource(i + 1));
             ASSERT_EQ(py_client_->put(keys[i], sources_[i], config), 0);
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            bool complete = false;
+            do {
+                const auto query = py_client_->client_->Query(keys[i]);
+                if (query)
+                    read_lease_deadline = std::chrono::steady_clock::now() +
+                                          std::chrono::seconds(1);
+                complete =
+                    query &&
+                    std::any_of(query->replicas.begin(), query->replicas.end(),
+                                [](const auto& replica) {
+                                    return replica.is_dfs_replica() &&
+                                           replica.status ==
+                                               ReplicaStatus::COMPLETE;
+                                });
+                if (!complete)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            } while (!complete && std::chrono::steady_clock::now() < deadline);
+            ASSERT_TRUE(complete);
         }
+        // Polling async BUCKET publication grants a read lease; clear after it.
+        std::this_thread::sleep_until(read_lease_deadline +
+                                      std::chrono::milliseconds(1));
         ASSERT_EQ(py_client_->batch_replica_clear(keys, client_address).size(),
                   keys.size());
         for (const auto& key : keys) {
@@ -403,9 +464,348 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         return static_cast<int>(toInt(ErrorCode::NO_AVAILABLE_HANDLE));
     }
 
+    void InstallBucketReadHook(std::function<void()> hook,
+                               uint64_t read_timeout_ms = 10000) {
+        FileStorageConfig file_config;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        file_config.storage_filepath = ssd_path_;
+        DistributedStorageConfig config;
+        config.fsdir = ssd_path_;
+        config.allocator_type = DfsAllocatorType::BUCKET;
+        config.fs_adapter_type = "posix";
+        config.batch_get_timeout_ms = read_timeout_ms;
+        auto adapter = std::make_unique<CompletionReadAdapter>();
+        adapter->after_read = std::move(hook);
+        auto backend = std::make_shared<DistributedStorageBackend>(
+            file_config, config, std::move(adapter),
+            py_client_->client_->GetDfsRootIdentity());
+        ASSERT_TRUE(backend->Init());
+        py_client_->client_->SetDfsStorageBackend(std::move(backend));
+    }
+
+    void SetSessionDeadline(const std::string& key,
+                            std::chrono::steady_clock::time_point deadline) {
+        std::lock_guard<std::mutex> lock(py_client_->session_mutex_);
+        const auto snapshot = py_client_->get_sessions_.at(key);
+        py_client_->get_sessions_.erase(key);
+        py_client_->get_sessions_.emplace(
+            key, QueryResult(std::vector(snapshot.replicas), deadline,
+                             snapshot.object_checksum));
+    }
+
+    void ExpectArenaReleased() {
+        // Timed DFS workers can briefly retain an owner after signaling
+        // success.
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        const auto capacity =
+            py_client_->file_storage_->PinnedPrefetchArenaCapacity();
+        while (py_client_->file_storage_->PinnedPrefetchArenaReport()
+                       .totalFreeSpace != capacity &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        EXPECT_EQ(py_client_->file_storage_->PinnedPrefetchArenaReport()
+                      .totalFreeSpace,
+                  capacity);
+    }
+
     std::optional<ScopedEnvVar> dfs_root_;
     std::vector<std::string> sources_;
 };
+
+// CPU tests exercise ownership and host copies; this does not simulate DMA.
+class CpuPrefetchDevice : public device::AcceleratorDevice {
+   public:
+    bool enabled = false;
+    device::AcceleratorVendor Vendor() const override {
+        return device::AcceleratorVendor::kSunrise;
+    }
+    bool Available(bool = false) const override { return enabled; }
+    device::PointerInfo QueryPointer(const void*) const override {
+        return {device::MemoryKind::kHost, -1};
+    }
+    int32_t CurrentDeviceId() const override { return -1; }
+    void SetContext(int32_t) const override {}
+    bool Copy(void* dst, const void* src, size_t size,
+              device::CopyDirection) const override {
+        std::memcpy(dst, src, size);
+        return true;
+    }
+    PinnedHostBuffer AllocatePinnedHost(size_t size) const override {
+        void* ptr = nullptr;
+        if (posix_memalign(&ptr, 4096, size) != 0) return {};
+        return {ptr, size, std::free};
+    }
+};
+CpuPrefetchDevice cpu_prefetch_device;
+
+class RealClientLeasePrefetchTest : public RealClientDfsPrefetchTest {
+   protected:
+    void SetUp() override {
+        if (!PinnedPrefetchMemorySupported()) {
+            previous_device_ = device::GetAcceleratorRegistry().GetDevice(
+                device::AcceleratorVendor::kSunrise);
+            cpu_prefetch_device.enabled = true;
+            device::AcceleratorDeviceRegistrar registration(
+                cpu_prefetch_device);
+            device::GetAcceleratorRegistry().RuntimeAccelerators(true);
+            simulated_ = true;
+        }
+        RealClientDfsPrefetchTest::SetUp();
+    }
+    void TearDown() override {
+        RealClientDfsPrefetchTest::TearDown();
+        if (simulated_) {
+            cpu_prefetch_device.enabled = false;
+            if (previous_device_) {
+                device::AcceleratorDeviceRegistrar registration(
+                    *previous_device_);
+            }
+            device::GetAcceleratorRegistry().RuntimeAccelerators(true);
+        }
+    }
+    bool simulated_ = false;
+    const device::AcceleratorDevice* previous_device_ = nullptr;
+};
+
+TEST_F(RealClientLeasePrefetchTest,
+       BucketPrefetchKeepsCacheAcrossLeaseDeadline) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+                                "4096");
+    const std::vector<std::string> keys{"prefetch_crosses_lease"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17835", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
+    SetSessionDeadline(keys[0], std::chrono::steady_clock::time_point::max());
+    ASSERT_NO_FATAL_FAILURE(InstallBucketReadHook([this, key = keys[0]] {
+        // Entry validation has already succeeded. Expire the session at the
+        // read-completion boundary without relying on a scheduling window.
+        SetSessionDeadline(key, std::chrono::steady_clock::now());
+    }));
+    EXPECT_EQ(py_client_->batch_get_session_prefetch(keys),
+              std::vector<int>{0});
+    ASSERT_EQ(py_client_->get_sessions_.count(keys[0]), 1u);
+    EXPECT_TRUE(py_client_->get_sessions_.at(keys[0]).IsLeaseExpired());
+    ASSERT_EQ(py_client_->get_session_prefetch_cache_.count(keys[0]), 1u);
+    auto handle =
+        py_client_->get_session_prefetch_cache_.at(keys[0]).buffer_handle;
+    ASSERT_TRUE(handle && handle->ptr());
+    EXPECT_EQ(
+        std::memcmp(handle->ptr(), sources_[0].data(), sources_[0].size()), 0);
+
+    // Existing range-entry expiry remains enforced; refresh first to reuse
+    // bytes.
+    ASSERT_EQ(py_client_->batch_get_session_refresh(keys), std::vector<int>{0});
+    EXPECT_EQ(py_client_->get_session_prefetch_cache_.at(keys[0]).buffer_handle,
+              handle);
+    ExpectRead(keys[0], 0, 128, /*cache_only=*/true);
+    handle.reset();
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
+    ExpectArenaReleased();
+}
+
+TEST_F(RealClientLeasePrefetchTest,
+       BucketPrefetchRejectsRetiredOrChangedSession) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+                                "4096");
+    const std::vector<std::string> keys{"prefetch_invalid_session"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17836", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    for (bool retire : {true, false}) {
+        SCOPED_TRACE(retire);
+        ASSERT_EQ(py_client_->batch_get_session_start(keys),
+                  std::vector<int>{0});
+        ASSERT_NO_FATAL_FAILURE(InstallBucketReadHook([&, retire] {
+            if (retire) {
+                py_client_->batch_get_session_end(keys);
+            } else {
+                std::lock_guard<std::mutex> lock(py_client_->session_mutex_);
+                const auto snapshot = py_client_->get_sessions_.at(keys[0]);
+                auto replicas = snapshot.replicas;
+                replicas[0].get_dfs_descriptor().offset += 4096;
+                py_client_->get_sessions_.erase(keys[0]);
+                py_client_->get_sessions_.emplace(
+                    keys[0],
+                    QueryResult(std::move(replicas), snapshot.lease_timeout,
+                                snapshot.object_checksum));
+            }
+        }));
+        EXPECT_EQ(py_client_->batch_get_session_prefetch(keys),
+                  std::vector<int>{toInt(retire ? ErrorCode::INVALID_PARAMS
+                                                : ErrorCode::INVALID_REPLICA)});
+        EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+        ExpectArenaReleased();
+    }
+}
+
+TEST_F(RealClientLeasePrefetchTest,
+       PrefetchEntryRejectsExpiredLeaseAndInvalidBuffer) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES",
+                                "4096");
+    const std::vector<std::string> keys{"prefetch_expired_entry"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17837", keys));
+    ASSERT_NO_FATAL_FAILURE(RequirePrefetchArena());
+    if (IsSkipped()) return;
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
+    ASSERT_EQ(py_client_->batch_get_session_prefetch(keys),
+              std::vector<int>{0});
+    SetSessionDeadline(keys[0], std::chrono::steady_clock::now());
+    EXPECT_EQ(
+        py_client_->batch_get_session_prefetch(keys),
+        std::vector<int>{toInt(ErrorCode::SESSION_PREFETCH_LEASE_EXPIRED)});
+    EXPECT_TRUE(py_client_->get_sessions_.empty());
+    EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
+    ExpectArenaReleased();
+
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
+    auto invalid = py_client_->AllocatePrefetchArenaRegion(1024, 4096);
+    ASSERT_TRUE(invalid);
+    py_client_->get_session_prefetch_cache_.emplace(
+        keys[0], PrefetchedSessionBuffer{std::move(invalid), 4096});
+    EXPECT_EQ(py_client_->batch_get_session_prefetch(keys),
+              std::vector<int>{NoAvailableHandle()});
+    EXPECT_TRUE(py_client_->get_session_prefetch_cache_.empty());
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+}
+
+TEST_F(RealClientDfsPrefetchTest, DfsBatchGetIntoPreservesDuplicateTargets) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
+    const std::vector<std::string> keys{"dfs_into_duplicates"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17838", keys));
+    std::vector<std::string> outputs(2, std::string(sources_[0].size(), '?'));
+    for (auto& output : outputs) {
+        ASSERT_EQ(py_client_->register_buffer(output.data(), output.size()), 0);
+    }
+    const auto results = py_client_->batch_get_into(
+        {keys[0], keys[0]}, {outputs[0].data(), outputs[1].data()},
+        {outputs[0].size(), outputs[1].size()});
+    EXPECT_EQ(results, std::vector<int64_t>(2, sources_[0].size()));
+    EXPECT_EQ(outputs[0], sources_[0]);
+    EXPECT_EQ(outputs[1], sources_[0]);
+    for (auto& output : outputs) {
+        EXPECT_EQ(py_client_->unregister_buffer(output.data()), 0);
+    }
+}
+
+TEST_F(RealClientDfsPrefetchTest, DfsSessionRangesPreserveDuplicateRequests) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
+    const std::vector<std::string> keys{"dfs_range_duplicates"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17839", keys));
+    ASSERT_EQ(py_client_->batch_get_session_start(keys), std::vector<int>{0});
+    SetSessionDeadline(keys[0], std::chrono::steady_clock::time_point::max());
+    std::vector<std::string> outputs{std::string(512, '?'),
+                                     std::string(333, '?'),
+                                     std::string(777, '?')};
+    for (auto& output : outputs) {
+        ASSERT_EQ(py_client_->register_buffer(output.data(), output.size()), 0);
+    }
+    // The invalid middle operation must not shift the two valid requests.
+    const auto results = py_client_->batch_get_into_multi_buffer_ranges(
+        {keys[0], keys[0], keys[0]},
+        {{outputs[0].data()}, {outputs[1].data()}, {outputs[2].data()}},
+        {{outputs[0].size()}, {outputs[1].size()}, {outputs[2].size()}},
+        {{127}, {sources_[0].size()}, {2048}});
+    EXPECT_EQ(results,
+              (std::vector<int>{512, toInt(ErrorCode::INVALID_PARAMS), 777}));
+    EXPECT_EQ(outputs[0], sources_[0].substr(127, 512));
+    EXPECT_EQ(outputs[1], std::string(333, '?'));
+    EXPECT_EQ(outputs[2], sources_[0].substr(2048, 777));
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    for (auto& output : outputs) {
+        EXPECT_EQ(py_client_->unregister_buffer(output.data()), 0);
+    }
+}
+
+TEST_F(RealClientDfsPrefetchTest, DuplicateDfsTimeoutKeepsTemporaryBuffersAlive) {
+    DfsPrefetchTestEnv dfs_env;
+    ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
+    ScopedEnvVar timeout("MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS", "100");
+    const std::vector<std::string> keys{"dfs_duplicate_timeout"};
+    ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17840", keys));
+    // Ordinary reads, duplicate ranges in one chunk, then one range per chunk.
+    for (int chunk_size : {0, 8192, 4096}) {
+        SCOPED_TRACE(chunk_size);
+        const auto chunk_bytes =
+            std::to_string(chunk_size == 0 ? 8192 : chunk_size);
+        ScopedEnvVar restore_chunk("MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES",
+                                   chunk_bytes.c_str());
+        std::vector<std::string> outputs(2, std::string(sources_[0].size(), '?'));
+        for (auto& output : outputs) {
+            ASSERT_EQ(py_client_->register_buffer(output.data(), output.size()),
+                      0);
+        }
+        // A destroyed promise also wakes wait(), so a fatal assertion cannot
+        // strand the worker and deadlock fixture teardown.
+        std::promise<void> release;
+        auto released = release.get_future().share();
+        auto reads = std::make_shared<std::atomic<size_t>>(0);
+        ASSERT_NO_FATAL_FAILURE(InstallBucketReadHook(
+            [released, reads] {
+                ++*reads;
+                released.wait();
+            },
+            100));
+        const auto free_before =
+            py_client_->client_buffer_allocator_->storageReport().totalFreeSpace;
+        std::vector<int64_t> results;
+        if (chunk_size != 0) {
+            ASSERT_EQ(py_client_->batch_get_session_start(keys),
+                      std::vector<int>{0});
+            SetSessionDeadline(keys[0],
+                               std::chrono::steady_clock::time_point::max());
+            auto range_results = py_client_->batch_get_into_multi_buffer_ranges(
+                {keys[0], keys[0]}, {{outputs[0].data()}, {outputs[1].data()}},
+                {{outputs[0].size()}, {outputs[1].size()}}, {{0}, {0}});
+            results.assign(range_results.begin(), range_results.end());
+        } else {
+            results = py_client_->batch_get_into(
+                {keys[0], keys[0]}, {outputs[0].data(), outputs[1].data()},
+                {outputs[0].size(), outputs[1].size()});
+        }
+        EXPECT_EQ(results, std::vector<int64_t>(
+                               2, toInt(ErrorCode::DFS_BATCH_GET_TIMEOUT)));
+        EXPECT_GE(reads->load(), 1u);
+        const size_t live_objects = chunk_size == 4096 ? 1 : 2;
+        EXPECT_LE(py_client_->client_buffer_allocator_->storageReport()
+                      .totalFreeSpace,
+                  free_before - live_objects * sources_[0].size());
+        release.set_value();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (py_client_->client_buffer_allocator_->storageReport()
+                       .totalFreeSpace != free_before &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        EXPECT_EQ(py_client_->client_buffer_allocator_->storageReport()
+                      .totalFreeSpace,
+                  free_before);
+        if (chunk_size == 4096) {
+            // A timeout in the first chunk must skip the remaining chunk.
+            EXPECT_EQ(reads->load(), 1u);
+        }
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+        for (auto& output : outputs) {
+            EXPECT_EQ(output, std::string(sources_[0].size(), '?'));
+            EXPECT_EQ(py_client_->unregister_buffer(output.data()), 0);
+        }
+    }
+}
 
 TEST_F(RealClientDfsPrefetchTest, FailsWithoutArenaAndOrdinaryReadWorks) {
     DfsPrefetchTestEnv dfs_env;
@@ -2176,6 +2576,60 @@ TEST_F(RealClientTest, TestPutSessionEndCompletesMemoryReplica) {
     ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
 }
 
+TEST_F(RealClientTest, SessionStartAndRefreshReportTheirLeaseStages) {
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(0).build()));
+    ASSERT_EQ(py_client_->setup_real("localhost:17838", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024, "tcp",
+                                     "", master_.master_address()),
+              0);
+    const std::string key = "session_stage_expiry";
+    ASSERT_EQ(py_client_->put(key, std::string(128, 'S')), 0);
+    EXPECT_EQ(py_client_->batch_get_session_start({key}),
+              std::vector<int>{toInt(ErrorCode::SESSION_START_LEASE_EXPIRED)});
+    EXPECT_TRUE(py_client_->get_sessions_.empty());
+
+    auto query = py_client_->client_->Query(key);
+    ASSERT_TRUE(query);
+    py_client_->get_sessions_.emplace(key, *query);
+    EXPECT_EQ(py_client_->batch_get_session_refresh({key}),
+              std::vector<int>{
+                  toInt(ErrorCode::SESSION_REFRESH_QUERY_LEASE_EXPIRED)});
+    EXPECT_TRUE(py_client_->get_sessions_.empty());
+}
+
+TEST_F(RealClientTest, SessionMemoryCompletionStillExpiresAndRecordsFailure) {
+    ScopedEnvVar metrics("MC_STORE_CLIENT_METRIC", "1");
+    StartMasterAndSetupClient();
+    const std::string key = "session_memory_completion_expiry";
+    const std::string source(128, 'M');
+    std::string destination(source.size(), '\0');
+    ASSERT_EQ(py_client_->put(key, source), 0);
+    ASSERT_EQ(
+        py_client_->register_buffer(destination.data(), destination.size()), 0);
+    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
+    std::vector<int> results{0};
+    SessionRangeReadContext context;
+    context.record_access = true;
+    auto requests = py_client_->prepare_session_range_read_requests(
+        {key}, {{destination.data()}}, {{destination.size()}}, {{0}}, results,
+        context);
+    ASSERT_EQ(requests.size(), 1u);
+    requests[0].lease_deadline = std::chrono::steady_clock::now();
+    py_client_->execute_session_memory_range_reads(requests, results);
+    EXPECT_EQ(results, std::vector<int>{toInt(
+                           ErrorCode::SESSION_MEMORY_TRANSFER_LEASE_EXPIRED)});
+    EXPECT_EQ(destination, source);
+    EXPECT_TRUE(py_client_->get_sessions_.empty());
+    py_client_->record_session_range_accesses({key}, {{destination.data()}},
+                                              {{destination.size()}}, {{0}},
+                                              results, context);
+    ASSERT_EQ(py_client_->get_session_access_records_.count(key), 1u);
+    EXPECT_FALSE(py_client_->get_session_access_records_.at(key).success);
+    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+}
+
 // Lease expire on get ranges must drop the cached get session.
 TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
     ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
@@ -2197,7 +2651,8 @@ TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
         0);
 
     constexpr size_t kSize = 128;
-    const int kLeaseExpired = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+    const int kLeaseExpired =
+        static_cast<int>(toInt(ErrorCode::SESSION_RANGE_LEASE_EXPIRED));
     const int kInvalidParams =
         static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
 
@@ -2222,7 +2677,8 @@ TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
         keys, {{dst.data()}}, {{kSize}}, {{0}});
     ASSERT_EQ(expired.size(), 1);
     EXPECT_EQ(expired[0], kLeaseExpired)
-        << "get ranges after lease ttl should return LEASE_EXPIRED";
+        << "get ranges after lease ttl should return "
+           "SESSION_RANGE_LEASE_EXPIRED";
 
     // Session must have been erased: next ranges sees no session.
     auto again = py_client_->batch_get_into_multi_buffer_ranges(
@@ -2236,8 +2692,9 @@ TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
 
     auto metrics = py_client_->client_->SerializeMetrics();
     ASSERT_TRUE(metrics.has_value());
-    EXPECT_NE(metrics.value().find("mooncake_direct_access_total{source="
-                                   "\"memory\",result=\"failure\"}"),
+    EXPECT_NE(metrics.value().find(
+                  "mooncake_direct_access_total{client_mode=\"real\",source="
+                  "\"memory\",result=\"failure\"}"),
               std::string::npos)
         << "the first range lease expiry must be counted as a direct access "
            "failure";
@@ -3344,6 +3801,65 @@ TEST_F(RealClientTest, PutBatchThenBatchGetBuffer) {
                   *expected[i])
             << "Data mismatch for key " << keys[i];
     }
+}
+
+TEST_F(RealClientTest, BatchGetBufferSupportsDuplicateKeys) {
+    StartMasterAndSetupClient();
+
+    const std::string key = "batch_get_duplicate_key";
+    const std::string value = "duplicate-key-value";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(
+                  key, std::span<const char>(value.data(), value.size()),
+                  config),
+              0);
+
+    auto handles = py_client_->batch_get_buffer({key, key});
+    ASSERT_EQ(handles.size(), 2u);
+    ASSERT_NE(handles[0], nullptr);
+    ASSERT_NE(handles[1], nullptr);
+    EXPECT_NE(handles[0]->ptr(), handles[1]->ptr());
+    for (const auto &handle : handles) {
+        EXPECT_EQ(std::string(static_cast<const char *>(handle->ptr()),
+                              handle->size()),
+                  value);
+    }
+}
+
+TEST_F(RealClientTest, BatchGetIntoSupportsDuplicateKeys) {
+    StartMasterAndSetupClient();
+
+    const std::string key = "batch_get_into_duplicate_key";
+    const std::string value = "duplicate-key-into-value";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(
+                  key, std::span<const char>(value.data(), value.size()),
+                  config),
+              0);
+
+    auto first_result =
+        py_client_->client_buffer_allocator_->allocate(value.size());
+    auto second_result =
+        py_client_->client_buffer_allocator_->allocate(value.size());
+    ASSERT_TRUE(first_result.has_value());
+    ASSERT_TRUE(second_result.has_value());
+    BufferHandle first = std::move(*first_result);
+    BufferHandle second = std::move(*second_result);
+    std::memset(first.ptr(), 0, first.size());
+    std::memset(second.ptr(), 0, second.size());
+
+    auto results = py_client_->batch_get_into(
+        {key, key}, {first.ptr(), second.ptr()}, {first.size(), second.size()});
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(results[0], static_cast<int64_t>(value.size()));
+    EXPECT_EQ(results[1], static_cast<int64_t>(value.size()));
+    EXPECT_EQ(std::string(static_cast<const char *>(first.ptr()), first.size()),
+              value);
+    EXPECT_EQ(
+        std::string(static_cast<const char *>(second.ptr()), second.size()),
+        value);
 }
 
 // ===================== HealthCheck Tests =====================

@@ -59,7 +59,7 @@ struct DistributedStorageConfig {
     uint64_t bucket_capacity = 256ULL * 1024 * 1024;
     // When false, retain old bucket files without recovering their replicas.
     // max_bucket_count then budgets only buckets created by this process.
-    bool bucket_recovery_enabled = true;
+    bool bucket_recovery_enabled = false;
     // BUCKET mode only: upper bound on live buckets. Also the fixed
     // denominator for eviction watermarks, so it must be > 0.
     int64_t max_bucket_count = 256;
@@ -85,8 +85,8 @@ struct DistributedStorageConfig {
     uint64_t batch_get_timeout_ms = 10000;
     // Bound DFS reads whose filesystem I/O has not actually completed. A
     // timeout keeps both charges until the background read really returns.
-    uint64_t batch_get_max_inflight_batches = 2;
-    uint64_t batch_get_max_inflight_bytes = 2ULL * 1024 * 1024 * 1024;
+    uint64_t batch_get_max_inflight_batches = 8;
+    uint64_t batch_get_max_inflight_bytes = 8ULL * 1024 * 1024 * 1024;
     // Cleared by FromEnvironment() when MOONCAKE_DFS_ALLOCATOR_TYPE names an
     // unknown allocator, so the master can reject the configuration instead of
     // silently defaulting to SHARD.
@@ -354,9 +354,10 @@ class DistributedStorageBackend
         const std::vector<DfsReadRequest>& requests,
         std::vector<tl::expected<void, ErrorCode>>& results);
 
-    bool AcquireInflightReadUntil(
+    ErrorCode AcquireInflightReadUntil(
         uint64_t bytes, std::chrono::steady_clock::time_point deadline);
     void ReleaseInflightRead(uint64_t bytes);
+    void SetDfsReadTimedOut(bool timed_out);
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;

@@ -11,6 +11,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -91,6 +93,7 @@ device::AcceleratorDeviceRegistrar staging_device_registration(staging_device);
 // Fails the Nth WriteAt so the asynchronous revoke path can be exercised.
 class FailingBucketFsAdapter : public PosixFsAdapter {
    public:
+    std::function<void()> after_read;
     int WriteCalls() const { return write_calls_.load(); }
     int FailedWrites() const { return failed_writes_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
@@ -151,6 +154,7 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
             read_cv_.wait(lock, [this] { return !reads_blocked_; });
         }
         auto result = PosixFsAdapter::DirectReadAt(fd, iov, iovcnt, offset);
+        if (after_read) after_read();
         {
             std::lock_guard<std::mutex> lock(read_mutex_);
             read_done_ = true;
@@ -332,6 +336,75 @@ class DfsBucketClientTest : public ::testing::Test {
         provider_->ExecuteTask(Client::ClientTask{task});
     }
 
+    void SubmitHolderTask(const TaskAssignment& task) {
+        provider_->SubmitTask(task);
+    }
+
+    void ExpectForegroundWriteCountsAfterBackfill(size_t memory_only) {
+        uint64_t pending = 0, memory_only_count = 0, both_success = 0;
+        for (const auto& client : {writer_, provider_}) {
+            std::lock_guard<std::mutex> lock(client->service_metrics_mutex_);
+            const auto& metrics = client->service_metrics_snapshot_;
+            pending += metrics.dual_write_pending;
+            memory_only_count += metrics.dual_write_memory_only;
+            both_success += metrics.dual_write_both_success;
+        }
+        EXPECT_EQ(pending, 0u);
+        EXPECT_EQ(memory_only_count, memory_only);
+        EXPECT_EQ(both_success, 0u);
+    }
+
+    bool StartHolderUnmountTimer(
+        void* buffer, size_t size,
+        std::function<void(const UUID&)> cleanup) {
+        if (provider_->transfer_engine_->registerLocalMemory(
+                buffer, size, kWildcardLocation, true, true) != 0) {
+            return false;
+        }
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.base = reinterpret_cast<uintptr_t>(buffer);
+        segment.size = size;
+        {
+            std::lock_guard<std::mutex> lock(provider_->mounted_segments_mutex_);
+            // Model the state after the master has removed an expired segment.
+            // Mounting another segment under the holder's existing name would
+            // interfere with the source replicas of the blocked backfills.
+            provider_->gracefully_unmounting_segments_.emplace(segment.id,
+                                                              segment);
+            provider_->graceful_unmount_cleanup_callbacks_.emplace(
+                segment.id, std::move(cleanup));
+        }
+        provider_->StartGracefulUnmountTimer(segment.id, 1);
+        return true;
+    }
+
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+    void PrepareWriterEnqueueFailure() {
+        writer_->StopServiceMetricsReporter();
+        writer_->write_thread_pool_.stop();
+    }
+
+    void ExpireWriterMetrics(bool force_deadline = false) {
+        if (force_deadline) {
+            size_t registered = 0;
+            {
+                std::lock_guard<std::mutex> lock(writer_->service_metrics_mutex_);
+                for (const auto& item : writer_->service_pending_writes_) {
+                    if (auto context = item.lock()) {
+                        // The foreground is paused at the failpoint and the
+                        // reporter/pool are stopped, so no other reader races.
+                        context->deadline = std::chrono::steady_clock::now();
+                        ++registered;
+                    }
+                }
+            }
+            ASSERT_GT(registered, 0u);
+        }
+        writer_->ExpireAsyncDfsWriteMetrics();
+    }
+#endif
+
     std::shared_ptr<DistributedStorageBackend> HolderBackfillBackend() {
         auto backend = provider_->GetDfsBackfillBackend();
         EXPECT_TRUE(backend);
@@ -343,7 +416,7 @@ class DfsBucketClientTest : public ::testing::Test {
         provider_->dfs_backfill_retry_after_ = {};
     }
 
-    std::vector<TaskAssignment> FetchBackfills(size_t count) {
+    std::vector<TaskAssignment> FetchHolderTasks(size_t count) {
         std::vector<TaskAssignment> tasks;
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::seconds(8);
@@ -829,7 +902,7 @@ TEST_F(DfsBucketClientTest, StaleDfsReadRetryHonorsRuntimeFilter) {
     EXPECT_EQ(output, value);
 }
 
-TEST_F(DfsBucketClientTest, BatchLeaseSummaryPreservesMixedTierErrors) {
+TEST_F(DfsBucketClientTest, BatchLeaseExpiryExemptsOnlyBucketDfs) {
     const std::vector<std::string> keys{"lease_memory", "lease_dfs"};
     std::vector<std::string> values{std::string(4096, 'M'),
                                     std::string(4096, 'D')};
@@ -863,10 +936,52 @@ TEST_F(DfsBucketClientTest, BatchLeaseSummaryPreservesMixedTierErrors) {
     }
     auto results = writer_->BatchGet(keys, queries, batch);
     ASSERT_EQ(results.size(), keys.size());
-    for (const auto& result : results) {
-        ASSERT_FALSE(result);
-        EXPECT_EQ(result.error(), ErrorCode::LEASE_EXPIRED);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::BATCH_GET_LEASE_EXPIRED);
+    EXPECT_TRUE(results[1]);
+    EXPECT_EQ(outputs, values);
+}
+
+TEST_F(DfsBucketClientTest, BatchReadCrossesLeaseDeadlineAfterValidation) {
+    // Client::BatchGet has no entry lease check. This covers completion past
+    // the captured lease; entry may already be expired when it is scheduled.
+    const std::string key = "bucket_crosses_lease";
+    std::string value(4096, 'L');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query);
+    const QueryResult expiring(
+        std::vector(query->replicas),
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(50),
+        query->object_checksum);
+    adapter_->after_read = [deadline = expiring.lease_timeout] {
+        std::this_thread::sleep_until(deadline + std::chrono::milliseconds(1));
+    };
+    std::string output(value.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {key, {{output.data(), output.size()}}}};
+    auto results = writer_->BatchGet({key}, {expiring}, batch);
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_TRUE(expiring.IsLeaseExpired());
+    ASSERT_TRUE(results[0]);
+    EXPECT_EQ(output, value);
+
+    // Expiry exemption must not mask checksum or short-read failures.
+    if (query->object_checksum) {
+        const QueryResult corrupt(std::vector(query->replicas),
+                                  expiring.lease_timeout,
+                                  *query->object_checksum ^ uint64_t{1});
+        results = writer_->BatchGet({key}, {corrupt}, batch);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::CHECKSUM_MISMATCH);
     }
+    const auto& desc = query->replicas[0].get_dfs_descriptor();
+    std::filesystem::resize_file(desc.file_path, 0);
+    results = writer_->BatchGet({key}, {expiring}, batch);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::FILE_READ_FAIL);
 }
 
 TEST_F(DfsBucketEpochClientTest,
@@ -1543,6 +1658,116 @@ TEST_F(DfsBucketClientTest, HolderBackfillBackoffBoundsProbesAndResetsOnSuccess)
     CheckHolderBackoffBounds();
 }
 
+TEST_F(DfsBucketClientTest, BlockedBackfillsDoNotStarveMaintenanceTasks) {
+    PauseHolderPolling();
+    provider_->SetDfsStorageBackend(backend_);
+    const auto endpoint = NextServiceEndpoint();
+    ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+    ASSERT_EQ(provider_->SetServiceEndpoint(endpoint), 0);
+
+    const std::vector<std::string> keys{
+        "isolated_backfill_0", "isolated_backfill_1",
+        "isolated_backfill_2", "isolated_backfill_3"};
+    std::vector<std::string> values(keys.size(), std::string(4096, 'R'));
+    auto slices = MakeSlices(values);
+    adapter_->FailAllWrites(true);
+    auto put = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(put.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(put[i]);
+        ASSERT_TRUE(WaitForKeyGone(keys[i]));
+    }
+    auto backfills = FetchHolderTasks(keys.size());
+    ASSERT_EQ(backfills.size(), keys.size());
+
+    // Separate keys avoid COPY/MOVE contending with a backfill's source pin.
+    ReplicateConfig memory_config;
+    memory_config.replica_num = 1;
+    memory_config.preferred_segment = "127.0.0.1:18202";
+    std::string memory_value(4096, 'M');
+    std::vector<Slice> memory_slices{{memory_value.data(), memory_value.size()}};
+    ASSERT_TRUE(writer_->Put("isolated_copy", memory_slices, memory_config));
+    ASSERT_TRUE(writer_->Put("isolated_move", memory_slices, memory_config));
+
+    auto target_segment = std::shared_ptr<void>(
+        allocate_buffer_allocator_memory(segment_size_),
+        [client = writer_, size = segment_size_](void* ptr) {
+            if (ptr) {
+                (void)client->UnmountSegment(ptr, size);
+                std::free(ptr);
+            }
+        });
+    ASSERT_NE(target_segment, nullptr);
+    ASSERT_TRUE(
+        writer_->MountSegment(target_segment.get(), segment_size_, "tcp"));
+
+    auto grace_segment = std::shared_ptr<void>(
+        allocate_buffer_allocator_memory(segment_size_), std::free);
+    ASSERT_NE(grace_segment, nullptr);
+    auto cleanup = std::make_shared<std::promise<void>>();
+    auto cleaned = cleanup->get_future();
+
+    adapter_->FailAllWrites(false);
+    adapter_->BlockWrites();
+    const int writes = adapter_->WriteCalls();
+    // Four assignments would occupy every shared worker before the fix.
+    for (const auto& task : backfills) {
+        ASSERT_EQ(task.type, TaskType::DFS_BACKFILL);
+        SubmitHolderTask(task);
+    }
+    const auto write_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (adapter_->WriteCalls() == writes &&
+           std::chrono::steady_clock::now() < write_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_GT(adapter_->WriteCalls(), writes);
+
+    auto copy = writer_->CreateCopyTask("isolated_copy", {"127.0.0.1:18201"});
+    auto move = writer_->CreateMoveTask("isolated_move", "127.0.0.1:18202",
+                                        "127.0.0.1:18201");
+    ASSERT_TRUE(copy);
+    ASSERT_TRUE(move);
+    auto maintenance = FetchHolderTasks(2);
+    ASSERT_EQ(maintenance.size(), 2u);
+    for (const auto& task : maintenance) SubmitHolderTask(task);
+    ASSERT_TRUE(StartHolderUnmountTimer(
+        grace_segment.get(), segment_size_,
+        [cleanup, grace_segment](const UUID&) { cleanup->set_value(); }));
+
+    auto wait_for_success = [&](const UUID& id) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto task = writer_->QueryTask(id);
+            if (!task || task->status == TaskStatus::FAILED) return false;
+            if (task->status == TaskStatus::SUCCESS) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    };
+    EXPECT_TRUE(wait_for_success(*copy));
+    EXPECT_TRUE(wait_for_success(*move));
+    // The production graceful-unmount timer includes a ten-second delay.
+    EXPECT_EQ(cleaned.wait_for(std::chrono::seconds(15)),
+              std::future_status::ready);
+    for (const auto& task : backfills) {
+        auto status = writer_->QueryTask(task.id);
+        ASSERT_TRUE(status);
+        EXPECT_EQ(status->status, TaskStatus::PROCESSING);
+    }
+
+    adapter_->ReleaseWrites();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(wait_for_success(backfills[i].id));
+        ASSERT_TRUE(WaitForDfsReplica(keys[i]));
+        ExpectDfsValue(keys[i], values[i]);
+    }
+    // Backfill recovery must not rewrite the foreground failed-write outcome
+    // or count as another foreground write, even across the separate executor.
+    ExpectForegroundWriteCountsAfterBackfill(keys.size());
+}
+
 TEST_F(DfsBucketClientTest, HolderBackoffCoversDistinctKeysAndRecoversTogether) {
     provider_->SetDfsStorageBackend(backend_);
     PauseHolderPolling();
@@ -1559,7 +1784,7 @@ TEST_F(DfsBucketClientTest, HolderBackoffCoversDistinctKeysAndRecoversTogether) 
         ASSERT_TRUE(put[i]);
         ASSERT_TRUE(WaitForKeyGone(keys[i]));
     }
-    auto tasks = FetchBackfills(keys.size());
+    auto tasks = FetchHolderTasks(keys.size());
     ASSERT_EQ(tasks.size(), keys.size());
     auto& metrics = MasterMetricManager::instance();
     const auto starts = metrics.get_copy_start_requests();
@@ -1569,7 +1794,7 @@ TEST_F(DfsBucketClientTest, HolderBackoffCoversDistinctKeysAndRecoversTogether) 
     EXPECT_EQ(metrics.get_copy_start_requests() - starts, 1);
     EXPECT_EQ(adapter_->FailedWrites() - failures, 1);
 
-    tasks = FetchBackfills(keys.size());
+    tasks = FetchHolderTasks(keys.size());
     ASSERT_EQ(tasks.size(), keys.size());
     adapter_->FailAllWrites(false);
     ExpireHolderBackoff();
@@ -1592,7 +1817,7 @@ TEST_F(DfsBucketClientTest, HolderBackoffCoversDistinctKeysAndRecoversTogether) 
     const auto recovered_at = std::chrono::steady_clock::now();
     for (size_t i = 2; i < tasks.size(); ++i) ExecuteBackfill(tasks[i]);
     // The one task held behind the probe follows only the normal 5s task retry.
-    auto remaining = FetchBackfills(1);
+    auto remaining = FetchHolderTasks(1);
     ASSERT_EQ(remaining.size(), 1u);
     ExecuteBackfill(remaining.front());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -1681,6 +1906,125 @@ TEST_F(DfsBucketClientTest,
     EXPECT_DOUBLE_EQ(*settled_pending, 0.0);
     EXPECT_DOUBLE_EQ(*memory_only, 1.0);
 }
+
+TEST_F(DfsBucketClientTest,
+       ServiceMetricsDeadlineSettlesBlockedWriteAndIgnoresLateResult) {
+    writer_.reset();
+    SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "50");
+    writer_ = CreateClient("127.0.0.1:18203");
+    ASSERT_NE(writer_, nullptr);
+    writer_->SetDfsStorageBackend(backend_);
+    const auto endpoint = NextServiceEndpoint();
+    ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+    adapter_->BlockWrites();
+
+    const std::string key = "service_metric_blocked_deadline";
+    std::vector<std::string> values{std::string(4096, 'D')};
+    auto slices = MakeSlices(values);
+    auto results = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results.front().has_value());
+
+    const auto started_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (adapter_->WriteCalls() == 0 &&
+           std::chrono::steady_clock::now() < started_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_GT(adapter_->WriteCalls(), 0);
+
+    // Leave the filesystem write blocked. The reporter must settle the
+    // existing publication deadline without waiting for its physical result.
+    auto memory_only =
+        WaitForServiceMetricValue("mooncake_master_service_dual_write_total",
+                                  endpoint, "outcome=\"memory_only\"", 1.0);
+    ASSERT_TRUE(memory_only.has_value());
+    EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+    auto pending = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_pending", endpoint);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_DOUBLE_EQ(*pending, 0.0);
+
+    adapter_->ReleaseWrites();
+    writer_.reset();  // Drain the late result and flush the final snapshot.
+    memory_only =
+        FindServiceMetricValue("mooncake_master_service_dual_write_total",
+                               endpoint, "outcome=\"memory_only\"");
+    pending = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_pending", endpoint);
+    auto both_success =
+        FindServiceMetricValue("mooncake_master_service_dual_write_total",
+                               endpoint, "outcome=\"both_success\"");
+    ASSERT_TRUE(memory_only.has_value());
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_TRUE(both_success.has_value());
+    EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+    EXPECT_DOUBLE_EQ(*pending, 0.0);
+    EXPECT_DOUBLE_EQ(*both_success, 0.0);
+}
+
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+TEST_F(DfsBucketClientTest, ServiceMetricsEnqueueFailureSettlesOnceInEitherOrder) {
+    for (bool reporter_first : {false, true}) {
+        SCOPED_TRACE(reporter_first);
+        writer_.reset();
+        SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "1000");
+        writer_ = CreateClient("127.0.0.1:18203");
+        ASSERT_NE(writer_, nullptr);
+        writer_->SetDfsStorageBackend(backend_);
+        const auto endpoint = NextServiceEndpoint();
+        ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+        PrepareWriterEnqueueFailure();
+
+        const auto failpoint_dir = std::filesystem::path(root_) /
+                                   (reporter_first ? "reporter_first"
+                                                   : "enqueue_first");
+        std::filesystem::create_directories(failpoint_dir);
+        SetEnv("MOONCAKE_TEST_FAILPOINT_DIR", failpoint_dir.string());
+        SetEnv("MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC", "20");
+        std::ofstream(failpoint_dir / "dfs_write_before_enqueue.arm").put('\n');
+
+        const std::string key = reporter_first ? "settled_before_rejection"
+                                                : "rejected_before_settlement";
+        std::vector<std::string> values{std::string(4096, 'E')};
+        auto slices = MakeSlices(values);
+        auto put = std::async(std::launch::async, [&] {
+            return writer_->BatchPut({key}, slices, DfsConfig());
+        });
+        const auto hit = failpoint_dir / "dfs_write_before_enqueue.hit";
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!std::filesystem::exists(hit) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(std::filesystem::exists(hit));
+        if (reporter_first) {
+            ASSERT_NO_FATAL_FAILURE(ExpireWriterMetrics(true));
+        }
+        std::ofstream(failpoint_dir / "dfs_write_before_enqueue.release")
+            .put('\n');
+        EXPECT_EQ(put.get().size(), 1u);
+        // Also exercise the reporter after the failed enqueue has returned.
+        ExpireWriterMetrics();
+        EXPECT_EQ(adapter_->WriteCalls(), 0);
+        writer_.reset();  // Flush the foreground's final metric snapshot.
+
+        const auto pending = FindServiceMetricValue(
+            "mooncake_master_service_dual_write_pending", endpoint);
+        const auto memory_only = FindServiceMetricValue(
+            "mooncake_master_service_dual_write_total", endpoint,
+            "outcome=\"memory_only\"");
+        const auto both_success = FindServiceMetricValue(
+            "mooncake_master_service_dual_write_total", endpoint,
+            "outcome=\"both_success\"");
+        ASSERT_TRUE(pending && memory_only && both_success);
+        EXPECT_DOUBLE_EQ(*pending, 0.0);
+        EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+        EXPECT_DOUBLE_EQ(*both_success, 0.0);
+    }
+}
+#endif
 
 TEST_F(DfsBucketClientTest,
        ServiceMetricsCountBatchReadFailuresOncePerKeyAndReplicaTier) {
@@ -2015,8 +2359,11 @@ TEST_F(DfsBucketClientTest, ReadTimeoutDoesNotChangeClientAccessPolicy) {
     std::unordered_map<std::string, std::shared_ptr<void>> buffer_owners;
     buffer_owners.emplace(key, output);
     adapter_->BlockReads();
-    auto timed_out = writer_->BatchGet({key}, {*query}, read_slices, false,
-                                       &buffer_owners);
+    const QueryResult expired(std::vector(query->replicas),
+                              std::chrono::steady_clock::now(),
+                              query->object_checksum);
+    auto timed_out =
+        writer_->BatchGet({key}, {expired}, read_slices, false, &buffer_owners);
     ASSERT_EQ(timed_out.size(), 1u);
     ASSERT_FALSE(timed_out[0].has_value());
     EXPECT_EQ(timed_out[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
@@ -2031,6 +2378,67 @@ TEST_F(DfsBucketClientTest, ReadTimeoutDoesNotChangeClientAccessPolicy) {
     ASSERT_EQ(recovered.size(), 1u);
     ASSERT_TRUE(recovered[0].has_value());
     EXPECT_EQ(*output, value);
+}
+
+TEST_F(DfsBucketClientTest, DuplicateKeyTimeoutKeepsEveryBufferAlive) {
+    const std::string key = "bucket_duplicate_key_timeout";
+    const std::string value(4096, 'R');
+    std::vector<std::string> values{value};
+    auto write_slices = MakeSlices(values);
+    auto put_results = writer_->BatchPut({key}, write_slices, DfsConfig());
+    ASSERT_EQ(put_results.size(), 1u);
+    ASSERT_TRUE(put_results[0].has_value());
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+
+    auto timeout_config = distributed_config_;
+    timeout_config.batch_get_timeout_ms = 25;
+    auto timeout_adapter = std::make_unique<FailingBucketFsAdapter>();
+    adapter_ = timeout_adapter.get();
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root_;
+    backend_ = std::make_shared<DistributedStorageBackend>(
+        file_config, timeout_config, std::move(timeout_adapter),
+        writer_->GetDfsRootIdentity());
+    ASSERT_TRUE(backend_->Init().has_value());
+    writer_->SetDfsStorageBackend(backend_);
+
+    auto first = std::make_shared<std::string>(value.size(), '\0');
+    auto second = std::make_shared<std::string>(value.size(), '\0');
+    std::weak_ptr<std::string> first_weak = first;
+    std::weak_ptr<std::string> second_weak = second;
+    std::vector<std::vector<Slice>> read_slices{
+        {{first->data(), first->size()}},
+        {{second->data(), second->size()}}};
+    std::vector<std::shared_ptr<void>> buffer_owners{first, second};
+
+    adapter_->BlockReads();
+    auto timed_out = writer_->BatchGet({key, key}, {*query, *query},
+                                       read_slices, false, &buffer_owners);
+    first.reset();
+    second.reset();
+    buffer_owners.clear();
+
+    ASSERT_EQ(timed_out.size(), 2u);
+    ASSERT_FALSE(timed_out[0].has_value());
+    ASSERT_FALSE(timed_out[1].has_value());
+    EXPECT_EQ(timed_out[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(timed_out[1].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_FALSE(first_weak.expired());
+    EXPECT_FALSE(second_weak.expired());
+
+    adapter_->ReleaseReads();
+    ASSERT_TRUE(adapter_->WaitUntilReadDone(std::chrono::seconds(2)));
+    const auto owners_released_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!first_weak.expired() || !second_weak.expired()) &&
+           std::chrono::steady_clock::now() < owners_released_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(first_weak.expired());
+    EXPECT_TRUE(second_weak.expired());
 }
 
 TEST_F(DfsBucketClientTest, ClientDestructionDrainsInFlightAsyncWrites) {

@@ -311,12 +311,13 @@ enum class ErrorCode : int32_t {
     INVALID_READ = -701,     ///< Invalid read operation.
     INVALID_REPLICA = -702,  ///< Invalid replica operation.
 
-    // Object errors (Range: -703 to -712)
+    // Object and lease errors (Range: -703 to -799)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
     OBJECT_HAS_LEASE = -706,       ///< Object has lease.
-    LEASE_EXPIRED = -707,  ///< Lease expired before data transfer completed.
+    LEASE_EXPIRED =
+        -707,  ///< Legacy generic read expiry; retained for ABI compatibility.
     OBJECT_HAS_REPLICATION_TASK =
         -708,  ///< Object has ongoing replication task.
     OBJECT_NO_REPLICATION_TASK =
@@ -327,6 +328,18 @@ enum class ErrorCode : int32_t {
     REPLICA_NOT_IN_LOCAL_MEMORY =
         -713,  ///< Replica does not reside in current node memory.
     OBJECT_REPLICA_BUSY = -714,  ///< Object replicas have non-zero refcnt.
+    BATCH_GET_LEASE_EXPIRED =
+        -715,  ///< Lease expired after batch read validation.
+    SESSION_START_LEASE_EXPIRED =
+        -716,  ///< Initial session query lease expired.
+    SESSION_REFRESH_QUERY_LEASE_EXPIRED = -717,  ///< Fresh query lease expired.
+    SESSION_REFRESH_COMMIT_LEASE_EXPIRED =
+        -718,  ///< Lease expired before refresh commit.
+    SESSION_PREFETCH_LEASE_EXPIRED =
+        -719,                            ///< Lease expired at prefetch entry.
+    SESSION_RANGE_LEASE_EXPIRED = -720,  ///< Lease expired at range-read entry.
+    SESSION_MEMORY_TRANSFER_LEASE_EXPIRED =
+        -721,  ///< Lease expired after memory range transfer.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
@@ -393,9 +406,9 @@ enum class ErrorCode : int32_t {
     DFS_BATCH_GET_TIMEOUT = -1607,    ///< DFS BatchGet exceeded its deadline.
     DFS_BATCH_GET_ADMISSION_TIMEOUT =
         -1608,  ///< Timed out waiting for DFS BatchGet in-flight capacity.
-    TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
-    TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
-    TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
+    TENANT_QUOTA_EXCEEDED = -1700,  ///< Tenant memory quota exceeded.
+    TENANT_NOT_REGISTERED = -1701,  ///< Tenant has no quota policy.
+    TENANT_NOT_EMPTY = -1702,       ///< Tenant still owns objects or quota.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

@@ -231,6 +231,19 @@ class Client {
             dfs_buffer_owners = nullptr);
 
     /**
+     * @brief Transfers data using operation-aligned inputs.
+     *
+     * Unlike the key-indexed overload, this form preserves independent slices
+     * and lifetime owners when object_keys contains duplicate keys.
+     */
+    std::vector<tl::expected<void, ErrorCode>> BatchGet(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::vector<std::vector<Slice>>& batched_slices,
+        bool prefer_same_node = false,
+        const std::vector<std::shared_ptr<void>>* dfs_buffer_owners = nullptr);
+
+    /**
      * @brief Stores data with replication
      * @param key Object key
      * @param slices Vector of data slices to store
@@ -853,10 +866,9 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchGetImpl(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        std::vector<std::vector<Slice>>& batched_slices,
         bool prefer_same_node,
-        const std::unordered_map<std::string, std::shared_ptr<void>>*
-            dfs_buffer_owners);
+        const std::vector<std::shared_ptr<void>>* dfs_buffer_owners);
 
     friend class test::DfsBucketClientTest;
 
@@ -1041,7 +1053,8 @@ class Client {
         std::shared_ptr<DfsWriteStagingPool::Slot> staging_slot;
         std::vector<std::vector<Slice>> slices;
         std::vector<ServiceDualWriteCompletion> service_dual_writes;
-        std::vector<bool> service_metrics_settled;
+        std::atomic<bool> service_metrics_settled{false};
+        std::atomic<bool> io_completed{false};
         // Ready before enqueue; every End retry uses the foreground checksum.
         std::vector<std::optional<uint64_t>> object_checksums;
         std::shared_ptr<DistributedStorageBackend> backend;
@@ -1080,13 +1093,17 @@ class Client {
     void CancelServiceDualWritePending();
     void CompleteServiceDualWrite(bool memory_succeeded,
                                   bool dfs_succeeded);
+    void CompleteAsyncDfsWriteMetrics(
+        const std::shared_ptr<AsyncDfsWriteContext>& context,
+        const std::vector<ErrorCode>& outcomes);
+    void ExpireAsyncDfsWriteMetrics();
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
         std::vector<PutOperation>& ops, bool is_upsert);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
+        std::vector<std::vector<Slice>>& batched_slices);
     ReplicateConfig AttachConfig(const ReplicateConfig& config) const;
 
     // Client identification
@@ -1143,6 +1160,8 @@ class Client {
     // has its own thread and cumulative snapshot, independent of local metrics.
     mutable std::mutex service_metrics_mutex_;
     ServiceMetricsSnapshot service_metrics_snapshot_;
+    // Weak references must not extend staging-buffer or physical-I/O lifetime.
+    std::vector<std::weak_ptr<AsyncDfsWriteContext>> service_pending_writes_;
     std::atomic<bool> service_metrics_report_running_{false};
     std::thread service_metrics_report_thread_;
 
@@ -1258,6 +1277,8 @@ class Client {
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;
+    // Blocking DFS recovery must not occupy COPY/MOVE or unmount workers.
+    ThreadPool dfs_backfill_thread_pool_;
     std::atomic<bool> task_running_{true};
 
     // Task polling configuration

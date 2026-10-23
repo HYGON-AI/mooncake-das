@@ -1102,6 +1102,75 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
     ASSERT_TRUE(backend->ProbeRead().has_value());
 }
 
+TEST(DfsBackendTimeoutTest, TimeoutLatchWakesInflightAdmissionWaiter) {
+    TempDir tmp("dfs_read_inflight_timeout_latch");
+    ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp.path();
+    DistributedStorageConfig config;
+    config.fsdir = tmp.path();
+    config.fs_adapter_type = "posix";
+    config.shard_count = 1;
+    config.shard_capacity = 64 * 1024;
+    config.alignment = 4096;
+    config.direct_read_enabled = false;
+    config.batch_get_timeout_ms = 100;
+    config.batch_get_max_inflight_batches = 1;
+    config.batch_get_max_inflight_bytes = 4096;
+
+    auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
+    auto* adapter_ptr = adapter.get();
+    auto backend = std::make_shared<DistributedStorageBackend>(
+        file_config, config, std::move(adapter), kTestDfsRootIdentity);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string shard =
+        tmp.file("dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 1) +
+                 ".data");
+    const DistributedFSDescriptor descriptor{shard, 0, 4096, 4096, 0};
+    std::string source(4096, 'R');
+    ASSERT_TRUE(backend->BatchWrite(
+        {{"latched_read", descriptor, {{source.data(), source.size()}}}})[0]);
+
+    std::string first(4096, '1');
+    std::string queued(4096, '2');
+    auto first_owner = std::shared_ptr<void>(first.data(), [](void*) {});
+    auto queued_owner = std::shared_ptr<void>(queued.data(), [](void*) {});
+    std::vector<tl::expected<void, ErrorCode>> first_results;
+    std::vector<tl::expected<void, ErrorCode>> queued_results;
+
+    adapter_ptr->BlockReads();
+    std::thread first_reader([&] {
+        first_results = backend->BatchRead(
+            {{"latched_read", descriptor,
+              {{first.data(), first.size()}}, first_owner}});
+    });
+    EXPECT_TRUE(adapter_ptr->WaitUntilStarted(1, std::chrono::seconds(2)));
+
+    std::thread queued_reader([&] {
+        queued_results = backend->BatchRead(
+            {{"latched_read", descriptor,
+              {{queued.data(), queued.size()}}, queued_owner}});
+    });
+
+    first_reader.join();
+    queued_reader.join();
+    const size_t started_reads = adapter_ptr->StartedReads();
+    adapter_ptr->ReleaseReads();
+    EXPECT_TRUE(
+        adapter_ptr->WaitUntilCompleted(1, std::chrono::seconds(2)));
+
+    ASSERT_EQ(first_results.size(), 1u);
+    ASSERT_FALSE(first_results[0].has_value());
+    EXPECT_EQ(first_results[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    ASSERT_EQ(queued_results.size(), 1u);
+    ASSERT_FALSE(queued_results[0].has_value());
+    EXPECT_EQ(queued_results[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(started_reads, 1u);
+}
+
 TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
     TempDir tmp("dfs_read_inflight_byte_limit");
     ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));

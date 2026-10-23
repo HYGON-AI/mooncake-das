@@ -421,28 +421,33 @@ TEST_F(DfsSyncClientTest, BatchGetUsesExplicitDfsDescriptors) {
 }
 
 TEST_F(DfsSyncClientTest, BatchGetReturnsLeaseExpiredAfterSuccessfulDfsRead) {
-    const std::string key = "dfs_batch_expired_lease";
+    const std::vector<std::string> keys{"dfs_batch_expired_lease_0",
+                                        "dfs_batch_expired_lease_1"};
     std::string value(4096, 'L');
     std::vector<Slice> write_slices{{value.data(), value.size()}};
-    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
-
-    auto query = QueryDfsOnly(key);
-    ASSERT_TRUE(query.has_value());
-    auto replicas = query->replicas;
     std::vector<QueryResult> queries;
-    queries.emplace_back(
-        std::move(replicas),
-        std::chrono::steady_clock::now() - std::chrono::seconds(1),
-        query->object_checksum);
-
-    std::string output(value.size(), '\0');
+    std::vector<std::string> output(keys.size(),
+                                    std::string(value.size(), '\0'));
     std::unordered_map<std::string, std::vector<Slice>> read_slices;
-    read_slices[key] = {{output.data(), output.size()}};
-    auto results = writer_->BatchGet({key}, queries, read_slices);
-    ASSERT_EQ(results.size(), 1);
-    ASSERT_FALSE(results[0].has_value());
-    EXPECT_EQ(results[0].error(), ErrorCode::LEASE_EXPIRED);
-    EXPECT_EQ(output, value);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_TRUE(
+            writer_->Put(keys[i], write_slices, DfsConfig()).has_value());
+        auto query = QueryDfsOnly(keys[i]);
+        ASSERT_TRUE(query.has_value());
+        auto replicas = query->replicas;
+        queries.emplace_back(
+            std::move(replicas),
+            std::chrono::steady_clock::now() - std::chrono::seconds(1),
+            query->object_checksum);
+        read_slices[keys[i]] = {{output[i].data(), output[i].size()}};
+    }
+    auto results = writer_->BatchGet(keys, queries, read_slices);
+    ASSERT_EQ(results.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_FALSE(results[i].has_value());
+        EXPECT_EQ(results[i].error(), ErrorCode::BATCH_GET_LEASE_EXPIRED);
+        EXPECT_EQ(output[i], value);
+    }
 }
 
 TEST_F(DfsSyncClientTest,
@@ -480,7 +485,9 @@ TEST_F(DfsSyncClientTest,
             writer_->BatchGet({key}, queries, read_slices, prefer_same_node);
         ASSERT_EQ(results.size(), 1);
         ASSERT_FALSE(results[0].has_value());
-        EXPECT_EQ(results[0].error(), ErrorCode::LEASE_EXPIRED);
+        EXPECT_EQ(results[0].error(), prefer_same_node
+                                          ? ErrorCode::LEASE_EXPIRED
+                                          : ErrorCode::BATCH_GET_LEASE_EXPIRED);
         EXPECT_EQ(output, value);
     }
 }

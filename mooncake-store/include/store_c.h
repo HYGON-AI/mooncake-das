@@ -39,6 +39,10 @@ typedef struct mooncake_replicate_config mooncake_replicate_config_t;
  * This means that the caller can free the memory pointed to by "char *"
  * parameters, after the call is completed.
  * All the C functions here follow this convention.
+ * Negative read results pass through Mooncake ErrorCode values unchanged.
+ * LEASE_EXPIRED (-707) remains the legacy generic/same-node batch-read code;
+ * other batch reads use BATCH_GET_LEASE_EXPIRED (-715) after validation.
+ * See docs/source/troubleshooting/error-code.md for lease-stage migration.
  */
 
 // ---------------------------------------------------------------------------

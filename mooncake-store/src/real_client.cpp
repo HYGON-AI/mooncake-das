@@ -4257,20 +4257,18 @@ RealClient::batch_get_buffer_internal(
     if (!valid_ops.empty()) {
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
-        std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+        std::vector<std::vector<Slice>> batch_slices;
+        std::vector<std::shared_ptr<void>> batch_buffer_owners;
         batch_keys.reserve(valid_ops.size());
         batch_query_results.reserve(valid_ops.size());
+        batch_slices.reserve(valid_ops.size());
+        batch_buffer_owners.reserve(valid_ops.size());
 
         for (auto &op : valid_ops) {
             batch_keys.push_back(op.key);
             batch_query_results.push_back(op.query_result);
-            batch_slices[op.key] = op.slices;
-        }
-
-        std::unordered_map<std::string, std::shared_ptr<void>>
-            batch_buffer_owners;
-        for (const auto &op : valid_ops) {
-            batch_buffer_owners.emplace(op.key, op.buffer_handle);
+            batch_slices.push_back(op.slices);
+            batch_buffer_owners.push_back(op.buffer_handle);
         }
         auto batch_get_results = client_->BatchGet(
             batch_keys, batch_query_results, batch_slices, false,
@@ -6188,15 +6186,17 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     // Prepare batch transfer data structures
     std::vector<std::string> batch_keys;
     std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+    // Operation-aligned: duplicate keys may target different user buffers.
+    std::vector<std::vector<Slice>> batch_slices;
 
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
+    batch_slices.reserve(valid_operations.size());
 
     for (const auto &op : valid_operations) {
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
-        batch_slices[op.key] = op.slices;
+        batch_slices.push_back(op.slices);
     }
     if (!valid_operations.empty()) {
         // Execute batch transfer
@@ -6220,10 +6220,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     if (!disk_operations.empty()) {
         std::vector<std::string> disk_batch_keys;
         std::vector<QueryResult> disk_batch_qrs;
-        std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
+        // Keep slices and owners aligned by operation; a key is not an
+        // operation identifier and may legitimately occur more than once.
+        std::vector<std::vector<Slice>> disk_batch_slices;
         std::vector<size_t> disk_batch_indices;
-        std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
-            disk_temp_handles;
+        std::vector<std::shared_ptr<BufferHandle>> disk_temp_handles;
+        disk_batch_keys.reserve(disk_operations.size());
+        disk_batch_qrs.reserve(disk_operations.size());
+        disk_batch_slices.reserve(disk_operations.size());
+        disk_batch_indices.reserve(disk_operations.size());
+        disk_temp_handles.reserve(disk_operations.size());
 
         for (size_t di = 0; di < disk_operations.size(); ++di) {
             auto &op = disk_operations[di];
@@ -6247,16 +6253,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             disk_batch_keys.push_back(op.key);
             disk_batch_qrs.push_back(
                 FilterQueryResult(op.query_result, replica));
-            disk_batch_slices[op.key] = std::move(disk_slices);
+            disk_batch_slices.push_back(std::move(disk_slices));
             disk_batch_indices.push_back(di);
-            disk_temp_handles.emplace(op.key, std::move(handle));
+            disk_temp_handles.push_back(std::move(handle));
         }
 
         if (!disk_batch_keys.empty()) {
-            std::unordered_map<std::string, std::shared_ptr<void>>
-                disk_buffer_owners;
-            for (const auto &[key, handle] : disk_temp_handles) {
-                disk_buffer_owners.emplace(key, handle);
+            std::vector<std::shared_ptr<void>> disk_buffer_owners;
+            disk_buffer_owners.reserve(disk_temp_handles.size());
+            for (const auto &handle : disk_temp_handles) {
+                disk_buffer_owners.push_back(handle);
             }
             auto disk_results = client_->BatchGet(
                 disk_batch_keys, disk_batch_qrs, disk_batch_slices, false,
@@ -6265,7 +6271,6 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             for (size_t di = 0; di < disk_batch_indices.size(); ++di) {
                 const auto &key = disk_batch_keys[di];
                 auto &op = disk_operations[disk_batch_indices[di]];
-                auto handle_it = disk_temp_handles.find(key);
                 const char *replica_type =
                     op.replica.is_dfs_replica() ? "DFS" : "DISK";
                 if (!disk_results[di]) {
@@ -6278,7 +6283,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 }
                 if (auto r = scatter_host_to_maybe_device(
                         op.dst_buffer,
-                        static_cast<char *>(handle_it->second->ptr()),
+                        static_cast<char *>(disk_temp_handles[di]->ptr()),
                         op.total_size,
                         std::string(replica_type) + " read, key: " + key);
                     !r) {
@@ -6517,7 +6522,7 @@ RealClient::batch_get_session_start_with_sources(
         if (query_result.IsLeaseExpired()) {
             result.all_memory = false;
             result.codes[i] =
-                static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                static_cast<int>(toInt(ErrorCode::SESSION_START_LEASE_EXPIRED));
             get_sessions_.erase(keys[i]);
             continue;
         }
@@ -6634,7 +6639,8 @@ std::vector<int> RealClient::batch_get_session_refresh(
             } else {
                 const auto &fresh_query = fresh_queries[i].value();
                 if (fresh_query.IsLeaseExpired()) {
-                    refresh_error = ErrorCode::LEASE_EXPIRED;
+                    refresh_error =
+                        ErrorCode::SESSION_REFRESH_QUERY_LEASE_EXPIRED;
                 } else {
                     const auto *replica = SelectSessionReplica(
                         fresh_query.replicas, local_endpoints,
@@ -6662,7 +6668,7 @@ std::vector<int> RealClient::batch_get_session_refresh(
 
             if (refresh_error == ErrorCode::OK &&
                 refreshed_session->IsLeaseExpired()) {
-                refresh_error = ErrorCode::LEASE_EXPIRED;
+                refresh_error = ErrorCode::SESSION_REFRESH_COMMIT_LEASE_EXPIRED;
             }
 
             if (prefetch_cache_enabled) {
@@ -6879,8 +6885,8 @@ std::vector<int> RealClient::batch_get_session_prefetch(
             auto session_it = get_sessions_.find(keys[i]);
             if (session_it == get_sessions_.end()) continue;
             if (session_it->second.IsLeaseExpired(now)) {
-                results[i] =
-                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                results[i] = static_cast<int>(
+                    toInt(ErrorCode::SESSION_PREFETCH_LEASE_EXPIRED));
                 get_sessions_.erase(session_it);
                 DetachPrefetchedSessionBuffer(
                     get_session_prefetch_cache_, keys[i],
@@ -6924,7 +6930,6 @@ std::vector<int> RealClient::batch_get_session_prefetch(
     // still owns a complete object view when this method returns.
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
-        auto completed_at = std::chrono::steady_clock::now();
         for (const auto &entry : entries) {
             const size_t i = entry.original_idx;
             if (results[i] != 0) continue;
@@ -6948,16 +6953,6 @@ std::vector<int> RealClient::batch_get_session_prefetch(
                     static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
                 continue;
             }
-            if (session_it->second.IsLeaseExpired(completed_at)) {
-                results[i] =
-                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-                get_sessions_.erase(session_it);
-                DetachPrefetchedSessionBuffer(
-                    get_session_prefetch_cache_, entry.key,
-                    detached_prefetch_buffers);
-                continue;
-            }
-
             auto cache_it = get_session_prefetch_cache_.find(entry.key);
             const auto &descriptor = entry.replica.get_dfs_descriptor();
             const uint64_t source_size =
@@ -7081,7 +7076,8 @@ RealClient::prepare_session_range_read_requests(
                     get_session_prefetch_cache_, keys[i],
                     detached_prefetch_buffers);
             }
-            results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+            results[i] =
+                static_cast<int>(toInt(ErrorCode::SESSION_RANGE_LEASE_EXPIRED));
             continue;
         }
 
@@ -7179,8 +7175,8 @@ void RealClient::execute_session_memory_range_reads(
         const auto &request = requests[i];
         if (transfer[i]) {
             if (now >= request.lease_deadline) {
-                results[request.original_idx] =
-                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                results[request.original_idx] = static_cast<int>(
+                    toInt(ErrorCode::SESSION_MEMORY_TRANSFER_LEASE_EXPIRED));
                 get_sessions_.erase(request.key);
             } else {
                 results[request.original_idx] =
@@ -7215,8 +7211,11 @@ void RealClient::record_session_range_accesses(
             if (record_it != get_session_access_records_.end()) {
                 record_it->second.success = false;
             }
-            if (results[i] ==
-                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED)) &&
+            if ((results[i] == static_cast<int>(toInt(
+                                   ErrorCode::SESSION_RANGE_LEASE_EXPIRED)) ||
+                 results[i] ==
+                     static_cast<int>(toInt(
+                         ErrorCode::SESSION_MEMORY_TRANSFER_LEASE_EXPIRED))) &&
                 context.access_sources[i] != "unknown") {
                 auto [insert_it, inserted] =
                     get_session_access_records_.try_emplace(
@@ -7538,18 +7537,40 @@ void RealClient::execute_session_dfs_range_reads(
     flush_chunk();
 
     for (size_t i = 0; i < chunks.size(); ++i) {
-        execute_session_dfs_range_reads_batch(
+        const ErrorCode chunk_error = execute_session_dfs_range_reads_batch(
             chunks[i], results, trace_id, false, i + 1, chunks.size(),
             chunk_limit_bytes, request_planned_bytes);
+        if (chunk_error != ErrorCode::DFS_BATCH_GET_TIMEOUT &&
+            chunk_error != ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT) {
+            continue;
+        }
+
+        size_t skipped_entries = 0;
+        for (size_t remaining = i + 1; remaining < chunks.size(); ++remaining) {
+            for (const auto *entry : chunks[remaining]) {
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(chunk_error));
+                ++skipped_entries;
+            }
+        }
+        LOG(ERROR) << "Stopping chunked DFS restore after timeout: trace_id="
+                   << trace_id << ", failed_chunk=" << i + 1 << "/"
+                   << chunks.size() << ", skipped_chunks="
+                   << chunks.size() - i - 1
+                   << ", skipped_entries=" << skipped_entries
+                   << ", error=" << toString(chunk_error) << " ("
+                   << toInt(chunk_error) << ")";
+        break;
     }
 }
 
-void RealClient::execute_session_dfs_range_reads_batch(
+ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     std::vector<SessionRangeReadRequest *> &entries,
     std::vector<int> &results, uint64_t trace_id, bool prefetch_only,
     size_t chunk_index, size_t chunk_count, size_t chunk_limit_bytes,
     size_t request_planned_bytes) {
     const auto timing_start = std::chrono::steady_clock::now();
+    const auto chunk_entries = entries;
     const bool trace_enabled = trace_id != 0;
     const size_t input_entries = entries.size();
     size_t prefetch_cache_hits = 0;
@@ -7719,9 +7740,8 @@ void RealClient::execute_session_dfs_range_reads_batch(
     // 2. Cache miss: allocate + BatchGet
     std::vector<std::string> disk_batch_keys;
     std::vector<QueryResult> disk_batch_qrs;
-    std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
-    std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
-        disk_temp_handles;
+    std::vector<std::vector<Slice>> disk_batch_slices;
+    std::vector<std::shared_ptr<BufferHandle>> disk_temp_handles;
 
     struct ArenaView {
         SessionRangeReadRequest *entry;
@@ -7850,8 +7870,10 @@ void RealClient::execute_session_dfs_range_reads_batch(
         disk_batch_keys.push_back(view.entry->key);
         disk_batch_qrs.push_back(
             FilterQueryResult(view.entry->query_result, view.entry->replica));
-        disk_batch_slices[view.entry->key] = std::move(disk_slices);
-        disk_temp_handles.emplace(view.entry->key, std::move(handle));
+        // A key can appear in multiple range requests with different targets.
+        // Keep each arena view aligned with its own read and completion.
+        disk_batch_slices.push_back(std::move(disk_slices));
+        disk_temp_handles.push_back(std::move(handle));
         if (trace_enabled) {
             for (size_t size : view.entry->sizes) {
                 dfs_requested_bytes += size;
@@ -7871,11 +7893,8 @@ void RealClient::execute_session_dfs_range_reads_batch(
     }
     auto t_io_done = std::chrono::steady_clock::now();
     if (!disk_batch_keys.empty()) {
-        std::unordered_map<std::string, std::shared_ptr<void>>
-            disk_buffer_owners;
-        for (const auto &[key, handle] : disk_temp_handles) {
-            disk_buffer_owners.emplace(key, handle);
-        }
+        std::vector<std::shared_ptr<void>> disk_buffer_owners(
+            disk_temp_handles.begin(), disk_temp_handles.end());
         const auto io_start = std::chrono::steady_clock::now();
         auto disk_results = client_->BatchGet(disk_batch_keys, disk_batch_qrs,
                                               disk_batch_slices, false,
@@ -7892,9 +7911,7 @@ void RealClient::execute_session_dfs_range_reads_batch(
         if (disk_results.size() == disk_batch_keys.size()) {
             for (size_t i = 0; i < disk_results.size(); ++i) {
                 if (!disk_results[i]) continue;
-                auto slices_it = disk_batch_slices.find(disk_batch_keys[i]);
-                if (slices_it == disk_batch_slices.end()) continue;
-                for (const auto &slice : slices_it->second) {
+                for (const auto &slice : disk_batch_slices[i]) {
                     dfs_read_bytes += slice.size;
                 }
             }
@@ -7905,48 +7922,28 @@ void RealClient::execute_session_dfs_range_reads_batch(
             dfs_read_success,
             dfs_read_bytes, io_duration);
 
-        // Build key -> entry map for O(1) lookup
-        std::unordered_map<std::string, SessionRangeReadRequest *> entry_map;
-        for (auto *entry_ptr : entries) {
-            entry_map[entry_ptr->key] = entry_ptr;
-        }
-
         // Build a copy plan before submitting any DMA. Destination pointers are
         // resolved once, adjacent compatible ranges are merged, and operations
         // are grouped by accelerator and physical device.
         for (size_t di = 0; di < disk_batch_keys.size(); ++di) {
             const auto &key = disk_batch_keys[di];
-            auto handle_it = disk_temp_handles.find(key);
-            if (handle_it == disk_temp_handles.end()) {
-                continue;
-            }
+            auto *entry = arena_views[di].entry;
 
             // A short backend response is a failure for the missing entries;
             // do not index past the returned vector.
             if (di >= disk_results.size()) {
-                auto map_it = entry_map.find(key);
-                if (map_it != entry_map.end()) {
-                    results[map_it->second->original_idx] =
-                        static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
-                }
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(ErrorCode::INTERNAL_ERROR));
                 continue;
             }
 
             if (!disk_results[di]) {
-                auto map_it = entry_map.find(key);
-                if (map_it != entry_map.end()) {
-                    results[map_it->second->original_idx] =
-                        static_cast<int>(toInt(disk_results[di].error()));
-                }
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(disk_results[di].error()));
                 continue;
             }
 
-            auto map_it = entry_map.find(key);
-            if (map_it == entry_map.end()) {
-                continue;
-            }
-            SessionRangeReadRequest *entry = map_it->second;
-            std::shared_ptr<BufferHandle> handle = std::move(handle_it->second);
+            auto handle = std::move(disk_temp_handles[di]);
             if (!valid_source_handle(entry, handle)) {
                 LOG(ERROR) << "DFS read buffer is smaller than the replica, "
                               "key: "
@@ -8073,6 +8070,19 @@ void RealClient::execute_session_dfs_range_reads_batch(
             << ", scatter_finalize_us=" << scatter_finalize_us
             << ", scatter_GBps=" << scatter_gbps;
     }
+
+    ErrorCode chunk_error = ErrorCode::OK;
+    for (const auto *entry : chunk_entries) {
+        const int result = results[entry->original_idx];
+        if (result >= 0) continue;
+        const auto error = static_cast<ErrorCode>(result);
+        if (error == ErrorCode::DFS_BATCH_GET_TIMEOUT ||
+            error == ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT) {
+            return error;
+        }
+        if (chunk_error == ErrorCode::OK) chunk_error = error;
+    }
+    return chunk_error;
 }
 
 std::vector<int> RealClient::batch_put_session_start(

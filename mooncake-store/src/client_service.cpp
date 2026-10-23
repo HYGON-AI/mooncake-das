@@ -43,6 +43,9 @@
 #include "transport/transport.h"
 #include "config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+#include "ha/oplog/oplog_test_failpoint.h"
+#endif
 #include "types.h"
 #include "client_buffer.h"
 #include "utils.h"
@@ -73,32 +76,6 @@ std::optional<size_t> GetTransportRegistrationLimit(
 }
 
 namespace {
-
-struct BatchLeaseExpirySummary {
-    size_t memory = 0, nof = 0, dfs = 0, disk = 0, local_disk = 0;
-
-    void Record(const Replica::Descriptor& replica) {
-        if (replica.is_memory_replica())
-            ++memory;
-        else if (replica.is_nof_replica())
-            ++nof;
-        else if (replica.is_dfs_replica())
-            ++dfs;
-        else if (replica.is_disk_replica())
-            ++disk;
-        else if (replica.is_local_disk_replica())
-            ++local_disk;
-    }
-
-    void Log(size_t batch_size) const {
-        const size_t expired = memory + nof + dfs + disk + local_disk;
-        if (expired == 0) return;
-        LOG(WARNING) << "BatchGet lease_expired: batch_size=" << batch_size
-                     << " expired=" << expired << " MEMORY=" << memory
-                     << " NOF_SSD=" << nof << " DFS=" << dfs << " DISK=" << disk
-                     << " LOCAL_DISK=" << local_disk;
-    }
-};
 
 UUID DfsWriteEpoch(const std::vector<Replica::Descriptor>& replicas) {
     for (const auto& replica : replicas) {
@@ -136,8 +113,8 @@ std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
 }
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteChunkSize = 256ULL * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteArenaCount = 2;
+constexpr size_t kDefaultDfsWriteChunkSize = 512ULL * 1024 * 1024;
+constexpr size_t kDefaultDfsWriteArenaCount = 16;
 
 size_t ReadDfsWriteChunkSize() {
     using Variables = FileStorageEnvironmentVariables;
@@ -663,7 +640,8 @@ Client::Client(const std::string& local_hostname,
               "MC_STORE_DFS_PINNED_POOL_BYTES",
               PinnedBufferPool::kDefaultMaxCachedBytes))),
       write_thread_pool_(2),
-      task_thread_pool_(4) {
+      task_thread_pool_(4),
+      dfs_backfill_thread_pool_(1) {
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
@@ -673,6 +651,9 @@ Client::Client(const std::string& local_hostname,
     }
     LOG(INFO) << "DFS BatchPut timeout baseline: "
               << dfs_batch_put_timeout_ms_ << " ms (0 disables)";
+
+    LOG(INFO) << "DFS write buffer, chunk_size=" << dfs_write_chunk_size_
+              << ", chunk_count=" << dfs_write_arena_count_;
 
     if (metrics_) {
         if (metrics_->GetReportingInterval() > 0) {
@@ -773,6 +754,44 @@ void Client::CompleteServiceDualWrite(bool memory_succeeded,
     }
 }
 
+void Client::CompleteAsyncDfsWriteMetrics(
+    const std::shared_ptr<AsyncDfsWriteContext>& context,
+    const std::vector<ErrorCode>& outcomes) {
+    if (context->service_metrics_settled.exchange(true)) return;
+    for (size_t i = 0; i < context->service_dual_writes.size(); ++i) {
+        const auto& metric = context->service_dual_writes[i];
+        if (!metric.eligible) continue;
+        const bool dfs_succeeded = i < outcomes.size() &&
+                                   outcomes[i] == ErrorCode::OK &&
+                                   metric.requested_dfs_replicas == 1;
+        CompleteServiceDualWrite(metric.memory_succeeded, dfs_succeeded);
+    }
+}
+
+void Client::ExpireAsyncDfsWriteMetrics() {
+    std::vector<std::shared_ptr<AsyncDfsWriteContext>> expired;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+        std::erase_if(
+            service_pending_writes_, [&expired, now](const auto& item) {
+                auto context = item.lock();
+                if (!context || context->service_metrics_settled.load() ||
+                    context->io_completed.load()) {
+                    return true;
+                }
+                if (context->deadline > now) return false;
+                expired.push_back(std::move(context));
+                return true;
+            });
+    }
+    for (const auto& context : expired) {
+        // Publication is already past its deadline. Settle statistics only;
+        // the worker still owns its buffers until the filesystem call ends.
+        CompleteAsyncDfsWriteMetrics(context, {});
+    }
+}
+
 void Client::ServiceMetricsReporterLoop() {
     while (service_metrics_report_running_.load(std::memory_order_acquire)) {
         for (int i = 0; i < 50 &&
@@ -785,6 +804,7 @@ void Client::ServiceMetricsReporterLoop() {
             break;
         }
 
+        ExpireAsyncDfsWriteMetrics();
         ServiceMetricsSnapshot snapshot;
         {
             std::lock_guard<std::mutex> lock(service_metrics_mutex_);
@@ -854,6 +874,7 @@ Client::~Client() {
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
     task_thread_pool_.stop();
+    dfs_backfill_thread_pool_.stop();
 
     // Make copies to avoid modifying while iterating
     std::vector<Segment> mounted_segments_copy;
@@ -1993,7 +2014,7 @@ struct BatchGetOperation {
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
-    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    std::vector<std::vector<Slice>>& batched_slices) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.resize(object_keys.size());
 
@@ -2001,9 +2022,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& replica_list = query_results[i].replicas;
-        auto slices_it = slices.find(key);
-        if (slices_it == slices.end()) {
-            LOG(ERROR) << "Slices not found for key: " << key;
+        if (batched_slices[i].empty()) {
+            LOG(ERROR) << "Slices are empty for key: " << key
+                       << ", operation_index=" << i;
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
@@ -2036,7 +2057,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         auto seg = buffer_descriptor.transport_endpoint_;
         auto& op = seg_to_op_map[seg];
         op.replicas.emplace_back(replica);
-        op.batched_slices.emplace_back(slices_it->second);
+        op.batched_slices.emplace_back(batched_slices[i]);
         op.key_indexes.emplace_back(i);
         op.cache_used.emplace_back(cache_used);
     }
@@ -2127,8 +2148,39 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     bool prefer_alloc_in_same_node,
     const std::unordered_map<std::string, std::shared_ptr<void>>*
         dfs_buffer_owners) {
-    auto results = BatchGetImpl(object_keys, query_results, slices,
-                                prefer_alloc_in_same_node, dfs_buffer_owners);
+    std::vector<std::vector<Slice>> batched_slices;
+    batched_slices.reserve(object_keys.size());
+    std::vector<std::shared_ptr<void>> aligned_buffer_owners;
+    if (dfs_buffer_owners != nullptr) {
+        aligned_buffer_owners.reserve(object_keys.size());
+    }
+    for (const auto& key : object_keys) {
+        auto slices_it = slices.find(key);
+        batched_slices.push_back(slices_it == slices.end()
+                                     ? std::vector<Slice>{}
+                                     : slices_it->second);
+        if (dfs_buffer_owners != nullptr) {
+            auto owner_it = dfs_buffer_owners->find(key);
+            aligned_buffer_owners.push_back(
+                owner_it == dfs_buffer_owners->end() ? nullptr
+                                                     : owner_it->second);
+        }
+    }
+    return BatchGet(object_keys, query_results, batched_slices,
+                    prefer_alloc_in_same_node,
+                    dfs_buffer_owners == nullptr ? nullptr
+                                                 : &aligned_buffer_owners);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
+    const std::vector<std::string>& object_keys,
+    const std::vector<QueryResult>& query_results,
+    std::vector<std::vector<Slice>>& batched_slices,
+    bool prefer_alloc_in_same_node,
+    const std::vector<std::shared_ptr<void>>* dfs_buffer_owners) {
+    auto results =
+        BatchGetImpl(object_keys, query_results, batched_slices,
+                     prefer_alloc_in_same_node, dfs_buffer_owners);
     std::vector<std::string> retry_keys;
     std::vector<size_t> retry_indices;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -2146,6 +2198,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
     std::vector<std::string> valid_keys;
     std::vector<QueryResult> valid_queries;
+    std::vector<std::vector<Slice>> valid_slices;
+    std::vector<std::shared_ptr<void>> valid_buffer_owners;
     std::vector<size_t> valid_indices;
     for (size_t i = 0; i < refreshed.size(); ++i) {
         if (!refreshed[i]) {
@@ -2160,12 +2214,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
         valid_keys.push_back(retry_keys[i]);
         valid_queries.push_back(std::move(*retry));
+        valid_slices.push_back(batched_slices[retry_indices[i]]);
+        if (dfs_buffer_owners != nullptr) {
+            valid_buffer_owners.push_back(
+                (*dfs_buffer_owners)[retry_indices[i]]);
+        }
         valid_indices.push_back(retry_indices[i]);
     }
     if (!valid_keys.empty()) {
-        auto retried = BatchGetImpl(valid_keys, valid_queries, slices,
-                                    prefer_alloc_in_same_node,
-                                    dfs_buffer_owners);
+        auto retried = BatchGetImpl(
+            valid_keys, valid_queries, valid_slices, prefer_alloc_in_same_node,
+            dfs_buffer_owners == nullptr ? nullptr : &valid_buffer_owners);
         for (size_t i = 0; i < retried.size(); ++i)
             results[valid_indices[i]] = std::move(retried[i]);
     }
@@ -2175,10 +2234,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
-    std::unordered_map<std::string, std::vector<Slice>>& slices,
+    std::vector<std::vector<Slice>>& batched_slices,
     bool prefer_alloc_in_same_node,
-    const std::unordered_map<std::string, std::shared_ptr<void>>*
-        dfs_buffer_owners) {
+    const std::vector<std::shared_ptr<void>>* dfs_buffer_owners) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -2201,10 +2259,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     }
 
     // Validate input size consistency
-    if (query_results.size() != object_keys.size()) {
-        LOG(ERROR) << "Query results size (" << query_results.size()
-                   << ") doesn't match object keys size (" << object_keys.size()
-                   << ")";
+    if (query_results.size() != object_keys.size() ||
+        batched_slices.size() != object_keys.size() ||
+        (dfs_buffer_owners != nullptr &&
+         dfs_buffer_owners->size() != object_keys.size())) {
+        LOG(ERROR) << "BatchGet operation-aligned input size mismatch: keys="
+                   << object_keys.size()
+                   << ", query_results=" << query_results.size()
+                   << ", batched_slices=" << batched_slices.size()
+                   << ", buffer_owners="
+                   << (dfs_buffer_owners == nullptr
+                           ? 0
+                           : dfs_buffer_owners->size());
         std::vector<tl::expected<void, ErrorCode>> results;
         results.reserve(object_keys.size());
         for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -2213,18 +2279,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
         return results;
     }
     if (prefer_alloc_in_same_node) {
-        auto results =
-            BatchGetWhenPreferSameNode(object_keys, query_results, slices);
-        BatchLeaseExpirySummary expired;
+        auto results = BatchGetWhenPreferSameNode(
+            object_keys, query_results, batched_slices);
         auto now = std::chrono::steady_clock::now();
         for (size_t i = 0; i < object_keys.size(); ++i) {
             if (results[i].has_value() &&
                 query_results[i].IsLeaseExpired(now)) {
-                ++expired.memory;  // Same-node reads accept only MEMORY.
                 results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
             }
         }
-        expired.Log(object_keys.size());
         return results;
     }
 
@@ -2246,10 +2309,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& query_result = query_results[i];
-
-        auto slices_it = slices.find(key);
-        if (slices_it == slices.end()) {
-            LOG(ERROR) << "Slices not found for key: " << key;
+        auto& object_slices = batched_slices[i];
+        if (object_slices.empty()) {
+            LOG(ERROR) << "Slices are empty for key: " << key
+                       << ", operation_index=" << i;
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
@@ -2292,28 +2355,25 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
             const auto& desc = replica.get_dfs_descriptor();
             std::shared_ptr<void> buffer_owner;
             if (dfs_buffer_owners != nullptr) {
-                auto owner_it = dfs_buffer_owners->find(key);
-                if (owner_it != dfs_buffer_owners->end()) {
-                    buffer_owner = owner_it->second;
-                }
+                buffer_owner = (*dfs_buffer_owners)[i];
             }
             dfs_read_requests.push_back(
-                DfsReadRequest{key, desc, slices_it->second,
+                DfsReadRequest{key, desc, object_slices,
                                std::move(buffer_owner)});
             dfs_read_indices.push_back(i);
             continue;
         } else if (replica.is_nof_replica()) {
-            auto contiguous_range = GetContiguousSliceRange(slices_it->second);
+            auto contiguous_range = GetContiguousSliceRange(object_slices);
             if (!contiguous_range.has_value()) {
                 LOG(ERROR) << "NoF transfer requires contiguous slices";
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
             future = transfer_submitter_->submit(
-                replica, slices_it->second, TransferRequest::READ,
+                replica, object_slices, TransferRequest::READ,
                 contiguous_range->ptr, contiguous_range->size);
         } else {
-            future = transfer_submitter_->submit(replica, slices_it->second,
+            future = transfer_submitter_->submit(replica, object_slices,
                                                  TransferRequest::READ);
         }
         if (!future) {
@@ -2432,14 +2492,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
             results[index] = tl::unexpected(result);
         } else {
             VLOG(1) << "Transfer completed successfully for key: " << key;
-
-            auto slices_it = slices.find(key);
-            if (slices_it == slices.end()) {
-                results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
             auto checksum_result = VerifyObjectChecksum(
-                key, slices_it->second, calculate_total_size(stored_replica),
+                key, batched_slices[index],
+                calculate_total_size(stored_replica),
                 query_results[index].object_checksum);
             if (!checksum_result) {
                 if (stored_replica.is_memory_replica() ||
@@ -2456,35 +2511,38 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
             // Frequency admission: only promote frequently accessed keys.
             // Skip when cache was used (data served from local cache).
             if (hot_cache_) {
-                auto slices_it = slices.find(key);
-                if (slices_it != slices.end() &&
-                    ShouldAdmitToHotCache(key, cache_used)) {
-                    ProcessSlicesAsync(key, slices_it->second, stored_replica);
+                if (ShouldAdmitToHotCache(key, cache_used)) {
+                    ProcessSlicesAsync(key, batched_slices[index],
+                                       stored_replica);
                 }
             }
         }
     }
 
-    BatchLeaseExpirySummary expired;
     auto now = std::chrono::steady_clock::now();
-    // These records identify the replicas actually used, without another
-    // replica-list scan or a per-key allocation for logging.
+    size_t non_dfs_lease_expired_keys = 0;
     for (const auto& [index, key, future, replica, cache_used] :
          pending_transfers) {
         if (results[index].has_value() &&
             query_results[index].IsLeaseExpired(now)) {
-            expired.Record(replica);
-            results[index] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+            ++non_dfs_lease_expired_keys;
+            results[index] = tl::unexpected(ErrorCode::BATCH_GET_LEASE_EXPIRED);
         }
     }
+    if (non_dfs_lease_expired_keys != 0) {
+        LOG(WARNING) << "BatchGet: non-DFS replicas expired, num_keys="
+                     << non_dfs_lease_expired_keys;
+    }
+    // Only validated reads from an initialized immutable bucket survive expiry.
+    const bool immutable_bucket =
+        dfs_storage_backend_ && dfs_storage_backend_->IsInitialized() &&
+        dfs_storage_backend_->GetAllocatorType() == DfsAllocatorType::BUCKET;
     for (size_t index : dfs_read_indices) {
-        if (results[index].has_value() &&
+        if (results[index].has_value() && !immutable_bucket &&
             query_results[index].IsLeaseExpired(now)) {
-            ++expired.dfs;
-            results[index] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+            results[index] = tl::unexpected(ErrorCode::BATCH_GET_LEASE_EXPIRED);
         }
     }
-    expired.Log(object_keys.size());
 
     auto us_batch_get = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - t0_batch_get)
@@ -3607,6 +3665,10 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         results.assign(requests.size(),
                        tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
     }
+    // Once the worker observes a result, it owns outcome classification. The
+    // reporter must not turn a timely result into a timeout while we process
+    // it.
+    context->io_completed.store(true);
     const double write_duration_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       write_started)
@@ -3642,21 +3704,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         successful_bytes = 0;
     }
 
-    for (size_t i = 0; i < context->service_dual_writes.size(); ++i) {
-        const auto& metric = context->service_dual_writes[i];
-        if (!metric.eligible ||
-            (i < context->service_metrics_settled.size() &&
-             context->service_metrics_settled[i])) {
-            continue;
-        }
-        const bool dfs_succeeded =
-            i < outcomes.size() && outcomes[i] == ErrorCode::OK &&
-            metric.requested_dfs_replicas == 1;
-        CompleteServiceDualWrite(metric.memory_succeeded, dfs_succeeded);
-        if (i < context->service_metrics_settled.size()) {
-            context->service_metrics_settled[i] = true;
-        }
-    }
+    CompleteAsyncDfsWriteMetrics(context, outcomes);
 
     ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
                     all_succeeded, successful_bytes,
@@ -3837,7 +3885,6 @@ void Client::SubmitDfsWriteChunk(
         context->is_upsert = is_upsert;
         context->object_checksums.resize(keys.size());
         context->service_dual_writes.resize(keys.size());
-        context->service_metrics_settled.assign(keys.size(), false);
         for (size_t i = 0; i < op_indices.size(); ++i) {
             const auto& op = ops[op_indices[i]];
             auto& metric = context->service_dual_writes[i];
@@ -3911,51 +3958,47 @@ void Client::SubmitDfsWriteChunk(
     }
 
     try {
+        {
+            std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+            if (!service_metrics_snapshot_.service_endpoint.empty() &&
+                context->deadline !=
+                    std::chrono::steady_clock::time_point::max()) {
+                service_pending_writes_.push_back(context);
+            }
+        }
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+        TestFailPoint::Wait("dfs_write_before_enqueue");
+#endif
         write_thread_pool_.enqueue([this, context, release_inflight]() {
             try {
                 RunAsyncDfsWrite(context);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Async DFS write task threw: " << e.what();
-                for (size_t i = 0; i < context->service_dual_writes.size();
-                     ++i) {
-                    const auto& metric = context->service_dual_writes[i];
-                    if (!metric.eligible ||
-                        (i < context->service_metrics_settled.size() &&
-                         context->service_metrics_settled[i])) {
-                        continue;
-                    }
-                    CompleteServiceDualWrite(metric.memory_succeeded, false);
-                    if (i < context->service_metrics_settled.size()) {
-                        context->service_metrics_settled[i] = true;
-                    }
-                }
+                CompleteAsyncDfsWriteMetrics(context, {});
             } catch (...) {
                 LOG(ERROR) << "Async DFS write task threw an unknown exception";
-                for (size_t i = 0; i < context->service_dual_writes.size();
-                     ++i) {
-                    const auto& metric = context->service_dual_writes[i];
-                    if (!metric.eligible ||
-                        (i < context->service_metrics_settled.size() &&
-                         context->service_metrics_settled[i])) {
-                        continue;
-                    }
-                    CompleteServiceDualWrite(metric.memory_succeeded, false);
-                    if (i < context->service_metrics_settled.size()) {
-                        context->service_metrics_settled[i] = true;
-                    }
-                }
+                CompleteAsyncDfsWriteMetrics(context, {});
             }
             release_inflight();
         });
     } catch (const std::exception& e) {
-        // The pool was stopped between the shutdown check and the enqueue.
+        // Enqueue may fail after the reporter has already settled the deadline.
         LOG(ERROR) << "Failed to enqueue async DFS write: " << e.what();
         release_inflight();
-        for (const auto& metric : context->service_dual_writes) {
-            if (metric.eligible) CancelServiceDualWritePending();
+        const bool metrics_already_settled =
+            context->service_metrics_settled.exchange(true);
+        if (!metrics_already_settled) {
+            for (const auto& metric : context->service_dual_writes) {
+                if (metric.eligible) CancelServiceDualWritePending();
+            }
         }
         for (const size_t index : op_indices) {
             auto& op = ops[index];
+            if (metrics_already_settled && op.service_dual_write_eligible) {
+                // The reporter owns this completion; the foreground must not
+                // count it again when it handles the rejected write.
+                op.service_metric_recorded = true;
+            }
             op.transfer_summary.RecordFailure(
                 ReplicaType::DFS, ErrorCode::DFS_SERVICE_UNAVAILABLE);
             op.AppendFailureContext("Failed to enqueue async DFS write");
@@ -6178,8 +6221,10 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
     client_task.assignment = assignment;
     client_task.retry_count = 0;
 
-    task_thread_pool_.enqueue(
-        [this, client_task]() { ExecuteTask(client_task); });
+    auto& executor = assignment.type == TaskType::DFS_BACKFILL
+                         ? dfs_backfill_thread_pool_
+                         : task_thread_pool_;
+    executor.enqueue([this, client_task]() { ExecuteTask(client_task); });
 }
 
 tl::expected<std::shared_ptr<DistributedStorageBackend>, ErrorCode>
