@@ -354,9 +354,10 @@ class DistributedStorageBackend
         const std::vector<DfsReadRequest>& requests,
         std::vector<tl::expected<void, ErrorCode>>& results);
 
-    bool AcquireInflightReadUntil(
+    ErrorCode AcquireInflightReadUntil(
         uint64_t bytes, std::chrono::steady_clock::time_point deadline);
     void ReleaseInflightRead(uint64_t bytes);
+    void SetDfsReadTimedOut(bool timed_out);
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;

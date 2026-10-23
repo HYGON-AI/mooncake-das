@@ -4257,20 +4257,18 @@ RealClient::batch_get_buffer_internal(
     if (!valid_ops.empty()) {
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_query_results;
-        std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+        std::vector<std::vector<Slice>> batch_slices;
+        std::vector<std::shared_ptr<void>> batch_buffer_owners;
         batch_keys.reserve(valid_ops.size());
         batch_query_results.reserve(valid_ops.size());
+        batch_slices.reserve(valid_ops.size());
+        batch_buffer_owners.reserve(valid_ops.size());
 
         for (auto &op : valid_ops) {
             batch_keys.push_back(op.key);
             batch_query_results.push_back(op.query_result);
-            batch_slices[op.key] = op.slices;
-        }
-
-        std::unordered_map<std::string, std::shared_ptr<void>>
-            batch_buffer_owners;
-        for (const auto &op : valid_ops) {
-            batch_buffer_owners.emplace(op.key, op.buffer_handle);
+            batch_slices.push_back(op.slices);
+            batch_buffer_owners.push_back(op.buffer_handle);
         }
         auto batch_get_results = client_->BatchGet(
             batch_keys, batch_query_results, batch_slices, false,
@@ -6188,15 +6186,17 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     // Prepare batch transfer data structures
     std::vector<std::string> batch_keys;
     std::vector<QueryResult> batch_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> batch_slices;
+    // Operation-aligned: duplicate keys may target different user buffers.
+    std::vector<std::vector<Slice>> batch_slices;
 
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
+    batch_slices.reserve(valid_operations.size());
 
     for (const auto &op : valid_operations) {
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
-        batch_slices[op.key] = op.slices;
+        batch_slices.push_back(op.slices);
     }
     if (!valid_operations.empty()) {
         // Execute batch transfer
@@ -6220,10 +6220,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     if (!disk_operations.empty()) {
         std::vector<std::string> disk_batch_keys;
         std::vector<QueryResult> disk_batch_qrs;
-        std::unordered_map<std::string, std::vector<Slice>> disk_batch_slices;
+        // Keep slices and owners aligned by operation; a key is not an
+        // operation identifier and may legitimately occur more than once.
+        std::vector<std::vector<Slice>> disk_batch_slices;
         std::vector<size_t> disk_batch_indices;
-        std::unordered_map<std::string, std::shared_ptr<BufferHandle>>
-            disk_temp_handles;
+        std::vector<std::shared_ptr<BufferHandle>> disk_temp_handles;
+        disk_batch_keys.reserve(disk_operations.size());
+        disk_batch_qrs.reserve(disk_operations.size());
+        disk_batch_slices.reserve(disk_operations.size());
+        disk_batch_indices.reserve(disk_operations.size());
+        disk_temp_handles.reserve(disk_operations.size());
 
         for (size_t di = 0; di < disk_operations.size(); ++di) {
             auto &op = disk_operations[di];
@@ -6247,16 +6253,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             disk_batch_keys.push_back(op.key);
             disk_batch_qrs.push_back(
                 FilterQueryResult(op.query_result, replica));
-            disk_batch_slices[op.key] = std::move(disk_slices);
+            disk_batch_slices.push_back(std::move(disk_slices));
             disk_batch_indices.push_back(di);
-            disk_temp_handles.emplace(op.key, std::move(handle));
+            disk_temp_handles.push_back(std::move(handle));
         }
 
         if (!disk_batch_keys.empty()) {
-            std::unordered_map<std::string, std::shared_ptr<void>>
-                disk_buffer_owners;
-            for (const auto &[key, handle] : disk_temp_handles) {
-                disk_buffer_owners.emplace(key, handle);
+            std::vector<std::shared_ptr<void>> disk_buffer_owners;
+            disk_buffer_owners.reserve(disk_temp_handles.size());
+            for (const auto &handle : disk_temp_handles) {
+                disk_buffer_owners.push_back(handle);
             }
             auto disk_results = client_->BatchGet(
                 disk_batch_keys, disk_batch_qrs, disk_batch_slices, false,
@@ -6265,7 +6271,6 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             for (size_t di = 0; di < disk_batch_indices.size(); ++di) {
                 const auto &key = disk_batch_keys[di];
                 auto &op = disk_operations[disk_batch_indices[di]];
-                auto handle_it = disk_temp_handles.find(key);
                 const char *replica_type =
                     op.replica.is_dfs_replica() ? "DFS" : "DISK";
                 if (!disk_results[di]) {
@@ -6278,7 +6283,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 }
                 if (auto r = scatter_host_to_maybe_device(
                         op.dst_buffer,
-                        static_cast<char *>(handle_it->second->ptr()),
+                        static_cast<char *>(disk_temp_handles[di]->ptr()),
                         op.total_size,
                         std::string(replica_type) + " read, key: " + key);
                     !r) {
@@ -7532,18 +7537,40 @@ void RealClient::execute_session_dfs_range_reads(
     flush_chunk();
 
     for (size_t i = 0; i < chunks.size(); ++i) {
-        execute_session_dfs_range_reads_batch(
+        const ErrorCode chunk_error = execute_session_dfs_range_reads_batch(
             chunks[i], results, trace_id, false, i + 1, chunks.size(),
             chunk_limit_bytes, request_planned_bytes);
+        if (chunk_error != ErrorCode::DFS_BATCH_GET_TIMEOUT &&
+            chunk_error != ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT) {
+            continue;
+        }
+
+        size_t skipped_entries = 0;
+        for (size_t remaining = i + 1; remaining < chunks.size(); ++remaining) {
+            for (const auto *entry : chunks[remaining]) {
+                results[entry->original_idx] =
+                    static_cast<int>(toInt(chunk_error));
+                ++skipped_entries;
+            }
+        }
+        LOG(ERROR) << "Stopping chunked DFS restore after timeout: trace_id="
+                   << trace_id << ", failed_chunk=" << i + 1 << "/"
+                   << chunks.size() << ", skipped_chunks="
+                   << chunks.size() - i - 1
+                   << ", skipped_entries=" << skipped_entries
+                   << ", error=" << toString(chunk_error) << " ("
+                   << toInt(chunk_error) << ")";
+        break;
     }
 }
 
-void RealClient::execute_session_dfs_range_reads_batch(
+ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     std::vector<SessionRangeReadRequest *> &entries,
     std::vector<int> &results, uint64_t trace_id, bool prefetch_only,
     size_t chunk_index, size_t chunk_count, size_t chunk_limit_bytes,
     size_t request_planned_bytes) {
     const auto timing_start = std::chrono::steady_clock::now();
+    const auto chunk_entries = entries;
     const bool trace_enabled = trace_id != 0;
     const size_t input_entries = entries.size();
     size_t prefetch_cache_hits = 0;
@@ -8067,6 +8094,19 @@ void RealClient::execute_session_dfs_range_reads_batch(
             << ", scatter_finalize_us=" << scatter_finalize_us
             << ", scatter_GBps=" << scatter_gbps;
     }
+
+    ErrorCode chunk_error = ErrorCode::OK;
+    for (const auto *entry : chunk_entries) {
+        const int result = results[entry->original_idx];
+        if (result >= 0) continue;
+        const auto error = static_cast<ErrorCode>(result);
+        if (error == ErrorCode::DFS_BATCH_GET_TIMEOUT ||
+            error == ErrorCode::DFS_BATCH_GET_ADMISSION_TIMEOUT) {
+            return error;
+        }
+        if (chunk_error == ErrorCode::OK) chunk_error = error;
+    }
+    return chunk_error;
 }
 
 std::vector<int> RealClient::batch_put_session_start(

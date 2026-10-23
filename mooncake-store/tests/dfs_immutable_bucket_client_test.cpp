@@ -2079,6 +2079,67 @@ TEST_F(DfsBucketClientTest, ReadTimeoutDoesNotChangeClientAccessPolicy) {
     EXPECT_EQ(*output, value);
 }
 
+TEST_F(DfsBucketClientTest, DuplicateKeyTimeoutKeepsEveryBufferAlive) {
+    const std::string key = "bucket_duplicate_key_timeout";
+    const std::string value(4096, 'R');
+    std::vector<std::string> values{value};
+    auto write_slices = MakeSlices(values);
+    auto put_results = writer_->BatchPut({key}, write_slices, DfsConfig());
+    ASSERT_EQ(put_results.size(), 1u);
+    ASSERT_TRUE(put_results[0].has_value());
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+
+    auto timeout_config = distributed_config_;
+    timeout_config.batch_get_timeout_ms = 25;
+    auto timeout_adapter = std::make_unique<FailingBucketFsAdapter>();
+    adapter_ = timeout_adapter.get();
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root_;
+    backend_ = std::make_shared<DistributedStorageBackend>(
+        file_config, timeout_config, std::move(timeout_adapter),
+        writer_->GetDfsRootIdentity());
+    ASSERT_TRUE(backend_->Init().has_value());
+    writer_->SetDfsStorageBackend(backend_);
+
+    auto first = std::make_shared<std::string>(value.size(), '\0');
+    auto second = std::make_shared<std::string>(value.size(), '\0');
+    std::weak_ptr<std::string> first_weak = first;
+    std::weak_ptr<std::string> second_weak = second;
+    std::vector<std::vector<Slice>> read_slices{
+        {{first->data(), first->size()}},
+        {{second->data(), second->size()}}};
+    std::vector<std::shared_ptr<void>> buffer_owners{first, second};
+
+    adapter_->BlockReads();
+    auto timed_out = writer_->BatchGet({key, key}, {*query, *query},
+                                       read_slices, false, &buffer_owners);
+    first.reset();
+    second.reset();
+    buffer_owners.clear();
+
+    ASSERT_EQ(timed_out.size(), 2u);
+    ASSERT_FALSE(timed_out[0].has_value());
+    ASSERT_FALSE(timed_out[1].has_value());
+    EXPECT_EQ(timed_out[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_EQ(timed_out[1].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);
+    EXPECT_FALSE(first_weak.expired());
+    EXPECT_FALSE(second_weak.expired());
+
+    adapter_->ReleaseReads();
+    ASSERT_TRUE(adapter_->WaitUntilReadDone(std::chrono::seconds(2)));
+    const auto owners_released_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!first_weak.expired() || !second_weak.expired()) &&
+           std::chrono::steady_clock::now() < owners_released_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(first_weak.expired());
+    EXPECT_TRUE(second_weak.expired());
+}
+
 TEST_F(DfsBucketClientTest, ClientDestructionDrainsInFlightAsyncWrites) {
     // A client torn down immediately after BatchPut must not leave a task
     // touching its RPC client or backend. The drain in ~Client makes this

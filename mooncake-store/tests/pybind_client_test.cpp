@@ -3675,6 +3675,65 @@ TEST_F(RealClientTest, PutBatchThenBatchGetBuffer) {
     }
 }
 
+TEST_F(RealClientTest, BatchGetBufferSupportsDuplicateKeys) {
+    StartMasterAndSetupClient();
+
+    const std::string key = "batch_get_duplicate_key";
+    const std::string value = "duplicate-key-value";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(
+                  key, std::span<const char>(value.data(), value.size()),
+                  config),
+              0);
+
+    auto handles = py_client_->batch_get_buffer({key, key});
+    ASSERT_EQ(handles.size(), 2u);
+    ASSERT_NE(handles[0], nullptr);
+    ASSERT_NE(handles[1], nullptr);
+    EXPECT_NE(handles[0]->ptr(), handles[1]->ptr());
+    for (const auto &handle : handles) {
+        EXPECT_EQ(std::string(static_cast<const char *>(handle->ptr()),
+                              handle->size()),
+                  value);
+    }
+}
+
+TEST_F(RealClientTest, BatchGetIntoSupportsDuplicateKeys) {
+    StartMasterAndSetupClient();
+
+    const std::string key = "batch_get_into_duplicate_key";
+    const std::string value = "duplicate-key-into-value";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(
+                  key, std::span<const char>(value.data(), value.size()),
+                  config),
+              0);
+
+    auto first_result =
+        py_client_->client_buffer_allocator_->allocate(value.size());
+    auto second_result =
+        py_client_->client_buffer_allocator_->allocate(value.size());
+    ASSERT_TRUE(first_result.has_value());
+    ASSERT_TRUE(second_result.has_value());
+    BufferHandle first = std::move(*first_result);
+    BufferHandle second = std::move(*second_result);
+    std::memset(first.ptr(), 0, first.size());
+    std::memset(second.ptr(), 0, second.size());
+
+    auto results = py_client_->batch_get_into(
+        {key, key}, {first.ptr(), second.ptr()}, {first.size(), second.size()});
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(results[0], static_cast<int64_t>(value.size()));
+    EXPECT_EQ(results[1], static_cast<int64_t>(value.size()));
+    EXPECT_EQ(std::string(static_cast<const char *>(first.ptr()), first.size()),
+              value);
+    EXPECT_EQ(
+        std::string(static_cast<const char *>(second.ptr()), second.size()),
+        value);
+}
+
 // ===================== HealthCheck Tests =====================
 
 TEST_F(RealClientTest, HealthCheckAfterSetup) {

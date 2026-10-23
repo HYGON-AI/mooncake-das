@@ -1967,7 +1967,7 @@ struct BatchGetOperation {
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
-    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    std::vector<std::vector<Slice>>& batched_slices) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.resize(object_keys.size());
 
@@ -1975,9 +1975,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& replica_list = query_results[i].replicas;
-        auto slices_it = slices.find(key);
-        if (slices_it == slices.end()) {
-            LOG(ERROR) << "Slices not found for key: " << key;
+        if (batched_slices[i].empty()) {
+            LOG(ERROR) << "Slices are empty for key: " << key
+                       << ", operation_index=" << i;
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
@@ -2010,7 +2010,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         auto seg = buffer_descriptor.transport_endpoint_;
         auto& op = seg_to_op_map[seg];
         op.replicas.emplace_back(replica);
-        op.batched_slices.emplace_back(slices_it->second);
+        op.batched_slices.emplace_back(batched_slices[i]);
         op.key_indexes.emplace_back(i);
         op.cache_used.emplace_back(cache_used);
     }
@@ -2101,8 +2101,39 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     bool prefer_alloc_in_same_node,
     const std::unordered_map<std::string, std::shared_ptr<void>>*
         dfs_buffer_owners) {
-    auto results = BatchGetImpl(object_keys, query_results, slices,
-                                prefer_alloc_in_same_node, dfs_buffer_owners);
+    std::vector<std::vector<Slice>> batched_slices;
+    batched_slices.reserve(object_keys.size());
+    std::vector<std::shared_ptr<void>> aligned_buffer_owners;
+    if (dfs_buffer_owners != nullptr) {
+        aligned_buffer_owners.reserve(object_keys.size());
+    }
+    for (const auto& key : object_keys) {
+        auto slices_it = slices.find(key);
+        batched_slices.push_back(slices_it == slices.end()
+                                     ? std::vector<Slice>{}
+                                     : slices_it->second);
+        if (dfs_buffer_owners != nullptr) {
+            auto owner_it = dfs_buffer_owners->find(key);
+            aligned_buffer_owners.push_back(
+                owner_it == dfs_buffer_owners->end() ? nullptr
+                                                     : owner_it->second);
+        }
+    }
+    return BatchGet(object_keys, query_results, batched_slices,
+                    prefer_alloc_in_same_node,
+                    dfs_buffer_owners == nullptr ? nullptr
+                                                 : &aligned_buffer_owners);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
+    const std::vector<std::string>& object_keys,
+    const std::vector<QueryResult>& query_results,
+    std::vector<std::vector<Slice>>& batched_slices,
+    bool prefer_alloc_in_same_node,
+    const std::vector<std::shared_ptr<void>>* dfs_buffer_owners) {
+    auto results =
+        BatchGetImpl(object_keys, query_results, batched_slices,
+                     prefer_alloc_in_same_node, dfs_buffer_owners);
     std::vector<std::string> retry_keys;
     std::vector<size_t> retry_indices;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -2120,6 +2151,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
     std::vector<std::string> valid_keys;
     std::vector<QueryResult> valid_queries;
+    std::vector<std::vector<Slice>> valid_slices;
+    std::vector<std::shared_ptr<void>> valid_buffer_owners;
     std::vector<size_t> valid_indices;
     for (size_t i = 0; i < refreshed.size(); ++i) {
         if (!refreshed[i]) {
@@ -2134,12 +2167,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
         valid_keys.push_back(retry_keys[i]);
         valid_queries.push_back(std::move(*retry));
+        valid_slices.push_back(batched_slices[retry_indices[i]]);
+        if (dfs_buffer_owners != nullptr) {
+            valid_buffer_owners.push_back(
+                (*dfs_buffer_owners)[retry_indices[i]]);
+        }
         valid_indices.push_back(retry_indices[i]);
     }
     if (!valid_keys.empty()) {
-        auto retried = BatchGetImpl(valid_keys, valid_queries, slices,
-                                    prefer_alloc_in_same_node,
-                                    dfs_buffer_owners);
+        auto retried = BatchGetImpl(
+            valid_keys, valid_queries, valid_slices, prefer_alloc_in_same_node,
+            dfs_buffer_owners == nullptr ? nullptr : &valid_buffer_owners);
         for (size_t i = 0; i < retried.size(); ++i)
             results[valid_indices[i]] = std::move(retried[i]);
     }
@@ -2149,10 +2187,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
-    std::unordered_map<std::string, std::vector<Slice>>& slices,
+    std::vector<std::vector<Slice>>& batched_slices,
     bool prefer_alloc_in_same_node,
-    const std::unordered_map<std::string, std::shared_ptr<void>>*
-        dfs_buffer_owners) {
+    const std::vector<std::shared_ptr<void>>* dfs_buffer_owners) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -2175,10 +2212,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     }
 
     // Validate input size consistency
-    if (query_results.size() != object_keys.size()) {
-        LOG(ERROR) << "Query results size (" << query_results.size()
-                   << ") doesn't match object keys size (" << object_keys.size()
-                   << ")";
+    if (query_results.size() != object_keys.size() ||
+        batched_slices.size() != object_keys.size() ||
+        (dfs_buffer_owners != nullptr &&
+         dfs_buffer_owners->size() != object_keys.size())) {
+        LOG(ERROR) << "BatchGet operation-aligned input size mismatch: keys="
+                   << object_keys.size()
+                   << ", query_results=" << query_results.size()
+                   << ", batched_slices=" << batched_slices.size()
+                   << ", buffer_owners="
+                   << (dfs_buffer_owners == nullptr
+                           ? 0
+                           : dfs_buffer_owners->size());
         std::vector<tl::expected<void, ErrorCode>> results;
         results.reserve(object_keys.size());
         for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -2187,8 +2232,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
         return results;
     }
     if (prefer_alloc_in_same_node) {
-        auto results =
-            BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        auto results = BatchGetWhenPreferSameNode(
+            object_keys, query_results, batched_slices);
         auto now = std::chrono::steady_clock::now();
         for (size_t i = 0; i < object_keys.size(); ++i) {
             if (results[i].has_value() &&
@@ -2217,10 +2262,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& query_result = query_results[i];
-
-        auto slices_it = slices.find(key);
-        if (slices_it == slices.end()) {
-            LOG(ERROR) << "Slices not found for key: " << key;
+        auto& object_slices = batched_slices[i];
+        if (object_slices.empty()) {
+            LOG(ERROR) << "Slices are empty for key: " << key
+                       << ", operation_index=" << i;
             results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
@@ -2263,28 +2308,25 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
             const auto& desc = replica.get_dfs_descriptor();
             std::shared_ptr<void> buffer_owner;
             if (dfs_buffer_owners != nullptr) {
-                auto owner_it = dfs_buffer_owners->find(key);
-                if (owner_it != dfs_buffer_owners->end()) {
-                    buffer_owner = owner_it->second;
-                }
+                buffer_owner = (*dfs_buffer_owners)[i];
             }
             dfs_read_requests.push_back(
-                DfsReadRequest{key, desc, slices_it->second,
+                DfsReadRequest{key, desc, object_slices,
                                std::move(buffer_owner)});
             dfs_read_indices.push_back(i);
             continue;
         } else if (replica.is_nof_replica()) {
-            auto contiguous_range = GetContiguousSliceRange(slices_it->second);
+            auto contiguous_range = GetContiguousSliceRange(object_slices);
             if (!contiguous_range.has_value()) {
                 LOG(ERROR) << "NoF transfer requires contiguous slices";
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
             future = transfer_submitter_->submit(
-                replica, slices_it->second, TransferRequest::READ,
+                replica, object_slices, TransferRequest::READ,
                 contiguous_range->ptr, contiguous_range->size);
         } else {
-            future = transfer_submitter_->submit(replica, slices_it->second,
+            future = transfer_submitter_->submit(replica, object_slices,
                                                  TransferRequest::READ);
         }
         if (!future) {
@@ -2403,14 +2445,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
             results[index] = tl::unexpected(result);
         } else {
             VLOG(1) << "Transfer completed successfully for key: " << key;
-
-            auto slices_it = slices.find(key);
-            if (slices_it == slices.end()) {
-                results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
             auto checksum_result = VerifyObjectChecksum(
-                key, slices_it->second, calculate_total_size(stored_replica),
+                key, batched_slices[index],
+                calculate_total_size(stored_replica),
                 query_results[index].object_checksum);
             if (!checksum_result) {
                 if (stored_replica.is_memory_replica() ||
@@ -2427,10 +2464,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
             // Frequency admission: only promote frequently accessed keys.
             // Skip when cache was used (data served from local cache).
             if (hot_cache_) {
-                auto slices_it = slices.find(key);
-                if (slices_it != slices.end() &&
-                    ShouldAdmitToHotCache(key, cache_used)) {
-                    ProcessSlicesAsync(key, slices_it->second, stored_replica);
+                if (ShouldAdmitToHotCache(key, cache_used)) {
+                    ProcessSlicesAsync(key, batched_slices[index],
+                                       stored_replica);
                 }
             }
         }
