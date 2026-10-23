@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -91,6 +92,7 @@ device::AcceleratorDeviceRegistrar staging_device_registration(staging_device);
 // Fails the Nth WriteAt so the asynchronous revoke path can be exercised.
 class FailingBucketFsAdapter : public PosixFsAdapter {
    public:
+    std::function<void()> after_read;
     int WriteCalls() const { return write_calls_.load(); }
     int FailedWrites() const { return failed_writes_.load(); }
     void FailWriteCall(int call) { fail_write_call_.store(call); }
@@ -151,6 +153,7 @@ class FailingBucketFsAdapter : public PosixFsAdapter {
             read_cv_.wait(lock, [this] { return !reads_blocked_; });
         }
         auto result = PosixFsAdapter::DirectReadAt(fd, iov, iovcnt, offset);
+        if (after_read) after_read();
         {
             std::lock_guard<std::mutex> lock(read_mutex_);
             read_done_ = true;
@@ -829,7 +832,7 @@ TEST_F(DfsBucketClientTest, StaleDfsReadRetryHonorsRuntimeFilter) {
     EXPECT_EQ(output, value);
 }
 
-TEST_F(DfsBucketClientTest, BatchLeaseSummaryPreservesMixedTierErrors) {
+TEST_F(DfsBucketClientTest, BatchLeaseExpiryExemptsOnlyBucketDfs) {
     const std::vector<std::string> keys{"lease_memory", "lease_dfs"};
     std::vector<std::string> values{std::string(4096, 'M'),
                                     std::string(4096, 'D')};
@@ -863,10 +866,50 @@ TEST_F(DfsBucketClientTest, BatchLeaseSummaryPreservesMixedTierErrors) {
     }
     auto results = writer_->BatchGet(keys, queries, batch);
     ASSERT_EQ(results.size(), keys.size());
-    for (const auto& result : results) {
-        ASSERT_FALSE(result);
-        EXPECT_EQ(result.error(), ErrorCode::LEASE_EXPIRED);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::BATCH_GET_LEASE_EXPIRED);
+    EXPECT_TRUE(results[1]);
+    EXPECT_EQ(outputs, values);
+}
+
+TEST_F(DfsBucketClientTest, BatchReadCrossesLeaseDeadlineAfterValidation) {
+    const std::string key = "bucket_crosses_lease";
+    std::string value(4096, 'L');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, slices, DfsConfig()));
+    ASSERT_TRUE(WaitForDfsReplica(key));
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query);
+    const QueryResult expiring(
+        std::vector(query->replicas),
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(50),
+        query->object_checksum);
+    adapter_->after_read = [deadline = expiring.lease_timeout] {
+        std::this_thread::sleep_until(deadline + std::chrono::milliseconds(1));
+    };
+    std::string output(value.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {key, {{output.data(), output.size()}}}};
+    auto results = writer_->BatchGet({key}, {expiring}, batch);
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_TRUE(expiring.IsLeaseExpired());
+    ASSERT_TRUE(results[0]);
+    EXPECT_EQ(output, value);
+
+    // Expiry exemption must not mask checksum or short-read failures.
+    if (query->object_checksum) {
+        const QueryResult corrupt(std::vector(query->replicas),
+                                  expiring.lease_timeout,
+                                  *query->object_checksum ^ uint64_t{1});
+        results = writer_->BatchGet({key}, {corrupt}, batch);
+        ASSERT_FALSE(results[0]);
+        EXPECT_EQ(results[0].error(), ErrorCode::CHECKSUM_MISMATCH);
     }
+    const auto& desc = query->replicas[0].get_dfs_descriptor();
+    std::filesystem::resize_file(desc.file_path, 0);
+    results = writer_->BatchGet({key}, {expiring}, batch);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::FILE_READ_FAIL);
 }
 
 TEST_F(DfsBucketEpochClientTest,
@@ -2015,8 +2058,11 @@ TEST_F(DfsBucketClientTest, ReadTimeoutDoesNotChangeClientAccessPolicy) {
     std::unordered_map<std::string, std::shared_ptr<void>> buffer_owners;
     buffer_owners.emplace(key, output);
     adapter_->BlockReads();
-    auto timed_out = writer_->BatchGet({key}, {*query}, read_slices, false,
-                                       &buffer_owners);
+    const QueryResult expired(std::vector(query->replicas),
+                              std::chrono::steady_clock::now(),
+                              query->object_checksum);
+    auto timed_out =
+        writer_->BatchGet({key}, {expired}, read_slices, false, &buffer_owners);
     ASSERT_EQ(timed_out.size(), 1u);
     ASSERT_FALSE(timed_out[0].has_value());
     EXPECT_EQ(timed_out[0].error(), ErrorCode::DFS_BATCH_GET_TIMEOUT);

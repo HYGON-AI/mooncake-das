@@ -6517,7 +6517,7 @@ RealClient::batch_get_session_start_with_sources(
         if (query_result.IsLeaseExpired()) {
             result.all_memory = false;
             result.codes[i] =
-                static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                static_cast<int>(toInt(ErrorCode::SESSION_START_LEASE_EXPIRED));
             get_sessions_.erase(keys[i]);
             continue;
         }
@@ -6634,7 +6634,8 @@ std::vector<int> RealClient::batch_get_session_refresh(
             } else {
                 const auto &fresh_query = fresh_queries[i].value();
                 if (fresh_query.IsLeaseExpired()) {
-                    refresh_error = ErrorCode::LEASE_EXPIRED;
+                    refresh_error =
+                        ErrorCode::SESSION_REFRESH_QUERY_LEASE_EXPIRED;
                 } else {
                     const auto *replica = SelectSessionReplica(
                         fresh_query.replicas, local_endpoints,
@@ -6662,7 +6663,7 @@ std::vector<int> RealClient::batch_get_session_refresh(
 
             if (refresh_error == ErrorCode::OK &&
                 refreshed_session->IsLeaseExpired()) {
-                refresh_error = ErrorCode::LEASE_EXPIRED;
+                refresh_error = ErrorCode::SESSION_REFRESH_COMMIT_LEASE_EXPIRED;
             }
 
             if (prefetch_cache_enabled) {
@@ -6879,8 +6880,8 @@ std::vector<int> RealClient::batch_get_session_prefetch(
             auto session_it = get_sessions_.find(keys[i]);
             if (session_it == get_sessions_.end()) continue;
             if (session_it->second.IsLeaseExpired(now)) {
-                results[i] =
-                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                results[i] = static_cast<int>(
+                    toInt(ErrorCode::SESSION_PREFETCH_LEASE_EXPIRED));
                 get_sessions_.erase(session_it);
                 DetachPrefetchedSessionBuffer(
                     get_session_prefetch_cache_, keys[i],
@@ -6924,7 +6925,6 @@ std::vector<int> RealClient::batch_get_session_prefetch(
     // still owns a complete object view when this method returns.
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
-        auto completed_at = std::chrono::steady_clock::now();
         for (const auto &entry : entries) {
             const size_t i = entry.original_idx;
             if (results[i] != 0) continue;
@@ -6948,16 +6948,6 @@ std::vector<int> RealClient::batch_get_session_prefetch(
                     static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
                 continue;
             }
-            if (session_it->second.IsLeaseExpired(completed_at)) {
-                results[i] =
-                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
-                get_sessions_.erase(session_it);
-                DetachPrefetchedSessionBuffer(
-                    get_session_prefetch_cache_, entry.key,
-                    detached_prefetch_buffers);
-                continue;
-            }
-
             auto cache_it = get_session_prefetch_cache_.find(entry.key);
             const auto &descriptor = entry.replica.get_dfs_descriptor();
             const uint64_t source_size =
@@ -7081,7 +7071,8 @@ RealClient::prepare_session_range_read_requests(
                     get_session_prefetch_cache_, keys[i],
                     detached_prefetch_buffers);
             }
-            results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+            results[i] =
+                static_cast<int>(toInt(ErrorCode::SESSION_RANGE_LEASE_EXPIRED));
             continue;
         }
 
@@ -7179,8 +7170,8 @@ void RealClient::execute_session_memory_range_reads(
         const auto &request = requests[i];
         if (transfer[i]) {
             if (now >= request.lease_deadline) {
-                results[request.original_idx] =
-                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+                results[request.original_idx] = static_cast<int>(
+                    toInt(ErrorCode::SESSION_MEMORY_TRANSFER_LEASE_EXPIRED));
                 get_sessions_.erase(request.key);
             } else {
                 results[request.original_idx] =
@@ -7215,8 +7206,11 @@ void RealClient::record_session_range_accesses(
             if (record_it != get_session_access_records_.end()) {
                 record_it->second.success = false;
             }
-            if (results[i] ==
-                    static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED)) &&
+            if ((results[i] == static_cast<int>(toInt(
+                                   ErrorCode::SESSION_RANGE_LEASE_EXPIRED)) ||
+                 results[i] ==
+                     static_cast<int>(toInt(
+                         ErrorCode::SESSION_MEMORY_TRANSFER_LEASE_EXPIRED))) &&
                 context.access_sources[i] != "unknown") {
                 auto [insert_it, inserted] =
                     get_session_access_records_.try_emplace(

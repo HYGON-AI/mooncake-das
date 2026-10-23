@@ -74,32 +74,6 @@ std::optional<size_t> GetTransportRegistrationLimit(
 
 namespace {
 
-struct BatchLeaseExpirySummary {
-    size_t memory = 0, nof = 0, dfs = 0, disk = 0, local_disk = 0;
-
-    void Record(const Replica::Descriptor& replica) {
-        if (replica.is_memory_replica())
-            ++memory;
-        else if (replica.is_nof_replica())
-            ++nof;
-        else if (replica.is_dfs_replica())
-            ++dfs;
-        else if (replica.is_disk_replica())
-            ++disk;
-        else if (replica.is_local_disk_replica())
-            ++local_disk;
-    }
-
-    void Log(size_t batch_size) const {
-        const size_t expired = memory + nof + dfs + disk + local_disk;
-        if (expired == 0) return;
-        LOG(WARNING) << "BatchGet lease_expired: batch_size=" << batch_size
-                     << " expired=" << expired << " MEMORY=" << memory
-                     << " NOF_SSD=" << nof << " DFS=" << dfs << " DISK=" << disk
-                     << " LOCAL_DISK=" << local_disk;
-    }
-};
-
 UUID DfsWriteEpoch(const std::vector<Replica::Descriptor>& replicas) {
     for (const auto& replica : replicas) {
         if (replica.is_dfs_replica()) {
@@ -2215,16 +2189,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
     if (prefer_alloc_in_same_node) {
         auto results =
             BatchGetWhenPreferSameNode(object_keys, query_results, slices);
-        BatchLeaseExpirySummary expired;
         auto now = std::chrono::steady_clock::now();
         for (size_t i = 0; i < object_keys.size(); ++i) {
             if (results[i].has_value() &&
                 query_results[i].IsLeaseExpired(now)) {
-                ++expired.memory;  // Same-node reads accept only MEMORY.
                 results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
             }
         }
-        expired.Log(object_keys.size());
         return results;
     }
 
@@ -2465,26 +2436,30 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetImpl(
         }
     }
 
-    BatchLeaseExpirySummary expired;
     auto now = std::chrono::steady_clock::now();
-    // These records identify the replicas actually used, without another
-    // replica-list scan or a per-key allocation for logging.
+    size_t non_dfs_lease_expired_keys = 0;
     for (const auto& [index, key, future, replica, cache_used] :
          pending_transfers) {
         if (results[index].has_value() &&
             query_results[index].IsLeaseExpired(now)) {
-            expired.Record(replica);
-            results[index] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+            ++non_dfs_lease_expired_keys;
+            results[index] = tl::unexpected(ErrorCode::BATCH_GET_LEASE_EXPIRED);
         }
     }
+    if (non_dfs_lease_expired_keys != 0) {
+        LOG(WARNING) << "BatchGet: non-DFS replicas expired, num_keys="
+                     << non_dfs_lease_expired_keys;
+    }
+    // Only validated reads from an initialized immutable bucket survive expiry.
+    const bool immutable_bucket =
+        dfs_storage_backend_ && dfs_storage_backend_->IsInitialized() &&
+        dfs_storage_backend_->GetAllocatorType() == DfsAllocatorType::BUCKET;
     for (size_t index : dfs_read_indices) {
-        if (results[index].has_value() &&
+        if (results[index].has_value() && !immutable_bucket &&
             query_results[index].IsLeaseExpired(now)) {
-            ++expired.dfs;
-            results[index] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+            results[index] = tl::unexpected(ErrorCode::BATCH_GET_LEASE_EXPIRED);
         }
     }
-    expired.Log(object_keys.size());
 
     auto us_batch_get = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - t0_batch_get)

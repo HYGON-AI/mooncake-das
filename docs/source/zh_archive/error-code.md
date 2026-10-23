@@ -47,7 +47,14 @@ Mooncake Store 在执行期间可能会产生各种类型的错误，对于绝�
 |       | OBJECT\_NOT\_FOUND (-704)                | 未找到对象            |
 |       | OBJECT\_ALREADY\_EXISTS (-705)           | 对象已存在            |
 |       | OBJECT\_HAS\_LEASE (-706)                | 对象存在租约           |
-|       | LEASE\_EXPIRED (-707)                    | 数据传输完成前租约已过期   |
+|       | LEASE\_EXPIRED (-707)                    | 保留的通用读取及优先同节点批量读取租约错误码，整数值和字符串不变 |
+|       | BATCH_GET_LEASE_EXPIRED (-715)           | 非优先同节点路径的批量读取校验完成后租约过期；成功的 immutable BUCKET DFS 读取豁免 |
+|       | SESSION_START_LEASE_EXPIRED (-716)       | session start 查询租约已过期 |
+|       | SESSION_REFRESH_QUERY_LEASE_EXPIRED (-717) | refresh fresh query 在选择副本前已过期 |
+|       | SESSION_REFRESH_COMMIT_LEASE_EXPIRED (-718) | refresh 提交 session 前二次检查过期 |
+|       | SESSION_PREFETCH_LEASE_EXPIRED (-719)    | prefetch 入口租约已过期 |
+|       | SESSION_RANGE_LEASE_EXPIRED (-720)       | range-get 入口租约已过期 |
+|       | SESSION_MEMORY_TRANSFER_LEASE_EXPIRED (-721) | memory range transfer 成功完成后租约过期 |
 | 数据传输  | TRANSFER\_FAIL (-800)                    | 数据传输失败           |
 | RPC   | RPC\_FAIL (-900)                         | RPC 操作失败         |
 | 高可用相关 | ETCD\_OPERATION\_ERROR (-1000)           | etcd 操作失败        |
@@ -63,3 +70,14 @@ Mooncake Store 在执行期间可能会产生各种类型的错误，对于绝�
 |       | FILE\_INVALID\_BUFFER (-1104)            | 文件缓冲区错误          |
 |       | FILE\_LOCK\_FAIL (-1105)                 | 文件加锁失败           |
 |       | FILE\_INVALID\_HANDLE (-1106)            | 无效的文件句柄          |
+
+兼容策略：保留 `LEASE_EXPIRED = -707` 及原字符串，通用单次/直接读取及优先同节点批量读取仍可返回旧码。
+其他批量读取和 get-session 各阶段改为返回上表的独立错误码；原先仅比较 `-707` 的调用方
+需按调用阶段接受 `-715` 至 `-721`，不做回映射。Python 直接返回每个 key 的整数状态；
+C API 原样传递负值读取结果，批量状态位于 `results_out`，没有独立错误枚举或 session 接口。
+
+仅已初始化 BUCKET 后端中通过现有读取、descriptor、epoch 和 checksum 校验的 DFS
+批量读取豁免完成后租约检查，SHARD DFS 和 MEMORY 保持完成后检查。prefetch 成功后不因
+完成时过期而清除有效缓存；prefetch 和 range-get 入口仍检查租约，消费过期预取缓存前需
+refresh 同一兼容 session，session end 仍释放缓存。读取失败或无效 session/buffer 不会因
+DFS 类型或缓存条目存在而变成可用快照。

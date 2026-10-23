@@ -47,7 +47,14 @@ Mooncake Store may generate various types of errors during execution. For most A
 |                          | OBJECT_NOT_FOUND (-704)        | Object not found                                                                                          |
 |                          | OBJECT_ALREADY_EXISTS (-705)   | Object already exists                                                                                     |
 |                          | OBJECT_HAS_LEASE (-706)        | Object has lease                                                                                          |
-|                          | LEASE_EXPIRED (-707)           | Lease expired before data transfer completed                                                              |
+|                          | LEASE_EXPIRED (-707)           | Legacy generic-read and same-node batch-read lease expiry; retained with its original value and string       |
+|                          | BATCH_GET_LEASE_EXPIRED (-715) | Lease expired after a validated batch read, excluding the same-node path; successful immutable BUCKET DFS reads are exempt |
+|                          | SESSION_START_LEASE_EXPIRED (-716) | Initial get-session query lease is already expired |
+|                          | SESSION_REFRESH_QUERY_LEASE_EXPIRED (-717) | Fresh refresh query lease expired before replica selection |
+|                          | SESSION_REFRESH_COMMIT_LEASE_EXPIRED (-718) | Refreshed lease expired before committing the session |
+|                          | SESSION_PREFETCH_LEASE_EXPIRED (-719) | Session lease expired at prefetch entry |
+|                          | SESSION_RANGE_LEASE_EXPIRED (-720) | Session lease expired at range-get entry |
+|                          | SESSION_MEMORY_TRANSFER_LEASE_EXPIRED (-721) | Session lease expired after a successful memory range transfer |
 | Transfer                 | TRANSFER_FAIL (-800)           | Transfer operation failed                                                                                 |
 | Checksum                 | CHECKSUM_MISMATCH (-801)       | Retrieved object data does not match its stored checksum                                                  |
 | RPC                      | RPC_FAIL (-900)                | RPC operation failed                                                                                      |
@@ -67,3 +74,21 @@ Mooncake Store may generate various types of errors during execution. For most A
 | Task / Job               | TASK_NOT_FOUND (-1400)         | Task ID not found, or a completed task has already been pruned from the master's in-memory history       |
 |                          | TASK_PENDING_LIMIT_EXCEEDED (-1401) | The master-side pending task queue is full and cannot accept another task                           |
 |                          | JOB_NOT_FOUND (-1402)          | Job ID not found                                                                                          |
+
+Lease-code compatibility: `LEASE_EXPIRED` retains integer `-707` and its string
+for generic single/direct reads and the preferred same-node batch path. Other
+batch reads and the get-session stages now
+return the distinct codes above; callers that previously compared only `-707`
+for these APIs must accept the relevant `-715` through `-721` codes as well.
+Python returns these per-key integers directly. The C API also forwards negative
+read results unchanged (batch statuses are in `results_out`); it has no separate
+error enum or session API. No compatibility remapping to `-707` is performed.
+
+Only successful DFS batch reads from an initialized `BUCKET` backend skip the
+completion lease check, after existing I/O, descriptor, epoch and checksum
+validation. `SHARD` DFS and MEMORY still check completion expiry. A completed
+prefetch retains its valid buffer and compatible session across expiry; prefetch
+entry and range-get entry still require a live lease. Refresh the same compatible
+session before consuming an expired prefetched buffer, and end the session to
+release the cache. Failed reads and invalid sessions or buffers never become
+successful snapshots merely because the replica is DFS.

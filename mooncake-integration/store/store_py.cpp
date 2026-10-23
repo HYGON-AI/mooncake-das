@@ -3199,7 +3199,8 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->batch_get_session_start(keys);
             },
             py::arg("keys"),
-            "Start a get session: query replicas once and cache them")
+            "Start a get session: query replicas once and cache them. "
+            "Returns SESSION_START_LEASE_EXPIRED (-716) for an expired query.")
         .def(
             "batch_get_session_refresh",
             [](MooncakeStorePyWrapper &self,
@@ -3214,7 +3215,9 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Refresh leases for active get sessions while preserving cached "
             "session objects; incompatible refreshed replicas fail and "
-            "invalidate that session")
+            "invalidate that session. Expiry returns "
+            "SESSION_REFRESH_QUERY_LEASE_EXPIRED (-717) before selection or "
+            "SESSION_REFRESH_COMMIT_LEASE_EXPIRED (-718) before commit.")
         .def(
             "batch_get_session_start_with_sources",
             [](MooncakeStorePyWrapper &self,
@@ -3232,7 +3235,7 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"),
             "Start get sessions and return each result with its selected "
-            "source")
+            "source; expired queries return SESSION_START_LEASE_EXPIRED (-716).")
         .def(
             "batch_get_session_prefetch",
             [](MooncakeStorePyWrapper &self,
@@ -3249,7 +3252,10 @@ PYBIND11_MODULE(store, m) {
             "Mooncake's dedicated prefetch arena without copying to caller "
             "buffers. A successful DFS status means the complete object bytes "
             "remain owned by a compatible active session; non-DFS entries use "
-            "the ordinary range-get path. Returns per-key status.")
+            "the ordinary range-get path. Returns per-key status; "
+            "SESSION_PREFETCH_LEASE_EXPIRED (-719) checks entry only. "
+            "Successful validated BUCKET reads may finish after lease expiry; "
+            "range-get still requires a live or refreshed lease.")
         .def(
             "dfs_prefetch_arena_available",
             [](MooncakeStorePyWrapper &self) {
@@ -3304,7 +3310,9 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("all_src_offsets"),
-            "Ranged get into multiple buffers using a get session")
+            "Ranged get into multiple buffers using a get session. Expiry "
+            "returns SESSION_RANGE_LEASE_EXPIRED (-720) at entry or "
+            "SESSION_MEMORY_TRANSFER_LEASE_EXPIRED (-721) after memory transfer.")
         .def(
             "batch_get_session_end",
             [](MooncakeStorePyWrapper &self,
