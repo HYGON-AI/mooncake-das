@@ -365,6 +365,32 @@ class DfsBucketClientTest : public ::testing::Test {
         return true;
     }
 
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+    void PrepareWriterEnqueueFailure() {
+        writer_->StopServiceMetricsReporter();
+        writer_->write_thread_pool_.stop();
+    }
+
+    void ExpireWriterMetrics(bool force_deadline = false) {
+        if (force_deadline) {
+            size_t registered = 0;
+            {
+                std::lock_guard<std::mutex> lock(writer_->service_metrics_mutex_);
+                for (const auto& item : writer_->service_pending_writes_) {
+                    if (auto context = item.lock()) {
+                        // The foreground is paused at the failpoint and the
+                        // reporter/pool are stopped, so no other reader races.
+                        context->deadline = std::chrono::steady_clock::now();
+                        ++registered;
+                    }
+                }
+            }
+            ASSERT_GT(registered, 0u);
+        }
+        writer_->ExpireAsyncDfsWriteMetrics();
+    }
+#endif
+
     std::shared_ptr<DistributedStorageBackend> HolderBackfillBackend() {
         auto backend = provider_->GetDfsBackfillBackend();
         EXPECT_TRUE(backend);
@@ -1858,6 +1884,125 @@ TEST_F(DfsBucketClientTest,
     EXPECT_DOUBLE_EQ(*settled_pending, 0.0);
     EXPECT_DOUBLE_EQ(*memory_only, 1.0);
 }
+
+TEST_F(DfsBucketClientTest,
+       ServiceMetricsDeadlineSettlesBlockedWriteAndIgnoresLateResult) {
+    writer_.reset();
+    SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "50");
+    writer_ = CreateClient("127.0.0.1:18203");
+    ASSERT_NE(writer_, nullptr);
+    writer_->SetDfsStorageBackend(backend_);
+    const auto endpoint = NextServiceEndpoint();
+    ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+    adapter_->BlockWrites();
+
+    const std::string key = "service_metric_blocked_deadline";
+    std::vector<std::string> values{std::string(4096, 'D')};
+    auto slices = MakeSlices(values);
+    auto results = writer_->BatchPut({key}, slices, DfsConfig());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results.front().has_value());
+
+    const auto started_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (adapter_->WriteCalls() == 0 &&
+           std::chrono::steady_clock::now() < started_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_GT(adapter_->WriteCalls(), 0);
+
+    // Leave the filesystem write blocked. The reporter must settle the
+    // existing publication deadline without waiting for its physical result.
+    auto memory_only =
+        WaitForServiceMetricValue("mooncake_master_service_dual_write_total",
+                                  endpoint, "outcome=\"memory_only\"", 1.0);
+    ASSERT_TRUE(memory_only.has_value());
+    EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+    auto pending = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_pending", endpoint);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_DOUBLE_EQ(*pending, 0.0);
+
+    adapter_->ReleaseWrites();
+    writer_.reset();  // Drain the late result and flush the final snapshot.
+    memory_only =
+        FindServiceMetricValue("mooncake_master_service_dual_write_total",
+                               endpoint, "outcome=\"memory_only\"");
+    pending = FindServiceMetricValue(
+        "mooncake_master_service_dual_write_pending", endpoint);
+    auto both_success =
+        FindServiceMetricValue("mooncake_master_service_dual_write_total",
+                               endpoint, "outcome=\"both_success\"");
+    ASSERT_TRUE(memory_only.has_value());
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_TRUE(both_success.has_value());
+    EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+    EXPECT_DOUBLE_EQ(*pending, 0.0);
+    EXPECT_DOUBLE_EQ(*both_success, 0.0);
+}
+
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+TEST_F(DfsBucketClientTest, ServiceMetricsEnqueueFailureSettlesOnceInEitherOrder) {
+    for (bool reporter_first : {false, true}) {
+        SCOPED_TRACE(reporter_first);
+        writer_.reset();
+        SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "1000");
+        writer_ = CreateClient("127.0.0.1:18203");
+        ASSERT_NE(writer_, nullptr);
+        writer_->SetDfsStorageBackend(backend_);
+        const auto endpoint = NextServiceEndpoint();
+        ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+        PrepareWriterEnqueueFailure();
+
+        const auto failpoint_dir = std::filesystem::path(root_) /
+                                   (reporter_first ? "reporter_first"
+                                                   : "enqueue_first");
+        std::filesystem::create_directories(failpoint_dir);
+        SetEnv("MOONCAKE_TEST_FAILPOINT_DIR", failpoint_dir.string());
+        SetEnv("MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC", "20");
+        std::ofstream(failpoint_dir / "dfs_write_before_enqueue.arm").put('\n');
+
+        const std::string key = reporter_first ? "settled_before_rejection"
+                                                : "rejected_before_settlement";
+        std::vector<std::string> values{std::string(4096, 'E')};
+        auto slices = MakeSlices(values);
+        auto put = std::async(std::launch::async, [&] {
+            return writer_->BatchPut({key}, slices, DfsConfig());
+        });
+        const auto hit = failpoint_dir / "dfs_write_before_enqueue.hit";
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!std::filesystem::exists(hit) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(std::filesystem::exists(hit));
+        if (reporter_first) {
+            ASSERT_NO_FATAL_FAILURE(ExpireWriterMetrics(true));
+        }
+        std::ofstream(failpoint_dir / "dfs_write_before_enqueue.release")
+            .put('\n');
+        EXPECT_EQ(put.get().size(), 1u);
+        // Also exercise the reporter after the failed enqueue has returned.
+        ExpireWriterMetrics();
+        EXPECT_EQ(adapter_->WriteCalls(), 0);
+        writer_.reset();  // Flush the foreground's final metric snapshot.
+
+        const auto pending = FindServiceMetricValue(
+            "mooncake_master_service_dual_write_pending", endpoint);
+        const auto memory_only = FindServiceMetricValue(
+            "mooncake_master_service_dual_write_total", endpoint,
+            "outcome=\"memory_only\"");
+        const auto both_success = FindServiceMetricValue(
+            "mooncake_master_service_dual_write_total", endpoint,
+            "outcome=\"both_success\"");
+        ASSERT_TRUE(pending && memory_only && both_success);
+        EXPECT_DOUBLE_EQ(*pending, 0.0);
+        EXPECT_DOUBLE_EQ(*memory_only, 1.0);
+        EXPECT_DOUBLE_EQ(*both_success, 0.0);
+    }
+}
+#endif
 
 TEST_F(DfsBucketClientTest,
        ServiceMetricsCountBatchReadFailuresOncePerKeyAndReplicaTier) {

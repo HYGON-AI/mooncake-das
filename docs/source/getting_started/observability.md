@@ -208,7 +208,7 @@ services.
 | Metric | Labels | Meaning |
 |--------|--------|---------|
 | `mooncake_master_service_dual_write_total` | `service_endpoint`, `outcome` | Completed foreground key writes requesting both memory and DFS replicas |
-| `mooncake_master_service_dual_write_pending` | `service_endpoint` | Such writes still waiting for their physical transfer result |
+| `mooncake_master_service_dual_write_pending` | `service_endpoint` | Such writes awaiting their DFS result or configured write deadline |
 | `mooncake_master_service_read_failures_total` | `service_endpoint`, `replica_type` | Failed key read attempts on `memory` or `dfs` |
 
 Write outcomes are `both_success`, `memory_only`, `dfs_only`, and
@@ -216,11 +216,16 @@ Write outcomes are `both_success`, `memory_only`, `dfs_only`, and
 tier finish transferring. `neither_success` can include partial success within
 a tier. Memory success with DFS allocation fallback counts as `memory_only`.
 An existing-key no-op does not count as a new write. An asynchronous DFS write
-remains pending until its result is available; background backfill does not
-count as a second foreground write.
+leaves pending when its result is available or its configured write deadline
+expires. The five-second reporter settles an expired write as DFS failure even
+if filesystem I/O is still blocked; a late result does not count again. With
+the write timeout disabled, it remains pending until the result is available.
+This accounting does not cancel I/O or release its staging buffers. Background
+backfill does not count as a second foreground write.
 
-These counters describe physical transfer results, not committed or currently
-live replicas. A later metadata RPC failure, revoke, eviction, or backfill
+These counters describe transfer results (including async write deadline
+failures), not committed or currently live replicas. A later metadata RPC
+failure, revoke, eviction, or backfill
 does not rewrite a previously recorded transfer outcome. Read failures count
 key access attempts, so a failed memory read followed by a successful DFS
 fallback still contributes one memory failure. Cache misses before choosing

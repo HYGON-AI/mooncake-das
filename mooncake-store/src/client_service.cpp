@@ -43,6 +43,9 @@
 #include "transport/transport.h"
 #include "config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+#include "ha/oplog/oplog_test_failpoint.h"
+#endif
 #include "types.h"
 #include "client_buffer.h"
 #include "utils.h"
@@ -748,6 +751,44 @@ void Client::CompleteServiceDualWrite(bool memory_succeeded,
     }
 }
 
+void Client::CompleteAsyncDfsWriteMetrics(
+    const std::shared_ptr<AsyncDfsWriteContext>& context,
+    const std::vector<ErrorCode>& outcomes) {
+    if (context->service_metrics_settled.exchange(true)) return;
+    for (size_t i = 0; i < context->service_dual_writes.size(); ++i) {
+        const auto& metric = context->service_dual_writes[i];
+        if (!metric.eligible) continue;
+        const bool dfs_succeeded = i < outcomes.size() &&
+                                   outcomes[i] == ErrorCode::OK &&
+                                   metric.requested_dfs_replicas == 1;
+        CompleteServiceDualWrite(metric.memory_succeeded, dfs_succeeded);
+    }
+}
+
+void Client::ExpireAsyncDfsWriteMetrics() {
+    std::vector<std::shared_ptr<AsyncDfsWriteContext>> expired;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+        std::erase_if(
+            service_pending_writes_, [&expired, now](const auto& item) {
+                auto context = item.lock();
+                if (!context || context->service_metrics_settled.load() ||
+                    context->io_completed.load()) {
+                    return true;
+                }
+                if (context->deadline > now) return false;
+                expired.push_back(std::move(context));
+                return true;
+            });
+    }
+    for (const auto& context : expired) {
+        // Publication is already past its deadline. Settle statistics only;
+        // the worker still owns its buffers until the filesystem call ends.
+        CompleteAsyncDfsWriteMetrics(context, {});
+    }
+}
+
 void Client::ServiceMetricsReporterLoop() {
     while (service_metrics_report_running_.load(std::memory_order_acquire)) {
         for (int i = 0; i < 50 &&
@@ -760,6 +801,7 @@ void Client::ServiceMetricsReporterLoop() {
             break;
         }
 
+        ExpireAsyncDfsWriteMetrics();
         ServiceMetricsSnapshot snapshot;
         {
             std::lock_guard<std::mutex> lock(service_metrics_mutex_);
@@ -3620,6 +3662,10 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         results.assign(requests.size(),
                        tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
     }
+    // Once the worker observes a result, it owns outcome classification. The
+    // reporter must not turn a timely result into a timeout while we process
+    // it.
+    context->io_completed.store(true);
     const double write_duration_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       write_started)
@@ -3655,21 +3701,7 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         successful_bytes = 0;
     }
 
-    for (size_t i = 0; i < context->service_dual_writes.size(); ++i) {
-        const auto& metric = context->service_dual_writes[i];
-        if (!metric.eligible ||
-            (i < context->service_metrics_settled.size() &&
-             context->service_metrics_settled[i])) {
-            continue;
-        }
-        const bool dfs_succeeded =
-            i < outcomes.size() && outcomes[i] == ErrorCode::OK &&
-            metric.requested_dfs_replicas == 1;
-        CompleteServiceDualWrite(metric.memory_succeeded, dfs_succeeded);
-        if (i < context->service_metrics_settled.size()) {
-            context->service_metrics_settled[i] = true;
-        }
-    }
+    CompleteAsyncDfsWriteMetrics(context, outcomes);
 
     ObserveDirectIo("write", DirectStorageMetricSource(ReplicaType::DFS),
                     all_succeeded, successful_bytes,
@@ -3850,7 +3882,6 @@ void Client::SubmitDfsWriteChunk(
         context->is_upsert = is_upsert;
         context->object_checksums.resize(keys.size());
         context->service_dual_writes.resize(keys.size());
-        context->service_metrics_settled.assign(keys.size(), false);
         for (size_t i = 0; i < op_indices.size(); ++i) {
             const auto& op = ops[op_indices[i]];
             auto& metric = context->service_dual_writes[i];
@@ -3924,51 +3955,47 @@ void Client::SubmitDfsWriteChunk(
     }
 
     try {
+        {
+            std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+            if (!service_metrics_snapshot_.service_endpoint.empty() &&
+                context->deadline !=
+                    std::chrono::steady_clock::time_point::max()) {
+                service_pending_writes_.push_back(context);
+            }
+        }
+#ifdef MOONCAKE_ENABLE_TEST_FAILPOINTS
+        TestFailPoint::Wait("dfs_write_before_enqueue");
+#endif
         write_thread_pool_.enqueue([this, context, release_inflight]() {
             try {
                 RunAsyncDfsWrite(context);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Async DFS write task threw: " << e.what();
-                for (size_t i = 0; i < context->service_dual_writes.size();
-                     ++i) {
-                    const auto& metric = context->service_dual_writes[i];
-                    if (!metric.eligible ||
-                        (i < context->service_metrics_settled.size() &&
-                         context->service_metrics_settled[i])) {
-                        continue;
-                    }
-                    CompleteServiceDualWrite(metric.memory_succeeded, false);
-                    if (i < context->service_metrics_settled.size()) {
-                        context->service_metrics_settled[i] = true;
-                    }
-                }
+                CompleteAsyncDfsWriteMetrics(context, {});
             } catch (...) {
                 LOG(ERROR) << "Async DFS write task threw an unknown exception";
-                for (size_t i = 0; i < context->service_dual_writes.size();
-                     ++i) {
-                    const auto& metric = context->service_dual_writes[i];
-                    if (!metric.eligible ||
-                        (i < context->service_metrics_settled.size() &&
-                         context->service_metrics_settled[i])) {
-                        continue;
-                    }
-                    CompleteServiceDualWrite(metric.memory_succeeded, false);
-                    if (i < context->service_metrics_settled.size()) {
-                        context->service_metrics_settled[i] = true;
-                    }
-                }
+                CompleteAsyncDfsWriteMetrics(context, {});
             }
             release_inflight();
         });
     } catch (const std::exception& e) {
-        // The pool was stopped between the shutdown check and the enqueue.
+        // Enqueue may fail after the reporter has already settled the deadline.
         LOG(ERROR) << "Failed to enqueue async DFS write: " << e.what();
         release_inflight();
-        for (const auto& metric : context->service_dual_writes) {
-            if (metric.eligible) CancelServiceDualWritePending();
+        const bool metrics_already_settled =
+            context->service_metrics_settled.exchange(true);
+        if (!metrics_already_settled) {
+            for (const auto& metric : context->service_dual_writes) {
+                if (metric.eligible) CancelServiceDualWritePending();
+            }
         }
         for (const size_t index : op_indices) {
             auto& op = ops[index];
+            if (metrics_already_settled && op.service_dual_write_eligible) {
+                // The reporter owns this completion; the foreground must not
+                // count it again when it handles the rejected write.
+                op.service_metric_recorded = true;
+            }
             op.transfer_summary.RecordFailure(
                 ReplicaType::DFS, ErrorCode::DFS_SERVICE_UNAVAILABLE);
             op.AppendFailureContext("Failed to enqueue async DFS write");
