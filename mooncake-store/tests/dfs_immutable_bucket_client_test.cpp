@@ -340,6 +340,20 @@ class DfsBucketClientTest : public ::testing::Test {
         provider_->SubmitTask(task);
     }
 
+    void ExpectForegroundWriteCountsAfterBackfill(size_t memory_only) {
+        uint64_t pending = 0, memory_only_count = 0, both_success = 0;
+        for (const auto& client : {writer_, provider_}) {
+            std::lock_guard<std::mutex> lock(client->service_metrics_mutex_);
+            const auto& metrics = client->service_metrics_snapshot_;
+            pending += metrics.dual_write_pending;
+            memory_only_count += metrics.dual_write_memory_only;
+            both_success += metrics.dual_write_both_success;
+        }
+        EXPECT_EQ(pending, 0u);
+        EXPECT_EQ(memory_only_count, memory_only);
+        EXPECT_EQ(both_success, 0u);
+    }
+
     bool StartHolderUnmountTimer(
         void* buffer, size_t size,
         std::function<void(const UUID&)> cleanup) {
@@ -929,6 +943,8 @@ TEST_F(DfsBucketClientTest, BatchLeaseExpiryExemptsOnlyBucketDfs) {
 }
 
 TEST_F(DfsBucketClientTest, BatchReadCrossesLeaseDeadlineAfterValidation) {
+    // Client::BatchGet has no entry lease check. This covers completion past
+    // the captured lease; entry may already be expired when it is scheduled.
     const std::string key = "bucket_crosses_lease";
     std::string value(4096, 'L');
     std::vector<Slice> slices{{value.data(), value.size()}};
@@ -1645,6 +1661,9 @@ TEST_F(DfsBucketClientTest, HolderBackfillBackoffBoundsProbesAndResetsOnSuccess)
 TEST_F(DfsBucketClientTest, BlockedBackfillsDoNotStarveMaintenanceTasks) {
     PauseHolderPolling();
     provider_->SetDfsStorageBackend(backend_);
+    const auto endpoint = NextServiceEndpoint();
+    ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
+    ASSERT_EQ(provider_->SetServiceEndpoint(endpoint), 0);
 
     const std::vector<std::string> keys{
         "isolated_backfill_0", "isolated_backfill_1",
@@ -1744,6 +1763,9 @@ TEST_F(DfsBucketClientTest, BlockedBackfillsDoNotStarveMaintenanceTasks) {
         ASSERT_TRUE(WaitForDfsReplica(keys[i]));
         ExpectDfsValue(keys[i], values[i]);
     }
+    // Backfill recovery must not rewrite the foreground failed-write outcome
+    // or count as another foreground write, even across the separate executor.
+    ExpectForegroundWriteCountsAfterBackfill(keys.size());
 }
 
 TEST_F(DfsBucketClientTest, HolderBackoffCoversDistinctKeysAndRecoversTogether) {

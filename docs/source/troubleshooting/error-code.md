@@ -86,8 +86,13 @@ error enum or session API. No compatibility remapping to `-707` is performed.
 
 Only successful DFS batch reads from an initialized `BUCKET` backend skip the
 completion lease check, after existing I/O, descriptor, epoch and checksum
-validation. `SHARD` DFS and MEMORY still check completion expiry. A completed
-prefetch retains its valid buffer and compatible session across expiry; prefetch
+validation. The low-level `Client::BatchGet` API has no entry lease check, so
+an already expired BUCKET query can also return its old immutable snapshot
+while that range or a cached file handle remains readable. It does not promise
+the current value after a key is removed and written again; query again when
+the current value is required. `SHARD` DFS and MEMORY still check completion
+expiry. A completed prefetch retains its valid buffer and compatible session
+across expiry; prefetch
 entry and range-get entry still require a live lease. Refresh the same compatible
 session before consuming an expired prefetched buffer, and end the session to
 release the cache. Failed reads and invalid sessions or buffers never become

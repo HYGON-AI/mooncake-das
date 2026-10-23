@@ -77,7 +77,9 @@ Mooncake Store 在执行期间可能会产生各种类型的错误，对于绝�
 C API 原样传递负值读取结果，批量状态位于 `results_out`，没有独立错误枚举或 session 接口。
 
 仅已初始化 BUCKET 后端中通过现有读取、descriptor、epoch 和 checksum 校验的 DFS
-批量读取豁免完成后租约检查，SHARD DFS 和 MEMORY 保持完成后检查。prefetch 成功后不因
+批量读取豁免完成后租约检查。低层 `Client::BatchGet` 没有入口租约检查，已过期的 BUCKET
+查询也可能在旧范围或缓存文件句柄仍可读时返回旧的不可变快照；key 被删除并重新写入后，
+该接口不保证旧查询返回当前值，需要最新值时应重新查询。SHARD DFS 和 MEMORY 保持完成后检查。prefetch 成功后不因
 完成时过期而清除有效缓存；prefetch 和 range-get 入口仍检查租约，消费过期预取缓存前需
 refresh 同一兼容 session，session end 仍释放缓存。读取失败或无效 session/buffer 不会因
 DFS 类型或缓存条目存在而变成可用快照。
