@@ -115,6 +115,7 @@ class EnvGuard {
         Save("MOONCAKE_DFS_SHARD_CAPACITY");
         Save("MOONCAKE_DFS_ALIGNMENT");
         Save("MOONCAKE_DFS_SINGLE_TENANT");
+        Save("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS");
     }
 
     ~EnvGuard() {
@@ -497,6 +498,7 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.65");
     env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "12");
     env.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
+    env.Set("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "65432");
     env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BATCHES", "7");
     env.Set("MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BYTES", "12345678");
 
@@ -511,6 +513,7 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
+    EXPECT_EQ(config.batch_timeout_fixed_ms, 65432u);
     EXPECT_EQ(config.batch_get_max_inflight_batches, 7u);
     EXPECT_EQ(config.batch_get_max_inflight_bytes, 12345678u);
     EXPECT_TRUE(config.Validate());
@@ -520,6 +523,8 @@ TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
     EXPECT_NE(formatted.find("fs_adapter_type=posix"), std::string::npos);
     EXPECT_NE(formatted.find("shard_count=8"), std::string::npos);
     EXPECT_NE(formatted.find("eviction_high_watermark=0.85"),
+              std::string::npos);
+    EXPECT_NE(formatted.find("batch_timeout_fixed_ms=65432"),
               std::string::npos);
 
     auto invalid_eviction = config;
@@ -877,20 +882,33 @@ class DfsBackendTest : public ::testing::Test {
 
 TEST(DfsTimeoutPolicyTest, ScalesConfiguredBaselineByBatchSize) {
     constexpr uint64_t kBaseMs = 10000;
-    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB), 20000u);
-    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1), 80000u);
-    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB), 80000u);
-    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1),
-              160000u);
+    constexpr uint64_t kFixedMs = kDefaultDfsBatchTimeoutFixedMs;
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, kFixedMs),
+              90000u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1, kFixedMs),
+              150000u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB, kFixedMs),
+              150000u);
+    EXPECT_EQ(
+        DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1, kFixedMs),
+        230000u);
 
-    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB), 40000u);
-    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1), 160000u);
-    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB), 160000u);
-    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1),
-              320000u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, kFixedMs),
+              110000u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB + 1, kFixedMs),
+              230000u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB, kFixedMs),
+              230000u);
+    EXPECT_EQ(
+        DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutFourGiB + 1, kFixedMs),
+        390000u);
 
-    EXPECT_EQ(DfsBatchGetTimeoutMs(0, kDfsTimeoutFourGiB + 1), 0u);
-    EXPECT_EQ(DfsBatchPutTimeoutMs(0, kDfsTimeoutFourGiB + 1), 0u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, 1234),
+              21234u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(kBaseMs, kDfsTimeoutOneGiB, 1234),
+              41234u);
+    EXPECT_EQ(DfsBatchGetTimeoutMs(0, kDfsTimeoutFourGiB + 1, kFixedMs), 0u);
+    EXPECT_EQ(DfsBatchPutTimeoutMs(0, kDfsTimeoutFourGiB + 1, kFixedMs), 0u);
 }
 
 class BlockingReadPosixFsAdapter : public PosixFsAdapter {
@@ -957,6 +975,7 @@ TEST(DfsBackendTimeoutTest, RequiresOwnerForTimeoutAndQuarantinesIt) {
     config.alignment = 4096;
     config.direct_read_enabled = false;
     config.batch_get_timeout_ms = 50;
+    config.batch_timeout_fixed_ms = 0;
 
     auto adapter = std::make_unique<BlockingReadPosixFsAdapter>();
     auto* adapter_ptr = adapter.get();
@@ -1036,6 +1055,7 @@ TEST(DfsBackendTimeoutTest, LimitsTimedReadsUntilRealCompletion) {
     config.alignment = 4096;
     config.direct_read_enabled = false;
     config.batch_get_timeout_ms = 20;
+    config.batch_timeout_fixed_ms = 0;
     config.batch_get_max_inflight_batches = 2;
     config.batch_get_max_inflight_bytes = 12288;
 
@@ -1117,6 +1137,7 @@ TEST(DfsBackendTimeoutTest, TimeoutLatchWakesInflightAdmissionWaiter) {
     config.alignment = 4096;
     config.direct_read_enabled = false;
     config.batch_get_timeout_ms = 100;
+    config.batch_timeout_fixed_ms = 0;
     config.batch_get_max_inflight_batches = 1;
     config.batch_get_max_inflight_bytes = 4096;
 
@@ -1185,6 +1206,7 @@ TEST(DfsBackendTimeoutTest, RejectsReadThatExceedsInflightByteLimit) {
     config.alignment = 4096;
     config.direct_read_enabled = false;
     config.batch_get_timeout_ms = 20;
+    config.batch_timeout_fixed_ms = 0;
     config.batch_get_max_inflight_batches = 2;
     config.batch_get_max_inflight_bytes = 4095;
 

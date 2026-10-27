@@ -16,6 +16,7 @@
 
 #include "fs_adapter.h"
 #include "replica.h"
+#include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/object_storage_adapter.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage_backend.h"
@@ -83,6 +84,9 @@ struct DistributedStorageConfig {
     bool direct_read_enabled = true;
     // Baseline for the size-scaled DFS BatchGet deadline. Zero disables it.
     uint64_t batch_get_timeout_ms = 10000;
+    // Fixed budget added after size scaling. Shared with BatchPut through
+    // MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS.
+    uint64_t batch_timeout_fixed_ms = kDefaultDfsBatchTimeoutFixedMs;
     // Bound DFS reads whose filesystem I/O has not actually completed. A
     // timeout keeps both charges until the background read really returns.
     uint64_t batch_get_max_inflight_batches = 8;

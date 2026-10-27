@@ -381,6 +381,9 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         "MOONCAKE_DFS_DIRECT_READ_ENABLED", config.direct_read_enabled);
     config.batch_get_timeout_ms = Environ::GetUInt64(
         "MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS", config.batch_get_timeout_ms);
+    config.batch_timeout_fixed_ms = Environ::GetUInt64(
+        "MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS",
+        config.batch_timeout_fixed_ms);
     config.batch_get_max_inflight_batches = Environ::GetUInt64(
         "MOONCAKE_DFS_BATCH_GET_MAX_INFLIGHT_BATCHES",
         config.batch_get_max_inflight_batches);
@@ -419,6 +422,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled
         << ", batch_get_timeout_ms=" << batch_get_timeout_ms
+        << ", batch_timeout_fixed_ms=" << batch_timeout_fixed_ms
         << ", batch_get_max_inflight_batches="
         << batch_get_max_inflight_batches
         << ", batch_get_max_inflight_bytes="
@@ -2025,7 +2029,9 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             tl::make_unexpected(ErrorCode::DFS_BATCH_GET_TIMEOUT));
     }
     const auto base_timeout_ms = distributed_config_.batch_get_timeout_ms;
-    const auto timeout_ms = DfsBatchGetTimeoutMs(base_timeout_ms, total_bytes);
+    const auto timeout_ms = DfsBatchGetTimeoutMs(
+        base_timeout_ms, total_bytes,
+        distributed_config_.batch_timeout_fixed_ms);
     const auto admission_deadline =
         base_timeout_ms == 0
             ? std::chrono::steady_clock::time_point::max()
