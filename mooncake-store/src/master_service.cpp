@@ -4270,22 +4270,23 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
     return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
 }
 
-bool MasterService::IsDfsReadFilteredOnly(
-    const ObjectMetadata& metadata) const {
-    if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0) {
+bool MasterService::IsReplicaReadableForGet(const Replica& replica) const {
+    if (!replica.is_completed() || replica.is_eviction_pending() ||
+        replica.has_invalid_mem_handle() || replica.has_invalid_nof_handle()) {
         return false;
     }
-    const bool has_completed_dfs =
-        metadata.HasReplica([](const Replica& replica) {
-            return replica.is_dfs_replica() && replica.is_completed();
-        });
-    if (!has_completed_dfs) {
-        return false;
+    const auto descriptor = replica.get_descriptor();
+    std::optional<std::string> endpoint;
+    if (descriptor.is_memory_replica()) {
+        endpoint = descriptor.get_memory_descriptor()
+                       .buffer_descriptor.transport_endpoint_;
+    } else if (descriptor.is_nof_replica()) {
+        endpoint = descriptor.get_nof_descriptor()
+                       .buffer_descriptor.transport_endpoint_;
+    } else if (descriptor.is_local_disk_replica()) {
+        endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
     }
-    return !metadata.HasReplica([](const Replica& replica) {
-        return !replica.is_dfs_replica() &&
-               (replica.is_completed() || replica.is_processing());
-    });
+    return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
@@ -4327,19 +4328,13 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
                     [this](const Replica& replica) {
-                        return IsReplicaReadable(replica);
+                        return IsReplicaReadableForGet(replica);
                     },
                     [&replica_list](const Replica& replica) {
                         replica_list.emplace_back(replica.get_descriptor());
                     });
 
                 if (replica_list.empty()) {
-                    if (IsDfsReadFilteredOnly(metadata) ||
-                        metadata.AllReplicas([](const Replica& replica) {
-                            return replica.status() == ReplicaStatus::REMOVED;
-                        })) {
-                        continue;
-                    }
                     LOG(WARNING)
                         << "key=" << key
                         << " matched by regex, but has no complete replicas.";
@@ -4378,7 +4373,7 @@ auto MasterService::GetReplicaList(const std::string& key,
         std::vector<Replica::Descriptor> replica_list;
         metadata.VisitReplicas(
             [this](const Replica& replica) {
-                return IsReplicaReadable(replica);
+                return IsReplicaReadableForGet(replica);
             },
             [this, &key, &replica_list](const Replica& replica) {
                 replica_list.emplace_back(replica.get_descriptor());
@@ -4389,8 +4384,7 @@ auto MasterService::GetReplicaList(const std::string& key,
             });
 
         if (replica_list.empty()) {
-            if (IsDfsReadFilteredOnly(metadata) ||
-                metadata.AllReplicas([](const Replica& replica) {
+            if (metadata.AllReplicas([](const Replica& replica) {
                     return replica.status() == ReplicaStatus::REMOVED;
                 })) {
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -4574,15 +4568,14 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
                     [this](const Replica& replica) {
-                        return IsReplicaReadable(replica);
+                        return IsReplicaReadableForGet(replica);
                     },
                     [&replica_list](const Replica& replica) {
                         replica_list.emplace_back(replica.get_descriptor());
                     });
 
                 if (replica_list.empty()) {
-                    if (IsDfsReadFilteredOnly(metadata) ||
-                        metadata.AllReplicas([](const Replica& replica) {
+                    if (metadata.AllReplicas([](const Replica& replica) {
                             return replica.status() == ReplicaStatus::REMOVED;
                         })) {
                         results[original_idx] =
