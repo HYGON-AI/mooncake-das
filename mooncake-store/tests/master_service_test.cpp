@@ -1347,11 +1347,11 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
         EXPECT_EQ(backfill.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
         ASSERT_TRUE(service.SetDfsFilterMode(0).has_value());
-        auto visible =
+        auto visible_after_filter =
             service.GetReplicaList("dfs_backfill", TenantId::Default());
-        ASSERT_TRUE(visible.has_value());
-        ASSERT_EQ(visible->replicas.size(), 1u);
-        EXPECT_TRUE(visible->replicas.front().is_dfs_replica());
+        ASSERT_TRUE(visible_after_filter.has_value());
+        ASSERT_EQ(visible_after_filter->replicas.size(), 1u);
+        EXPECT_TRUE(visible_after_filter->replicas.front().is_dfs_replica());
 
         auto admin =
             service.GetReplicaListForAdmin("dfs_backfill", TenantId::Default());
