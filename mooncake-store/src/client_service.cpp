@@ -632,6 +632,9 @@ Client::Client(const std::string& local_hostname,
       object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
       dfs_batch_put_timeout_ms_(Environ::GetUInt64(
           "MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", 10000)),
+      dfs_batch_timeout_fixed_ms_(Environ::GetUInt64(
+          "MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS",
+          kDefaultDfsBatchTimeoutFixedMs)),
       dfs_write_arena_count_(ReadDfsWriteArenaCount()),
       dfs_write_chunk_size_(ReadDfsWriteChunkSize()),
       dfs_write_arena_wait_(ReadDfsWriteArenaWait()),
@@ -650,7 +653,8 @@ Client::Client(const std::string& local_hostname,
         LOG(INFO) << "Object checksum validation is enabled";
     }
     LOG(INFO) << "DFS BatchPut timeout baseline: "
-              << dfs_batch_put_timeout_ms_ << " ms (0 disables)";
+              << dfs_batch_put_timeout_ms_ << " ms, fixed budget: "
+              << dfs_batch_timeout_fixed_ms_ << " ms (0 baseline disables)";
 
     LOG(INFO) << "DFS write buffer, chunk_size=" << dfs_write_chunk_size_
               << ", chunk_count=" << dfs_write_arena_count_;
@@ -4031,7 +4035,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         }
     }
     const auto timeout_ms = DfsBatchPutTimeoutMs(
-        dfs_batch_put_timeout_ms_, total_dfs_payload_bytes);
+        dfs_batch_put_timeout_ms_, total_dfs_payload_bytes,
+        dfs_batch_timeout_fixed_ms_);
     const auto deadline =
         dfs_batch_put_timeout_ms_ == 0
             ? std::chrono::steady_clock::time_point::max()

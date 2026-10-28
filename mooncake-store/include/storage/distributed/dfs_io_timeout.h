@@ -9,6 +9,7 @@ namespace mooncake {
 
 inline constexpr uint64_t kDfsTimeoutOneGiB = 1ULL << 30;
 inline constexpr uint64_t kDfsTimeoutFourGiB = 4ULL << 30;
+inline constexpr uint64_t kDefaultDfsBatchTimeoutFixedMs = 70000;
 
 inline uint64_t SaturatingScaleTimeoutMs(uint64_t base_timeout_ms,
                                          uint64_t multiplier) {
@@ -20,26 +21,43 @@ inline uint64_t SaturatingScaleTimeoutMs(uint64_t base_timeout_ms,
     return base_timeout_ms * multiplier;
 }
 
+inline uint64_t SaturatingAddTimeoutMs(uint64_t timeout_ms,
+                                       uint64_t fixed_timeout_ms) {
+    if (fixed_timeout_ms >
+        std::numeric_limits<uint64_t>::max() - timeout_ms) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return timeout_ms + fixed_timeout_ms;
+}
+
 inline uint64_t DfsBatchGetTimeoutMs(uint64_t base_timeout_ms,
-                                     uint64_t total_bytes) {
+                                     uint64_t total_bytes,
+                                     uint64_t fixed_timeout_ms) {
+    if (base_timeout_ms == 0) return 0;
     uint64_t multiplier = 16;
     if (total_bytes <= kDfsTimeoutOneGiB) {
         multiplier = 2;
     } else if (total_bytes <= kDfsTimeoutFourGiB) {
         multiplier = 8;
     }
-    return SaturatingScaleTimeoutMs(base_timeout_ms, multiplier);
+    return SaturatingAddTimeoutMs(
+        SaturatingScaleTimeoutMs(base_timeout_ms, multiplier),
+        fixed_timeout_ms);
 }
 
 inline uint64_t DfsBatchPutTimeoutMs(uint64_t base_timeout_ms,
-                                     uint64_t total_bytes) {
+                                     uint64_t total_bytes,
+                                     uint64_t fixed_timeout_ms) {
+    if (base_timeout_ms == 0) return 0;
     uint64_t multiplier = 32;
     if (total_bytes <= kDfsTimeoutOneGiB) {
         multiplier = 4;
     } else if (total_bytes <= kDfsTimeoutFourGiB) {
         multiplier = 16;
     }
-    return SaturatingScaleTimeoutMs(base_timeout_ms, multiplier);
+    return SaturatingAddTimeoutMs(
+        SaturatingScaleTimeoutMs(base_timeout_ms, multiplier),
+        fixed_timeout_ms);
 }
 
 inline void SaturatingAddBytes(uint64_t bytes, uint64_t* total) {
