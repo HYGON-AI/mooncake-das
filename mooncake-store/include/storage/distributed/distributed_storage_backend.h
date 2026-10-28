@@ -222,6 +222,13 @@ class DistributedStorageBackend
         return distributed_config_.allocator_type;
     }
 
+    void SetBatchTimeoutFixedMs(uint64_t timeout_ms) {
+        batch_timeout_fixed_ms_.store(timeout_ms, std::memory_order_release);
+    }
+    [[nodiscard]] uint64_t GetBatchTimeoutFixedMs() const {
+        return batch_timeout_fixed_ms_.load(std::memory_order_acquire);
+    }
+
     tl::expected<size_t, ErrorCode> InvalidateAllBucketFds();
     // Configured before I/O starts; consulted on epoch changes and cache
     // misses.
@@ -366,6 +373,7 @@ class DistributedStorageBackend
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
+    std::atomic<uint64_t> batch_timeout_fixed_ms_;
     std::string expected_root_identity_;
     std::function<tl::expected<std::string, ErrorCode>()> root_identity_provider_;
     std::string root_dir_;

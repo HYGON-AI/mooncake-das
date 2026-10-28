@@ -1799,6 +1799,11 @@ WrappedMasterService::SetDfsHeartbeatInterval(uint32_t new_interval_seconds) {
     return master_service_.SetDfsHeartbeatInterval(new_interval_seconds);
 }
 
+uint64_t WrappedMasterService::SetDfsBatchTimeoutFixedMs(
+    uint64_t new_timeout_ms) {
+    return master_service_.SetDfsBatchTimeoutFixedMs(new_timeout_ms);
+}
+
 tl::expected<uint8_t, ErrorCode> WrappedMasterService::SetDfsFilterMode(
     uint8_t new_filter_mode) {
     return master_service_.SetDfsFilterMode(new_filter_mode);

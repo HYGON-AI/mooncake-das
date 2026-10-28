@@ -654,7 +654,8 @@ Client::Client(const std::string& local_hostname,
     }
     LOG(INFO) << "DFS BatchPut timeout baseline: "
               << dfs_batch_put_timeout_ms_ << " ms, fixed budget: "
-              << dfs_batch_timeout_fixed_ms_ << " ms (0 baseline disables)";
+              << dfs_batch_timeout_fixed_ms_.load(std::memory_order_relaxed)
+              << " ms (0 baseline disables)";
 
     LOG(INFO) << "DFS write buffer, chunk_size=" << dfs_write_chunk_size_
               << ", chunk_count=" << dfs_write_arena_count_;
@@ -4036,7 +4037,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     }
     const auto timeout_ms = DfsBatchPutTimeoutMs(
         dfs_batch_put_timeout_ms_, total_dfs_payload_bytes,
-        dfs_batch_timeout_fixed_ms_);
+        dfs_batch_timeout_fixed_ms_.load(std::memory_order_acquire));
     const auto deadline =
         dfs_batch_put_timeout_ms_ == 0
             ? std::chrono::steady_clock::time_point::max()
@@ -5401,11 +5402,24 @@ void Client::SetDfsStorageBackend(
                   << dfs_write_chunk_size_;
     }
     if (backend) {
+        backend->SetBatchTimeoutFixedMs(GetDfsBatchTimeoutFixedMs());
         backend->SetMasterEpochProvider(
             master_client_.MakeDfsMasterEpochProvider());
     }
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
+}
+
+void Client::SetDfsBatchTimeoutFixedMs(uint64_t timeout_ms) {
+    const uint64_t old_timeout_ms = dfs_batch_timeout_fixed_ms_.exchange(
+        timeout_ms, std::memory_order_acq_rel);
+    if (dfs_storage_backend_) {
+        dfs_storage_backend_->SetBatchTimeoutFixedMs(timeout_ms);
+    }
+    if (old_timeout_ms != timeout_ms) {
+        LOG(INFO) << "Updated DFS batch timeout fixed budget from "
+                  << old_timeout_ms << "ms to " << timeout_ms << "ms";
+    }
 }
 
 tl::expected<std::string, ErrorCode> Client::FetchDfsRootIdentity() {
