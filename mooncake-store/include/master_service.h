@@ -3059,7 +3059,7 @@ class MasterService {
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
     bool IsReplicaReadable(const Replica& replica) const;
-    bool IsDfsReadFilteredOnly(const ObjectMetadata& metadata) const;
+    bool IsReplicaReadableForGet(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKeyInternal(

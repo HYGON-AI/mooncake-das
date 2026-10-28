@@ -1326,9 +1326,20 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
 
         service.RunBatchEvictForTesting(1.0, 1.0);
         ASSERT_TRUE(service.SetDfsFilterMode(1).has_value());
-        auto hidden =
+        auto visible =
             service.GetReplicaList("dfs_backfill", TenantId::Default());
-        ASSERT_FALSE(hidden.has_value());
+        ASSERT_TRUE(visible.has_value());
+        ASSERT_EQ(visible->replicas.size(), 1u);
+        EXPECT_TRUE(visible->replicas.front().is_dfs_replica());
+
+        auto exists = service.ExistKey("dfs_backfill", TenantId::Default());
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value());
+        auto batch_exists =
+            service.BatchExistKey({"dfs_backfill"}, TenantId::Default());
+        ASSERT_EQ(batch_exists.size(), 1u);
+        ASSERT_TRUE(batch_exists.front().has_value());
+        EXPECT_FALSE(batch_exists.front().value());
 
         auto backfill = service.PutStart(context.client_id, "dfs_backfill",
                                          TenantId::Default(), 4096, config);
@@ -1352,7 +1363,7 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
-TEST_F(MasterServiceTest, DfsReadFilterReportsDfsOnlyAsNotFound) {
+TEST_F(MasterServiceTest, DfsReadFilterKeepsDfsOnlyGetVisible) {
     const auto dfs_root =
         (std::filesystem::temp_directory_path() /
          ("master_dfs_filtered_not_found_" + std::to_string(::getpid())))
@@ -1386,14 +1397,16 @@ TEST_F(MasterServiceTest, DfsReadFilterReportsDfsOnlyAsNotFound) {
 
         auto single =
             service.GetReplicaList("dfs_filtered_only", TenantId::Default());
-        ASSERT_FALSE(single.has_value());
-        EXPECT_EQ(single.error(), ErrorCode::OBJECT_NOT_FOUND);
+        ASSERT_TRUE(single.has_value());
+        ASSERT_EQ(single->replicas.size(), 1u);
+        EXPECT_TRUE(single->replicas.front().is_dfs_replica());
 
         auto batch = service.BatchGetReplicaList({"dfs_filtered_only"},
                                                  TenantId::Default());
         ASSERT_EQ(batch.size(), 1u);
-        ASSERT_FALSE(batch.front().has_value());
-        EXPECT_EQ(batch.front().error(), ErrorCode::OBJECT_NOT_FOUND);
+        ASSERT_TRUE(batch.front().has_value());
+        ASSERT_EQ(batch.front()->replicas.size(), 1u);
+        EXPECT_TRUE(batch.front()->replicas.front().is_dfs_replica());
 
         auto admin = service.GetReplicaListForAdmin("dfs_filtered_only",
                                                     TenantId::Default());
