@@ -1326,9 +1326,20 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
 
         service.RunBatchEvictForTesting(1.0, 1.0);
         ASSERT_TRUE(service.SetDfsFilterMode(1).has_value());
-        auto hidden =
+        auto visible =
             service.GetReplicaList("dfs_backfill", TenantId::Default());
-        ASSERT_FALSE(hidden.has_value());
+        ASSERT_TRUE(visible.has_value());
+        ASSERT_EQ(visible->replicas.size(), 1u);
+        EXPECT_TRUE(visible->replicas.front().is_dfs_replica());
+
+        auto exists = service.ExistKey("dfs_backfill", TenantId::Default());
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value());
+        auto batch_exists =
+            service.BatchExistKey({"dfs_backfill"}, TenantId::Default());
+        ASSERT_EQ(batch_exists.size(), 1u);
+        ASSERT_TRUE(batch_exists.front().has_value());
+        EXPECT_FALSE(batch_exists.front().value());
 
         auto backfill = service.PutStart(context.client_id, "dfs_backfill",
                                          TenantId::Default(), 4096, config);
@@ -1336,11 +1347,11 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
         EXPECT_EQ(backfill.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
         ASSERT_TRUE(service.SetDfsFilterMode(0).has_value());
-        auto visible =
+        auto visible_after_filter =
             service.GetReplicaList("dfs_backfill", TenantId::Default());
-        ASSERT_TRUE(visible.has_value());
-        ASSERT_EQ(visible->replicas.size(), 1u);
-        EXPECT_TRUE(visible->replicas.front().is_dfs_replica());
+        ASSERT_TRUE(visible_after_filter.has_value());
+        ASSERT_EQ(visible_after_filter->replicas.size(), 1u);
+        EXPECT_TRUE(visible_after_filter->replicas.front().is_dfs_replica());
 
         auto admin =
             service.GetReplicaListForAdmin("dfs_backfill", TenantId::Default());
@@ -1352,7 +1363,7 @@ TEST_F(MasterServiceTest, DfsReadFilterDoesNotBackfillMemoryReplica) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
-TEST_F(MasterServiceTest, DfsReadFilterReportsDfsOnlyAsNotFound) {
+TEST_F(MasterServiceTest, DfsReadFilterKeepsDfsOnlyGetVisible) {
     const auto dfs_root =
         (std::filesystem::temp_directory_path() /
          ("master_dfs_filtered_not_found_" + std::to_string(::getpid())))
@@ -1386,14 +1397,16 @@ TEST_F(MasterServiceTest, DfsReadFilterReportsDfsOnlyAsNotFound) {
 
         auto single =
             service.GetReplicaList("dfs_filtered_only", TenantId::Default());
-        ASSERT_FALSE(single.has_value());
-        EXPECT_EQ(single.error(), ErrorCode::OBJECT_NOT_FOUND);
+        ASSERT_TRUE(single.has_value());
+        ASSERT_EQ(single->replicas.size(), 1u);
+        EXPECT_TRUE(single->replicas.front().is_dfs_replica());
 
         auto batch = service.BatchGetReplicaList({"dfs_filtered_only"},
                                                  TenantId::Default());
         ASSERT_EQ(batch.size(), 1u);
-        ASSERT_FALSE(batch.front().has_value());
-        EXPECT_EQ(batch.front().error(), ErrorCode::OBJECT_NOT_FOUND);
+        ASSERT_TRUE(batch.front().has_value());
+        ASSERT_EQ(batch.front()->replicas.size(), 1u);
+        EXPECT_TRUE(batch.front()->replicas.front().is_dfs_replica());
 
         auto admin = service.GetReplicaListForAdmin("dfs_filtered_only",
                                                     TenantId::Default());
@@ -2188,6 +2201,7 @@ TEST_F(MasterServiceTest, DfsBucketSnapshotTracksVersionEpochAndHeartbeatInterva
     ScopedBucketDfsEnv env(root, "1048576", "16");
     ScopedEnvVar ready("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
     ScopedEnvVar interval("MOONCAKE_OFFLOAD_DFS_HEARTBEAT_INTERVAL_SECONDS", "5");
+    ScopedEnvVar fixed_timeout("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "54321");
     UUID old_epoch{};
     {
         MasterService service;
@@ -2196,16 +2210,19 @@ TEST_F(MasterServiceTest, DfsBucketSnapshotTracksVersionEpochAndHeartbeatInterva
         ASSERT_TRUE(first.has_value());
         EXPECT_FALSE(first->unchanged);
         EXPECT_EQ(first->heartbeat_interval_seconds, 5u);
+        EXPECT_EQ(first->batch_timeout_fixed_ms, 54321u);
         old_epoch = first->epoch;
 
         ASSERT_TRUE(service.SetDfsHeartbeatInterval(2).has_value());
         EXPECT_FALSE(service.SetDfsHeartbeatInterval(0).has_value());
+        EXPECT_EQ(service.SetDfsBatchTimeoutFixedMs(12345), 54321u);
         auto unchanged = service.GetDfsBucketSnapshot(
             context.client_id, first->epoch, first->version);
         ASSERT_TRUE(unchanged.has_value());
         EXPECT_TRUE(unchanged->unchanged);
         EXPECT_TRUE(unchanged->bucket_ids.empty());
         EXPECT_EQ(unchanged->heartbeat_interval_seconds, 2u);
+        EXPECT_EQ(unchanged->batch_timeout_fixed_ms, 12345u);
 
         ReplicateConfig config;
         config.replica_num = 1;

@@ -108,6 +108,8 @@ class MasterAdminServer {
                                     coro_http::coro_http_response& resp);
     void HandleSetDfsHeartbeatInterval(coro_http::coro_http_request& req,
                                        coro_http::coro_http_response& resp);
+    void HandleSetDfsBatchTimeoutFixedMs(coro_http::coro_http_request& req,
+                                         coro_http::coro_http_response& resp);
     void HandleGetDfsFilterMode(coro_http::coro_http_request& req,
                                 coro_http::coro_http_response& resp);
     void HandleSetDfsFilterMode(coro_http::coro_http_request& req,

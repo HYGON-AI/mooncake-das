@@ -258,6 +258,7 @@ class DfsBucketClientTest : public ::testing::Test {
         // Timeout behavior has a dedicated test with an explicitly bounded
         // client.
         SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "0");
+        SetEnv("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "0");
         // Keep the shard fields valid; they are unused in bucket mode.
         SetEnv("MOONCAKE_DFS_SHARD_COUNT", "1");
         SetEnv("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
@@ -287,6 +288,7 @@ class DfsBucketClientTest : public ::testing::Test {
         distributed_config_.alignment = 4096;
         distributed_config_.shard_count = 1;
         distributed_config_.shard_capacity = 1024 * 1024;
+        distributed_config_.batch_timeout_fixed_ms = 0;
 
         auto adapter = std::make_unique<FailingBucketFsAdapter>();
         adapter_ = adapter.get();
@@ -587,6 +589,12 @@ class DfsBucketClientTest : public ::testing::Test {
     std::string root_;
     std::vector<std::pair<std::string, std::optional<std::string>>> saved_env_;
 };
+
+TEST_F(DfsBucketClientTest, BatchTimeoutFixedMsUpdateReachesReadBackend) {
+    writer_->SetDfsBatchTimeoutFixedMs(12345);
+    EXPECT_EQ(writer_->GetDfsBatchTimeoutFixedMs(), 12345u);
+    EXPECT_EQ(backend_->GetBatchTimeoutFixedMs(), 12345u);
+}
 
 TEST_F(DfsBucketClientTest, PutThenGetRoundTrip) {
     const std::string key = "bucket_put_get";

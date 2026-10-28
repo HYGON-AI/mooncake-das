@@ -47,6 +47,13 @@ struct HttpDfsFilterModeResponse {
 };
 YLT_REFL(HttpDfsFilterModeResponse, success, old_value, new_value);
 
+struct HttpDfsBatchTimeoutFixedMsResponse {
+    bool success{true};
+    uint64_t old_value{0};
+    uint64_t new_value{0};
+};
+YLT_REFL(HttpDfsBatchTimeoutFixedMsResponse, success, old_value, new_value);
+
 struct HttpCreateDrainJobResponse {
     bool success{false};
     std::string job_id;
@@ -240,6 +247,41 @@ TEST_F(MasterAdminServerTest, DfsFilterModeRejectsMissingOrInvalidField) {
     struct_json::from_json(current, response.body);
     EXPECT_EQ(current.old_value, 1u);
     EXPECT_EQ(current.new_value, 1u);
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, DfsBatchTimeoutFixedMsUpdatesRuntimeConfig) {
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 5000;
+    config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(config);
+
+    const int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto response = HttpPutJson(
+        port, "/api/v1/dfs/batch_timeout_fixed_ms",
+        R"({"timeout_ms":12345})");
+    ASSERT_EQ(response.http_status, 200);
+    HttpDfsBatchTimeoutFixedMsResponse updated;
+    struct_json::from_json(updated, response.body);
+    EXPECT_TRUE(updated.success);
+    EXPECT_EQ(updated.new_value, 12345u);
+
+    response = HttpPutJson(port, "/api/v1/dfs/batch_timeout_fixed_ms",
+                           R"({})");
+    EXPECT_EQ(response.http_status, 400);
+
+    response = HttpPutJson(port, "/api/v1/dfs/batch_timeout_fixed_ms",
+                           R"({"timeout_ms":0})");
+    ASSERT_EQ(response.http_status, 200);
+    struct_json::from_json(updated, response.body);
+    EXPECT_EQ(updated.old_value, 12345u);
+    EXPECT_EQ(updated.new_value, 0u);
     admin.Stop();
 }
 

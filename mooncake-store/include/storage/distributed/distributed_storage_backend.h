@@ -16,6 +16,7 @@
 
 #include "fs_adapter.h"
 #include "replica.h"
+#include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/object_storage_adapter.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage_backend.h"
@@ -83,6 +84,9 @@ struct DistributedStorageConfig {
     bool direct_read_enabled = true;
     // Baseline for the size-scaled DFS BatchGet deadline. Zero disables it.
     uint64_t batch_get_timeout_ms = 10000;
+    // Fixed budget added after size scaling. Shared with BatchPut through
+    // MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS.
+    uint64_t batch_timeout_fixed_ms = kDefaultDfsBatchTimeoutFixedMs;
     // Bound DFS reads whose filesystem I/O has not actually completed. A
     // timeout keeps both charges until the background read really returns.
     uint64_t batch_get_max_inflight_batches = 8;
@@ -216,6 +220,13 @@ class DistributedStorageBackend
      */
     DfsAllocatorType GetAllocatorType() const {
         return distributed_config_.allocator_type;
+    }
+
+    void SetBatchTimeoutFixedMs(uint64_t timeout_ms) {
+        batch_timeout_fixed_ms_.store(timeout_ms, std::memory_order_release);
+    }
+    [[nodiscard]] uint64_t GetBatchTimeoutFixedMs() const {
+        return batch_timeout_fixed_ms_.load(std::memory_order_acquire);
     }
 
     tl::expected<size_t, ErrorCode> InvalidateAllBucketFds();
@@ -362,6 +373,7 @@ class DistributedStorageBackend
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
+    std::atomic<uint64_t> batch_timeout_fixed_ms_;
     std::string expected_root_identity_;
     std::function<tl::expected<std::string, ErrorCode>()> root_identity_provider_;
     std::string root_dir_;

@@ -1339,6 +1339,8 @@ void FileStorage::DfsHeartbeatThreadFunc() {
                 LOG(WARNING) << "DFS bucket snapshot request failed: "
                              << snapshot.error();
             } else {
+                client_->SetDfsBatchTimeoutFixedMs(
+                    snapshot->batch_timeout_fixed_ms);
                 const uint32_t heartbeat_interval = std::max<uint32_t>(
                     snapshot->heartbeat_interval_seconds, 1);
                 const uint32_t previous_interval =

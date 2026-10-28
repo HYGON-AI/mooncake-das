@@ -474,6 +474,7 @@ class RealClientDfsPrefetchTest : public RealClientTest {
         config.allocator_type = DfsAllocatorType::BUCKET;
         config.fs_adapter_type = "posix";
         config.batch_get_timeout_ms = read_timeout_ms;
+        config.batch_timeout_fixed_ms = 0;
         auto adapter = std::make_unique<CompletionReadAdapter>();
         adapter->after_read = std::move(hook);
         auto backend = std::make_shared<DistributedStorageBackend>(
@@ -735,6 +736,7 @@ TEST_F(RealClientDfsPrefetchTest, DuplicateDfsTimeoutKeepsTemporaryBuffersAlive)
     ScopedEnvVar bucket_mode("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
     ScopedEnvVar prefetch_arena("MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES", "0");
     ScopedEnvVar timeout("MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS", "100");
+    ScopedEnvVar fixed_timeout("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "0");
     const std::vector<std::string> keys{"dfs_duplicate_timeout"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17840", keys));
     // Ordinary reads, duplicate ranges in one chunk, then one range per chunk.
