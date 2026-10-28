@@ -456,6 +456,7 @@ DistributedStorageBackend::DistributedStorageBackend(
       fs_adapter_(std::move(fs_adapter)),
       object_storage_adapter_(std::move(object_storage_adapter)),
       distributed_config_(distributed_config),
+      batch_timeout_fixed_ms_(distributed_config.batch_timeout_fixed_ms),
       expected_root_identity_(std::move(expected_root_identity)),
       root_dir_(distributed_config.fsdir),
       descriptor_root_dir_(distributed_config.fsdir) {
@@ -2031,7 +2032,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     const auto base_timeout_ms = distributed_config_.batch_get_timeout_ms;
     const auto timeout_ms = DfsBatchGetTimeoutMs(
         base_timeout_ms, total_bytes,
-        distributed_config_.batch_timeout_fixed_ms);
+        batch_timeout_fixed_ms_.load(std::memory_order_acquire));
     const auto admission_deadline =
         base_timeout_ms == 0
             ? std::chrono::steady_clock::time_point::max()

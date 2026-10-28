@@ -224,6 +224,7 @@ class MasterService {
         int64_t new_max_bucket_count);
     tl::expected<uint32_t, ErrorCode> SetDfsHeartbeatInterval(
         uint32_t new_interval_seconds);
+    uint64_t SetDfsBatchTimeoutFixedMs(uint64_t new_timeout_ms);
 
     // 0 keeps DFS allocation and reads enabled; 1 filters both.
     uint8_t GetDfsFilterMode() const {
@@ -2867,6 +2868,8 @@ class MasterService {
     // recovery, deferred metadata flush) that are not part of the common
     // interface.
     std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{300};
+    std::atomic<uint64_t> dfs_batch_timeout_fixed_ms_{
+        kDefaultDfsBatchTimeoutFixedMs};
     UUID dfs_snapshot_epoch_{};
     AtomicBorrowedPtr<ImmutableBucketAllocator> bucket_allocator_;
     std::atomic<bool> dfs_retry_running_{false};

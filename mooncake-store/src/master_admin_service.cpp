@@ -246,6 +246,18 @@ struct HttpDfsHeartbeatIntervalResponse {
 };
 YLT_REFL(HttpDfsHeartbeatIntervalResponse, success, old_value, new_value);
 
+struct HttpDfsBatchTimeoutFixedMsRequest {
+    std::optional<uint64_t> timeout_ms;
+};
+YLT_REFL(HttpDfsBatchTimeoutFixedMsRequest, timeout_ms);
+
+struct HttpDfsBatchTimeoutFixedMsResponse {
+    bool success{true};
+    uint64_t old_value{0};
+    uint64_t new_value{0};
+};
+YLT_REFL(HttpDfsBatchTimeoutFixedMsResponse, success, old_value, new_value);
+
 struct HttpDfsFilterModeRequest {
     std::optional<uint32_t> filter_mode;
 };
@@ -349,6 +361,21 @@ ParseDfsHeartbeatIntervalBody(coro_http::coro_http_request& req) {
     }
     if (request.interval_seconds == 0) {
         return tl::make_unexpected("interval_seconds must be positive (>0)");
+    }
+    return request;
+}
+
+tl::expected<HttpDfsBatchTimeoutFixedMsRequest, std::string>
+ParseDfsBatchTimeoutFixedMsBody(coro_http::coro_http_request& req) {
+    HttpDfsBatchTimeoutFixedMsRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(std::string("Invalid JSON body: ") +
+                                   e.what());
+    }
+    if (!request.timeout_ms.has_value()) {
+        return tl::make_unexpected("timeout_ms is required");
     }
     return request;
 }
@@ -1409,6 +1436,24 @@ void MasterAdminServer::HandleSetDfsHeartbeatInterval(
     });
 }
 
+void MasterAdminServer::HandleSetDfsBatchTimeoutFixedMs(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    auto body_result = ParseDfsBatchTimeoutFixedMsBody(req);
+    if (!body_result.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, body_result.error());
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        HttpDfsBatchTimeoutFixedMsResponse response;
+        response.old_value = service->SetDfsBatchTimeoutFixedMs(
+            *body_result->timeout_ms);
+        response.new_value = *body_result->timeout_ms;
+        WriteJsonResponse(resp, coro_http::status_type::ok, response);
+    });
+}
+
 void MasterAdminServer::HandleGetDfsFilterMode(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
@@ -1554,6 +1599,11 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/dfs/heartbeat_interval",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSetDfsHeartbeatInterval(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/dfs/batch_timeout_fixed_ms",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetDfsBatchTimeoutFixedMs(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/api/v1/dfs/filter_mode",

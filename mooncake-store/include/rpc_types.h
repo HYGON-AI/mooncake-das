@@ -5,6 +5,7 @@
 
 #include "types.h"
 #include "replica.h"
+#include "storage/distributed/dfs_io_timeout.h"
 #include "task_manager.h"
 
 namespace mooncake {
@@ -25,10 +26,11 @@ struct DfsBucketSnapshotResponse {
     uint64_t version = 0;
     bool unchanged = false;
     uint32_t heartbeat_interval_seconds = 300;
+    uint64_t batch_timeout_fixed_ms = kDefaultDfsBatchTimeoutFixedMs;
     std::vector<int64_t> bucket_ids;
 };
 YLT_REFL(DfsBucketSnapshotResponse, epoch, version, unchanged,
-         heartbeat_interval_seconds, bucket_ids);
+         heartbeat_interval_seconds, batch_timeout_fixed_ms, bucket_ids);
 
 enum class ReplicaActionType {
     ADD = 0,

@@ -632,6 +632,10 @@ class Client {
     [[nodiscard]] bool DfsWriteAllowed() const {
         return dfs_write_allowed_.load(std::memory_order_acquire);
     }
+    void SetDfsBatchTimeoutFixedMs(uint64_t timeout_ms);
+    [[nodiscard]] uint64_t GetDfsBatchTimeoutFixedMs() const {
+        return dfs_batch_timeout_fixed_ms_.load(std::memory_order_acquire);
+    }
 
     /**
      * @brief Fetch tasks assigned to a client
@@ -1152,7 +1156,7 @@ class Client {
     const std::string protocol_;
     const bool object_checksum_enabled_;
     const uint64_t dfs_batch_put_timeout_ms_;
-    const uint64_t dfs_batch_timeout_fixed_ms_;
+    std::atomic<uint64_t> dfs_batch_timeout_fixed_ms_;
     const size_t dfs_write_arena_count_;
     const size_t dfs_write_chunk_size_;
     const std::chrono::milliseconds dfs_write_arena_wait_;

@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/dfs_log_limiter.h"
 
 #include <algorithm>
@@ -581,12 +582,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 uint32_t{300}),
             1),
         std::memory_order_release);
+    dfs_batch_timeout_fixed_ms_.store(
+        Environ::GetUInt64("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS",
+                           kDefaultDfsBatchTimeoutFixedMs),
+        std::memory_order_release);
     dfs_root_guard_interval_ = std::chrono::seconds(std::max(
         Environ::GetInt("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS", 5), 1));
     LOG(INFO) << "DFS heartbeat interval initialized to "
               << dfs_heartbeat_interval_seconds_.load(
                      std::memory_order_acquire)
               << "s";
+    LOG(INFO) << "DFS batch timeout fixed budget initialized to "
+              << dfs_batch_timeout_fixed_ms_.load(std::memory_order_acquire)
+              << "ms";
 
     if (default_kv_soft_pin_ttl_ > max_kv_soft_pin_ttl_) {
         LOG(ERROR) << "Invalid soft-pin TTL configuration: default="
@@ -2142,6 +2150,14 @@ tl::expected<uint32_t, ErrorCode> MasterService::SetDfsHeartbeatInterval(
     }
     return dfs_heartbeat_interval_seconds_.exchange(
         new_interval_seconds, std::memory_order_acq_rel);
+}
+
+uint64_t MasterService::SetDfsBatchTimeoutFixedMs(uint64_t new_timeout_ms) {
+    const uint64_t old_timeout_ms = dfs_batch_timeout_fixed_ms_.exchange(
+        new_timeout_ms, std::memory_order_acq_rel);
+    LOG(INFO) << "Updated DFS batch timeout fixed budget from "
+              << old_timeout_ms << "ms to " << new_timeout_ms << "ms";
+    return old_timeout_ms;
 }
 
 tl::expected<uint8_t, ErrorCode> MasterService::SetDfsFilterMode(
@@ -9174,6 +9190,8 @@ auto MasterService::GetDfsBucketSnapshot(
     response.version = snapshot->version;
     response.heartbeat_interval_seconds =
         dfs_heartbeat_interval_seconds_.load(std::memory_order_acquire);
+    response.batch_timeout_fixed_ms =
+        dfs_batch_timeout_fixed_ms_.load(std::memory_order_acquire);
     response.unchanged = last_epoch == dfs_snapshot_epoch_ &&
                          last_version == snapshot->version;
     if (!response.unchanged) response.bucket_ids = snapshot->bucket_ids;

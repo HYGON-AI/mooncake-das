@@ -590,6 +590,12 @@ class DfsBucketClientTest : public ::testing::Test {
     std::vector<std::pair<std::string, std::optional<std::string>>> saved_env_;
 };
 
+TEST_F(DfsBucketClientTest, BatchTimeoutFixedMsUpdateReachesReadBackend) {
+    writer_->SetDfsBatchTimeoutFixedMs(12345);
+    EXPECT_EQ(writer_->GetDfsBatchTimeoutFixedMs(), 12345u);
+    EXPECT_EQ(backend_->GetBatchTimeoutFixedMs(), 12345u);
+}
+
 TEST_F(DfsBucketClientTest, PutThenGetRoundTrip) {
     const std::string key = "bucket_put_get";
     std::string value(4096, 'A');

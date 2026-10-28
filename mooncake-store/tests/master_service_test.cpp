@@ -2188,6 +2188,7 @@ TEST_F(MasterServiceTest, DfsBucketSnapshotTracksVersionEpochAndHeartbeatInterva
     ScopedBucketDfsEnv env(root, "1048576", "16");
     ScopedEnvVar ready("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
     ScopedEnvVar interval("MOONCAKE_OFFLOAD_DFS_HEARTBEAT_INTERVAL_SECONDS", "5");
+    ScopedEnvVar fixed_timeout("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "54321");
     UUID old_epoch{};
     {
         MasterService service;
@@ -2196,16 +2197,19 @@ TEST_F(MasterServiceTest, DfsBucketSnapshotTracksVersionEpochAndHeartbeatInterva
         ASSERT_TRUE(first.has_value());
         EXPECT_FALSE(first->unchanged);
         EXPECT_EQ(first->heartbeat_interval_seconds, 5u);
+        EXPECT_EQ(first->batch_timeout_fixed_ms, 54321u);
         old_epoch = first->epoch;
 
         ASSERT_TRUE(service.SetDfsHeartbeatInterval(2).has_value());
         EXPECT_FALSE(service.SetDfsHeartbeatInterval(0).has_value());
+        EXPECT_EQ(service.SetDfsBatchTimeoutFixedMs(12345), 54321u);
         auto unchanged = service.GetDfsBucketSnapshot(
             context.client_id, first->epoch, first->version);
         ASSERT_TRUE(unchanged.has_value());
         EXPECT_TRUE(unchanged->unchanged);
         EXPECT_TRUE(unchanged->bucket_ids.empty());
         EXPECT_EQ(unchanged->heartbeat_interval_seconds, 2u);
+        EXPECT_EQ(unchanged->batch_timeout_fixed_ms, 12345u);
 
         ReplicateConfig config;
         config.replica_num = 1;
