@@ -28,12 +28,15 @@
 #include <utility>
 #include <vector>
 #include <dirent.h>
+#include <fcntl.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "cuda_alike.h"
 #include "config.h"
@@ -536,6 +539,173 @@ static bool isSameNumaNode(const char *bus1, const char *bus2) {
     return (numa1 != -1 && numa1 == numa2);
 }
 
+// Register access used to read REG_SOCKET_ID through /dev/mkfd.
+constexpr size_t kMkfdMaxNodes = 256;
+constexpr uint32_t kMkfdRegSocketId = 0x5A08C;
+// Number of GPUs sharing one base board (OAM), and number of GPUs of a node.
+constexpr int kGpuPerOam = 2;
+constexpr int kGpuPerNode = 8;
+
+struct MkfdRegsOpArgs {
+    uint32_t gpu_id;  // to KFD
+    bool read;
+    bool pm_pg_lock;
+    bool use_bank;
+    bool use_ring;
+    uint32_t se_bank;
+    uint32_t sh_bank;
+    uint32_t instance_bank;
+    uint32_t me;
+    uint32_t pipe;
+    uint32_t queue;
+    uint32_t vmid;
+    uint32_t reg;
+    uint32_t value;
+};
+
+constexpr unsigned long kMkfdIocRegsOp =
+    _IOWR('M', 0x18, struct MkfdRegsOpArgs);
+
+// REG_SOCKET_ID of every GPU: the KFD node ids are enumerated from sysfs and
+// the register is read back through /dev/mkfd. Returns false when the
+// information is not available, and the caller then keeps the HCA lists as
+// discovered per GPU.
+static bool getSocketIdByGpu(std::vector<int> &socket_ids) {
+    socket_ids.clear();
+
+    // The KFD node ids are listed in node order, which is the order of the
+    // CUDA/HIP devices.
+    std::vector<int> kfd_ids;
+    for (size_t node = 0; node < kMkfdMaxNodes; ++node) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/virtual/kfd/kfd/topology/nodes/%zu/gpu_id",
+                 node);
+        std::ifstream gpu_id_file(path);
+        unsigned int gpu_id = 0;
+        if (!(gpu_id_file >> gpu_id) || gpu_id == 0) continue;
+        kfd_ids.push_back(static_cast<int>(gpu_id));
+    }
+    if (kfd_ids.empty()) {
+        LOG(INFO) << "No GPU in the KFD topology, skipping the OAM grouping";
+        return false;
+    }
+
+    int fd = open("/dev/mkfd", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(INFO) << "Cannot open /dev/mkfd, skipping the OAM grouping";
+        return false;
+    }
+
+    for (size_t gpu = 0; gpu < kfd_ids.size(); ++gpu) {
+        MkfdRegsOpArgs args{};
+        args.gpu_id = static_cast<uint32_t>(kfd_ids[gpu]);
+        args.read = true;
+        args.reg = kMkfdRegSocketId;
+        if (ioctl(fd, kMkfdIocRegsOp, &args) < 0) {
+            PLOG(WARNING) << "Failed to read REG_SOCKET_ID of GPU " << gpu;
+            close(fd);
+            socket_ids.clear();
+            return false;
+        }
+        socket_ids.push_back(static_cast<int>(args.value));
+    }
+    close(fd);
+    return true;
+}
+
+// Partition the GPUs by OAM and let every GPU of one OAM be served by the same
+// network ports. `topology` holds one entry per GPU, named after the device it
+// was built for, with the HCAs at minimum distance from it in preferred_hca.
+static void partitionHcaByOamGroup(std::vector<TopologyEntry> &topology) {
+    // The grouping is only applied to nodes holding a multiple of eight GPUs.
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
+        device_count % kGpuPerNode != 0) {
+        LOG(INFO) << "GPU count " << device_count << " is not a multiple of "
+                  << kGpuPerNode << ", skipping the OAM grouping";
+        return;
+    }
+    if (topology.size() < 2) return;
+
+    std::vector<int> socket_ids;
+    if (!getSocketIdByGpu(socket_ids)) return;
+    if (socket_ids.size() != topology.size()) {
+        LOG(WARNING) << "Found " << socket_ids.size() << " GPUs in the KFD "
+                     << "topology for " << topology.size()
+                     << " GPUs, skipping the OAM grouping";
+        return;
+    }
+
+    std::map<int, std::vector<size_t>> gpus_of_oam;
+    for (size_t gpu = 0; gpu < topology.size(); ++gpu) {
+        // The entries are named GPU_PREFIX + device index, e.g. "cuda:3".
+        const std::string &name = topology[gpu].name;
+        const size_t colon = name.rfind(':');
+        if (colon == std::string::npos || colon + 1 == name.size() ||
+            name.find_first_not_of("0123456789", colon + 1) !=
+                std::string::npos) {
+            LOG(WARNING) << "Cannot map " << name
+                         << " to an OAM, skipping the OAM grouping";
+            return;
+        }
+        const size_t device =
+            static_cast<size_t>(atoi(name.c_str() + colon + 1));
+        if (device >= socket_ids.size()) {
+            LOG(WARNING) << "No REG_SOCKET_ID for " << name
+                         << ", skipping the OAM grouping";
+            return;
+        }
+        // Two adjacent REG_SOCKET_ID values share one base board, so the GPUs
+        // pair up: 0 with 1, 2 with 3, and so on.
+        gpus_of_oam[socket_ids[device] / kGpuPerOam].push_back(gpu);
+    }
+
+    // Resolve the HCA list of every OAM first: a group without any reachable
+    // HCA drops the whole grouping, and the per-GPU lists are kept.
+    std::map<int, std::vector<std::string>> hca_of_oam;
+    for (const auto &oam : gpus_of_oam) {
+        const std::vector<size_t> &gpus = oam.second;
+        if (gpus.size() < 2) continue;
+        // The HCA lists of the members of an OAM are merged, and the merged
+        // list is handed to all of them; a member without any HCA is covered
+        // by the HCAs of the others.
+        std::vector<std::string> pool;
+        for (size_t gpu : gpus) {
+            for (const auto &hca : topology[gpu].preferred_hca) {
+                if (std::find(pool.begin(), pool.end(), hca) == pool.end()) {
+                    pool.push_back(hca);
+                }
+            }
+        }
+        if (pool.empty()) {
+            LOG(WARNING) << "No HCA reached by OAM " << oam.first
+                         << ", skipping the OAM grouping";
+            return;
+        }
+        hca_of_oam[oam.first] = std::move(pool);
+    }
+
+    for (const auto &oam : gpus_of_oam) {
+        const auto pool_it = hca_of_oam.find(oam.first);
+        if (pool_it == hca_of_oam.end()) continue;
+        const std::vector<std::string> &pool = pool_it->second;
+        // The GPUs of one OAM are served by the same ports, and those ports
+        // leave the fallback list of every member.
+        for (size_t gpu : oam.second) {
+            TopologyEntry &entry = topology[gpu];
+            entry.preferred_hca = pool;
+            entry.avail_hca.erase(
+                std::remove_if(entry.avail_hca.begin(), entry.avail_hca.end(),
+                               [&pool](const std::string &hca) {
+                                   return std::find(pool.begin(), pool.end(),
+                                                    hca) != pool.end();
+                               }),
+                entry.avail_hca.end());
+        }
+    }
+}
+
 static std::vector<TopologyEntry> discoverCudaTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     std::vector<TopologyEntry> topology;
@@ -594,6 +764,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
                           .preferred_hca = std::move(preferred_hca),
                           .avail_hca = std::move(avail_hca)});
     }
+    partitionHcaByOamGroup(topology);
     return topology;
 }
 #endif
