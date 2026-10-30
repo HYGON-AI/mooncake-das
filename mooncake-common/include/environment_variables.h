@@ -14,17 +14,11 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_FILE_STORAGE_PATH);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES);
-    MC_DEFINE_ENV_VAR(int64_t, MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES);
-    // On-demand restore staging cap, in bytes. Values <= 0 use the 1 GiB
-    // default; this applies only to ordinary restore misses, not prefetch.
-    MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES);
-    // Fixed host staging arena and maximum payload bytes per async DFS chunk.
+    MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES);
+    MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_READ_CHUNK_SIZE_BYTES);
     MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES);
-    // Number of asynchronous DFS write staging slots.
-    MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_WRITE_ARENA_COUNT);
-    // Maximum time to wait for an asynchronous DFS write staging slot.
     MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_WRITE_ARENA_WAIT_MS);
-    MC_DEFINE_ENV_VAR(int64_t, MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_DFS_PREFETCH_CAPACITY_RATIO);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT);
     MC_DEFINE_ENV_VAR(int64_t, MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT);

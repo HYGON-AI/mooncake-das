@@ -748,12 +748,64 @@ struct SsdMetric {
     }
 };
 
+struct UnifiedBufferMetric {
+    UnifiedBufferMetric(std::map<std::string, std::string> labels = {})
+        : capacity_bytes("mooncake_dfs_unified_buffer_capacity_bytes",
+                         "Unified DFS buffer capacity in bytes", labels),
+          read_bytes("mooncake_dfs_unified_buffer_read_bytes",
+                     "Unified DFS buffer read allocation bytes", labels),
+          prefetch_bytes("mooncake_dfs_unified_buffer_prefetch_bytes",
+                         "Unified DFS buffer prefetch allocation bytes", labels),
+          write_bytes("mooncake_dfs_unified_buffer_write_bytes",
+                      "Unified DFS buffer write allocation bytes", labels),
+          total_bytes("mooncake_dfs_unified_buffer_total_bytes",
+                      "Unified DFS buffer total allocation bytes", labels),
+          peak_total_bytes("mooncake_dfs_unified_buffer_peak_total_bytes",
+                           "Unified DFS buffer peak allocation bytes", labels),
+          write_backlog("mooncake_dfs_unified_buffer_write_backlog",
+                        "In-flight asynchronous DFS writes", labels),
+          read_allocation_failures(
+              "mooncake_dfs_unified_buffer_read_allocation_failures_total",
+              "Unified DFS buffer read allocation failures", labels),
+          prefetch_allocation_failures(
+              "mooncake_dfs_unified_buffer_prefetch_allocation_failures_total",
+              "Unified DFS buffer prefetch allocation failures", labels),
+          write_allocation_failures(
+              "mooncake_dfs_unified_buffer_write_allocation_failures_total",
+              "Unified DFS buffer write allocation failures", labels) {}
+
+    ylt::metric::gauge_t capacity_bytes;
+    ylt::metric::gauge_t read_bytes;
+    ylt::metric::gauge_t prefetch_bytes;
+    ylt::metric::gauge_t write_bytes;
+    ylt::metric::gauge_t total_bytes;
+    ylt::metric::gauge_t peak_total_bytes;
+    ylt::metric::gauge_t write_backlog;
+    ylt::metric::counter_t read_allocation_failures;
+    ylt::metric::counter_t prefetch_allocation_failures;
+    ylt::metric::counter_t write_allocation_failures;
+
+    void serialize(std::string& str) {
+        capacity_bytes.serialize(str);
+        read_bytes.serialize(str);
+        prefetch_bytes.serialize(str);
+        write_bytes.serialize(str);
+        total_bytes.serialize(str);
+        peak_total_bytes.serialize(str);
+        write_backlog.serialize(str);
+        read_allocation_failures.serialize(str);
+        prefetch_allocation_failures.serialize(str);
+        write_allocation_failures.serialize(str);
+    }
+};
+
 struct ClientMetric {
     TransferMetric transfer_metric;
     MasterClientMetric master_client_metric;
     TransferOperationMetric transfer_operation_metric;
     DirectStorageMetric direct_storage_metric;
     SsdMetric ssd_metric;
+    UnifiedBufferMetric unified_buffer_metric;
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables

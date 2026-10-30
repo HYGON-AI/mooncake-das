@@ -314,6 +314,7 @@ class RealClient : public PyClient {
     // Whether waiting-queue DFS prefetch has a staging arena. Callers should
     // not submit prefetches when this is false: every DFS staging allocation
     // would fail.
+    void SetDfsReadChunkSize(size_t chunk_size);
     bool dfs_prefetch_arena_available() const override;
 
     // Startup-only. The caller must serialize this with request/session
@@ -1135,30 +1136,11 @@ class RealClient : public PyClient {
     std::unordered_map<std::string, PrefetchedSessionBuffer>
         get_session_prefetch_cache_;
     std::atomic<bool> prefetch_arena_available_{false};
+    size_t dfs_read_chunk_size_ = size_t{1} << 30;
     class DfsH2dStreamPool;
     class DfsAsyncScatterContext;
     mutable std::shared_mutex dfs_read_lifecycle_mutex_;
     bool dfs_read_shutting_down_ = false;
-    // Waiting-queue prefetch buffers outlive the read that populated them.
-    // They come only from FileStorage's dedicated prefetch arena, never from
-    // the request-scoped restore arena or a runtime pinned allocation.
-    struct PrefetchArenaStats {
-        std::atomic<uint64_t> alloc_ok{0};
-        std::atomic<uint64_t> alloc_fail{0};
-        // Requested bytes of live root regions; released after the region
-        // has been returned to the arena.
-        std::atomic<uint64_t> requested_bytes_in_use{0};
-        // Arena occupancy (capacity - free, including alignment and bin
-        // rounding) observed right after allocations; not an exact peak.
-        std::atomic<uint64_t> occupied_bytes_observed_peak{0};
-        // Minimum observed conservative lower bound of the largest free
-        // region.
-        std::atomic<uint64_t> largest_free_region_min{UINT64_MAX};
-        std::atomic<int64_t> last_summary_ns{0};
-        std::atomic<bool> unavailable_logged{false};
-    };
-    // Shared with region deleters so accounting never touches FileStorage.
-    std::shared_ptr<PrefetchArenaStats> prefetch_arena_stats_;
     std::shared_ptr<BufferHandle> AllocatePrefetchArenaRegion(size_t size,
                                                               size_t alignment);
     std::unique_ptr<DfsH2dStreamPool> dfs_h2d_stream_pool_;

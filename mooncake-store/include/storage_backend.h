@@ -339,13 +339,13 @@ struct FileStorageConfig {
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
-    int64_t pinned_restore_arena_size = 0;
+    // Unified pinned+mapped backing shared by DFS read, prefetch and write.
+    int64_t unified_buffer_size = 8LL * 1024 * 1024 * 1024;
+    double prefetch_capacity_ratio = 0.5;
 
-    // Dedicated arena for waiting-queue DFS prefetch staging. Prefetched
-    // buffers stay pinned until their session ends, so they get their own
-    // fixed arena instead of the request-scoped restore arena. 0 disables
-    // DFS prefetch staging.
-    int64_t pinned_prefetch_arena_size = 0;
+    // Read/write request chunk sizes; these are not backing capacities.
+    int64_t read_chunk_size = 1LL * 1024 * 1024 * 1024;
+    int64_t write_chunk_size = 1LL * 1024 * 1024 * 1024;
 
     // Limits for scanning and iteration operations
     int64_t scanmeta_iterator_keys_limit =

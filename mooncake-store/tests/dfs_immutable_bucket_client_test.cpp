@@ -235,6 +235,7 @@ std::optional<double> WaitForServiceMetricValue(
 class DfsBucketClientTest : public ::testing::Test {
    protected:
     virtual void ConfigureClientEnvironment() {}
+    virtual size_t UnifiedBufferSize() const { return 8 * 1024 * 1024; }
 
     void SetUp() override {
         root_ = (std::filesystem::temp_directory_path() /
@@ -324,7 +325,13 @@ class DfsBucketClientTest : public ::testing::Test {
     std::shared_ptr<Client> CreateClient(const std::string& hostname) {
         auto client = Client::Create(hostname, "P2PHANDSHAKE", "tcp",
                                      std::nullopt, master_.master_address());
-        return client ? *client : nullptr;
+        if (!client || !*client) return nullptr;
+        // Every client created by this fixture needs a unified DFS buffer:
+        // tests recreate writer_ after SetUp() for per-case timeout settings.
+        (*client)->SetUnifiedDfsBuffer(
+            ClientBufferAllocator::create(UnifiedBufferSize()),
+            UnifiedBufferSize());
+        return *client;
     }
 
     void PauseHolderPolling() {
@@ -1214,7 +1221,6 @@ class DfsBucketClientChunkLimitTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "16384");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
     }
 };
 
@@ -1237,9 +1243,11 @@ class DfsBucketClientSlotTimeoutTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+        SetEnv("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "8192");
         SetEnv("MC_STORE_DFS_WRITE_ARENA_WAIT_MS", "1");
     }
+
+    size_t UnifiedBufferSize() const override { return 8192; }
 };
 
 TEST_F(DfsBucketClientSlotTimeoutTest,
@@ -1273,7 +1281,6 @@ class DfsBucketClientMultiChunkTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
     }
 };
 

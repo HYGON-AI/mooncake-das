@@ -4,6 +4,7 @@
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
+#include "dfs_buffer_usage.h"
 
 namespace mooncake {
 
@@ -86,36 +87,45 @@ class FileStorage {
         return pinned_restore_arena_allocator_ != nullptr;
     }
 
+    [[nodiscard]] std::shared_ptr<ClientBufferAllocator>
+    UnifiedBufferAllocator() const {
+        return pinned_restore_arena_allocator_;
+    }
+
+    [[nodiscard]] double PrefetchCapacityRatio() const {
+        return config_.prefetch_capacity_ratio;
+    }
+
+    // Effective prefetch bytes after the read and write protections have been
+    // carved out of the ratio-derived budget. Zero means prefetch cannot
+    // succeed regardless of the configured ratio.
+    [[nodiscard]] size_t UnifiedPrefetchLimitBytes() const {
+        return usage_tracker_ ? static_cast<size_t>(
+                                    usage_tracker_->PrefetchLimitBytes())
+                              : 0;
+    }
+
+    [[nodiscard]] size_t UnifiedBufferCapacity() const {
+        return pinned_restore_arena_ ? pinned_restore_arena_->capacity : 0;
+    }
+
+    [[nodiscard]] std::shared_ptr<DfsBufferUsageTracker>
+    UnifiedBufferUsageTracker() const {
+        return usage_tracker_;
+    }
+
     // Allocate request-scoped staging from the fixed-capacity pinned restore
     // arena. The handle returns its sub-allocation to the arena on destruction.
     [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
         size_t size, size_t alignment = 1) const;
 
-    // Dedicated arena for waiting-queue DFS prefetch staging, allocated once
-    // at construction. It is the only staging source for prefetch reads;
-    // there is no runtime pinned allocation fallback.
-    [[nodiscard]] bool HasPinnedPrefetchArena() const {
-        return pinned_prefetch_arena_allocator_ != nullptr;
-    }
-
-    // "ready" or the reason the prefetch arena is unavailable.
-    [[nodiscard]] const std::string& PinnedPrefetchArenaStatus() const {
-        return pinned_prefetch_arena_status_;
-    }
-
-    [[nodiscard]] size_t PinnedPrefetchArenaCapacity() const {
-        return pinned_prefetch_arena_ ? pinned_prefetch_arena_->capacity : 0;
-    }
-
+    // Allocate from the unified restore arena for prefetch and enforce the
+    // caller's active-capacity limit before publishing the handle.
     [[nodiscard]] std::optional<BufferHandle> AllocatePinnedPrefetchBuffer(
         size_t size, size_t alignment = 1) const;
 
     [[nodiscard]] offset_allocator::OffsetAllocStorageReport
-    PinnedPrefetchArenaReport() const;
-
-    // Release the startup-allocated arena only when no suballocations remain.
-    // The caller must serialize this with DFS prefetch allocations.
-    [[nodiscard]] bool ReleasePinnedPrefetchArena();
+    UnifiedBufferReport() const;
 
     FileStorageConfig config_;
 
@@ -237,12 +247,9 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
 
-    // Allocates the dedicated prefetch arena once and records its status.
-    void InitPinnedPrefetchArena(const FileStorageConfig& config,
-                                 const std::shared_ptr<Client>& client);
-
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker_;
     std::string local_rpc_addr_;
     // Pinned memory for GPU staging and SSD/DFS-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
@@ -250,10 +257,7 @@ class FileStorage {
     // finish after FileStorage is destroyed.
     std::shared_ptr<PinnedBufferPool::Buffer> pinned_restore_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
-    std::shared_ptr<PinnedBufferPool::Buffer> pinned_prefetch_arena_;
-    std::shared_ptr<ClientBufferAllocator> pinned_prefetch_arena_allocator_;
-    uint64_t pinned_prefetch_arena_full_free_bytes_{0};
-    std::string pinned_prefetch_arena_status_ = "not configured";
+    mutable std::mutex unified_prefetch_mutex_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> distributed_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
