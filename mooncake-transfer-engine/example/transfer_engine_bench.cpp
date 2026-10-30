@@ -769,6 +769,15 @@ static std::string getLocationName(int buffer_id) {
     return "cpu:" + std::to_string(buffer_id);
 }
 
+// freeBatchID() returns BatchCleanupDeferred when a completion callback is
+// still unwinding. The handle is already released and the engine finishes
+// the cleanup, so for a finished batch this is success.
+static Status releaseFinishedBatch(TransferEngine* engine, BatchID batch_id) {
+    Status status = engine->freeBatchID(batch_id);
+    if (status.IsBatchCleanupDeferred()) return Status::OK();
+    return status;
+}
+
 Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
                        int thread_id, void* addr) {
     bindToSocket(thread_id % NR_SOCKETS);
@@ -842,7 +851,7 @@ Status initiatorWorker(TransferEngine* engine, SegmentID segment_id,
             }
         }
 
-        s = engine->freeBatchID(batch_id);
+        s = releaseFinishedBatch(engine, batch_id);
         LOG_ASSERT(s.ok());
         batch_count++;
     }

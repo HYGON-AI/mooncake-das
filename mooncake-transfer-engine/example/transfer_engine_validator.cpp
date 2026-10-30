@@ -224,6 +224,7 @@ Status submitRequestSync(TransferEngine *engine, SegmentID handle,
     }
 
     s = engine->freeBatchID(batch_id);
+    if (s.IsBatchCleanupDeferred()) s = Status::OK();
     LOG_ASSERT(s.ok());
     return Status::OK();
 }
