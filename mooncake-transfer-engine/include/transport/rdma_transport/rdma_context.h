@@ -102,6 +102,14 @@ struct MemoryRegionMeta {
     void *addr;
     size_t length;
     struct ibv_mr *mr;
+    // True when the registered range is backed by an ordinary host VMA, i.e.
+    // the only case where ibv_reg_mr() went through rdma-core's
+    // MADV_DONTFORK bookkeeping and unregistering has fork state to undo
+    // (Mooncake#3639). False for dma-buf imports (mr->addr is then a device
+    // iova/offset) and for device or managed memory that only falls back to
+    // ibv_reg_mr() through peermem: they pin no host pages, so
+    // madvise(MADV_DOFORK) has nothing to act on and the kernel rejects it.
+    bool host_vma = false;
 };
 
 // A dma_buf handle exported once for a buffer and shared across every NIC's
@@ -113,6 +121,12 @@ struct MemoryRegionMeta {
 struct DmabufExport {
     enum class Method { kHostReg, kDmabufReg };
     Method method = Method::kHostReg;
+    // False when the range is device or managed memory that only takes the
+    // plain ibv_reg_mr() path (peermem fallback, no dma-buf export): the
+    // address then belongs to the accelerator, not to an ordinary host VMA.
+    // Registration tracks it so unregistering does not madvise a range that
+    // never carried a MADV_DONTFORK (Mooncake#3639).
+    bool host_vma = true;
     int fd = -1;          // live dma_buf fd; -1 when not applicable
     uint64_t offset = 0;  // offset of addr within the exported allocation
     // sysfs PCI root of the GPU owning the memory ("pci0009:00"); empty when

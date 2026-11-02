@@ -51,6 +51,7 @@
 #endif
 #include "transport/rdma_transport/data_direct_topology.h"
 #include "transport/rdma_transport/endpoint_store.h"
+#include "transport/rdma_transport/fork_state.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -586,6 +587,9 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
         out.method = DmabufExport::Method::kHostReg;
+        // Device memory has no ordinary host VMA behind it: nothing to restore
+        // on unregister.
+        out.host_vma = false;
 #endif
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
 #if defined(USE_CUDA) || defined(USE_SUPA)
@@ -728,12 +732,18 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
                      << " — dmabuf export skipped (pages may migrate); "
                         "falling back to ibv_reg_mr";
         out.method = DmabufExport::Method::kHostReg;
+        // Managed pages migrate and cannot carry a stable VM_DONTCOPY: do not
+        // touch fork state on unregister.
+        out.host_vma = false;
     } else if (hipAttr.type == hipMemoryTypeDevice &&
                !isKernelDmabufSupported()) {
         // Kernel lacks CONFIG_PCI_P2PDMA / CONFIG_DMABUF_MOVE_NOTIFY —
         // ibv_reg_dmabuf_mr may succeed but transfers will silently fail.
         // Fall back to ibv_reg_mr() instead.
         out.method = DmabufExport::Method::kHostReg;
+        // Device memory registered through peermem: the range is a device
+        // address, not a host VMA, so there is no fork state to restore.
+        out.host_vma = false;
     } else if (hipAttr.type == hipMemoryTypeDevice) {
         // Device memory + kernel support — export the dmabuf fd.
         // Pin to the owning device for the duration of the export calls.
@@ -827,6 +837,14 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     }
     mrMeta.addr = addr;
     mrMeta.length = length;
+    // A range only carries fork state when it is an ordinary host mapping that
+    // ibv_reg_mr() registered directly; dma-buf imports and device memory that
+    // fell back to ibv_reg_mr() have none (Mooncake#3639). exportDmabuf()
+    // reports what its own path knows, and the runtime probe covers the builds
+    // where the export path is a no-op.
+    mrMeta.host_vma =
+        forkStateShouldBeRestored(exp.method == DmabufExport::Method::kHostReg,
+                                  exp.host_vma, isHostBackedRange(addr));
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
     defined(USE_HIP_DMABUF) || defined(USE_SUPA)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
@@ -951,21 +969,17 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         memory_region_map_.erase(iter);
         return 0;
     }
-    // Cache addr/length before ibv_dereg_mr: the MR is freed by dereg_mr, so
-    // reading mr->length (or the cached region length) afterwards is a use-
-    // after-free. We restore fork state on the same range to undo the
-    // MADV_DONTFORK applied at register time (see issue #3639).
-    size_t region_length = iter->second.mr->length;
-    void *region_addr = static_cast<char *>(iter->second.addr) -
-                        (region_length - iter->second.length);
     if (ibv_dereg_mr(iter->second.mr)) {
         LOG(ERROR) << "Failed to unregister memory " << addr;
         return ERR_CONTEXT;
     }
-    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
-        PLOG(WARNING) << "Failed to restore fork state for memory region at "
-                      << region_addr << " (" << region_length
-                      << " bytes), deregister already succeeded";
+    // Undo the MADV_DONTFORK ibv_reg_mr() may have applied at register time,
+    // on the range the caller actually registered (see issue #3639). Only MRs
+    // backed by an ordinary host VMA ever carried that state; dma-buf imports
+    // and peermem device memory pin no host pages, so they are skipped
+    // entirely instead of issuing a madvise() the kernel has to reject.
+    if (iter->second.host_vma) {
+        restoreForkState(iter->second.addr, iter->second.length);
     }
     memory_region_map_.erase(iter);
     return 0;
@@ -988,7 +1002,14 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
         return ret;
     }
     if (!mrMeta.mr) return 0;  // skipped on a non-paired Data Direct NIC
-    return ibv_dereg_mr(mrMeta.mr);
+    const int rc = ibv_dereg_mr(mrMeta.mr);
+    // Same fork-state rollback as unregisterMemoryRegion(): the temporary MR
+    // went through the same ibv_reg_mr() path, so it is symmetric to undo it
+    // here for host-backed ranges (Mooncake#3639).
+    if (mrMeta.host_vma) {
+        restoreForkState(mrMeta.addr, mrMeta.length);
+    }
+    return rc;
 }
 
 uint32_t RdmaContext::rkey(void *addr) {

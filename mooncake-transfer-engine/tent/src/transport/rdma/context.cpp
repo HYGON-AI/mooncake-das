@@ -684,6 +684,35 @@ int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
     return 0;
 }
 
+namespace {
+
+// ibv_reg_mr() applies madvise(MADV_DONTFORK) to the registered range when
+// verbs fork protection is active; a stack that does not issue the matching
+// MADV_DOFORK on ibv_dereg_mr() leaves those VMAs permanently split and
+// eventually exhausts vm.max_map_count (Mooncake#3639, kvcache-ai#3660).
+// Undo it with the page rounding rdma-core's ibv_madvise_range() uses. dma-buf
+// MRs never reach this helper (they are skipped by dmabuf_mr_set_ below), so a
+// failure here is reported at WARNING, as before this change.
+void restoreForkState(void *addr, size_t length) {
+    static const size_t page_size = [] {
+        long ps = sysconf(_SC_PAGESIZE);
+        return ps > 0 ? static_cast<size_t>(ps) : size_t{4096};
+    }();
+    if (addr == nullptr || length == 0) return;
+    const uintptr_t start =
+        reinterpret_cast<uintptr_t>(addr) & ~(page_size - 1);
+    const uintptr_t end =
+        (reinterpret_cast<uintptr_t>(addr) + length + page_size - 1) &
+        ~(page_size - 1);
+    if (end <= start) return;
+    if (madvise(reinterpret_cast<void *>(start), end - start, MADV_DOFORK) == 0)
+        return;
+    PLOG(WARNING) << "Failed to restore fork state for memory region at "
+                  << reinterpret_cast<void *>(start) << " (" << (end - start)
+                  << " bytes), deregister already succeeded";
+}
+}  // namespace
+
 int RdmaContext::unregisterMemReg(MemReg id) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
@@ -713,11 +742,7 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     // is active; failing to undo this on unregister leaves VMAs permanently
     // split, exhausting vm.max_map_count under high register/unregister churn.
     // See issue #3639.
-    if (madvise(region_addr, region_length, MADV_DOFORK) != 0) {
-        PLOG(WARNING) << "Failed to restore fork state for memory region at "
-                      << region_addr << " (" << region_length
-                      << " bytes), deregister already succeeded";
-    }
+    restoreForkState(region_addr, region_length);
 
     return 0;
 }

@@ -695,3 +695,8 @@ add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
 target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
                                                      gtest_main)
 add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)
+
+add_executable(rdma_fork_state_test ${WORKSPACE}/rdma_fork_state_test.cpp)
+target_link_libraries(rdma_fork_state_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+add_test(NAME rdma_fork_state_test COMMAND rdma_fork_state_test)
