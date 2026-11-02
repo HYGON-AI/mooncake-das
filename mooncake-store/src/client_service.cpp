@@ -675,6 +675,37 @@ Client::Client(const std::string& local_hostname,
     }
 }
 
+void Client::ObserveL4Read(bool prefetch, bool success, uint64_t bytes,
+                           double duration_seconds) {
+    if (metrics_ != nullptr) {
+        metrics_->ObserveL4Read(prefetch, success, bytes, duration_seconds);
+    }
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    if (service_metrics_snapshot_.service_endpoint.empty()) return;
+    auto& l4 = service_metrics_snapshot_.l4;
+    const size_t index = (prefetch ? 0 : 2) + (success ? 0 : 1);
+    ++l4.read_operations[index];
+    l4.read_bytes[index] += bytes;
+    l4.read_duration_us[index] += static_cast<uint64_t>(duration_seconds * 1e6);
+    const auto bucket =
+        std::lower_bound(kL4ReadLatencySecondsBuckets.begin(),
+                         kL4ReadLatencySecondsBuckets.end(), duration_seconds);
+    ++l4.read_duration_buckets[index]
+                              [bucket - kL4ReadLatencySecondsBuckets.begin()];
+}
+
+void Client::ObserveL4Restore(bool prefetched, uint64_t ranges,
+                              uint64_t bytes) {
+    if (metrics_ != nullptr) {
+        metrics_->ObserveL4Restore(prefetched, ranges, bytes);
+    }
+    std::lock_guard<std::mutex> lock(service_metrics_mutex_);
+    if (service_metrics_snapshot_.service_endpoint.empty()) return;
+    const size_t index = prefetched ? 0 : 1;
+    service_metrics_snapshot_.l4.restore_ranges[index] += ranges;
+    service_metrics_snapshot_.l4.restore_bytes[index] += bytes;
+}
+
 int Client::SetServiceEndpoint(const std::string& endpoint) {
     if (!IsValidServiceEndpoint(endpoint)) {
         return toInt(ErrorCode::INVALID_PARAMS);

@@ -698,17 +698,9 @@ class Client {
     }
 
     void ObserveL4Read(bool prefetch, bool success, uint64_t bytes,
-                       double duration_seconds) {
-        if (metrics_ != nullptr) {
-            metrics_->ObserveL4Read(prefetch, success, bytes, duration_seconds);
-        }
-    }
+                       double duration_seconds);
 
-    void ObserveL4Restore(bool prefetched, uint64_t ranges, uint64_t bytes) {
-        if (metrics_ != nullptr) {
-            metrics_->ObserveL4Restore(prefetched, ranges, bytes);
-        }
-    }
+    void ObserveL4Restore(bool prefetched, uint64_t ranges, uint64_t bytes);
 
     void ObserveDirectSessionCacheEviction() {
         if (metrics_ != nullptr) {

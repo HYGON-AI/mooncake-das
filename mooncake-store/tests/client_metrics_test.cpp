@@ -4,10 +4,12 @@
 // csignal must precede coro_http_client.hpp: the bundled ylt's coro_io.hpp
 // calls std::signal without including <csignal> itself.
 #include <csignal>
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -636,6 +638,55 @@ TEST_F(ClientMetricsTest, HttpMetricsEndpointReturns503WhenMetricsDisabled) {
     EXPECT_NE(metrics.body.find("metrics not available"), std::string::npos);
 
     EXPECT_EQ(client->tearDownAll(), 0);
+}
+
+TEST_F(ClientMetricsTest, ServiceL4ReportsWithoutClientMetricsOrHttpEndpoint) {
+    ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
+    setenv("MC_STORE_CLIENT_METRIC", "0", 1);
+    std::unordered_set<int> used_ports;
+    const int rpc_port = GetTestPort(used_ports);
+    const int http_port = GetTestPort(used_ports);
+    const int client_port = GetTestPort(used_ports);
+    ASSERT_GT(rpc_port, 0);
+    ASSERT_GT(http_port, 0);
+    ASSERT_GT(client_port, 0);
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_rpc_port(rpc_port)
+                                 .set_http_metrics_port(http_port)
+                                 .set_http_metadata_port(0)
+                                 .build()));
+    auto client = Client::Create("127.0.0.1:" + std::to_string(client_port),
+                                 "P2PHANDSHAKE", "tcp", std::nullopt,
+                                 master.master_address());
+    ASSERT_TRUE(client.has_value());
+    EXPECT_FALSE((*client)->MetricsEnabled());
+    const std::string endpoint = "198.51.100.61:45304";
+    ASSERT_EQ((*client)->SetServiceEndpoint(endpoint), 0);
+    (*client)->ObserveL4Read(true, true, 8192, 0.025);
+    (*client)->ObserveL4Read(false, false, 4096, 0.050);
+    (*client)->ObserveL4Restore(true, 2, 1024);
+    (*client)->ObserveL4Restore(false, 1, 512);
+    const std::string expected =
+        "mooncake_master_service_l4_restore_bytes_total{service_endpoint=\"" +
+        endpoint + "\",mode=\"prefetched\"} 1024";
+    HttpResponse response{};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(12);
+    do {
+        response = FetchUrl("http://127.0.0.1:" + std::to_string(http_port) +
+                            "/metrics");
+        if (response.body.find(expected) != std::string::npos) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    } while (std::chrono::steady_clock::now() < deadline);
+    EXPECT_EQ(response.status, 200);
+    EXPECT_NE(response.body.find(expected), std::string::npos) << response.body;
+    EXPECT_NE(response.body.find(
+                  "mooncake_master_service_l4_read_duration_seconds_bucket"),
+              std::string::npos);
+    EXPECT_NE(response.body.find("mode=\"on_demand\",result=\"failure\"} 4096"),
+              std::string::npos);
+    client->reset();
 }
 
 TEST_F(ClientMetricsTest, HttpMetricsPortConflictDoesNotFailSetup) {

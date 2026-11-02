@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "types.h"
+#include "service_metrics.h"
 #include "replica.h"
 #include "storage/distributed/dfs_io_timeout.h"
 #include "task_manager.h"
@@ -89,6 +90,9 @@ struct PingResponse {
 };
 YLT_REFL(PingResponse, view_version_id, client_status);
 
+YLT_REFL(ServiceL4Metrics, read_operations, read_bytes, read_duration_us,
+         read_duration_buckets, restore_ranges, restore_bytes);
+
 // Cumulative, per-client service-level I/O metrics. Reports are sent from a
 // background thread so they do not add RPCs to foreground data operations or
 // the heartbeat path. The master deduplicates reports by client UUID and
@@ -103,11 +107,12 @@ struct ServiceMetricsSnapshot {
     uint64_t dual_write_pending = 0;
     uint64_t read_failures_memory = 0;
     uint64_t read_failures_dfs = 0;
+    ServiceL4Metrics l4;
 };
 YLT_REFL(ServiceMetricsSnapshot, service_endpoint, sequence,
-         dual_write_both_success, dual_write_memory_only,
-         dual_write_dfs_only, dual_write_neither_success,
-         dual_write_pending, read_failures_memory, read_failures_dfs);
+         dual_write_both_success, dual_write_memory_only, dual_write_dfs_only,
+         dual_write_neither_success, dual_write_pending, read_failures_memory,
+         read_failures_dfs, l4);
 
 /**
  * @brief Response structure for GetReplicaList operation

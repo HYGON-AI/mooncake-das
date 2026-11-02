@@ -2,6 +2,8 @@
 #include <array>
 #include <variant>
 #include <map>
+#include <span>
+#include <stdexcept>
 
 #include <ylt/metric/counter.hpp>
 #include <ylt/metric/histogram.hpp>
@@ -258,6 +260,17 @@ class basic_hybrid_histogram : public dynamic_metric {
                                            bucket_boundaries_.end(), value)));
         sum_->inc(labels_value, value);
         bucket_counts_[bucket_index]->inc(labels_value);
+    }
+
+    void merge(const std::array<std::string, N>& labels_value,
+               std::span<const uint64_t> bucket_counts, value_type sum) {
+        if (bucket_counts.size() != bucket_counts_.size()) {
+            throw std::invalid_argument("Histogram bucket count mismatch");
+        }
+        sum_->inc(labels_value, sum);
+        for (size_t i = 0; i < bucket_counts.size(); ++i) {
+            bucket_counts_[i]->inc(labels_value, bucket_counts[i]);
+        }
     }
 
     void clean_expired_label() override {
