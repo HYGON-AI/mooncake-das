@@ -509,8 +509,9 @@ struct DirectStorageMetric {
     std::array<std::string, 1> cache_labels = {"result"};
     std::array<std::string, 1> eviction_labels = {"reason"};
     std::array<std::string, 3> io_labels = {"operation", "source", "result"};
-    explicit DirectStorageMetric(
-        std::map<std::string, std::string> labels = {})
+    std::array<std::string, 2> l4_read_labels = {"mode", "result"};
+    std::array<std::string, 1> l4_restore_labels = {"mode"};
+    explicit DirectStorageMetric(std::map<std::string, std::string> labels = {})
         : access_total("mooncake_direct_access_total",
                        "Direct logical object accesses by selected source",
                        labels, access_labels),
@@ -528,16 +529,35 @@ struct DirectStorageMetric {
                               "Direct storage I/O operations", labels,
                               io_labels),
           io_bytes_total("mooncake_direct_io_bytes_total",
-                         "Direct storage I/O payload bytes", labels,
-                         io_labels),
+                         "Direct storage I/O payload bytes", labels, io_labels),
           io_duration_seconds(
               "mooncake_direct_io_duration_seconds",
               "Direct storage I/O wall-clock duration in seconds",
               kStorageLatencySecondsBucket, labels, io_labels),
-          prefetched_tokens_total(
-              "mooncake_prefetched_tokens_total",
-              "Total prompt tokens successfully prefetched by the direct linker",
-              labels) {}
+          prefetched_tokens_total("mooncake_prefetched_tokens_total",
+                                  "Total prompt tokens successfully prefetched "
+                                  "by the direct linker",
+                                  labels),
+          l4_read_operations_total(
+              "mooncake_l4_read_operations_total",
+              "DFS BatchGet calls by prefetch or on-demand mode", labels,
+              l4_read_labels),
+          l4_read_bytes_total(
+              "mooncake_l4_read_bytes_total",
+              "Successfully read DFS bytes by prefetch or on-demand mode",
+              labels, l4_read_labels),
+          l4_read_duration_seconds(
+              "mooncake_l4_read_duration_seconds",
+              "DFS BatchGet duration in seconds by prefetch or on-demand mode",
+              kStorageLatencySecondsBucket, labels, l4_read_labels),
+          l4_restore_ranges_total("mooncake_l4_restore_ranges_total",
+                                  "Successfully restored DFS ranges by "
+                                  "prefetched or on-demand mode",
+                                  labels, l4_restore_labels),
+          l4_restore_bytes_total("mooncake_l4_restore_bytes_total",
+                                 "Successfully restored DFS payload bytes by "
+                                 "prefetched or on-demand mode",
+                                 labels, l4_restore_labels) {}
 
     ylt::metric::hybrid_counter_2t access_total;
     ylt::metric::hybrid_counter_2t access_bytes_total;
@@ -547,6 +567,28 @@ struct DirectStorageMetric {
     ylt::metric::hybrid_counter_3t io_bytes_total;
     ylt::metric::hybrid_histogram_3d io_duration_seconds;
     ylt::metric::counter_t prefetched_tokens_total;
+    ylt::metric::hybrid_counter_2t l4_read_operations_total;
+    ylt::metric::hybrid_counter_2t l4_read_bytes_total;
+    ylt::metric::hybrid_histogram_2d l4_read_duration_seconds;
+    ylt::metric::hybrid_counter_1t l4_restore_ranges_total;
+    ylt::metric::hybrid_counter_1t l4_restore_bytes_total;
+
+    void ObserveL4Read(bool prefetch, bool success, uint64_t bytes,
+                       double duration_seconds) {
+        const std::array<std::string, 2> label = {
+            prefetch ? "prefetch" : "on_demand",
+            success ? "success" : "failure"};
+        l4_read_operations_total.inc(label);
+        l4_read_bytes_total.inc(label, bytes);
+        l4_read_duration_seconds.observe(label, duration_seconds);
+    }
+
+    void ObserveL4Restore(bool prefetched, uint64_t ranges, uint64_t bytes) {
+        const std::array<std::string, 1> label = {prefetched ? "prefetched"
+                                                             : "on_demand"};
+        l4_restore_ranges_total.inc(label, ranges);
+        l4_restore_bytes_total.inc(label, bytes);
+    }
     void ObserveAccess(const std::string& source, bool success,
                        uint64_t bytes) {
         const std::array<std::string, 2> label = {
@@ -578,6 +620,11 @@ struct DirectStorageMetric {
 
     void serialize(std::string& str) {
         prefetched_tokens_total.serialize(str);
+        l4_read_operations_total.serialize(str);
+        l4_read_bytes_total.serialize(str);
+        l4_read_duration_seconds.serialize(str);
+        l4_restore_ranges_total.serialize(str);
+        l4_restore_bytes_total.serialize(str);
         access_total.serialize(str);
         access_bytes_total.serialize(str);
         session_cache_access_total.serialize(str);
@@ -783,6 +830,16 @@ struct ClientMetric {
 
     void ObservePrefetchedTokens(uint64_t tokens) {
         direct_storage_metric.ObservePrefetchedTokens(tokens);
+    }
+
+    void ObserveL4Read(bool prefetch, bool success, uint64_t bytes,
+                       double duration_seconds) {
+        direct_storage_metric.ObserveL4Read(prefetch, success, bytes,
+                                            duration_seconds);
+    }
+
+    void ObserveL4Restore(bool prefetched, uint64_t ranges, uint64_t bytes) {
+        direct_storage_metric.ObserveL4Restore(prefetched, ranges, bytes);
     }
 
     void ObserveDirectSessionCache(bool hit) {

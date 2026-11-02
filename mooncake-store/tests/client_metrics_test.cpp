@@ -218,6 +218,31 @@ TEST_F(ClientMetricsTest, DirectStorageMetricSourceClassification) {
                  "local_disk");
 }
 
+TEST_F(ClientMetricsTest, WaitingQueueL4MetricsSeparateReadsFromConsumption) {
+    ClientMetric metrics(0);
+    metrics.ObserveL4Read(true, true, 8192, 0.025);
+    metrics.ObserveL4Read(false, false, 4096, 0.050);
+    auto& direct = metrics.direct_storage_metric;
+    EXPECT_EQ(direct.l4_read_operations_total.value({"prefetch", "success"}),
+              1);
+    EXPECT_EQ(direct.l4_read_bytes_total.value({"prefetch", "success"}), 8192);
+    // A partially failed batch retains its successfully read byte count.
+    EXPECT_EQ(direct.l4_read_bytes_total.value({"on_demand", "failure"}), 4096);
+    EXPECT_EQ(direct.l4_restore_bytes_total.value({"prefetched"}), 0);
+
+    metrics.ObserveL4Restore(true, 2, 1024);
+    metrics.ObserveL4Restore(false, 1, 512);
+    EXPECT_EQ(direct.l4_restore_ranges_total.value({"prefetched"}), 2);
+    EXPECT_EQ(direct.l4_restore_bytes_total.value({"prefetched"}), 1024);
+    EXPECT_EQ(direct.l4_restore_bytes_total.value({"on_demand"}), 512);
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_NE(serialized.find("mooncake_l4_read_duration_seconds_bucket"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("mooncake_l4_restore_bytes_total"),
+              std::string::npos);
+}
+
 TEST_F(ClientMetricsTest, ByteFormattingTest) {
     TransferMetric metrics;
 
