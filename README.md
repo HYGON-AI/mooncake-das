@@ -44,6 +44,31 @@ This project is based on upstream [Mooncake](https://github.com/kvcache-ai/Moonc
 
 Modified by Hygon Information Technology Co., Ltd.
 
+### Store API compatibility
+
+The L4 Python Store retains the community `v0.3.13.post1` and HYGON L3
+entry points. Integrations can discover optional APIs before `setup()`:
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+capabilities = store.get_capabilities()
+print(capabilities["setup_parameters"])
+print(capabilities["features"])
+```
+
+This additive query describes the local package and current client mode. Older
+callers can continue using their existing setup and read/write calls. For a
+standalone client, use a matching Python package and `mooncake_client` daemon;
+the query does not probe remote support. Store Client and Master must also use
+the same RPC protocol version; API compatibility does not bypass epoch checks.
+
+Native regression checks are in
+[`test_store_compatibility.py`](mooncake-store/tests/e2e/test_store_compatibility.py).
+Set `MOONCAKE_MASTER=HOST:PORT` to additionally test legacy setup forms and
+registered range reads using TCP on Linux with an installed L4 wheel.
+
 <h2 id="updates">🔄 Updates</h2>
 
 - **Aug 24, 2026**: Mooncake now supports [UCL-MPComm](https://github.com/Tencent/UCL-MPComm) as a TENT transport backend, an RDMA-native multi-rail data plane open-sourced by the Tencent Astral Network Team. It can achieve maximum performance in both DRAM and VRAM transfer scenarios.
