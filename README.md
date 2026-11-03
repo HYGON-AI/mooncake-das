@@ -46,8 +46,18 @@ Modified by Hygon Information Technology Co., Ltd.
 
 ### Store API compatibility
 
-The L4 Python Store retains the community `v0.3.13.post1` and HYGON L3
-entry points. Integrations can discover optional APIs before `setup()`:
+The compatibility target is one L4 wheel serving existing community
+`v0.3.13.post1`, HYGON L3, and L4 SGLang callers without changing their calls.
+Existing callers do not need a capability query. For example, the GLM5.3 L3
+direct path still uses `setup`, `batch_put_from_multi_buffers`, and the
+session start / range read / session end APIs.
+
+This branch also backports HYGON L3 commit `6eb1b21a` to Classic RDMA and TENT:
+data QPs request remote atomic access only when supported by the NIC, and
+their outstanding READ/atomic depths respect device limits. This restores a
+lower-level L3 hardware fix that API compatibility alone cannot provide.
+
+New integrations can optionally discover local APIs before `setup()`:
 
 ```python
 from mooncake.store import MooncakeDistributedStore
@@ -68,6 +78,14 @@ Native regression checks are in
 [`test_store_compatibility.py`](mooncake-store/tests/e2e/test_store_compatibility.py).
 Set `MOONCAKE_MASTER=HOST:PORT` to additionally test legacy setup forms and
 registered range reads using TCP on Linux with an installed L4 wheel.
+The GLM5.3 native-call regression does not call `get_capabilities()`. To run
+that case over RDMA, also set `MOONCAKE_COMPAT_PROTOCOL=rdma` and
+`MOONCAKE_COMPAT_DEVICE=DEVICE` on the client; use a routable
+`MOONCAKE_COMPAT_HOSTNAME=CLIENT_IP:0` for multi-host testing. The CPU-buffer
+regression does not replace GPU model validation. `rdma_atomic_cap_test` provides Classic
+RDMA depth checks without requiring a NIC, but still needs the Linux build
+dependencies. Real package/model combinations remain subject to integration
+validation; the backport alone does not establish every SGLang branch works.
 
 <h2 id="updates">🔄 Updates</h2>
 

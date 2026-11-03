@@ -87,7 +87,18 @@ class OldStoreCallerTest(unittest.TestCase):
                     os.environ["MOONCAKE_MASTER"],
                 )
                 kwargs = dict(
-                    zip(store.get_capabilities()["setup_parameters"][:7], args)
+                    zip(
+                        (
+                            "local_hostname",
+                            "metadata_server",
+                            "global_segment_size",
+                            "local_buffer_size",
+                            "protocol",
+                            "rdma_devices",
+                            "master_server_addr",
+                        ),
+                        args,
+                    )
                 )
                 if shape == "community_positional":
                     code = store.setup(*args)
@@ -127,6 +138,85 @@ class OldStoreCallerTest(unittest.TestCase):
                         store.unregister_buffer(address)
                     store.remove(key)
                     store.close()
+
+    def test_glm53_l3_direct_calls_without_capability_query(self):
+        """Replay the native calls used by maxiaobetter SGLang 35130b2f.
+
+        Use two registered objects and two layers so strided destinations,
+        source offsets and multi-buffer packing are checked together. The
+        caller deliberately never uses get_capabilities or any L4-only API.
+        CPU buffers check the API/data contract; real GPU/RDMA is a separate
+        integration run using the same test's configurable transport.
+        """
+        store = MooncakeDistributedStore()
+        protocol = os.environ.get("MOONCAKE_COMPAT_PROTOCOL", "tcp")
+        device = os.environ.get("MOONCAKE_COMPAT_DEVICE", "")
+        self.assertEqual(
+            store.setup(
+                os.environ.get("MOONCAKE_COMPAT_HOSTNAME", "127.0.0.1:0"),
+                "P2PHANDSHAKE",
+                64 * 1024**2,
+                16 * 1024**2,
+                protocol,
+                device,
+                os.environ["MOONCAKE_MASTER"],
+                None,  # Old SGLang passes its optional shared engine here.
+            ),
+            0,
+        )
+        keys = ["glm53-compat-" + uuid4().hex for _ in range(2)]
+        source = ctypes.create_string_buffer(b"abcdefghijklmnop", 16)
+        destination = (ctypes.c_ubyte * 16)()
+        source_ptr = ctypes.addressof(source)
+        destination_ptr = ctypes.addressof(destination)
+        registered = []
+        session_attempted = False
+        try:
+            for address, size in ((source_ptr, 16), (destination_ptr, 16)):
+                self.assertEqual(store.register_buffer(address, size), 0)
+                registered.append(address)
+            config = ReplicateConfig()
+            self.assertEqual(
+                list(
+                    store.batch_put_from_multi_buffers(
+                        keys,
+                        [
+                            [source_ptr, source_ptr + 4],
+                            [source_ptr + 8, source_ptr + 12],
+                        ],
+                        [[4, 4], [4, 4]],
+                        config,
+                    )
+                ),
+                [0, 0],
+            )
+            self.assertEqual(list(store.batch_is_exist(keys)), [1, 1])
+            session_attempted = True
+            self.assertEqual(list(store.batch_get_session_start(keys)), [0, 0])
+            for layer in range(2):
+                self.assertEqual(
+                    list(
+                        store.batch_get_into_multi_buffer_ranges(
+                            keys,
+                            [
+                                [destination_ptr + layer * 8],
+                                [destination_ptr + layer * 8 + 4],
+                            ],
+                            [[4], [4]],
+                            [[layer * 4], [layer * 4]],
+                        )
+                    ),
+                    [4, 4],
+                )
+            self.assertEqual(bytes(destination), b"abcdijklefghmnop")
+        finally:
+            if session_attempted:
+                store.batch_get_session_end(keys)
+            for address in reversed(registered):
+                store.unregister_buffer(address)
+            for key in keys:
+                store.remove(key)
+            store.close()
 
 
 if __name__ == "__main__":
