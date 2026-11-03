@@ -29,6 +29,7 @@ class StoreCapabilitiesTest(unittest.TestCase):
                     "read_plan",
                     "read_layout",
                     "service_metrics",
+                    "client_http_auto_port",
                 ),
                 True,
             ),

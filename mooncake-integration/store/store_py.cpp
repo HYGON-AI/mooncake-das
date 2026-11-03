@@ -2301,6 +2301,7 @@ PYBIND11_MODULE(store, m) {
                 features["read_plan"] = embedded;
                 features["read_layout"] = embedded;
                 features["service_metrics"] = true;
+                features["client_http_auto_port"] = true;
                 py::dict result;
                 result["api_version"] = 1;
                 result["scope"] = "local_package";
