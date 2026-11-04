@@ -27,7 +27,7 @@ jobs:
       pull-requests: read
     strategy:
       matrix:
-        build_variant: [standard, shca, rpc]
+        build_variant: [standard, shca]
         include:
           - dtk_version: "26.10"
             py: "3.12"

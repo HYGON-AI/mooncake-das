@@ -110,7 +110,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build_variant: [standard, shca, rpc]
+        build_variant: [standard, shca]
         include:
           - dtk_version: "26.10"
             py: "3.12"
@@ -330,7 +330,7 @@ jobs:
             exit 0
           fi
 
-          printf 'Build standard/rpc/shca wheels: %s\n' "${BUILD_RESULT}"
+          printf 'Build standard/shca wheels:     %s\n' "${BUILD_RESULT}"
           printf 'Standard wheel RDMA test:       %s\n' "${RDMA_TEST_RESULT}"
           printf 'Standard wheel Store benchmark: %s\n' "${STORE_TEST_RESULT}"
 
@@ -341,7 +341,7 @@ jobs:
             exit 1
           fi
 
-          echo "All three wheels built successfully and all standard-wheel tests passed."
+          echo "Both wheels built successfully and all standard-wheel tests passed."
 
   # Consume the approval label so every maintainer approval authorizes exactly
   # one run. After a new commit is pushed, the maintainer applies the label

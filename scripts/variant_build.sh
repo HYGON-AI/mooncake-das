@@ -16,12 +16,11 @@ BUILD_TYPE="Release"
 
 usage() {
     cat <<'EOF'
-Usage: ./scripts/variant_build.sh [options] <standard|rpc|shca>
+Usage: ./scripts/variant_build.sh [options] <standard|shca>
 
 Build variants:
-  standard  mooncake_transfer_engine       (normal NIC, no hylink; USE_HYGON=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
-  rpc       mooncake_transfer_engine_rpc   (normal NIC, hylink enabled; USE_HYGON=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
-  shca      mooncake_transfer_engine_shca  (TianLong NIC, no hylink; USE_HYGON=ON, USE_SHCA=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
+  standard  mooncake_transfer_engine       (normal NIC + hylink; USE_HYLINK=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
+  shca      mooncake_transfer_engine_shca  (TianLong NIC + hylink; USE_HYLINK=ON, USE_SHCA=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
 
 Options:
   --skip-deps   Skip `bash dependencies.sh`
@@ -150,35 +149,28 @@ setup_shca_env() {
 build_variant() {
     local variant="$1"
     local package_basename=""
-    local -a cmake_args=(-DUSE_ETCD=ON -DSTORE_USE_ETCD=ON)
+    # ENABLE_MULTI_PROTOCOL keeps RDMA+HIP on the same segment (e.g. "rdma,hip")
+    # so cross-node VRAM traffic can fall back to RDMA instead of HIP IPC.
+    local -a cmake_args=(-DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DBUILD_UNIT_TESTS=OFF
+                         -DENABLE_MULTI_PROTOCOL=ON)
 
     case "${variant}" in
         standard)
             package_basename="mooncake_transfer_engine"
-            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=OFF)
+            cmake_args+=(-DUSE_HYLINK=ON -DUSE_SHCA=OFF)
             if [ "${DRY_RUN}" -eq 0 ]; then
                 restore_pyproject
             fi
             ;;
-        rpc)
-            package_basename="mooncake_transfer_engine_rpc"
-            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=OFF)
-            if [ "${DRY_RUN}" -eq 0 ]; then
-                patch_pyproject \
-                    "mooncake-transfer-engine-rpc" \
-                    "Python binding of a Mooncake library using pybind11 (Hylink-enabled version)" \
-                    '["mooncake", "data transfer", "kv cache", "llm inference", "hylink", "rpc"]'
-            fi
-            ;;
         shca)
             package_basename="mooncake_transfer_engine_shca"
-            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=ON)
+            cmake_args+=(-DUSE_HYLINK=ON -DUSE_SHCA=ON)
             setup_shca_env
             if [ "${DRY_RUN}" -eq 0 ]; then
                 patch_pyproject \
                     "mooncake-transfer-engine-shca" \
                     "Python binding of a Mooncake library using pybind11 (TianLong SHCA version)" \
-                    '["mooncake", "data transfer", "kv cache", "llm inference", "tianlong", "shca"]'
+                    '["mooncake", "data transfer", "kv cache", "llm inference", "tianlong", "shca", "hylink"]'
             fi
             ;;
         *)
@@ -200,7 +192,7 @@ build_variant() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        standard|rpc|shca)
+        standard|shca)
             if [ -n "${BUILD_VARIANT}" ]; then
                 echo "Error: exactly one build variant must be specified." >&2
                 usage >&2
