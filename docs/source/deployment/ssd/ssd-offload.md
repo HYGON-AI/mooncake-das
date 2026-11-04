@@ -133,7 +133,11 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory |
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
-| `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES` | `0` | Size of the additional preallocated pinned-host arena for same-process SSD-to-GPU restores. See the constraints below |
+| `MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES` | `8589934592` (8 GiB) | Shared pinned unified buffer for DFS read, prefetch, and write staging |
+| `MC_STORE_DFS_READ_CHUNK_SIZE_BYTES` | `1073741824` (1 GiB) | DFS read chunk size; values `<= 0` use the default |
+| `MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES` | `1073741824` (1 GiB) | DFS write chunk size; values `<= 0` use the default |
+| `MC_STORE_DFS_PREFETCH_CAPACITY_RATIO` | `0.5` | Maximum fraction of the unified buffer retained by prefetch allocations; truncated to what remains after one read chunk and one write chunk |
+| `MC_STORE_DFS_WRITE_ARENA_WAIT_MS` | `10000` | Maximum time DFS write staging waits for unified-buffer space |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
@@ -147,7 +151,33 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 
 The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO` and `MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO` are also accepted. The high watermark must be greater than the low watermark.
 
-The pinned restore quota is separate from `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`; it does not convert the normal FileStorage arena to pinned memory. It is allocated only when `MC_STORE_MEMCPY=1`, and selected only when the current process owns the SSD replica and the restore destination is GPU memory. Tensor payload ranges are copied from their source offset without an additional FileStorage staging allocation. Remote, CPU-destination, and io_uring reads continue to use the existing path. If the pinned quota is exhausted, the request uses the normal restore arena; if the quota cannot be pinned at startup, the optimization remains disabled. The file-per-key backend may still use its own temporary pageable buffer internally; the bucket and offset-allocator backends can read into the supplied restore buffer directly.
+The unified DFS buffer is created when DFS is enabled and its configured size is positive. It is shared by DFS reads, prefetch, and writes; io_uring and local memcpy settings do not disable its creation. On HYGON, a mapped pinned allocation is preferred and falls back to ordinary pinned host memory if the device-visible alias cannot be created. If the configured unified buffer cannot be allocated, client setup fails with `DFS_SERVICE_UNAVAILABLE` instead of degrading at request time.
+
+On a machine without pinned memory the only way to start is `MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES=0`. That disables the unified buffer entirely, and DFS writes lose their staging space: the asynchronous bucket path fails every chunk with `allocator_unavailable` and keeps only the memory replicas, a synchronous write of an object containing GPU slices returns `NO_AVAILABLE_HANDLE` for the DFS replica, and only a synchronous write of a pure host object can still reach DFS. A warning is logged at setup when DFS is enabled with a zero-sized buffer, because that configuration silently degrades DFS writes to memory-only.
+
+#### Unified buffer admission
+
+The unified buffer is not physically partitioned; three byte budgets are enforced on top of the single pool:
+
+| Budget | Value | Effect |
+|---|---|---|
+| Read protection | One read chunk after alignment, capped at half the buffer | Non-read usage must always leave this many bytes free, whether or not a read is in flight |
+| Write protection | One write chunk after alignment, capped by the space left after the read protection | Carved out of the prefetch budget, so admission always reserves room for one write chunk when prefetch is admitted |
+| Prefetch limit | `MC_STORE_DFS_PREFETCH_CAPACITY_RATIO × buffer size`, truncated to `buffer − read protection − write protection` | Prefetch never retains more than this |
+
+Both protections are resolved once at startup. The prefetch limit is `min(ratio × buffer, buffer − read protection − write protection)`; when the ratio asks for more, the limit is silently truncated and a warning records both values. If the two protections consume the whole buffer, the prefetch limit becomes `0`, prefetch is disabled, and a warning says so — raise `MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES` or reduce the chunk sizes. Write protection is a configuration-time reservation only: writes wait for space, bounded by `MC_STORE_DFS_WRITE_ARENA_WAIT_MS` (default 10 s), rather than failing immediately, so a write proceeds as soon as reads release memory. Per-request admission therefore does not re-check the write protection.
+
+Read protection is a byte-level floor, not a guarantee of a contiguous free region. The effective read protection is `max(read chunk, in-flight read bytes)`: with no reads in flight it is exactly one read chunk, and it grows when concurrent reads exceed one chunk so that they are not crowded out by prefetch or writes. The floor is always held, even when no read is in flight: prefetch and writes together may use at most `buffer − read protection`, and the remainder stays reserved for reads that arrive later. This is intentional — reads never wait, so the space must already be there when a read starts. A single read request is never rejected by these budgets; only non-read requests can be refused at admission time.
+
+If `MC_STORE_DFS_READ_CHUNK_SIZE_BYTES` after alignment exceeds half the buffer, the read protection is clamped to half the buffer and a warning is logged. In that configuration writes and prefetch can fill the remaining half, which may leave too little contiguous space for a full read chunk. Set the read chunk to at most half the unified buffer, or size the buffer to at least twice the read chunk, to avoid this.
+
+Note that the aligned allocation size of a chunk is larger than the chunk size itself: a request is padded by up to `MOONCAKE_DFS_ALIGNMENT - 1` bytes and then rounded up to the allocator bin size, so a 4 KiB read chunk with 4 KiB alignment reserves 8 KiB. Size the buffer against the aligned sizes, not the raw chunk sizes.
+
+A single DFS write staging request is limited to `buffer − read protection`. The asynchronous bucket path splits payloads by `MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES`, so it stays within that bound as long as the write chunk fits.
+
+The synchronous shard path behaves differently depending on where the object lives. A **host-only** object is written straight from the caller's slices and never consumes unified buffer space, so its size is not bounded by the buffer. An object that contains **device (GPU) slices** must be staged, because each GPU slice is copied to host anyway: the whole object is staged in one request so every slice shares one allocation for the lifetime of the write, and such an object must therefore fit within `buffer − read protection`. A device object larger than that bound is refused with `NO_AVAILABLE_HANDLE` for the DFS replica while its memory replicas still succeed. Objects written through `put_from` from ordinary host memory are not affected.
+
+Because the protections only reserve bytes, fragmentation can still make a large aligned allocation fail even though the admission counters allow it. A failed DFS read falls back to the ordinary client buffer and, if that also fails, returns an allocation error.
 
 ### Bucket backend settings
 

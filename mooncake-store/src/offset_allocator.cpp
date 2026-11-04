@@ -524,6 +524,12 @@ OffsetAllocationHandle& OffsetAllocationHandle::operator=(
     return *this;
 }
 
+uint64_t OffsetAllocationHandle::allocationSize() const {
+    auto allocator = m_allocator.lock();
+    if (!allocator) return 0;
+    return allocator->normalizedAllocationSize(requested_size);
+}
+
 OffsetAllocationHandle::~OffsetAllocationHandle() {
     auto allocator = m_allocator.lock();
     if (allocator) {

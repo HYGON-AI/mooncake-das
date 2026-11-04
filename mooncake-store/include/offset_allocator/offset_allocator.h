@@ -97,6 +97,9 @@ class OffsetAllocationHandle {
 
     void* ptr() const { return reinterpret_cast<void*>(address()); }
 
+    // Get size reserved by the allocator bin for this allocation.
+    [[nodiscard]] uint64_t allocationSize() const;
+
     // Get size
     uint64_t size() const { return requested_size; }
 

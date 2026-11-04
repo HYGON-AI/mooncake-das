@@ -3263,7 +3263,7 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->dfs_prefetch_arena_available();
             },
             "Whether batch_get_session_prefetch has a DFS staging arena "
-            "(MC_STORE_DFS_PREFETCH_ARENA_SIZE_BYTES). When false every DFS "
+            "(MC_STORE_DFS_PREFETCH_CAPACITY_RATIO). When false every DFS "
             "prefetch read fails, so callers should not submit prefetches.")
         .def(
             "disable_dfs_prefetch",
