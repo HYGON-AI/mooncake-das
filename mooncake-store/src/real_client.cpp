@@ -7597,6 +7597,7 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     struct PendingScatterResult {
         SessionRangeReadRequest *entry;
         size_t transferred;
+        bool from_prefetch_cache;
     };
     std::vector<PendingScatterResult> pending_scatter_results;
     pending_scatter_results.reserve(entries.size());
@@ -7658,7 +7659,7 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         }
         inflight_handles.push_back(handle);
         pending_scatter_results.push_back(
-            PendingScatterResult{entry, transferred});
+            PendingScatterResult{entry, transferred, from_prefetch_cache});
     };
 
     auto queue_loaded_object =
@@ -7921,6 +7922,8 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             "read", DirectStorageMetricSource(ReplicaType::DFS),
             dfs_read_success,
             dfs_read_bytes, io_duration);
+        client_->ObserveL4Read(prefetch_only, dfs_read_success, dfs_read_bytes,
+                               io_duration);
 
         // Build a copy plan before submitting any DMA. Destination pointers are
         // resolved once, adjacent compatible ranges are merged, and operations
@@ -7983,6 +7986,13 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             continue;
         }
         results[result_index] = static_cast<int>(pending.transferred);
+        // Count useful payload only after the scatter has completed. Host
+        // prefetch alone never reaches this point or counts as a restore.
+        if (pending.entry->replica.is_dfs_replica()) {
+            client_->ObserveL4Restore(pending.from_prefetch_cache,
+                                      pending.entry->sizes.size(),
+                                      pending.transferred);
+        }
     }
     if (!scatter_succeeded) {
         LOG(ERROR) << "One or more DFS H2D stream operations failed";
