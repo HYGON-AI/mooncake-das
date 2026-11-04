@@ -896,6 +896,23 @@ TEST_F(RealClientDfsPrefetchTest, DisabledPrefetchKeepsOrdinaryReadWorking) {
 
     ExpectRead(keys[0], 0, 512, /*cache_only=*/false);
 
+    // Keep the ordinary allocator available: an exhausted unified buffer must
+    // reject the read instead of silently borrowing from that allocator.
+    const auto report = py_client_->file_storage_->UnifiedBufferReport();
+    auto occupied = py_client_->file_storage_->AllocatePinnedStagingBuffer(
+        report.largestFreeRegion, 1);
+    ASSERT_TRUE(occupied.has_value());
+    std::string destination(1024, '?');
+    ASSERT_EQ(
+        py_client_->register_buffer(destination.data(), destination.size()), 0);
+    const auto exhausted = py_client_->batch_get_into_multi_buffer_ranges(
+        {keys[0]}, {{destination.data()}}, {{destination.size()}}, {{512}});
+    EXPECT_EQ(exhausted, std::vector<int>{NoAvailableHandle()});
+    EXPECT_EQ(destination, std::string(destination.size(), '?'));
+    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+    occupied.reset();
+    ExpectRead(keys[0], 0, 512, /*cache_only=*/false);
+
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
 }
 

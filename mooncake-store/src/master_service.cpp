@@ -4550,28 +4550,9 @@ auto MasterService::BatchReplicaClear(
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
-    if (!replica.is_completed() || replica.is_eviction_pending() ||
-        replica.has_invalid_mem_handle() || replica.has_invalid_nof_handle()) {
-        return false;
-    }
-    if (replica.is_dfs_replica() &&
-        ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0 ||
-         !enable_dfs_.load(std::memory_order_acquire) ||
-         dfs_root_recovery_in_progress_.load(std::memory_order_acquire))) {
-        return false;
-    }
-    const auto descriptor = replica.get_descriptor();
-    std::optional<std::string> endpoint;
-    if (descriptor.is_memory_replica()) {
-        endpoint = descriptor.get_memory_descriptor()
-                       .buffer_descriptor.transport_endpoint_;
-    } else if (descriptor.is_nof_replica()) {
-        endpoint = descriptor.get_nof_descriptor()
-                       .buffer_descriptor.transport_endpoint_;
-    } else if (descriptor.is_local_disk_replica()) {
-        endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
-    }
-    return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
+    return IsReplicaReadableForGet(replica) &&
+           (!replica.is_dfs_replica() ||
+            (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0);
 }
 
 bool MasterService::IsReplicaReadableForGet(const Replica& replica) const {
@@ -4583,7 +4564,8 @@ bool MasterService::IsReplicaReadableForGet(const Replica& replica) const {
     // disabled DFS root cannot serve its old bucket generation. Keep those
     // replicas hidden from Get throughout root recovery (including retries).
     if (replica.is_dfs_replica() &&
-        !enable_dfs_.load(std::memory_order_acquire)) {
+        (!enable_dfs_.load(std::memory_order_acquire) ||
+         dfs_root_recovery_in_progress_.load(std::memory_order_acquire))) {
         return false;
     }
     const auto descriptor = replica.get_descriptor();
@@ -9358,9 +9340,13 @@ tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
 tl::expected<GetStorageConfigResponse, ErrorCode>
 MasterService::GetStorageConfig() const {
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
-    const std::string dfs_fsdir = enable_dfs_ ? dfs_config.fsdir : std::string();
+    // Recovery disables I/O temporarily, not the configured DFS tier. New
+    // clients still need its path and identity to initialize in degraded mode.
+    const bool dfs_configured = dfs_allocator_ != nullptr;
+    const std::string dfs_fsdir =
+        dfs_configured ? dfs_config.fsdir : std::string();
     const std::string dfs_root_identity =
-        enable_dfs_ ? dfs_root_identity_ : std::string();
+        dfs_configured ? dfs_root_identity_ : std::string();
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
         LOG(INFO)
             << "Storage root directory or cluster ID is not set. persisting "

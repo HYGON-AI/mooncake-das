@@ -1396,35 +1396,38 @@ void FileStorage::DfsHeartbeatThreadFunc() {
                 LOG(WARNING) << "DFS bucket snapshot request failed: "
                              << snapshot.error();
             } else {
-                client_->SetDfsBatchTimeoutFixedMs(
-                    snapshot->batch_timeout_fixed_ms);
-                const uint32_t heartbeat_interval = std::max<uint32_t>(
-                    snapshot->heartbeat_interval_seconds, 1);
-                const uint32_t previous_interval =
-                    dfs_heartbeat_interval_seconds_.exchange(
-                        heartbeat_interval, std::memory_order_acq_rel);
-                if (previous_interval != heartbeat_interval) {
-                    LOG(INFO) << "Updated DFS heartbeat interval from "
-                              << previous_interval << "s to "
-                              << heartbeat_interval << "s";
-                }
                 auto epoch_guard =
                     distributed_backend_->AcquireBucketEpoch(snapshot->epoch);
                 if (!epoch_guard) {
                     LOG(WARNING) << "Ignoring DFS snapshot from an unavailable "
                                     "or superseded Master epoch: "
                                  << epoch_guard.error();
-                } else if (!snapshot->unchanged) {
-                    dfs_snapshot_epoch_ = snapshot->epoch;
-                    dfs_snapshot_version_ = snapshot->version;
-                    auto result = distributed_backend_->CleanupStaleBucketFds(
-                        snapshot->bucket_ids);
-                    if (!result) {
-                        LOG(WARNING) << "DFS FD cleanup failed: "
-                                     << result.error();
-                    } else if (*result > 0) {
-                        LOG(INFO) << "DFS FD cleanup removed " << *result
-                                  << " stale bucket handles";
+                } else {
+                    client_->SetDfsBatchTimeoutFixedMs(
+                        snapshot->batch_timeout_fixed_ms);
+                    const uint32_t heartbeat_interval = std::max<uint32_t>(
+                        snapshot->heartbeat_interval_seconds, 1);
+                    const uint32_t previous_interval =
+                        dfs_heartbeat_interval_seconds_.exchange(
+                            heartbeat_interval, std::memory_order_acq_rel);
+                    if (previous_interval != heartbeat_interval) {
+                        LOG(INFO) << "Updated DFS heartbeat interval from "
+                                  << previous_interval << "s to "
+                                  << heartbeat_interval << "s";
+                    }
+                    if (!snapshot->unchanged) {
+                        dfs_snapshot_epoch_ = snapshot->epoch;
+                        dfs_snapshot_version_ = snapshot->version;
+                        auto result =
+                            distributed_backend_->CleanupStaleBucketFds(
+                                snapshot->bucket_ids);
+                        if (!result) {
+                            LOG(WARNING)
+                                << "DFS FD cleanup failed: " << result.error();
+                        } else if (*result > 0) {
+                            LOG(INFO) << "DFS FD cleanup removed " << *result
+                                      << " stale bucket handles";
+                        }
                     }
                 }
             }

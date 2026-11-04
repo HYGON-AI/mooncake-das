@@ -411,7 +411,7 @@ TEST_F(ClientBufferTest, ExternalDeviceAliasTracksSuballocationOffset) {
 TEST_F(ClientBufferTest, AlignedExternalAllocationPreservesDeviceAlias) {
     constexpr size_t kAlignment = 4096;
     constexpr size_t kAllocationSize = 1024;
-    std::vector<char> host(3 * kAlignment);
+    std::vector<char> host(3 * kAlignment + 1);
     std::vector<char> device_alias(host.size());
     void* host_base = host.data() + 1;
     void* device_base = device_alias.data() + 1;

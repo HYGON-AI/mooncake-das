@@ -1,4 +1,5 @@
 .cache
+.codex/
 .vscode
 build
 build_ofed4

@@ -348,6 +348,8 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     size_t ready_bucket_count = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // Heartbeats also carry runtime configuration before any bucket exists.
+        if (!GetBucketIdSnapshot()) PublishBucketIdSnapshotLocked();
         ready_bucket_count = ready_bucket_ids_.size();
     }
     LOG(INFO) << "DFS bucket allocator initialized, fsdir=" << fsdir_

@@ -2750,6 +2750,13 @@ TEST_F(MasterServiceTest, DfsRootRecoveryPreparationDoesNotBlockL3Requests) {
     EXPECT_TRUE(still_has_dfs.has_value());
     if (still_has_dfs) EXPECT_TRUE(*still_has_dfs);
 
+    const auto storage_during_recovery = service.GetStorageConfig();
+    EXPECT_TRUE(storage_during_recovery.has_value());
+    if (storage_during_recovery) {
+        EXPECT_EQ(storage_during_recovery->dfs_fsdir, root);
+        EXPECT_FALSE(storage_during_recovery->dfs_root_identity.empty());
+    }
+
     auto single_during_recovery = service.GetReplicaList(
         "dfs_only_during_recovery", TenantId::Default());
     EXPECT_FALSE(single_during_recovery.has_value());
@@ -2860,6 +2867,7 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
     const auto root = MakeDfsTestRoot("retry_after_recovery");
     const auto saved_root = root + "_saved";
     ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
     std::filesystem::path persisted_meta;
 
     {
@@ -2990,8 +2998,8 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         ASSERT_TRUE(conflict_metadata.has_value());
         ASSERT_EQ(conflict_metadata->replicas.size(), 1u);
         EXPECT_TRUE(conflict_metadata->replicas.front().is_memory_replica());
-        ASSERT_TRUE(
-            service.Remove("retry_conflict", TenantId::Default()).has_value());
+        ASSERT_TRUE(service.Remove("retry_conflict", TenantId::Default(), true)
+                        .has_value());
         auto conflict_rewrite = service.PutStart(
             context.client_id, "retry_conflict", TenantId::Default(), 4096,
             config);
@@ -3063,6 +3071,7 @@ TEST_F(MasterServiceTest,
        DfsUninitializedFallsBackForPutAndUpsertSingleAndBatch) {
     const auto root = MakeDfsTestRoot("uninitialized_write_fallback");
     ScopedBucketDfsEnv env(root, "1048576", "16");
+    ASSERT_TRUE(std::filesystem::remove(root));
     {
         std::ofstream blocker(root);
         ASSERT_TRUE(blocker.good());
@@ -3736,6 +3745,7 @@ TEST_F(MasterServiceTest, DfsBucketBatchPutStartRollsBackRejectedKeys) {
 TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
     const auto root = MakeDfsTestRoot("restart");
     ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
 
     std::vector<std::string> keys{"restart_a", "restart_b"};
     std::vector<DistributedFSDescriptor> before;

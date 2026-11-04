@@ -226,7 +226,7 @@ class MasterService {
         uint32_t new_interval_seconds);
     uint64_t SetDfsBatchTimeoutFixedMs(uint64_t new_timeout_ms);
 
-    // 0 keeps DFS allocation and reads enabled; 1 filters both.
+    // 1 filters DFS allocation and existence checks; Get may still read DFS.
     uint8_t GetDfsFilterMode() const {
         return dfs_filter_mode_.load(std::memory_order_acquire);
     }

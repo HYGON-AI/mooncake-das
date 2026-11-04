@@ -7735,10 +7735,8 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     bool prefetch_arena_alloc_fail = false;
     if (!arena_views.empty()) {
         if (prefetch_only) {
-            // Prefetch buffers remain in get_session_prefetch_cache_ until the
-            // session ends, so they come only from the dedicated prefetch
-            // arena: never the request-scoped restore arena and never a
-            // runtime pinned allocation.
+            // Cached prefetch views retain their unified buffer allocation
+            // until session end and count against the prefetch admission limit.
             arena = AllocatePrefetchArenaRegion(arena_size, dfs_alignment);
             prefetch_arena_used = arena != nullptr;
             prefetch_arena_alloc_fail = arena == nullptr;
@@ -7749,7 +7747,17 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
                     arena_size, dfs_alignment);
                 pinned_restore_arena_used = allocation.has_value();
             }
-            if (!allocation && client_buffer_allocator_) {
+            const bool has_dfs_reads = std::any_of(
+                arena_views.begin(), arena_views.end(), [](const auto &view) {
+                    return view.entry->replica.is_dfs_replica();
+                });
+            // Enforce an active unified budget while preserving ordinary reads
+            // when it is explicitly disabled or this batch only uses local SSD.
+            const bool unified_budget_active =
+                has_dfs_reads && file_storage_ &&
+                file_storage_->HasPinnedRestoreArena();
+            if (!allocation && !unified_budget_active &&
+                client_buffer_allocator_) {
                 allocation = client_buffer_allocator_->allocate_aligned(
                     arena_size, dfs_alignment);
             }
