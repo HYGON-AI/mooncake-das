@@ -21,6 +21,7 @@
 #include "ssd_register_client.h"
 #include "read_layout.h"
 #include "read_plan.h"
+#include "version.h"
 #include "device/accelerator_registry.h"
 #include "device/cuda_ipc_buffer.h"
 
@@ -2288,6 +2289,36 @@ PYBIND11_MODULE(store, m) {
 
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
+        .def(
+            "get_capabilities",
+            [](const MooncakeStorePyWrapper &self) {
+                // Local API support only. DummyClient forwards health/metrics
+                // RPCs to a daemon built from the same Mooncake package.
+                const bool embedded = !self.use_dummy_client_;
+                py::dict features;
+                features["dfs_health"] = true;
+                features["dfs_prefetch"] = embedded;
+                features["read_plan"] = embedded;
+                features["read_layout"] = embedded;
+                features["service_metrics"] = true;
+                features["client_http_auto_port"] = true;
+                py::dict result;
+                result["api_version"] = 1;
+                result["scope"] = "local_package";
+                result["client_mode"] = embedded ? "embedded" : "standalone";
+                result["rpc_protocol_version"] = GetMooncakeStoreVersion();
+                result["features"] = std::move(features);
+                result["setup_parameters"] = std::vector<std::string>{
+                    "local_hostname", "metadata_server", "global_segment_size",
+                    "local_buffer_size", "protocol", "rdma_devices",
+                    "master_server_addr", "engine", "enable_ssd_offload",
+                    "ssd_offload_path", "tenant_id", "enable_client_http_server",
+                    "client_http_port", "enable_dfs_prefetch"};
+                return result;
+            },
+            "Describe optional local APIs and setup parameters without an RPC. "
+            "Callable before setup; does not probe a standalone daemon. "
+            "Legacy callers do not need to call this method.")
         .def(
             "_get_pyclient_capsule",
             [make_pyclient_capsule](MooncakeStorePyWrapper &self)
