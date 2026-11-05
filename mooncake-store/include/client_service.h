@@ -28,7 +28,7 @@
 #include "count_min_sketch.h"
 #include "local_hot_cache.h"
 #include "pinned_buffer_pool.h"
-#include "dfs_write_staging_pool.h"
+#include "client_buffer.h"
 
 namespace mooncake {
 
@@ -685,6 +685,22 @@ class Client {
 
     [[nodiscard]] bool MetricsEnabled() const { return metrics_ != nullptr; }
 
+    void ObserveUnifiedDfsBufferAllocationFailure(
+        DfsBufferUsageKind kind) {
+        if (metrics_ == nullptr) return;
+        switch (kind) {
+            case DfsBufferUsageKind::kRead:
+                metrics_->unified_buffer_metric.read_allocation_failures.inc();
+                break;
+            case DfsBufferUsageKind::kPrefetch:
+                metrics_->unified_buffer_metric.prefetch_allocation_failures.inc();
+                break;
+            case DfsBufferUsageKind::kWrite:
+                metrics_->unified_buffer_metric.write_allocation_failures.inc();
+                break;
+        }
+    }
+
     void ObservePrefetchedTokens(uint64_t tokens) {
         if (metrics_ != nullptr) {
             metrics_->ObservePrefetchedTokens(tokens);
@@ -696,6 +712,11 @@ class Client {
             metrics_->ObserveDirectSessionCache(hit);
         }
     }
+
+    void ObserveL4Read(bool prefetch, bool success, uint64_t bytes,
+                       double duration_seconds);
+
+    void ObserveL4Restore(bool prefetched, uint64_t ranges, uint64_t bytes);
 
     void ObserveDirectSessionCacheEviction() {
         if (metrics_ != nullptr) {
@@ -731,6 +752,12 @@ class Client {
     }
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
+    // Called once during RealClient setup to install the unified DFS buffer.
+    void SetUnifiedDfsBuffer(
+        std::shared_ptr<ClientBufferAllocator> allocator, size_t capacity);
+    void SetDfsWriteChunkSize(size_t chunk_size);
+    void SetDfsWriteAlignment(size_t alignment);
 
     [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
         return transfer_submitter_ != nullptr &&
@@ -1015,9 +1042,10 @@ class Client {
     void SubmitDfsWriteChunk(std::vector<PutOperation>& ops,
                              const std::vector<size_t>& op_indices,
                              bool is_upsert, bool allow_async,
-                             bool* slot_timed_out = nullptr,
                              std::chrono::steady_clock::time_point deadline =
-                                 std::chrono::steady_clock::time_point::max());
+                                 std::chrono::steady_clock::time_point::max(),
+                             bool* staging_timed_out = nullptr,
+                             bool* staging_exceeds_limit = nullptr);
     void FinalizeBatchPut(std::vector<PutOperation>& ops,
                           bool allow_memory_only_fallback);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
@@ -1027,22 +1055,27 @@ class Client {
         const std::vector<PutOperation>& ops);
     void RecordBatchServiceDualWriteMetrics(std::vector<PutOperation>& ops);
 
+    // Callers must pass the configured arena wait (dfs_write_arena_wait_,
+    // derived from MC_STORE_DFS_WRITE_ARENA_WAIT_MS). The default only exists
+    // as a safety net and is not the configured value.
     std::vector<ErrorCode> WriteDfsReplicas(
         const std::vector<std::string>& keys,
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors,
-        std::shared_ptr<DistributedStorageBackend> backend = nullptr);
+        std::shared_ptr<DistributedStorageBackend> backend = nullptr,
+        std::chrono::milliseconds staging_wait =
+            std::chrono::seconds(10));
 
     /**
      * @brief Everything one asynchronous DFS write batch needs, owned outright.
      *
      * The background task must not reference the caller's CPU or GPU buffers,
      * which may be freed or overwritten as soon as BatchPut returns. All slice
-     * bytes are copied into one fixed-capacity arena slot before the task is
-     * queued, and `slices` points into that slot.
+     * bytes are copied into one dynamically allocated unified buffer before the
+     * task is queued, and `slices` points into that buffer.
      *
-     * `backend` and `staging_pool` are held by shared_ptr so the task keeps
-     * them alive while the write is in flight.
+     * `backend` and `staging_buffer` keep all async state alive while the write
+     * is in flight.
      */
     struct AsyncDfsWriteContext {
         struct ServiceDualWriteCompletion {
@@ -1053,8 +1086,8 @@ class Client {
 
         std::vector<std::string> keys;
         std::vector<DistributedFSDescriptor> descriptors;
-        std::shared_ptr<DfsWriteStagingPool> staging_pool;
-        std::shared_ptr<DfsWriteStagingPool::Slot> staging_slot;
+        std::shared_ptr<ClientBufferAllocator> unified_buffer_allocator;
+        std::optional<BufferHandle> staging_buffer;
         std::vector<std::vector<Slice>> slices;
         std::vector<ServiceDualWriteCompletion> service_dual_writes;
         std::atomic<bool> service_metrics_settled{false};
@@ -1066,7 +1099,7 @@ class Client {
         std::chrono::steady_clock::time_point deadline =
             std::chrono::steady_clock::time_point::max();
 
-        void ReleaseStagingSlot();
+        void ReleaseStagingBuffer();
         ~AsyncDfsWriteContext();
     };
 
@@ -1090,6 +1123,8 @@ class Client {
      * Called from the destructor before the master client goes away.
      */
     void DrainAsyncDfsWrites();
+    void LogUnifiedDfsBufferUsage();
+
     void StopServiceMetricsReporter();
     void ServiceMetricsReporterLoop();
     void RecordServiceDualWrite(bool memory_succeeded, bool dfs_succeeded);
@@ -1157,9 +1192,9 @@ class Client {
     const bool object_checksum_enabled_;
     const uint64_t dfs_batch_put_timeout_ms_;
     std::atomic<uint64_t> dfs_batch_timeout_fixed_ms_;
-    const size_t dfs_write_arena_count_;
-    const size_t dfs_write_chunk_size_;
     const std::chrono::milliseconds dfs_write_arena_wait_;
+    size_t dfs_write_chunk_size_;
+    size_t dfs_write_alignment_ = 4096;
 
     // Explicitly enabled by the serving application after setup. This reporter
     // has its own thread and cumulative snapshot, independent of local metrics.
@@ -1170,10 +1205,15 @@ class Client {
     std::atomic<bool> service_metrics_report_running_{false};
     std::thread service_metrics_report_thread_;
 
-    // Pinned host memory pool for synchronous and fallback staging. The fixed
-    // asynchronous DFS arenas are owned by `dfs_write_staging_pool_`.
+    // Unified allocator is owned by FileStorage and retained here while async
+    // BufferHandles are alive.
+    std::shared_ptr<ClientBufferAllocator> unified_buffer_allocator_;
+    size_t unified_buffer_capacity_ = 0;
     std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
-    std::shared_ptr<DfsWriteStagingPool> dfs_write_staging_pool_;
+    mutable std::mutex unified_buffer_log_mutex_;
+    std::condition_variable unified_buffer_log_cv_;
+    std::atomic<bool> unified_buffer_log_running_{false};
+    std::thread unified_buffer_log_thread_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::string master_dfs_root_dir_;

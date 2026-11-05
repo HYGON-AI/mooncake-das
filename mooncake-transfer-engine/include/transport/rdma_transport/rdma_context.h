@@ -46,6 +46,20 @@
 
 namespace mooncake {
 
+// The historical Mooncake value for outstanding RDMA READ/atomic operations
+// per QP (the IB default most HCAs advertise).
+constexpr int kIdealRdAtomicDepth = 16;
+
+// Program a QP's RD-atomic depth from the device's advertised limit. Capped at
+// kIdealRdAtomicDepth to preserve the previous behaviour on HCAs that support
+// more, and floored at 1 so a device that reports 0 (no single-sided READ
+// support) fails loudly in ibv_modify_qp() instead of silently on every later
+// READ.
+inline int clampRdAtomicDepth(int device_max) {
+    if (device_max <= 0) return 1;
+    return device_max < kIdealRdAtomicDepth ? device_max : kIdealRdAtomicDepth;
+}
+
 class RdmaEndPoint;
 class RdmaTransport;
 class RdmaContextTestPeer;
@@ -258,6 +272,12 @@ class RdmaContext {
 
     ibv_mtu activeMTU() const { return active_mtu_; }
 
+    // Per-NIC outstanding RD-atomic depths, derived from this device's
+    // ibv_device_attr so a slower NIC on a heterogeneous host cannot cap the
+    // QPs of the faster ones.
+    int maxQpRdAtom() const { return max_qp_rd_atom_; }
+    int maxQpInitRdAtom() const { return max_qp_init_rd_atom_; }
+
     ibv_comp_channel *compChannel();
 
     int compVector();
@@ -275,6 +295,11 @@ class RdmaContext {
     int poll(int num_entries, ibv_wc *wc, int cq_index = 0);
 
     int socketId();
+
+    // False when the HCA reports IBV_ATOMIC_NONE. Data QPs then omit
+    // IBV_ACCESS_REMOTE_ATOMIC. Mooncake's host path only posts RDMA
+    // READ/WRITE, so this does not change the transfer protocol.
+    bool supportsRdmaAtomic() const { return supports_rdma_atomic_; }
 
    private:
     int openRdmaDevice(const std::string &device_name, uint8_t port,
@@ -308,6 +333,9 @@ class RdmaContext {
     ibv_comp_channel **comp_channel_ = nullptr;
 
     uint8_t port_ = 0;
+    bool supports_rdma_atomic_ = true;
+    int max_qp_rd_atom_ = kIdealRdAtomicDepth;
+    int max_qp_init_rd_atom_ = kIdealRdAtomicDepth;
     uint32_t lid_ = 0;
     int gid_index_ = -1;
     int active_speed_ = -1;

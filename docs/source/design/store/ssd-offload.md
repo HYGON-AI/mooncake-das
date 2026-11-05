@@ -119,7 +119,7 @@ Requesting Client                 Target Client                    Master
        │                                    │ (free ClientBuffer slot)│
 ```
 
-For a same-process GPU destination, FileStorage reads into a quota-bounded pinned restore arena and submits H2D copies to the caller's GPU slices. Tensor ranges use a source offset, avoiding another CPU staging allocation. This path requires local memcpy and a pinned quota; CPU and remote restores are unchanged.
+For a same-process GPU destination, FileStorage reads into the shared pinned unified DFS buffer and submits H2D copies to the caller's GPU slices. Tensor ranges use a source offset, avoiding another CPU staging allocation. The unified buffer is independent of io_uring and local memcpy settings; CPU and remote restores continue to use their existing paths.
 
 Step by step:
 

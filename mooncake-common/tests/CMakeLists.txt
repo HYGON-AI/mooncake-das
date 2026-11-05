@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 add_executable(default_config_test default_config_test.cpp)
 target_link_libraries(default_config_test PUBLIC mooncake_common gtest pthread)
 add_test(NAME default_config_test COMMAND default_config_test)
@@ -28,3 +33,19 @@ foreach(parser_test ascii_string bool_parser environment_value_parser
                                                    gtest_main pthread)
   add_test(NAME ${parser_test}_test COMMAND ${parser_test}_test)
 endforeach()
+
+add_executable(rpc_tcp_nodelay_test rpc_tcp_nodelay_test.cpp)
+target_link_libraries(
+  rpc_tcp_nodelay_test PRIVATE asio_shared yalantinglibs::yalantinglibs gtest
+                               gtest_main pthread)
+target_compile_definitions(rpc_tcp_nodelay_test PRIVATE UNIT_TEST_INJECT)
+target_include_directories(
+  rpc_tcp_nodelay_test PRIVATE ${yalantinglibs_SOURCE_DIR}/src/coro_rpc/tests)
+if(YLT_ENABLE_SSL)
+  target_compile_definitions(
+    rpc_tcp_nodelay_test
+    PRIVATE
+      YLT_TEST_CERT_DIR="${yalantinglibs_SOURCE_DIR}/src/coro_rpc/tests/openssl_files"
+  )
+endif()
+add_test(NAME rpc_tcp_nodelay_test COMMAND rpc_tcp_nodelay_test)

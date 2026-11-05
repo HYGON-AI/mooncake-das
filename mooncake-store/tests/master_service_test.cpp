@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -34,6 +36,7 @@
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
 #include "storage/distributed/fs_adapter.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
 #include "types.h"
 #include "utils.h"
 
@@ -152,6 +155,51 @@ class MasterServiceTest : public ::testing::Test {
     void SetDfsAllocator(MasterService& service,
                          DfsAllocatorInterface* allocator) {
         service.dfs_allocator_.store(allocator);
+    }
+
+    std::vector<int64_t> GetTrackedDfsBucketIds(MasterService& service) {
+        auto snapshot = service.bucket_allocator_->GetBucketIdSnapshot();
+        return snapshot ? snapshot->bucket_ids : std::vector<int64_t>{};
+    }
+
+    std::optional<bool> HasDfsReplicaInMetadata(MasterService& service,
+                                                const std::string& key) {
+        std::shared_lock<std::shared_mutex> snapshot_lock(
+            service.snapshot_mutex_);
+        MasterService::MetadataAccessorRO accessor(
+            &service,
+            service.MakeObjectIdentityForRequest(key, TenantId::Default()));
+        if (!accessor.Exists()) return std::nullopt;
+        return accessor.Get().HasReplica(
+            [](const Replica& replica) { return replica.is_dfs_replica(); });
+    }
+
+    void SetDfsRootRecoveryBeforeCommitHook(MasterService& service,
+                                            std::function<void()> hook) {
+        service.dfs_root_recovery_before_commit_hook_ = std::move(hook);
+    }
+
+    void SetDfsBatchReservationHook(MasterService& service,
+                                    std::function<void()> hook) {
+        service.dfs_batch_reservation_hook_ = std::move(hook);
+    }
+
+    void SetDfsRootStatErrorForTesting(MasterService& service, int error) {
+        service.dfs_root_stat_error_for_testing_.store(
+            error, std::memory_order_release);
+    }
+
+    void ReconcileDfsRootFiles(MasterService& service) {
+        service.ReconcileDfsRootFiles();
+    }
+
+    bool IsDfsEnabled(const MasterService& service) {
+        return service.enable_dfs_.load(std::memory_order_acquire);
+    }
+
+    bool IsDfsRootRecoveryNeeded(MasterService& service) {
+        std::lock_guard lock(service.dfs_root_guard_mutex_);
+        return service.dfs_root_recovery_needed_;
     }
 
     void RequestMemoryEviction(MasterService& service) {
@@ -2357,6 +2405,438 @@ TEST_F(MasterServiceTest,
     std::filesystem::remove_all(root);
 }
 
+TEST_F(MasterServiceTest,
+       DfsRootGuardRecoversRecreatedRootWithOrWithoutManualIdentity) {
+    for (const bool restore_identity_manually : {false, true}) {
+        SCOPED_TRACE(restore_identity_manually);
+        const auto root = MakeDfsTestRoot(
+            restore_identity_manually ? "root_guard_manual_identity"
+                                      : "root_guard_automatic_identity");
+        ScopedBucketDfsEnv env(root, "1048576", "16");
+        ScopedEnvVar guard_interval(
+            "MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS", "1");
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        const UUID old_epoch = service.GetDfsMasterEpoch();
+        ASSERT_NE(old_epoch, UUID{});
+
+        auto storage = service.GetStorageConfig();
+        ASSERT_TRUE(storage.has_value());
+        const std::string pinned_identity = storage->dfs_root_identity;
+        ASSERT_FALSE(pinned_identity.empty());
+        FileStorageConfig file_config;
+        file_config.storage_filepath = root;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        DistributedStorageBackend backend(
+            file_config, DistributedStorageConfig::FromEnvironment(),
+            std::make_unique<PosixFsAdapter>(), pinned_identity);
+        backend.SetMasterEpochProvider(
+            [&service]() -> tl::expected<UUID, ErrorCode> {
+                return service.GetDfsMasterEpoch();
+            });
+        ASSERT_TRUE(backend.Init().has_value());
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        auto old_start = service.PutStart(
+            context.client_id, "root_replacement_old", TenantId::Default(),
+            4096, config);
+        ASSERT_TRUE(old_start.has_value());
+        const auto* old_dfs = FindDfsDescriptor(*old_start);
+        ASSERT_NE(old_dfs, nullptr);
+        auto old_descriptor = old_dfs->get_dfs_descriptor();
+        old_descriptor.master_epoch = old_epoch;
+        std::string old_value(4096, 'O');
+        auto old_write = backend.BatchWrite({{"root_replacement_old",
+                                              old_descriptor,
+                                              {{old_value.data(),
+                                                old_value.size()}}}});
+        ASSERT_EQ(old_write.size(), 1u);
+        ASSERT_TRUE(old_write.front().has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "root_replacement_old",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        ASSERT_GT(std::filesystem::remove_all(root), 0u);
+        ASSERT_TRUE(std::filesystem::create_directory(root));
+        if (restore_identity_manually) {
+            std::ofstream identity(root + "/" + kDfsRootIdentityFileName,
+                                   std::ios::binary);
+            ASSERT_TRUE(identity.good());
+            identity << pinned_identity;
+            identity.close();
+            ASSERT_TRUE(identity.good());
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(8);
+        UUID new_epoch{};
+        while (std::chrono::steady_clock::now() < deadline) {
+            new_epoch = service.GetDfsMasterEpoch();
+            if (new_epoch != UUID{} && new_epoch != old_epoch) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        ASSERT_NE(new_epoch, UUID{});
+        ASSERT_NE(new_epoch, old_epoch);
+
+        std::ifstream identity_file(root + "/" + kDfsRootIdentityFileName,
+                                    std::ios::binary);
+        const std::string restored_identity(
+            (std::istreambuf_iterator<char>(identity_file)),
+            std::istreambuf_iterator<char>());
+        EXPECT_EQ(restored_identity, pinned_identity);
+        EXPECT_TRUE(std::filesystem::exists(root + "/" +
+                                            kDfsRootMarkerFileName));
+        for (const auto directory_name : kDfsReadProbeDirectoryNames) {
+            EXPECT_TRUE(std::filesystem::exists(
+                std::filesystem::path(root) / std::string(directory_name) /
+                kDfsReadProbeFileName));
+        }
+        EXPECT_TRUE(backend.ProbeWrite().has_value());
+        EXPECT_TRUE(backend.ProbeRead().has_value());
+
+        auto old_query = service.GetReplicaList("root_replacement_old",
+                                                TenantId::Default());
+        ASSERT_TRUE(old_query.has_value());
+        EXPECT_EQ(FindDfsDescriptor(old_query->replicas), nullptr);
+
+        auto new_start = service.PutStart(
+            context.client_id, "root_replacement_new", TenantId::Default(),
+            4096, config);
+        ASSERT_TRUE(new_start.has_value());
+        const auto* new_dfs = FindDfsDescriptor(*new_start);
+        ASSERT_NE(new_dfs, nullptr);
+        EXPECT_TRUE(std::filesystem::exists(
+            new_dfs->get_dfs_descriptor().file_path));
+        EXPECT_NE(new_dfs->get_dfs_descriptor().shard_idx,
+                  old_descriptor.shard_idx);
+        auto new_descriptor = new_dfs->get_dfs_descriptor();
+        new_descriptor.master_epoch = new_epoch;
+        std::string new_value(4096, 'N');
+        auto new_write = backend.BatchWrite({{"root_replacement_new",
+                                              new_descriptor,
+                                              {{new_value.data(),
+                                                new_value.size()}}}});
+        ASSERT_EQ(new_write.size(), 1u);
+        ASSERT_TRUE(new_write.front().has_value());
+        std::string new_output(new_value.size(), '\0');
+        auto new_read = backend.BatchRead({{"root_replacement_new",
+                                            new_descriptor,
+                                            {{new_output.data(),
+                                              new_output.size()}}}});
+        ASSERT_EQ(new_read.size(), 1u);
+        ASSERT_TRUE(new_read.front().has_value());
+        EXPECT_EQ(new_output, new_value);
+        std::filesystem::remove_all(root);
+    }
+}
+
+TEST_F(MasterServiceTest,
+       DfsRootGuardTransientStatFailureDoesNotTriggerRecovery) {
+    const auto root = MakeDfsTestRoot("root_guard_transient_stat_failure");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
+                                "3600");
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        const UUID old_epoch = service.GetDfsMasterEpoch();
+        ASSERT_NE(old_epoch, UUID{});
+
+        SetDfsRootStatErrorForTesting(service, EIO);
+        ReconcileDfsRootFiles(service);
+
+        EXPECT_TRUE(IsDfsEnabled(service));
+        EXPECT_FALSE(IsDfsRootRecoveryNeeded(service));
+        EXPECT_EQ(service.GetDfsMasterEpoch(), old_epoch);
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        auto start = service.PutStart(context.client_id, "after_stat_eio",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start.has_value());
+        EXPECT_NE(FindDfsDescriptor(*start), nullptr);
+
+        SetDfsRootStatErrorForTesting(service, 0);
+        ReconcileDfsRootFiles(service);
+        EXPECT_TRUE(IsDfsEnabled(service));
+        EXPECT_FALSE(IsDfsRootRecoveryNeeded(service));
+        EXPECT_EQ(service.GetDfsMasterEpoch(), old_epoch);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest,
+       DfsRootGuardPreservesReplicasWhenOnlyEmptyReadyBucketIsMissing) {
+    const auto root = MakeDfsTestRoot("root_guard_missing_ready_bucket");
+    const auto old_root = root + "_old";
+    const auto replacement_root = root + "_replacement";
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
+                                "1");
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        const UUID old_epoch = service.GetDfsMasterEpoch();
+        ASSERT_NE(old_epoch, UUID{});
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        auto start = service.PutStart(context.client_id, "preserved_dfs_key",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start.has_value());
+        const auto* dfs = FindDfsDescriptor(*start);
+        ASSERT_NE(dfs, nullptr);
+        const auto descriptor = dfs->get_dfs_descriptor();
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "preserved_dfs_key",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        int64_t empty_bucket_id = -1;
+        const auto ready_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (empty_bucket_id < 0 &&
+               std::chrono::steady_clock::now() < ready_deadline) {
+            const auto tracked = GetTrackedDfsBucketIds(service);
+            for (const int64_t bucket_id : tracked) {
+                if (bucket_id != descriptor.shard_idx) {
+                    empty_bucket_id = bucket_id;
+                    break;
+                }
+            }
+            if (empty_bucket_id < 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        ASSERT_GE(empty_bucket_id, 0);
+        ASSERT_NE(empty_bucket_id, descriptor.shard_idx);
+
+        std::filesystem::copy(root, replacement_root,
+                              std::filesystem::copy_options::recursive);
+        const auto missing_ready_path =
+            std::filesystem::path(replacement_root) /
+            ("bucket_" + ImmutableBucketAllocator::FormatBucketId(
+                             empty_bucket_id) +
+             ".data");
+        ASSERT_TRUE(std::filesystem::remove(missing_ready_path));
+        std::filesystem::rename(root, old_root);
+        std::filesystem::rename(replacement_root, root);
+
+        UUID new_epoch = service.GetDfsMasterEpoch();
+        const auto recovery_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        while ((new_epoch == UUID{} || new_epoch == old_epoch) &&
+               std::chrono::steady_clock::now() < recovery_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            new_epoch = service.GetDfsMasterEpoch();
+        }
+        ASSERT_NE(new_epoch, UUID{});
+        ASSERT_NE(new_epoch, old_epoch);
+
+        auto query = service.GetReplicaListForAdmin("preserved_dfs_key",
+                                                    TenantId::Default());
+        ASSERT_TRUE(query.has_value());
+        const auto* preserved_dfs = FindDfsDescriptor(query->replicas);
+        ASSERT_NE(preserved_dfs, nullptr);
+        EXPECT_EQ(preserved_dfs->get_dfs_descriptor().shard_idx,
+                  descriptor.shard_idx);
+        EXPECT_EQ(preserved_dfs->status, ReplicaStatus::COMPLETE);
+        const auto tracked_after_recovery = GetTrackedDfsBucketIds(service);
+        EXPECT_EQ(std::find(tracked_after_recovery.begin(),
+                            tracked_after_recovery.end(), empty_bucket_id),
+                  tracked_after_recovery.end());
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::remove_all(old_root, ec);
+    std::filesystem::remove_all(replacement_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsRootRecoveryPreparationDoesNotBlockL3Requests) {
+    const auto root = MakeDfsTestRoot("root_recovery_l3_available");
+    const auto old_root = root + "_old";
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
+                                "1");
+    MasterService service;
+    const UUID old_epoch = service.GetDfsMasterEpoch();
+    ASSERT_NE(old_epoch, UUID{});
+    const auto context = PrepareSimpleSegment(service);
+
+    ReplicateConfig with_dfs;
+    with_dfs.replica_num = 1;
+    with_dfs.dfs_replica_num = 1;
+    ASSERT_TRUE(service
+                    .PutStart(context.client_id, "dfs_only_during_recovery",
+                              TenantId::Default(), 4096, with_dfs)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "dfs_only_during_recovery",
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+    service.RunBatchEvictForTesting(1.0, 1.0);
+    auto dfs_only_before = service.GetReplicaList("dfs_only_during_recovery",
+                                                  TenantId::Default());
+    ASSERT_TRUE(dfs_only_before.has_value());
+    ASSERT_EQ(dfs_only_before->replicas.size(), 1u);
+    ASSERT_TRUE(dfs_only_before->replicas.front().is_dfs_replica());
+
+    ReplicateConfig memory_only;
+    memory_only.replica_num = 1;
+    auto existing = service.PutStart(context.client_id, "l3_existing",
+                                     TenantId::Default(), 4096, memory_only);
+    ASSERT_TRUE(existing.has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "l3_existing",
+                            TenantId::Default(), ReplicaType::ALL)
+                    .has_value());
+
+    struct RecoveryHookState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool prepared{false};
+        bool allow_commit{false};
+    };
+    auto hook_state = std::make_shared<RecoveryHookState>();
+    SetDfsRootRecoveryBeforeCommitHook(service, [hook_state] {
+        std::unique_lock<std::mutex> lock(hook_state->mutex);
+        hook_state->prepared = true;
+        hook_state->cv.notify_all();
+        hook_state->cv.wait(lock, [&] { return hook_state->allow_commit; });
+    });
+
+    // Keep the original inode allocated so the new root cannot reuse it.
+    std::error_code replace_error;
+    std::filesystem::rename(root, old_root, replace_error);
+    bool recreated_root = false;
+    if (!replace_error) {
+        recreated_root = std::filesystem::create_directory(root, replace_error);
+    }
+    if (!recreated_root) {
+        {
+            std::lock_guard<std::mutex> lock(hook_state->mutex);
+            hook_state->allow_commit = true;
+        }
+        hook_state->cv.notify_all();
+        FAIL() << "Failed to replace the DFS root for the recovery test: "
+               << replace_error.message();
+    }
+    bool reached_commit_hook = false;
+    {
+        std::unique_lock<std::mutex> lock(hook_state->mutex);
+        reached_commit_hook =
+            hook_state->cv.wait_for(lock, std::chrono::seconds(8),
+                                    [&] { return hook_state->prepared; });
+    }
+    if (!reached_commit_hook) {
+        {
+            std::lock_guard<std::mutex> lock(hook_state->mutex);
+            hook_state->allow_commit = true;
+        }
+        hook_state->cv.notify_all();
+        FAIL() << "DFS root recovery did not reach the commit hook";
+    }
+
+    const auto still_has_dfs =
+        HasDfsReplicaInMetadata(service, "dfs_only_during_recovery");
+    EXPECT_TRUE(still_has_dfs.has_value());
+    if (still_has_dfs) EXPECT_TRUE(*still_has_dfs);
+
+    const auto storage_during_recovery = service.GetStorageConfig();
+    EXPECT_TRUE(storage_during_recovery.has_value());
+    if (storage_during_recovery) {
+        EXPECT_EQ(storage_during_recovery->dfs_fsdir, root);
+        EXPECT_FALSE(storage_during_recovery->dfs_root_identity.empty());
+    }
+
+    auto single_during_recovery = service.GetReplicaList(
+        "dfs_only_during_recovery", TenantId::Default());
+    EXPECT_FALSE(single_during_recovery.has_value());
+    if (!single_during_recovery) {
+        EXPECT_EQ(single_during_recovery.error(),
+                  ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    auto batch_during_recovery = service.BatchGetReplicaList(
+        {"dfs_only_during_recovery"}, TenantId::Default());
+    EXPECT_EQ(batch_during_recovery.size(), 1u);
+    if (batch_during_recovery.size() == 1u) {
+        EXPECT_FALSE(batch_during_recovery.front().has_value());
+        if (!batch_during_recovery.front()) {
+            EXPECT_EQ(batch_during_recovery.front().error(),
+                      ErrorCode::REPLICA_IS_NOT_READY);
+        }
+    }
+    auto regex_during_recovery = service.GetReplicaListByRegex(
+        "^dfs_only_during_recovery$", TenantId::Default());
+    EXPECT_TRUE(regex_during_recovery.has_value());
+    if (regex_during_recovery) {
+        EXPECT_TRUE(regex_during_recovery->empty());
+    }
+
+    std::atomic<bool> requests_finished{false};
+    std::atomic<bool> requests_succeeded{false};
+    std::thread requests([&] {
+        const auto exists =
+            service.ExistKey("l3_existing", TenantId::Default());
+        const auto replicas =
+            service.GetReplicaList("l3_existing", TenantId::Default());
+        auto start = service.PutStart(context.client_id, "l3_during_recovery",
+                                      TenantId::Default(), 4096, memory_only);
+        bool success =
+            exists.value_or(false) && replicas.has_value() && start.has_value();
+        if (start) {
+            success =
+                success && service
+                               .PutEnd(context.client_id, "l3_during_recovery",
+                                       TenantId::Default(), ReplicaType::ALL)
+                               .has_value();
+        }
+        requests_succeeded.store(success, std::memory_order_release);
+        requests_finished.store(true, std::memory_order_release);
+    });
+
+    const auto request_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!requests_finished.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < request_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(requests_finished.load(std::memory_order_acquire));
+    EXPECT_TRUE(requests_succeeded.load(std::memory_order_acquire));
+
+    {
+        std::lock_guard<std::mutex> lock(hook_state->mutex);
+        hook_state->allow_commit = true;
+    }
+    hook_state->cv.notify_all();
+    requests.join();
+
+    const auto recovery_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    UUID recovered_epoch = service.GetDfsMasterEpoch();
+    while ((recovered_epoch == UUID{} || recovered_epoch == old_epoch) &&
+           std::chrono::steady_clock::now() < recovery_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        recovered_epoch = service.GetDfsMasterEpoch();
+    }
+    EXPECT_NE(recovered_epoch, UUID{});
+    EXPECT_NE(recovered_epoch, old_epoch);
+    SetDfsRootRecoveryBeforeCommitHook(service, {});
+    EXPECT_TRUE(service.ExistKey("l3_during_recovery", TenantId::Default())
+                    .value_or(false));
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(root, cleanup_error);
+    std::filesystem::remove_all(old_root, cleanup_error);
+}
+
 TEST_F(MasterServiceTest, DfsRootGuardDoesNotOverwriteMismatchedIdentity) {
     const auto root = MakeDfsTestRoot("root_guard_rejects_mismatch");
     ScopedBucketDfsEnv env(root, "1048576", "16");
@@ -2387,6 +2867,7 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
     const auto root = MakeDfsTestRoot("retry_after_recovery");
     const auto saved_root = root + "_saved";
     ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
     std::filesystem::path persisted_meta;
 
     {
@@ -2517,8 +2998,8 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         ASSERT_TRUE(conflict_metadata.has_value());
         ASSERT_EQ(conflict_metadata->replicas.size(), 1u);
         EXPECT_TRUE(conflict_metadata->replicas.front().is_memory_replica());
-        ASSERT_TRUE(
-            service.Remove("retry_conflict", TenantId::Default()).has_value());
+        ASSERT_TRUE(service.Remove("retry_conflict", TenantId::Default(), true)
+                        .has_value());
         auto conflict_rewrite = service.PutStart(
             context.client_id, "retry_conflict", TenantId::Default(), 4096,
             config);
@@ -2590,6 +3071,7 @@ TEST_F(MasterServiceTest,
        DfsUninitializedFallsBackForPutAndUpsertSingleAndBatch) {
     const auto root = MakeDfsTestRoot("uninitialized_write_fallback");
     ScopedBucketDfsEnv env(root, "1048576", "16");
+    ASSERT_TRUE(std::filesystem::remove(root));
     {
         std::ofstream blocker(root);
         ASSERT_TRUE(blocker.good());
@@ -3107,6 +3589,114 @@ TEST_F(MasterServiceTest, DfsBucketBatchPutStartAllocatesContiguously) {
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_F(MasterServiceTest,
+       DfsBucketBatchPutStartRejectsReservationFromRetiredAllocator) {
+    const auto root = MakeDfsTestRoot("batch_root_replacement");
+    const auto old_root = root + "_old";
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar guard_interval("MOONCAKE_DFS_ROOT_GUARD_INTERVAL_SECONDS",
+                                "1");
+
+    MasterService service;
+    const auto context = PrepareSimpleSegment(service);
+    const UUID old_epoch = service.GetDfsMasterEpoch();
+    ASSERT_NE(old_epoch, UUID{});
+
+    struct ReservationHookState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool reserved{false};
+        bool proceed{false};
+    };
+    auto hook_state = std::make_shared<ReservationHookState>();
+    SetDfsBatchReservationHook(service, [hook_state] {
+        std::unique_lock<std::mutex> lock(hook_state->mutex);
+        hook_state->reserved = true;
+        hook_state->cv.notify_all();
+        hook_state->cv.wait(lock, [&] { return hook_state->proceed; });
+    });
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    using BatchResults =
+        std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>;
+    std::optional<BatchResults> batch_results;
+    std::thread batch_thread([&] {
+        batch_results = service.BatchPutStart(
+            context.client_id, {"batch_stale_reservation"},
+            TenantId::Default(), {4096}, config);
+    });
+
+    bool reached_reservation_hook = false;
+    {
+        std::unique_lock<std::mutex> lock(hook_state->mutex);
+        reached_reservation_hook = hook_state->cv.wait_for(
+            lock, std::chrono::seconds(5), [&] { return hook_state->reserved; });
+    }
+    if (!reached_reservation_hook) {
+        {
+            std::lock_guard<std::mutex> lock(hook_state->mutex);
+            hook_state->proceed = true;
+        }
+        hook_state->cv.notify_all();
+        batch_thread.join();
+        FAIL() << "BatchPutStart did not reach the reservation hook";
+    }
+
+    // Keep the old directory alive so the replacement cannot reuse its inode.
+    // A remove-then-create sequence can look unchanged to the root guard.
+    std::error_code replace_error;
+    std::filesystem::rename(root, old_root, replace_error);
+    bool recreated_root = false;
+    if (!replace_error) {
+        recreated_root = std::filesystem::create_directory(root, replace_error);
+    }
+    if (!recreated_root) {
+        {
+            std::lock_guard<std::mutex> lock(hook_state->mutex);
+            hook_state->proceed = true;
+        }
+        hook_state->cv.notify_all();
+        batch_thread.join();
+        SetDfsBatchReservationHook(service, {});
+        FAIL() << "Failed to replace the DFS root for the batch race test";
+    }
+    UUID new_epoch = service.GetDfsMasterEpoch();
+    const auto recovery_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while ((new_epoch == UUID{} || new_epoch == old_epoch) &&
+           std::chrono::steady_clock::now() < recovery_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        new_epoch = service.GetDfsMasterEpoch();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(hook_state->mutex);
+        hook_state->proceed = true;
+    }
+    hook_state->cv.notify_all();
+    batch_thread.join();
+    SetDfsBatchReservationHook(service, {});
+
+    ASSERT_NE(new_epoch, UUID{});
+    ASSERT_NE(new_epoch, old_epoch);
+    ASSERT_TRUE(batch_results.has_value());
+    ASSERT_EQ(batch_results->size(), 1u);
+    ASSERT_TRUE((*batch_results)[0].has_value())
+        << toString((*batch_results)[0].error());
+    EXPECT_EQ(FindDfsDescriptor(*(*batch_results)[0]), nullptr);
+
+    auto has_stored_dfs =
+        HasDfsReplicaInMetadata(service, "batch_stale_reservation");
+    ASSERT_TRUE(has_stored_dfs.has_value());
+    EXPECT_FALSE(*has_stored_dfs);
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::remove_all(old_root, ec);
+}
+
 TEST_F(MasterServiceTest, DfsBucketBatchPutStartRollsBackRejectedKeys) {
     const auto root = MakeDfsTestRoot("batch_rollback");
     ScopedBucketDfsEnv env(root, "1048576", "16");
@@ -3155,6 +3745,7 @@ TEST_F(MasterServiceTest, DfsBucketBatchPutStartRollsBackRejectedKeys) {
 TEST_F(MasterServiceTest, DfsBucketRestartRestoresQueryableReplicas) {
     const auto root = MakeDfsTestRoot("restart");
     ScopedBucketDfsEnv env(root, "1048576", "16");
+    ScopedEnvVar recovery("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
 
     std::vector<std::string> keys{"restart_a", "restart_b"};
     std::vector<DistributedFSDescriptor> before;

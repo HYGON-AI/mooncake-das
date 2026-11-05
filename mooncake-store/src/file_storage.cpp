@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -53,6 +54,10 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     : config_(config),
       client_(client),
       ssd_metric_(ssd_metric),
+      usage_tracker_(std::make_shared<DfsBufferUsageTracker>(
+          config.unified_buffer_size > 0
+              ? static_cast<uint64_t>(config.unified_buffer_size)
+              : 0)),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
@@ -64,42 +69,155 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
-    if (config.pinned_restore_arena_size > 0) {
-        if (config.use_uring) {
-            LOG(WARNING) << "Pinned SSD restore is disabled with io_uring";
-        } else if (!client ||
-                   !client->CanUseLocalMemcpy(client->GetSegmentEndpoint())) {
+    if (config_.enable_dfs && config_.unified_buffer_size > 0) {
+        const size_t arena_size =
+            static_cast<size_t>(config_.unified_buffer_size);
+        bool mapped_required = UseMappedPinnedRestoreArena();
+        auto buffer =
+            PinnedBufferPool::AllocatePinned(arena_size, mapped_required);
+        if (mapped_required &&
+            (!buffer.pinned_host.addr || !buffer.mapped ||
+             !buffer.device_data)) {
             LOG(WARNING)
-                << "Pinned SSD restore is disabled: local memcpy unavailable";
-        } else {
-            const size_t arena_size =
-                static_cast<size_t>(config.pinned_restore_arena_size);
-            const bool mapped_requested = UseMappedPinnedRestoreArena();
-            auto buffer =
-                PinnedBufferPool::AllocatePinned(arena_size, mapped_requested);
-            if (!buffer.data && mapped_requested) {
-                LOG(WARNING) << "Mapped pinned restore arena is unavailable; "
-                                "falling back to ordinary pinned memory";
-                buffer = PinnedBufferPool::AllocatePinned(arena_size);
-            }
-            if (buffer.pinned_host.addr) {
-                pinned_restore_arena_ =
-                    std::make_shared<PinnedBufferPool::Buffer>(
-                        std::move(buffer));
-                pinned_restore_arena_allocator_ = ClientBufferAllocator::create(
-                    pinned_restore_arena_->data,
-                    pinned_restore_arena_->capacity, client->GetProtocol(),
-                    pinned_restore_arena_->device_data, pinned_restore_arena_);
-                LOG(INFO) << "Initialized pinned SSD restore arena, size="
-                          << pinned_restore_arena_->capacity
-                          << ", mapped=" << pinned_restore_arena_->mapped;
-            } else {
-                LOG(WARNING) << "Failed to allocate pinned SSD restore arena";
-            }
+                << "Mapped unified DFS buffer allocation failed; falling "
+                   "back to pinned host memory, size="
+                << arena_size;
+            buffer = PinnedBufferPool::AllocatePinned(arena_size, false);
+            mapped_required = false;
         }
+        if (buffer.pinned_host.addr &&
+            (!mapped_required ||
+             (buffer.mapped && buffer.device_data != nullptr))) {
+            pinned_restore_arena_ =
+                std::make_shared<PinnedBufferPool::Buffer>(
+                    std::move(buffer));
+            pinned_restore_arena_allocator_ = ClientBufferAllocator::create(
+                pinned_restore_arena_->data, pinned_restore_arena_->capacity,
+                client ? client->GetProtocol() : "",
+                pinned_restore_arena_->device_data, pinned_restore_arena_,
+                usage_tracker_, DfsBufferUsageKind::kRead);
+            const auto dfs_alignment =
+                GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
+            const auto read_chunk_allocation_bytes =
+                pinned_restore_arena_allocator_->allocation_size_for_aligned_request(
+                    static_cast<size_t>(std::max<int64_t>(
+                        config_.read_chunk_size, 0)),
+                    dfs_alignment);
+            const auto write_chunk_allocation_bytes =
+                pinned_restore_arena_allocator_->allocation_size_for_aligned_request(
+                    static_cast<size_t>(std::max<int64_t>(
+                        config_.write_chunk_size, 0)),
+                    dfs_alignment);
+            const auto read_min_protection_bytes = std::min(
+                read_chunk_allocation_bytes,
+                pinned_restore_arena_->capacity / 2);
+            if (read_chunk_allocation_bytes > read_min_protection_bytes) {
+                LOG(WARNING)
+                    << "DFS read free reserve was clamped to half of the "
+                       "unified buffer: requested_read_min_protection_bytes="
+                    << read_chunk_allocation_bytes
+                    << ", effective_read_min_protection_bytes="
+                    << read_min_protection_bytes
+                    << ", unified_capacity_bytes="
+                    << pinned_restore_arena_->capacity;
+            }
+            // Carve one write chunk out of the prefetch budget so prefetch can
+            // never fill the whole non-read region and leave DFS write staging
+            // without space. This is a configuration-time reservation only:
+            // writes wait for space (bounded by MC_STORE_DFS_WRITE_ARENA_WAIT_MS,
+            // default 10s) instead of failing immediately, so once reads
+            // release memory the write proceeds. No per-request write
+            // protection is therefore needed in the admission path.
+            const auto write_min_protection_bytes = std::min(
+                write_chunk_allocation_bytes,
+                pinned_restore_arena_->capacity - read_min_protection_bytes);
+            const auto prefetch_limit_bytes = static_cast<uint64_t>(
+                static_cast<double>(pinned_restore_arena_->capacity) *
+                config_.prefetch_capacity_ratio);
+            const auto admission_limits = usage_tracker_->ConfigureAdmission(
+                read_min_protection_bytes, write_min_protection_bytes,
+                prefetch_limit_bytes);
+            if (prefetch_limit_bytes >
+                admission_limits.prefetch_limit_bytes) {
+                LOG(WARNING)
+                    << "DFS prefetch capacity was truncated to leave room for "
+                       "one read chunk and one write chunk: "
+                       "requested_prefetch_limit_bytes="
+                    << prefetch_limit_bytes
+                    << ", effective_prefetch_limit_bytes="
+                    << admission_limits.prefetch_limit_bytes
+                    << ", read_min_protection_bytes="
+                    << admission_limits.read_min_protection_bytes
+                    << ", write_min_protection_bytes="
+                    << admission_limits.write_min_protection_bytes
+                    << ", unified_capacity_bytes="
+                    << pinned_restore_arena_->capacity
+                    << (admission_limits.prefetch_limit_bytes == 0
+                            ? "; prefetch is disabled, increase "
+                              "MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES or reduce "
+                              "the read/write chunk sizes"
+                            : "");
+            }
+            LOG(INFO) << "Initialized unified DFS buffer from restore arena, "
+                      << "size=" << pinned_restore_arena_->capacity
+                      << ", mapped=" << pinned_restore_arena_->mapped
+                      << ", read_min_protection_bytes="
+                      << admission_limits.read_min_protection_bytes
+                      << ", write_min_protection_bytes="
+                      << admission_limits.write_min_protection_bytes
+                      << ", prefetch_limit_bytes="
+                      << admission_limits.prefetch_limit_bytes;
+            const auto validate_chunk =
+                [this, read_min_protection_bytes, dfs_alignment](
+                    int64_t chunk_size, const char* name, bool is_write_chunk) {
+                if (chunk_size <= 0) return;
+                const auto requested_size = static_cast<size_t>(chunk_size);
+                const auto allocation_size =
+                    pinned_restore_arena_allocator_
+                        ->allocation_size_for_aligned_request(requested_size,
+                                                              dfs_alignment);
+                const auto available_capacity =
+                    is_write_chunk
+                        ? pinned_restore_arena_->capacity -
+                              read_min_protection_bytes
+                        : pinned_restore_arena_->capacity;
+                if (allocation_size == 0 ||
+                    allocation_size > available_capacity) {
+                    LOG(ERROR) << "Unified DFS buffer is too small for " << name
+                               << ": chunk_size=" << chunk_size
+                               << ", required_allocation_size="
+                               << allocation_size << ", capacity="
+                               << pinned_restore_arena_->capacity;
+                    throw std::invalid_argument(
+                        "Unified DFS buffer is too small for DFS chunk size");
+                }
+            };
+            validate_chunk(config_.read_chunk_size, "read chunk", false);
+            validate_chunk(config_.write_chunk_size, "write chunk", true);
+        } else {
+            LOG(ERROR) << "Failed to allocate required pinned/mapped unified "
+                       << "DFS buffer, size=" << arena_size;
+            // Failing to allocate a configured unified buffer leaves no DFS
+            // staging capacity at all: every read and write would fail at
+            // request time instead of at startup. Fail fast so the
+            // misconfiguration or memory shortage is visible immediately.
+            throw std::runtime_error(
+                "Unified DFS buffer allocation failed while "
+                "MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES is non-zero");
+        }
+    } else if (config_.enable_dfs && config_.unified_buffer_size == 0) {
+        // DFS is on but has no staging space. Reads and writes still work for
+        // host data, but every path that needs a unified allocation degrades:
+        // async DFS writes keep only the memory replica, and a synchronous
+        // write of an object holding GPU slices loses its DFS replica. Warn
+        // because the configuration looks valid yet silently weakens DFS.
+        LOG(WARNING) << "Unified DFS buffer disabled by configuration "
+                        "(MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES=0): DFS "
+                        "writes have no staging space, so async DFS writes "
+                        "keep only memory replicas and GPU-slice synchronous "
+                        "writes lose their DFS replica; only host-only "
+                        "synchronous writes still reach DFS";
     }
-
-    InitPinnedPrefetchArena(config, client);
 
     auto create_storage_backend_result = CreateStorageBackend(
         config_, client_ ? client_->GetDfsRootIdentity() : std::string{});
@@ -168,104 +286,43 @@ FileStorage::~FileStorage() {
 
 std::optional<BufferHandle> FileStorage::AllocatePinnedStagingBuffer(
     size_t size, size_t alignment) const {
-    if (!pinned_restore_arena_allocator_) return std::nullopt;
-    return pinned_restore_arena_allocator_->allocate_aligned(size, alignment);
-}
-
-void FileStorage::InitPinnedPrefetchArena(
-    const FileStorageConfig& config, const std::shared_ptr<Client>& client) {
-    if (config.pinned_prefetch_arena_size <= 0) {
-        pinned_prefetch_arena_status_ = "not configured";
-        return;
+    if (!pinned_restore_arena_allocator_) {
+        LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=read size="
+                   << size << " alignment=" << alignment;
+        return std::nullopt;
     }
-    // Allocated once on the constructing (setup) thread, like the restore
-    // arena (whose pages were observed on the rank GPU's NUMA node), instead
-    // of from prefetch worker threads at runtime. Unlike the restore
-    // arena, a mapped allocation failure is not downgraded to ordinary pinned
-    // memory: without a device alias the HYGON H2D kernel falls back to DMA
-    // and the arena would no longer match the restore arena's behaviour.
-    if (config.use_uring) {
-        pinned_prefetch_arena_status_ = "disabled: io_uring";
-    } else if (!client ||
-               !client->CanUseLocalMemcpy(client->GetSegmentEndpoint())) {
-        pinned_prefetch_arena_status_ = "disabled: local memcpy unavailable";
-    } else {
-        const size_t arena_size =
-            static_cast<size_t>(config.pinned_prefetch_arena_size);
-        const bool mapped_required = UseMappedPinnedRestoreArena();
-        auto buffer =
-            PinnedBufferPool::AllocatePinned(arena_size, mapped_required);
-        if (!buffer.pinned_host.addr) {
-            pinned_prefetch_arena_status_ = "pinned allocation failed";
-        } else if (mapped_required &&
-                   (!buffer.mapped || buffer.device_data == nullptr)) {
-            pinned_prefetch_arena_status_ = "mapped device alias unavailable";
-        } else {
-            pinned_prefetch_arena_ =
-                std::make_shared<PinnedBufferPool::Buffer>(std::move(buffer));
-            pinned_prefetch_arena_allocator_ = ClientBufferAllocator::create(
-                pinned_prefetch_arena_->data, pinned_prefetch_arena_->capacity,
-                client->GetProtocol(), pinned_prefetch_arena_->device_data,
-                pinned_prefetch_arena_);
-            pinned_prefetch_arena_full_free_bytes_ =
-                pinned_prefetch_arena_allocator_->storageReport().totalFreeSpace;
-            pinned_prefetch_arena_status_ = "ready";
-        }
+    auto allocation = pinned_restore_arena_allocator_->allocate_aligned(
+        size, alignment, DfsBufferUsageKind::kRead);
+    if (!allocation) {
+        LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=read size="
+                   << size << " alignment=" << alignment;
     }
-
-    int32_t device_id = -1;
-    const auto accelerators =
-        device::GetAcceleratorRegistry().RuntimeAccelerators();
-    if (!accelerators.Devices().empty()) {
-        device_id = accelerators.Devices().front()->CurrentDeviceId();
-    }
-    if (HasPinnedPrefetchArena()) {
-        LOG(INFO) << "Initialized pinned DFS prefetch arena, size="
-                  << pinned_prefetch_arena_->capacity
-                  << ", mapped=" << pinned_prefetch_arena_->mapped
-                  << ", device_alias="
-                  << (pinned_prefetch_arena_->device_data != nullptr)
-                  << ", device_id=" << device_id << ", addr="
-                  << static_cast<void*>(pinned_prefetch_arena_->data);
-    } else {
-        LOG(ERROR) << "Pinned DFS prefetch arena unavailable ("
-                   << pinned_prefetch_arena_status_
-                   << "), requested size=" << config.pinned_prefetch_arena_size
-                   << ", device_id=" << device_id
-                   << "; waiting-queue DFS prefetch reads will fail";
-    }
+    return allocation;
 }
 
 std::optional<BufferHandle> FileStorage::AllocatePinnedPrefetchBuffer(
     size_t size, size_t alignment) const {
-    if (!pinned_prefetch_arena_allocator_) return std::nullopt;
-    return pinned_prefetch_arena_allocator_->allocate_aligned(size, alignment);
-}
-
-offset_allocator::OffsetAllocStorageReport
-FileStorage::PinnedPrefetchArenaReport() const {
-    if (!pinned_prefetch_arena_allocator_) return {0, 0};
-    return pinned_prefetch_arena_allocator_->storageReport();
-}
-
-bool FileStorage::ReleasePinnedPrefetchArena() {
-    if (pinned_prefetch_arena_allocator_) {
-        const auto report = PinnedPrefetchArenaReport();
-        if (report.totalFreeSpace != pinned_prefetch_arena_full_free_bytes_) {
-            return false;
-        }
-    } else if (PinnedPrefetchArenaCapacity() != 0 ||
-               pinned_prefetch_arena_full_free_bytes_ != 0) {
-        return false;
+    if (!pinned_restore_arena_allocator_ || size == 0 || alignment == 0) {
+        LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
+                   << size << " alignment=" << alignment;
+        return std::nullopt;
     }
-
-    // Outstanding handles also retain the backing through their allocator.
-    pinned_prefetch_arena_allocator_.reset();
-    pinned_prefetch_arena_.reset();
-    pinned_prefetch_arena_full_free_bytes_ = 0;
-    pinned_prefetch_arena_status_ = "disabled";
-    return true;
+    std::lock_guard<std::mutex> lock(unified_prefetch_mutex_);
+    auto allocation = pinned_restore_arena_allocator_->allocate_aligned(
+        size, alignment, DfsBufferUsageKind::kPrefetch);
+    if (!allocation) {
+        LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
+                   << size << " alignment=" << alignment;
+    }
+    return allocation;
 }
+
+offset_allocator::OffsetAllocStorageReport FileStorage::UnifiedBufferReport()
+    const {
+    if (!pinned_restore_arena_allocator_) return {0, 0};
+    return pinned_restore_arena_allocator_->storageReport();
+}
+
 
 tl::expected<void, ErrorCode> FileStorage::InitDfs() {
     dfs_heartbeat_interval_seconds_.store(300, std::memory_order_release);
@@ -1339,35 +1396,38 @@ void FileStorage::DfsHeartbeatThreadFunc() {
                 LOG(WARNING) << "DFS bucket snapshot request failed: "
                              << snapshot.error();
             } else {
-                client_->SetDfsBatchTimeoutFixedMs(
-                    snapshot->batch_timeout_fixed_ms);
-                const uint32_t heartbeat_interval = std::max<uint32_t>(
-                    snapshot->heartbeat_interval_seconds, 1);
-                const uint32_t previous_interval =
-                    dfs_heartbeat_interval_seconds_.exchange(
-                        heartbeat_interval, std::memory_order_acq_rel);
-                if (previous_interval != heartbeat_interval) {
-                    LOG(INFO) << "Updated DFS heartbeat interval from "
-                              << previous_interval << "s to "
-                              << heartbeat_interval << "s";
-                }
                 auto epoch_guard =
                     distributed_backend_->AcquireBucketEpoch(snapshot->epoch);
                 if (!epoch_guard) {
                     LOG(WARNING) << "Ignoring DFS snapshot from an unavailable "
                                     "or superseded Master epoch: "
                                  << epoch_guard.error();
-                } else if (!snapshot->unchanged) {
-                    dfs_snapshot_epoch_ = snapshot->epoch;
-                    dfs_snapshot_version_ = snapshot->version;
-                    auto result = distributed_backend_->CleanupStaleBucketFds(
-                        snapshot->bucket_ids);
-                    if (!result) {
-                        LOG(WARNING) << "DFS FD cleanup failed: "
-                                     << result.error();
-                    } else if (*result > 0) {
-                        LOG(INFO) << "DFS FD cleanup removed " << *result
-                                  << " stale bucket handles";
+                } else {
+                    client_->SetDfsBatchTimeoutFixedMs(
+                        snapshot->batch_timeout_fixed_ms);
+                    const uint32_t heartbeat_interval = std::max<uint32_t>(
+                        snapshot->heartbeat_interval_seconds, 1);
+                    const uint32_t previous_interval =
+                        dfs_heartbeat_interval_seconds_.exchange(
+                            heartbeat_interval, std::memory_order_acq_rel);
+                    if (previous_interval != heartbeat_interval) {
+                        LOG(INFO) << "Updated DFS heartbeat interval from "
+                                  << previous_interval << "s to "
+                                  << heartbeat_interval << "s";
+                    }
+                    if (!snapshot->unchanged) {
+                        dfs_snapshot_epoch_ = snapshot->epoch;
+                        dfs_snapshot_version_ = snapshot->version;
+                        auto result =
+                            distributed_backend_->CleanupStaleBucketFds(
+                                snapshot->bucket_ids);
+                        if (!result) {
+                            LOG(WARNING)
+                                << "DFS FD cleanup failed: " << result.error();
+                        } else if (*result > 0) {
+                            LOG(INFO) << "DFS FD cleanup removed " << *result
+                                      << " stale bucket handles";
+                        }
                     }
                 }
             }

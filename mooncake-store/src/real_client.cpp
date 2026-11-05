@@ -1547,6 +1547,10 @@ void ResourceTracker::startSignalThread() {
     });
 }
 
+void RealClient::SetDfsReadChunkSize(size_t chunk_size) {
+    dfs_read_chunk_size_ = chunk_size;
+}
+
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
@@ -1601,7 +1605,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_client_http_server, int client_http_port,
     bool enable_dfs_prefetch) {
     prefetch_arena_available_.store(false, std::memory_order_release);
-    prefetch_arena_stats_.reset();
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -1974,25 +1977,38 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
         }
-        if (!enable_dfs_prefetch) {
-            file_storage_config.pinned_prefetch_arena_size = 0;
+        // setup_internal reports failures through tl::expected; do not let a
+        // constructor throw escape into the caller (pybind would abort).
+        try {
+            file_storage_ = std::make_shared<FileStorage>(
+                file_storage_config, client_, this->local_rpc_addr,
+                client_->GetSsdMetricPtr());
+        } catch (const std::invalid_argument& e) {
+            LOG(ERROR) << "Invalid FileStorage configuration: " << e.what();
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to construct FileStorage: " << e.what();
+            return tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
-        file_storage_ = std::make_shared<FileStorage>(
-            file_storage_config, client_, this->local_rpc_addr,
-            client_->GetSsdMetricPtr());
+        client_->SetUnifiedDfsBuffer(file_storage_->UnifiedBufferAllocator(),
+                                     file_storage_->UnifiedBufferCapacity());
+        client_->SetDfsWriteChunkSize(
+            static_cast<size_t>(file_storage_config.write_chunk_size));
+        client_->SetDfsWriteAlignment(
+            GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096));
+        SetDfsReadChunkSize(
+            static_cast<size_t>(file_storage_config.read_chunk_size));
         auto init_result = file_storage_->Init();
         if (!init_result) {
             LOG(ERROR) << "file storage init failed with error: "
                        << init_result.error();
             return init_result;
         }
-        const bool prefetch_arena_available =
-            enable_dfs_prefetch && file_storage_->HasPinnedPrefetchArena();
-        if (prefetch_arena_available) {
-            prefetch_arena_stats_ = std::make_shared<PrefetchArenaStats>();
-        }
-        prefetch_arena_available_.store(prefetch_arena_available,
-                                        std::memory_order_release);
+        prefetch_arena_available_.store(
+            enable_dfs_prefetch && file_storage_->HasPinnedRestoreArena() &&
+                file_storage_config.prefetch_capacity_ratio > 0.0 &&
+                file_storage_->UnifiedPrefetchLimitBytes() > 0,
+            std::memory_order_release);
     }
     client_requester_ = std::make_shared<ClientRequester>();
     const bool should_start_http_server =
@@ -2239,7 +2255,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         }
         get_session_prefetch_cache_.clear();
         prefetch_arena_available_.store(false, std::memory_order_release);
-        prefetch_arena_stats_.reset();
     }
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
@@ -6726,16 +6741,8 @@ bool RealClient::dfs_prefetch_arena_available() const {
 }
 
 bool RealClient::disable_dfs_prefetch() {
-    // This is a startup-only operation. The exclusive lifecycle lock drains
-    // any DFS range read that could be allocating from the arena. Callers
-    // must also serialize against session creation, which uses session_mutex_
-    // but does not take this lifecycle lock.
     std::unique_lock<std::shared_mutex> dfs_read_lock(
         dfs_read_lifecycle_mutex_);
-    if (!prefetch_arena_available_.load(std::memory_order_acquire) &&
-        (!file_storage_ || !file_storage_->HasPinnedPrefetchArena())) {
-        return true;
-    }
     {
         std::lock_guard<std::mutex> session_lock(session_mutex_);
         if (!get_sessions_.empty() || !get_session_access_records_.empty() ||
@@ -6744,11 +6751,7 @@ bool RealClient::disable_dfs_prefetch() {
         }
     }
 
-    if (file_storage_ && !file_storage_->ReleasePinnedPrefetchArena()) {
-        return false;
-    }
     prefetch_arena_available_.store(false, std::memory_order_release);
-    prefetch_arena_stats_.reset();
     return true;
 }
 
@@ -6756,101 +6759,34 @@ std::string RealClient::dfs_prefetch_arena_status() const {
     if (!file_storage_) {
         return "unavailable: no FileStorage (SSD offload disabled)";
     }
-    return file_storage_->PinnedPrefetchArenaStatus();
+    if (!file_storage_->HasPinnedRestoreArena()) {
+        return "unavailable: unified DFS buffer is not initialized";
+    }
+    if (file_storage_->PrefetchCapacityRatio() <= 0.0) {
+        return "disabled: prefetch capacity ratio is zero";
+    }
+    if (file_storage_->UnifiedPrefetchLimitBytes() == 0) {
+        return "disabled: prefetch limit is zero after read/write protection";
+    }
+    return prefetch_arena_available_.load(std::memory_order_acquire)
+               ? "ready"
+               : "disabled";
 }
 
 std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
     size_t size, size_t alignment) {
-    auto stats = prefetch_arena_stats_;
-    if (!dfs_prefetch_arena_available() || !stats) {
-        if (stats) {
-            stats->alloc_fail.fetch_add(1, std::memory_order_relaxed);
+    if (!dfs_prefetch_arena_available() || !file_storage_) return nullptr;
+    auto allocation = file_storage_->AllocatePinnedPrefetchBuffer(size, alignment);
+    if (!allocation) {
+        if (client_) {
+            client_->ObserveUnifiedDfsBufferAllocationFailure(
+                DfsBufferUsageKind::kPrefetch);
         }
-        if (stats && !stats->unavailable_logged.exchange(true)) {
-            LOG(WARNING) << "DFS prefetch staging arena unavailable ("
-                         << dfs_prefetch_arena_status()
-                         << "); waiting-queue DFS prefetch reads will fail";
-        } else if (!stats) {
-            LOG_EVERY_N(WARNING, 64)
-                << "DFS prefetch staging arena unavailable ("
-                << dfs_prefetch_arena_status()
-                << "); waiting-queue DFS prefetch reads will fail";
-        }
+        LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
+                   << size << " alignment=" << alignment;
         return nullptr;
     }
-
-    auto allocation =
-        file_storage_->AllocatePinnedPrefetchBuffer(size, alignment);
-    const auto report = file_storage_->PinnedPrefetchArenaReport();
-    const uint64_t capacity = file_storage_->PinnedPrefetchArenaCapacity();
-    const uint64_t occupied =
-        capacity > report.totalFreeSpace ? capacity - report.totalFreeSpace : 0;
-    std::shared_ptr<BufferHandle> region;
-    if (!allocation) {
-        const uint64_t failures =
-            stats->alloc_fail.fetch_add(1, std::memory_order_relaxed) + 1;
-        LOG_EVERY_N(WARNING, 64)
-            << "DFS prefetch arena exhausted: request_bytes=" << size
-            << ", occupied_bytes=" << occupied
-            << ", free_bytes=" << report.totalFreeSpace
-            << ", largest_free_region_lower_bound=" << report.largestFreeRegion
-            << ", capacity=" << capacity << ", failures=" << failures;
-    } else {
-        stats->alloc_ok.fetch_add(1, std::memory_order_relaxed);
-        stats->requested_bytes_in_use.fetch_add(size,
-                                                std::memory_order_relaxed);
-        uint64_t peak =
-            stats->occupied_bytes_observed_peak.load(std::memory_order_relaxed);
-        while (occupied > peak &&
-               !stats->occupied_bytes_observed_peak.compare_exchange_weak(
-                   peak, occupied, std::memory_order_relaxed)) {
-        }
-        // The root region is shared by every key view of this read. Its
-        // deleter runs after the last view is gone: returning the region to
-        // the arena first, then the accounting. Only the stats object is
-        // captured, so release never depends on FileStorage lifetime.
-        region = std::shared_ptr<BufferHandle>(
-            new BufferHandle(std::move(*allocation)),
-            [stats, size](BufferHandle *handle) {
-                delete handle;
-                stats->requested_bytes_in_use.fetch_sub(
-                    size, std::memory_order_relaxed);
-            });
-    }
-    uint64_t largest_min =
-        stats->largest_free_region_min.load(std::memory_order_relaxed);
-    while (
-        report.largestFreeRegion < largest_min &&
-        !stats->largest_free_region_min.compare_exchange_weak(
-            largest_min, report.largestFreeRegion, std::memory_order_relaxed)) {
-    }
-
-    // Always-on summary, at most every 30 s while prefetch is active.
-    constexpr int64_t kSummaryIntervalNs = 30LL * 1000 * 1000 * 1000;
-    const int64_t now_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count();
-    int64_t last_ns = stats->last_summary_ns.load(std::memory_order_relaxed);
-    if (now_ns - last_ns >= kSummaryIntervalNs &&
-        stats->last_summary_ns.compare_exchange_strong(
-            last_ns, now_ns, std::memory_order_relaxed)) {
-        LOG(INFO)
-            << "DFS prefetch arena summary: capacity=" << capacity
-            << ", alloc_ok=" << stats->alloc_ok.load(std::memory_order_relaxed)
-            << ", alloc_fail="
-            << stats->alloc_fail.load(std::memory_order_relaxed)
-            << ", requested_bytes_in_use="
-            << stats->requested_bytes_in_use.load(std::memory_order_relaxed)
-            << ", occupied_bytes=" << occupied
-            << ", occupied_bytes_observed_peak="
-            << stats->occupied_bytes_observed_peak.load(
-                   std::memory_order_relaxed)
-            << ", largest_free_region_lower_bound=" << report.largestFreeRegion
-            << ", largest_free_region_min="
-            << stats->largest_free_region_min.load(std::memory_order_relaxed);
-    }
-    return region;
+    return std::make_shared<BufferHandle>(std::move(*allocation));
 }
 
 std::vector<int> RealClient::batch_get_session_prefetch(
@@ -7441,20 +7377,7 @@ void RealClient::execute_session_dfs_range_reads(
         return;
     }
 
-    constexpr size_t kDefaultRestoreChunkSize = size_t{1} << 30;
-    using Variables = FileStorageEnvironmentVariables;
-    const int64_t configured_chunk_size = Environ::ReadOr(
-        Variables::MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES,
-        static_cast<int64_t>(kDefaultRestoreChunkSize));
-    const size_t chunk_limit_bytes =
-        configured_chunk_size > 0
-            ? static_cast<size_t>(configured_chunk_size)
-            : kDefaultRestoreChunkSize;
-    if (configured_chunk_size <= 0) {
-        LOG(WARNING) << Variables::MC_STORE_DFS_RESTORE_CHUNK_SIZE_BYTES.name
-                     << " must be positive; using default "
-                     << kDefaultRestoreChunkSize;
-    }
+    const size_t chunk_limit_bytes = dfs_read_chunk_size_;
 
     // Match the full-object layout used below: DFS objects read aligned_size
     // (including padding), with an alignment gap between staging slots.
@@ -7597,6 +7520,7 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     struct PendingScatterResult {
         SessionRangeReadRequest *entry;
         size_t transferred;
+        bool from_prefetch_cache;
     };
     std::vector<PendingScatterResult> pending_scatter_results;
     pending_scatter_results.reserve(entries.size());
@@ -7658,7 +7582,7 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         }
         inflight_handles.push_back(handle);
         pending_scatter_results.push_back(
-            PendingScatterResult{entry, transferred});
+            PendingScatterResult{entry, transferred, from_prefetch_cache});
     };
 
     auto queue_loaded_object =
@@ -7811,10 +7735,8 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
     bool prefetch_arena_alloc_fail = false;
     if (!arena_views.empty()) {
         if (prefetch_only) {
-            // Prefetch buffers remain in get_session_prefetch_cache_ until the
-            // session ends, so they come only from the dedicated prefetch
-            // arena: never the request-scoped restore arena and never a
-            // runtime pinned allocation.
+            // Cached prefetch views retain their unified buffer allocation
+            // until session end and count against the prefetch admission limit.
             arena = AllocatePrefetchArenaRegion(arena_size, dfs_alignment);
             prefetch_arena_used = arena != nullptr;
             prefetch_arena_alloc_fail = arena == nullptr;
@@ -7825,7 +7747,17 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
                     arena_size, dfs_alignment);
                 pinned_restore_arena_used = allocation.has_value();
             }
-            if (!allocation && client_buffer_allocator_) {
+            const bool has_dfs_reads = std::any_of(
+                arena_views.begin(), arena_views.end(), [](const auto &view) {
+                    return view.entry->replica.is_dfs_replica();
+                });
+            // Enforce an active unified budget while preserving ordinary reads
+            // when it is explicitly disabled or this batch only uses local SSD.
+            const bool unified_budget_active =
+                has_dfs_reads && file_storage_ &&
+                file_storage_->HasPinnedRestoreArena();
+            if (!allocation && !unified_budget_active &&
+                client_buffer_allocator_) {
                 allocation = client_buffer_allocator_->allocate_aligned(
                     arena_size, dfs_alignment);
             }
@@ -7840,6 +7772,10 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             // Prefetch failures are reported (rate-limited) by
             // AllocatePrefetchArenaRegion.
             if (!prefetch_only) {
+                if (client_) {
+                    client_->ObserveUnifiedDfsBufferAllocationFailure(
+                        DfsBufferUsageKind::kRead);
+                }
                 LOG(ERROR) << "DFS staging arena allocation failed, size: "
                            << arena_size << ", pinned_restore_available="
                            << (file_storage_ &&
@@ -7921,6 +7857,8 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             "read", DirectStorageMetricSource(ReplicaType::DFS),
             dfs_read_success,
             dfs_read_bytes, io_duration);
+        client_->ObserveL4Read(prefetch_only, dfs_read_success, dfs_read_bytes,
+                               io_duration);
 
         // Build a copy plan before submitting any DMA. Destination pointers are
         // resolved once, adjacent compatible ranges are merged, and operations
@@ -7983,6 +7921,13 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             continue;
         }
         results[result_index] = static_cast<int>(pending.transferred);
+        // Count useful payload only after the scatter has completed. Host
+        // prefetch alone never reaches this point or counts as a restore.
+        if (pending.entry->replica.is_dfs_replica()) {
+            client_->ObserveL4Restore(pending.from_prefetch_cache,
+                                      pending.entry->sizes.size(),
+                                      pending.transferred);
+        }
     }
     if (!scatter_succeeded) {
         LOG(ERROR) << "One or more DFS H2D stream operations failed";

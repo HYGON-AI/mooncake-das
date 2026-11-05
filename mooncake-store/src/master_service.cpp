@@ -1143,28 +1143,317 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
     dfs_root_guard_device_ = static_cast<uint64_t>(st.st_dev);
     dfs_root_guard_inode_ = static_cast<uint64_t>(st.st_ino);
     dfs_root_guard_ready_ = true;
+    dfs_root_recovery_needed_ = false;
+    dfs_root_replacement_lost_data_ = false;
+    return true;
+}
+
+size_t MasterService::DropDfsReplicasAfterRootReplacement() {
+    size_t removed_replicas = 0;
+    for (size_t shard_index = 0; shard_index < kNumShards; ++shard_index) {
+        MetadataShardAccessorRW shard(this, shard_index);
+        for (auto& [tenant_id, tenant_state] : shard->tenants) {
+            for (auto it = tenant_state.metadata.begin();
+                 it != tenant_state.metadata.end();) {
+                auto& metadata = it->second;
+                const size_t removed = EraseReplicasWithCacheTotalAccounting(
+                    metadata, [](const Replica& replica) {
+                        return replica.is_dfs_replica();
+                    });
+                if (removed == 0) {
+                    ++it;
+                    continue;
+                }
+                removed_replicas += removed;
+                const std::string key = it->first;
+                if (!metadata.IsValid()) {
+                    PublishKvRemoved(key, metadata, tenant_id);
+                    it = EraseMetadata(tenant_state, it, tenant_id,
+                                       QuotaEraseMode::kFull, &shard);
+                    continue;
+                }
+                if (metadata.HasReplica([](const Replica& replica) {
+                        return replica.is_memory_replica() &&
+                               replica.is_completed() &&
+                               !replica.has_invalid_mem_handle();
+                    })) {
+                    tenant_state.dfs_backfill[key] = {};
+                }
+                ++it;
+            }
+        }
+    }
+    return removed_replicas;
+}
+
+bool MasterService::RecoverDfsRootAfterReplacement(
+    const std::string& root, const std::string& identity) {
+    bool expected = false;
+    if (!dfs_root_recovery_in_progress_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        return false;
+    }
+    enable_dfs_.store(false, std::memory_order_release);
+    struct RecoveryFlagReset {
+        std::atomic<bool>& flag;
+        ~RecoveryFlagReset() { flag.store(false, std::memory_order_release); }
+    } recovery_flag_reset{dfs_root_recovery_in_progress_};
+
+    // Everything through allocator construction and guard publication is
+    // deliberately outside snapshot_mutex_. DFS publication is gated by
+    // dfs_root_recovery_in_progress_, while L3-only metadata requests remain
+    // available throughout slow DFS inspection and bucket creation.
+    const std::string identity_path = root + "/" + kDfsRootIdentityFileName;
+    const auto identity_status =
+        ReadExpectedDfsRootFile(identity_path, identity);
+    if (identity_status == DfsRootFileStatus::kInvalid) {
+        LOG(ERROR) << "Replacement DFS root carries a conflicting identity; "
+                      "refusing recovery, root="
+                   << root;
+        return false;
+    }
+    if (identity_status == DfsRootFileStatus::kIoError) {
+        LOG(ERROR) << "Failed to inspect replacement DFS root identity, root="
+                   << root;
+        return false;
+    }
+
+    const std::string marker_path = root + "/" + kDfsRootMarkerFileName;
+    const std::string marker_contents(kDfsRootMarkerPayload,
+                                      sizeof(kDfsRootMarkerPayload) - 1);
+    const auto marker_status =
+        ReadExpectedDfsRootFile(marker_path, marker_contents);
+    if (marker_status == DfsRootFileStatus::kInvalid) {
+        LOG(ERROR) << "Replacement DFS root carries a conflicting marker; "
+                      "refusing recovery, root="
+                   << root;
+        return false;
+    }
+    if (marker_status == DfsRootFileStatus::kIoError) {
+        LOG(ERROR) << "Failed to inspect replacement DFS root marker, root="
+                   << root;
+        return false;
+    }
+
+    // The root marker is created by the allocator, independently of the
+    // identity. If only the identity was copied into a newly created root,
+    // the missing marker proves that the old bucket generation is gone.
+    bool root_lost_data = identity_status == DfsRootFileStatus::kMissing ||
+                          marker_status == DfsRootFileStatus::kMissing;
+    if (!root_lost_data && bucket_allocator_ != nullptr) {
+        const auto snapshot = bucket_allocator_->GetBucketIdSnapshot();
+        if (!snapshot) {
+            LOG(ERROR) << "Failed to inspect bucket generation while "
+                          "recovering replacement DFS root, root="
+                       << root;
+            return false;
+        }
+        for (const int64_t bucket_id : snapshot->bucket_ids) {
+            const auto present =
+                bucket_allocator_->IsBucketDataFilePresent(bucket_id);
+            if (!present) {
+                LOG(ERROR) << "Failed to verify bucket " << bucket_id
+                           << " while recovering replacement DFS root, root="
+                           << root << ", error=" << present.error();
+                return false;
+            }
+            if (!*present) {
+                // Ready buckets are only preallocated capacity. Recheck under
+                // the allocator lock because SetMaxBucketCount may have
+                // removed one after this snapshot, or an in-flight allocation
+                // may have promoted it and made the missing file significant.
+                if (bucket_allocator_->DiscardMissingBucketIfEmpty(bucket_id)) {
+                    LOG(WARNING)
+                        << "Replacement DFS root is missing empty bucket "
+                        << bucket_id
+                        << "; discarded it without invalidating live DFS "
+                           "replicas, root="
+                        << root;
+                    continue;
+                }
+                root_lost_data = true;
+                LOG(WARNING) << "Replacement DFS root is missing bucket "
+                             << bucket_id
+                             << "; treating the old storage generation as "
+                                "lost, root="
+                             << root;
+                break;
+            }
+        }
+    }
+    {
+        std::lock_guard lock(dfs_root_guard_mutex_);
+        root_lost_data =
+            root_lost_data || dfs_root_replacement_lost_data_;
+        dfs_root_replacement_lost_data_ = root_lost_data;
+    }
+    if (identity_status == DfsRootFileStatus::kMissing &&
+        !PublishExpectedDfsRootFile(root, identity_path, identity)) {
+        LOG(ERROR) << "Failed to restore identity in replacement DFS root "
+                   << root;
+        return false;
+    }
+
+    std::unique_ptr<ImmutableBucketAllocator> replacement_allocator;
+    if (root_lost_data) {
+        if (bucket_allocator_ == nullptr) {
+            LOG(ERROR) << "Automatic DFS root replacement recovery currently "
+                          "requires the bucket allocator, root="
+                       << root;
+            return false;
+        }
+        auto config = DistributedStorageConfig::FromEnvironment();
+        if (config.allocator_type != DfsAllocatorType::BUCKET ||
+            config.fsdir != root) {
+            LOG(ERROR) << "DFS configuration changed during root recovery, "
+                          "root="
+                       << root << ", config={" << config.FormatStr() << "}";
+            return false;
+        }
+        replacement_allocator =
+            bucket_allocator_->RetireAndCreateReplacementAllocator();
+        auto initialized = replacement_allocator->Init(config);
+        if (!initialized) {
+            LOG(ERROR) << "Failed to rebuild DFS bucket allocator after root "
+                          "replacement, root="
+                       << root << ", error=" << initialized.error();
+            return false;
+        }
+        // A replacement root is a new storage generation. It contains no
+        // trustworthy old DFS replicas; consume any recovery candidates that
+        // may have raced into the directory without publishing them.
+        (void)replacement_allocator->TakeRecoveredReplicas();
+        // Keep vector growth, and therefore heap allocation, out of the
+        // snapshot commit barrier below.
+        retired_dfs_allocators_.reserve(retired_dfs_allocators_.size() + 1);
+    }
+
+    if (!InitializeDfsRootGuard(root, identity)) {
+        LOG(ERROR) << "Failed to rebuild DFS guard files after root "
+                      "replacement, root="
+                   << root;
+        return false;
+    }
+    UUID new_epoch = generate_uuid();
+    if (dfs_root_recovery_before_commit_hook_) {
+        dfs_root_recovery_before_commit_hook_();
+    }
+
+    size_t removed_replicas = 0;
+    {
+        // The commit barrier excludes metadata requests only while DFS replicas
+        // are removed and the fully initialized allocator generation is
+        // published. No DFS filesystem I/O or bucket creation occurs here.
+        std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        if (root_lost_data) {
+            removed_replicas = DropDfsReplicasAfterRootReplacement();
+
+            auto old_allocator = std::move(dfs_allocator_owner_);
+            auto* replacement_ptr = replacement_allocator.get();
+            dfs_allocator_owner_ = std::move(replacement_allocator);
+            bucket_allocator_.store(replacement_ptr);
+            dfs_allocator_.store(replacement_ptr);
+            retired_dfs_allocators_.push_back(std::move(old_allocator));
+        }
+        std::lock_guard<std::mutex> epoch_lock(dfs_epoch_mutex_);
+        dfs_snapshot_epoch_ = new_epoch;
+        enable_dfs_.store(true, std::memory_order_release);
+    }
+    RefreshDfsMetrics();
+    LOG(WARNING) << "Recovered replacement DFS root, root=" << root
+                 << ", data_generation_lost=" << root_lost_data
+                 << ", removed_dfs_replicas=" << removed_replicas
+                 << ", new_epoch=" << new_epoch;
     return true;
 }
 
 void MasterService::ReconcileDfsRootFiles() {
-    std::lock_guard lock(dfs_root_guard_mutex_);
-    if (!dfs_root_guard_ready_ ||
-        !enable_dfs_.load(std::memory_order_acquire)) {
-        return;
+    std::string root;
+    std::string identity;
+    uint64_t expected_device = 0;
+    uint64_t expected_inode = 0;
+    bool recovery_needed = false;
+    {
+        std::lock_guard lock(dfs_root_guard_mutex_);
+        if (!dfs_root_guard_ready_ ||
+            (!enable_dfs_.load(std::memory_order_acquire) &&
+             !dfs_root_recovery_needed_)) {
+            return;
+        }
+        root = dfs_root_guard_path_;
+        identity = dfs_root_guard_identity_;
+        expected_device = dfs_root_guard_device_;
+        expected_inode = dfs_root_guard_inode_;
+        recovery_needed = dfs_root_recovery_needed_;
     }
 
     struct stat st {};
-    if (::stat(dfs_root_guard_path_.c_str(), &st) != 0 ||
-        !S_ISDIR(st.st_mode) ||
-        static_cast<uint64_t>(st.st_dev) != dfs_root_guard_device_ ||
-        static_cast<uint64_t>(st.st_ino) != dfs_root_guard_inode_) {
-        static DfsLogLimiter mount_log_limiter;
-        if (auto suppressed = mount_log_limiter.ShouldLog()) {
-            LOG(ERROR) << "DFS root mount identity changed; refusing to "
-                          "recreate guard files, root="
-                       << dfs_root_guard_path_
+    const int injected_stat_error =
+        dfs_root_stat_error_for_testing_.load(std::memory_order_acquire);
+    int stat_result = 0;
+    int stat_error = 0;
+    if (injected_stat_error != 0) {
+        stat_result = -1;
+        stat_error = injected_stat_error;
+    } else {
+        stat_result = ::stat(root.c_str(), &st);
+        if (stat_result != 0) stat_error = errno;
+    }
+    if (stat_result != 0 && stat_error != ENOENT && stat_error != ENOTDIR) {
+        // EIO, ETIMEDOUT, ESTALE, and similar failures do not prove that the
+        // mounted generation changed. Keep serving DFS and retry on the next
+        // guard pass; otherwise one transient metadata-server error forces an
+        // unnecessary epoch change and rejects in-flight client writes.
+        static DfsLogLimiter stat_log_limiter;
+        if (auto suppressed = stat_log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to inspect DFS root; keeping the current "
+                          "generation active, root="
+                       << root << ", errno=" << stat_error
+                       << ", error=" << std::strerror(stat_error)
                        << ", suppressed=" << *suppressed;
         }
+        return;
+    }
+    if (stat_result != 0 || !S_ISDIR(st.st_mode)) {
+        enable_dfs_.store(false, std::memory_order_release);
+        {
+            std::lock_guard lock(dfs_root_guard_mutex_);
+            dfs_root_recovery_needed_ = true;
+        }
+        static DfsLogLimiter mount_log_limiter;
+        if (auto suppressed = mount_log_limiter.ShouldLog()) {
+            LOG(ERROR) << "DFS root is unavailable; waiting for recovery, "
+                          "root="
+                       << root
+                       << ", suppressed=" << *suppressed;
+        }
+        return;
+    }
+    const uint64_t actual_device = static_cast<uint64_t>(st.st_dev);
+    const uint64_t actual_inode = static_cast<uint64_t>(st.st_ino);
+    if (actual_device != expected_device) {
+        enable_dfs_.store(false, std::memory_order_release);
+        {
+            std::lock_guard lock(dfs_root_guard_mutex_);
+            dfs_root_recovery_needed_ = true;
+        }
+        static DfsLogLimiter mount_log_limiter;
+        if (auto suppressed = mount_log_limiter.ShouldLog()) {
+            LOG(ERROR) << "DFS root device changed; refusing automatic "
+                          "recovery, root="
+                       << root << ", expected_device=" << expected_device
+                       << ", actual_device=" << actual_device
+                       << ", suppressed=" << *suppressed;
+        }
+        return;
+    }
+    if (recovery_needed || actual_inode != expected_inode) {
+        enable_dfs_.store(false, std::memory_order_release);
+        {
+            std::lock_guard lock(dfs_root_guard_mutex_);
+            dfs_root_recovery_needed_ = true;
+        }
+        (void)RecoverDfsRootAfterReplacement(root, identity);
         return;
     }
 
@@ -1197,28 +1486,25 @@ void MasterService::ReconcileDfsRootFiles() {
     // Identity is the safety boundary. Do not recreate the read-probe files
     // until the root still carries (or has atomically recovered) the exact
     // identity pinned when the allocator was initialized.
-    if (!reconcile(dfs_root_guard_path_, kDfsRootIdentityFileName,
-                   dfs_root_guard_identity_)) {
+    if (!reconcile(root, kDfsRootIdentityFileName, identity)) {
         return;
     }
-    reconcile(dfs_root_guard_path_, kDfsRootMarkerFileName,
+    reconcile(root, kDfsRootMarkerFileName,
               std::string(kDfsRootMarkerPayload,
                           sizeof(kDfsRootMarkerPayload) - 1));
     for (size_t probe_index = 0;
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
         const auto directory_name =
             kDfsReadProbeDirectoryNames[probe_index];
-        if (!EnsureDfsReadProbeDirectory(dfs_root_guard_path_,
-                                         directory_name)) {
+        if (!EnsureDfsReadProbeDirectory(root, directory_name)) {
             LOG(ERROR) << "Failed to create DFS read-probe directory "
-                       << dfs_root_guard_path_ << "/" << directory_name;
+                       << root << "/" << directory_name;
             continue;
         }
         const std::string probe_directory =
-            dfs_root_guard_path_ + "/" + std::string(directory_name);
+            root + "/" + std::string(directory_name);
         reconcile(probe_directory, kDfsReadProbeFileName,
-                  BuildDfsReadProbeContents(dfs_root_guard_identity_,
-                                            probe_index));
+                  BuildDfsReadProbeContents(identity, probe_index));
     }
 }
 
@@ -4264,31 +4550,22 @@ auto MasterService::BatchReplicaClear(
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
-    if (!replica.is_completed() || replica.is_eviction_pending() ||
-        replica.has_invalid_mem_handle() || replica.has_invalid_nof_handle()) {
-        return false;
-    }
-    if (replica.is_dfs_replica() &&
-        (dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0) {
-        return false;
-    }
-    const auto descriptor = replica.get_descriptor();
-    std::optional<std::string> endpoint;
-    if (descriptor.is_memory_replica()) {
-        endpoint = descriptor.get_memory_descriptor()
-                       .buffer_descriptor.transport_endpoint_;
-    } else if (descriptor.is_nof_replica()) {
-        endpoint = descriptor.get_nof_descriptor()
-                       .buffer_descriptor.transport_endpoint_;
-    } else if (descriptor.is_local_disk_replica()) {
-        endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
-    }
-    return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
+    return IsReplicaReadableForGet(replica) &&
+           (!replica.is_dfs_replica() ||
+            (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0);
 }
 
 bool MasterService::IsReplicaReadableForGet(const Replica& replica) const {
     if (!replica.is_completed() || replica.is_eviction_pending() ||
         replica.has_invalid_mem_handle() || replica.has_invalid_nof_handle()) {
+        return false;
+    }
+    // Get may read DFS replicas while the existence filter is enabled, but a
+    // disabled DFS root cannot serve its old bucket generation. Keep those
+    // replicas hidden from Get throughout root recovery (including retries).
+    if (replica.is_dfs_replica() &&
+        (!enable_dfs_.load(std::memory_order_acquire) ||
+         dfs_root_recovery_in_progress_.load(std::memory_order_acquire))) {
         return false;
     }
     const auto descriptor = replica.get_descriptor();
@@ -4778,7 +5055,7 @@ auto MasterService::AllocateAndInsertMetadata(
     uint64_t& quota_deficit_bytes,
     std::optional<std::chrono::system_clock::time_point>
         committed_soft_pin_timeout,
-    const std::optional<DistributedFSDescriptor>& preallocated_dfs,
+    const std::optional<DfsBatchReservation>& preallocated_dfs,
     bool skip_dfs_replica, std::optional<ErrorCode>* dfs_allocation_error,
     std::optional<bool> dfs_allocation_allowed_snapshot)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -4794,6 +5071,25 @@ auto MasterService::AllocateAndInsertMetadata(
     if (GetGroupRoute(tenant_id, key).has_value()) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+
+    const bool dfs_recovery_in_progress =
+        dfs_root_recovery_in_progress_.load(std::memory_order_acquire);
+    const bool preallocated_dfs_is_current =
+        !preallocated_dfs.has_value() ||
+        (preallocated_dfs->source_allocator == dfs_allocator_.get() &&
+         !dfs_recovery_in_progress);
+    if (!skip_dfs_replica && !preallocated_dfs_is_current) {
+        // The batch reservation was made outside snapshot_mutex_. Recovery may
+        // have published a new allocator generation before this metadata write
+        // acquired its shared lock. Never publish the old generation's
+        // descriptor as part of the new one; let PutStartInternal retry without
+        // DFS instead. BatchPutStart releases the unused reservation through
+        // its source allocator.
+        if (dfs_allocation_error != nullptr) {
+            *dfs_allocation_error = ErrorCode::DFS_SERVICE_UNAVAILABLE;
+        }
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
     const uint64_t pending_quota_charge =
@@ -4812,9 +5108,10 @@ auto MasterService::AllocateAndInsertMetadata(
     std::vector<Replica> replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
     const bool dfs_allocation_allowed =
-        preallocated_dfs.has_value() ||
-        dfs_allocation_allowed_snapshot.value_or(
-            (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0);
+        (preallocated_dfs.has_value() && preallocated_dfs_is_current) ||
+        (!dfs_recovery_in_progress &&
+         dfs_allocation_allowed_snapshot.value_or(
+             (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0));
     const size_t expected_dfs_replicas =
         dfs_allocation_allowed ? config.dfs_replica_num : 0;
     size_t allocated_memory_replicas = 0;
@@ -4986,7 +5283,8 @@ auto MasterService::AllocateAndInsertMetadata(
             // BatchPutStart already reserved this key's space as part of one
             // contiguous batch reservation; reuse it rather than allocating
             // again, which would break the batch's contiguity.
-            replicas.emplace_back(*preallocated_dfs, ReplicaStatus::PROCESSING);
+            replicas.emplace_back(preallocated_dfs->descriptor,
+                                  ReplicaStatus::PROCESSING);
         } else {
             auto alloc = dfs_allocator_->Allocate(key, value_length);
             if (!alloc) {
@@ -5092,7 +5390,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutStartInternal(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     const uint64_t slice_length, const ReplicateConfig& config,
-    const std::optional<DistributedFSDescriptor>& preallocated_dfs,
+    const std::optional<DfsBatchReservation>& preallocated_dfs,
     bool skip_dfs_replica, std::optional<ErrorCode> dfs_fallback_reason,
     std::optional<bool> dfs_allocation_allowed_snapshot)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -5349,14 +5647,15 @@ auto MasterService::PutStartInternal(
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
-std::unordered_map<std::string, DistributedFSDescriptor>
+std::unordered_map<std::string, MasterService::DfsBatchReservation>
 MasterService::ReserveDfsSpaceForBatch(
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& value_lengths,
     const std::vector<bool>& needs_dfs,
     std::unordered_map<std::string, ErrorCode>& errors_out) {
-    std::unordered_map<std::string, DistributedFSDescriptor> reservations;
-    if (bucket_allocator_ == nullptr || !bucket_allocator_->IsInitialized()) {
+    std::unordered_map<std::string, DfsBatchReservation> reservations;
+    auto* source_allocator = bucket_allocator_.get();
+    if (source_allocator == nullptr || !source_allocator->IsInitialized()) {
         return reservations;
     }
 
@@ -5368,7 +5667,7 @@ MasterService::ReserveDfsSpaceForBatch(
     }
     if (requests.empty()) return reservations;
 
-    auto results = bucket_allocator_->BatchAllocate(requests);
+    auto results = source_allocator->BatchAllocate(requests);
     if (results.size() != requests.size()) {
         LOG(ERROR) << "DFS BatchAllocate returned " << results.size()
                    << " results for " << requests.size() << " requests";
@@ -5395,7 +5694,9 @@ MasterService::ReserveDfsSpaceForBatch(
 
     for (auto& result : results) {
         if (!result.success) continue;
-        reservations.emplace(result.key, std::move(result.descriptor));
+        reservations.emplace(
+            result.key,
+            DfsBatchReservation{std::move(result.descriptor), source_allocator});
     }
     return reservations;
 }
@@ -5422,7 +5723,9 @@ MasterService::BatchPutStart(const UUID& client_id,
 
     const uint8_t dfs_filter_mode =
         dfs_filter_mode_.load(std::memory_order_acquire);
-    const bool dfs_allocation_allowed_snapshot = (dfs_filter_mode & 1) == 0;
+    const bool dfs_allocation_allowed_snapshot =
+        (dfs_filter_mode & 1) == 0 &&
+        !dfs_root_recovery_in_progress_.load(std::memory_order_acquire);
     // Batch preallocation is a BUCKET-only optimization. SHARD allocation and
     // requests without DFS replicas retain the original per-key allocation,
     // failure, and rollback behavior of PutStart.
@@ -5450,18 +5753,21 @@ MasterService::BatchPutStart(const UUID& client_id,
         }
     }
 
-    std::unordered_map<std::string, DistributedFSDescriptor> reservations;
+    std::unordered_map<std::string, DfsBatchReservation> reservations;
     std::unordered_map<std::string, ErrorCode> reservation_errors;
     if (any_dfs) {
         // One allocator call for the whole batch keeps its entries in a single
         // contiguous run that concurrent batches cannot interleave with.
         reservations = ReserveDfsSpaceForBatch(keys, slice_lengths, needs_dfs,
                                                reservation_errors);
+        if (dfs_batch_reservation_hook_) {
+            dfs_batch_reservation_hook_();
+        }
     }
 
     for (size_t i = 0; i < keys.size(); ++i) {
         auto key_config = config.ForSingleKey(i);
-        std::optional<DistributedFSDescriptor> preallocated;
+        std::optional<DfsBatchReservation> preallocated;
         if (needs_dfs[i]) {
             auto it = reservations.find(keys[i]);
             if (it != reservations.end()) {
@@ -5496,7 +5802,18 @@ MasterService::BatchPutStart(const UUID& client_id,
         if (!result && preallocated.has_value()) {
             // PutStart rejected this key (duplicate, quota, ...) after we had
             // already reserved its space; give the reservation back.
-            bucket_allocator_->Free(keys[i], *preallocated);
+            preallocated->source_allocator->Free(keys[i],
+                                                  preallocated->descriptor);
+        } else if (result && preallocated.has_value() &&
+                   std::none_of(result->begin(), result->end(),
+                                [](const Replica::Descriptor& descriptor) {
+                                    return descriptor.is_dfs_replica();
+                                })) {
+            // The reservation became stale while root recovery replaced the
+            // allocator. PutStart fell back to memory, so release it from the
+            // generation that created it rather than from the new allocator.
+            preallocated->source_allocator->Free(keys[i],
+                                                  preallocated->descriptor);
         }
         results.emplace_back(std::move(result));
     }
@@ -7020,7 +7337,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::DfsBackfillStart(
             src_segment, owner) != ErrorCode::OK || owner != client_id) {
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
     }
-    if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0) {
+    if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0 ||
+        dfs_root_recovery_in_progress_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
@@ -9022,9 +9340,13 @@ tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
 tl::expected<GetStorageConfigResponse, ErrorCode>
 MasterService::GetStorageConfig() const {
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
-    const std::string dfs_fsdir = enable_dfs_ ? dfs_config.fsdir : std::string();
+    // Recovery disables I/O temporarily, not the configured DFS tier. New
+    // clients still need its path and identity to initialize in degraded mode.
+    const bool dfs_configured = dfs_allocator_ != nullptr;
+    const std::string dfs_fsdir =
+        dfs_configured ? dfs_config.fsdir : std::string();
     const std::string dfs_root_identity =
-        enable_dfs_ ? dfs_root_identity_ : std::string();
+        dfs_configured ? dfs_root_identity_ : std::string();
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
         LOG(INFO)
             << "Storage root directory or cluster ID is not set. persisting "
@@ -9167,11 +9489,22 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return std::vector<OffloadTaskItem>{};
 }
 
+UUID MasterService::GetDfsMasterEpoch() const {
+    if (!enable_dfs_.load(std::memory_order_acquire) ||
+        bucket_allocator_ == nullptr) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(dfs_epoch_mutex_);
+    return dfs_snapshot_epoch_;
+}
+
 auto MasterService::GetDfsBucketSnapshot(
     const UUID& client_id, const UUID& last_epoch, uint64_t last_version)
     -> tl::expected<DfsBucketSnapshotResponse, ErrorCode> {
     (void)client_id;
-    if (bucket_allocator_ == nullptr) {
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    const UUID current_epoch = GetDfsMasterEpoch();
+    if (current_epoch == UUID{} || bucket_allocator_ == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
     auto snapshot = bucket_allocator_->GetBucketIdSnapshot();
@@ -9179,13 +9512,13 @@ auto MasterService::GetDfsBucketSnapshot(
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     DfsBucketSnapshotResponse response;
-    response.epoch = dfs_snapshot_epoch_;
+    response.epoch = current_epoch;
     response.version = snapshot->version;
     response.heartbeat_interval_seconds =
         dfs_heartbeat_interval_seconds_.load(std::memory_order_acquire);
     response.batch_timeout_fixed_ms =
         dfs_batch_timeout_fixed_ms_.load(std::memory_order_acquire);
-    response.unchanged = last_epoch == dfs_snapshot_epoch_ &&
+    response.unchanged = last_epoch == current_epoch &&
                          last_version == snapshot->version;
     if (!response.unchanged) response.bucket_ids = snapshot->bucket_ids;
     LOG(INFO) << "Returned DFS bucket snapshot, version=" << response.version
@@ -10917,6 +11250,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
 
 void MasterService::RunDfsBackfill() {
     if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0 ||
+        dfs_root_recovery_in_progress_.load(std::memory_order_acquire) ||
         !dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
         return;
     }

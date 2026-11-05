@@ -4,6 +4,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstring>
@@ -51,6 +52,157 @@ class ClientBufferTest : public ::testing::Test {
     }
 };
 
+TEST_F(ClientBufferTest, AdmissionProtectsOneReadChunkFromWrites) {
+    constexpr size_t kCapacity = 16 * 1024;
+    constexpr size_t kReadFreeReserve = 4 * 1024;
+    auto tracker = std::make_shared<DfsBufferUsageTracker>(kCapacity);
+    tracker->ConfigureAdmission(kReadFreeReserve, 0, kCapacity);
+
+    ASSERT_EQ(tracker->TryReserve(DfsBufferUsageKind::kWrite,
+                                   kCapacity - kReadFreeReserve),
+              DfsBufferAdmissionFailure::kNone);
+    tracker->CommitReservation(DfsBufferUsageKind::kWrite,
+                               kCapacity - kReadFreeReserve,
+                               kCapacity - kReadFreeReserve);
+    EXPECT_EQ(tracker->TryReserve(DfsBufferUsageKind::kWrite, 1),
+              DfsBufferAdmissionFailure::kReadReserve);
+    EXPECT_EQ(tracker->TryReserve(DfsBufferUsageKind::kRead, kReadFreeReserve),
+              DfsBufferAdmissionFailure::kNone);
+}
+
+TEST_F(ClientBufferTest, AdmissionRejectsRequestLargerThanNonReadCapacity) {
+    constexpr size_t kCapacity = 16 * 1024;
+    constexpr size_t kReadFreeReserve = 4 * 1024;
+    auto tracker = std::make_shared<DfsBufferUsageTracker>(kCapacity);
+    tracker->ConfigureAdmission(kReadFreeReserve, 0, kCapacity);
+
+    EXPECT_EQ(tracker->TryReserve(DfsBufferUsageKind::kWrite,
+                                   kCapacity - kReadFreeReserve + 1),
+              DfsBufferAdmissionFailure::kRequestExceedsLimit);
+    EXPECT_EQ(tracker->TryReserve(DfsBufferUsageKind::kPrefetch,
+                                   kCapacity - kReadFreeReserve + 1),
+              DfsBufferAdmissionFailure::kRequestExceedsLimit);
+}
+
+TEST_F(ClientBufferTest, AdmissionUsesCurrentReadAsProtection) {
+    constexpr size_t kCapacity = 16 * 1024;
+    constexpr size_t kReadFreeReserve = 4 * 1024;
+    auto tracker = std::make_shared<DfsBufferUsageTracker>(kCapacity);
+    tracker->ConfigureAdmission(kReadFreeReserve, 0, kCapacity);
+
+    ASSERT_EQ(tracker->TryReserve(DfsBufferUsageKind::kRead, 8 * 1024),
+              DfsBufferAdmissionFailure::kNone);
+    EXPECT_EQ(tracker->TryReserve(DfsBufferUsageKind::kWrite, 8 * 1024),
+              DfsBufferAdmissionFailure::kNone);
+}
+
+TEST_F(ClientBufferTest, AdmissionCarvesWriteProtectionOutOfPrefetch) {
+    constexpr size_t kCapacity = 16 * 1024;
+    constexpr size_t kReadFreeReserve = 4 * 1024;
+    constexpr size_t kWriteReserve = 4 * 1024;
+    auto tracker = std::make_shared<DfsBufferUsageTracker>(kCapacity);
+    // Ask for the whole buffer as the prefetch budget; admission truncates it
+    // to what is left after the read and write protections.
+    const auto limits =
+        tracker->ConfigureAdmission(kReadFreeReserve, kWriteReserve, kCapacity);
+
+    EXPECT_EQ(limits.read_min_protection_bytes, kReadFreeReserve);
+    EXPECT_EQ(limits.write_min_protection_bytes, kWriteReserve);
+    EXPECT_EQ(limits.prefetch_limit_bytes, kCapacity - kReadFreeReserve -
+                                               kWriteReserve);
+    // Prefetch fills its truncated budget and is then refused.
+    ASSERT_EQ(tracker->TryReserve(DfsBufferUsageKind::kPrefetch,
+                                  limits.prefetch_limit_bytes),
+              DfsBufferAdmissionFailure::kNone);
+    tracker->CommitReservation(DfsBufferUsageKind::kPrefetch,
+                               limits.prefetch_limit_bytes,
+                               limits.prefetch_limit_bytes);
+    EXPECT_EQ(tracker->TryReserve(DfsBufferUsageKind::kPrefetch, 1),
+              DfsBufferAdmissionFailure::kPrefetchLimit);
+    // The write protection is still available to write staging.
+    EXPECT_EQ(tracker->TryReserve(DfsBufferUsageKind::kWrite, kWriteReserve),
+              DfsBufferAdmissionFailure::kNone);
+}
+
+TEST_F(ClientBufferTest, AdmissionReservationRollsBackAfterAllocatorFailure) {
+    constexpr size_t kCapacity = 16 * 1024;
+    constexpr size_t kBackingSize = 4 * 1024;
+    std::vector<char> backing(kBackingSize);
+    auto tracker = std::make_shared<DfsBufferUsageTracker>(kCapacity);
+    tracker->ConfigureAdmission(0, 0, kCapacity);
+    auto allocator = ClientBufferAllocator::create(
+        backing.data(), backing.size(), "", nullptr, nullptr, tracker,
+        DfsBufferUsageKind::kWrite);
+
+    EXPECT_FALSE(allocator->allocate(kBackingSize + 1));
+    auto allocation = allocator->allocate(kBackingSize);
+    ASSERT_TRUE(allocation.has_value());
+    EXPECT_EQ(tracker->Snapshot().write_bytes, allocation->allocation_size());
+}
+
+TEST_F(ClientBufferTest, AdmissionReservationIsAtomicAcrossWriters) {
+    constexpr size_t kCapacity = 16 * 1024;
+    constexpr size_t kReadFreeReserve = 4 * 1024;
+    auto tracker = std::make_shared<DfsBufferUsageTracker>(kCapacity);
+    tracker->ConfigureAdmission(kReadFreeReserve, 0, kCapacity);
+
+    std::array<DfsBufferAdmissionFailure, 2> results;
+    std::thread first([&] {
+        results[0] = tracker->TryReserve(
+            DfsBufferUsageKind::kWrite, kCapacity - kReadFreeReserve);
+    });
+    std::thread second([&] {
+        results[1] = tracker->TryReserve(
+            DfsBufferUsageKind::kWrite, kCapacity - kReadFreeReserve);
+    });
+    first.join();
+    second.join();
+
+    EXPECT_EQ((results[0] == DfsBufferAdmissionFailure::kNone) +
+                  (results[1] == DfsBufferAdmissionFailure::kNone),
+              1);
+}
+
+TEST_F(ClientBufferTest, AlignedAllocationCommitsActualRegionAndReleases) {
+    constexpr size_t kCapacity = 16 * 1024;
+    std::vector<char> backing(kCapacity + 1);
+    auto tracker = std::make_shared<DfsBufferUsageTracker>(kCapacity);
+    tracker->ConfigureAdmission(0, 0, kCapacity);
+    auto allocator = ClientBufferAllocator::create(
+        backing.data() + 1, kCapacity, "", nullptr, nullptr, tracker,
+        DfsBufferUsageKind::kRead);
+
+    auto allocation = allocator->allocate_aligned(1024, 4096);
+    ASSERT_TRUE(allocation.has_value());
+    EXPECT_EQ(tracker->Snapshot().read_bytes, allocation->allocation_size());
+    allocation.reset();
+    EXPECT_EQ(tracker->Snapshot().total_bytes, 0);
+}
+
+TEST_F(ClientBufferTest, UnconfiguredAdmissionAllowsPrefetch) {
+    constexpr size_t kCapacity = 16 * 1024;
+    std::vector<char> backing(kCapacity);
+    auto tracker = std::make_shared<DfsBufferUsageTracker>(kCapacity);
+    auto allocator = ClientBufferAllocator::create(
+        backing.data(), backing.size(), "", nullptr, nullptr, tracker,
+        DfsBufferUsageKind::kPrefetch);
+
+    auto allocation = allocator->allocate(1024);
+    ASSERT_TRUE(allocation.has_value());
+}
+
+TEST_F(ClientBufferTest, ConfiguredZeroPrefetchLimitRejectsPrefetch) {
+    constexpr size_t kCapacity = 16 * 1024;
+    std::vector<char> backing(kCapacity);
+    auto tracker = std::make_shared<DfsBufferUsageTracker>(kCapacity);
+    tracker->ConfigureAdmission(0, 0, 0);
+    auto allocator = ClientBufferAllocator::create(
+        backing.data(), backing.size(), "", nullptr, nullptr, tracker,
+        DfsBufferUsageKind::kPrefetch);
+
+    EXPECT_FALSE(allocator->allocate(1024));
+}
+
 // Test allocator zero size
 TEST_F(ClientBufferTest, ZeroSizeAllocator) {
     auto allocator = ClientBufferAllocator::create(0);
@@ -58,6 +210,58 @@ TEST_F(ClientBufferTest, ZeroSizeAllocator) {
 
     auto handle_opt = allocator->allocate(1024);
     EXPECT_FALSE(handle_opt.has_value());
+}
+
+TEST_F(ClientBufferTest, AllocationWaitIsWokenByRelease) {
+    auto allocator = ClientBufferAllocator::create(16384);
+    auto held = allocator->allocate(16384);
+    ASSERT_TRUE(held.has_value());
+
+    std::atomic<bool> allocated{false};
+    std::thread waiter([&] {
+        auto result = allocator->allocate_aligned_wait(
+            4096, 4096, DfsBufferUsageKind::kWrite,
+            std::chrono::seconds(2));
+        allocated.store(result.has_value());
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    held.reset();
+    waiter.join();
+    EXPECT_TRUE(allocated.load());
+}
+
+TEST_F(ClientBufferTest, AllocationWaitReportsTimeout) {
+    auto allocator = ClientBufferAllocator::create(16384);
+    auto held = allocator->allocate(16384);
+    ASSERT_TRUE(held.has_value());
+
+    bool timed_out = false;
+    const auto start = std::chrono::steady_clock::now();
+    auto result = allocator->allocate_aligned_wait(
+        4096, 4096, DfsBufferUsageKind::kWrite,
+        std::chrono::milliseconds(30), &timed_out);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_FALSE(result.has_value());
+    EXPECT_TRUE(timed_out);
+    EXPECT_GE(elapsed, std::chrono::milliseconds(20));
+}
+
+TEST_F(ClientBufferTest, AllocationWaitStopsOnShutdown) {
+    auto allocator = ClientBufferAllocator::create(16384);
+    auto held = allocator->allocate(16384);
+    ASSERT_TRUE(held.has_value());
+
+    std::atomic<bool> returned{false};
+    std::thread waiter([&] {
+        auto result = allocator->allocate_aligned_wait(
+            4096, 4096, DfsBufferUsageKind::kWrite,
+            std::chrono::milliseconds::max());
+        returned.store(!result.has_value());
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    allocator->ShutdownAllocationWaiters();
+    waiter.join();
+    EXPECT_TRUE(returned.load());
 }
 
 TEST_F(ClientBufferTest, ExternalBackingOutlivesAllocatorReference) {
@@ -207,7 +411,7 @@ TEST_F(ClientBufferTest, ExternalDeviceAliasTracksSuballocationOffset) {
 TEST_F(ClientBufferTest, AlignedExternalAllocationPreservesDeviceAlias) {
     constexpr size_t kAlignment = 4096;
     constexpr size_t kAllocationSize = 1024;
-    std::vector<char> host(3 * kAlignment);
+    std::vector<char> host(3 * kAlignment + 1);
     std::vector<char> device_alias(host.size());
     void* host_base = host.data() + 1;
     void* device_base = device_alias.data() + 1;

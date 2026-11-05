@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <limits>
 #include <optional>
 #include <string>
 #include <thread>
@@ -205,6 +206,141 @@ TEST_F(MasterMetricsTest, ServiceMetricsExpirePendingWithoutRecountingOnResume) 
     --snapshot.sequence;
     EXPECT_FALSE(metrics.ReportServiceMetrics(client, snapshot));
     EXPECT_EQ(value(pending), 1);
+}
+
+TEST_F(MasterMetricsTest, ServiceL4MetricsAggregateHistogramsAndDeduplicate) {
+    auto& metrics = MasterMetricManager::instance();
+    const std::string endpoint = "198.51.100.24:45301";
+    const UUID first = generate_uuid();
+    const UUID second = generate_uuid();
+    ServiceMetricsSnapshot snapshot;
+    snapshot.service_endpoint = endpoint;
+    snapshot.sequence = 1;
+    snapshot.l4.read_operations[0] = 2;
+    snapshot.l4.read_bytes[0] = 8192;
+    snapshot.l4.read_duration_us[0] = 75000;
+    snapshot.l4.read_duration_buckets[0][7] = 1;  // 25 ms
+    snapshot.l4.read_duration_buckets[0][8] = 1;  // 50 ms
+    ASSERT_TRUE(metrics.ReportServiceMetrics(first, snapshot));
+    ASSERT_TRUE(metrics.ReportServiceMetrics(first, snapshot));
+    auto value = [&](const std::string& name, const std::string& label = "") {
+        return FindServiceMetricValue(metrics.serialize_metrics(), name,
+                                      endpoint, label)
+            .value_or(-1);
+    };
+    const std::string prefix = "mooncake_master_service_l4_";
+    EXPECT_EQ(value(prefix + "read_operations_total",
+                    "mode=\"prefetch\",result=\"success\""),
+              2);
+    EXPECT_EQ(value(prefix + "restore_bytes_total", "mode=\"prefetched\""), 0);
+    EXPECT_EQ(value(prefix + "read_duration_seconds_bucket", "le=\"0.025000\""),
+              1);
+    EXPECT_EQ(value(prefix + "read_duration_seconds_bucket", "le=\"0.050000\""),
+              2);
+    EXPECT_DOUBLE_EQ(value(prefix + "read_duration_seconds_sum"), 0.075);
+
+    // Another rank (or restarted client with a new UUID) adds its own totals.
+    snapshot.l4.restore_ranges[0] = 2;
+    snapshot.l4.restore_bytes[0] = 1024;
+    snapshot.l4.restore_ranges[1] = 1;
+    snapshot.l4.restore_bytes[1] = 512;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(second, snapshot));
+    ++snapshot.sequence;
+    snapshot.l4.restore_bytes[0] = 2048;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(second, snapshot));
+    ASSERT_TRUE(metrics.ReportServiceMetrics(second, snapshot));
+    EXPECT_EQ(value(prefix + "read_operations_total",
+                    "mode=\"prefetch\",result=\"success\""),
+              4);
+    EXPECT_EQ(value(prefix + "read_bytes_total",
+                    "mode=\"prefetch\",result=\"success\""),
+              16384);
+    EXPECT_EQ(value(prefix + "read_duration_seconds_count"), 4);
+    EXPECT_DOUBLE_EQ(value(prefix + "read_duration_seconds_sum"), 0.15);
+    EXPECT_EQ(value(prefix + "read_duration_seconds_bucket", "le=\"+Inf\""), 4);
+    EXPECT_EQ(value(prefix + "restore_ranges_total", "mode=\"prefetched\""), 2);
+    EXPECT_EQ(value(prefix + "restore_bytes_total", "mode=\"prefetched\""),
+              2048);
+    EXPECT_EQ(value(prefix + "restore_bytes_total", "mode=\"on_demand\""), 512);
+    EXPECT_EQ(value("mooncake_master_service_reporting_clients"), 2);
+}
+
+TEST_F(MasterMetricsTest, ServiceL4MetricsRejectInvalidSnapshotsAtomically) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto client = generate_uuid();
+    ServiceMetricsSnapshot initial;
+    initial.service_endpoint = "198.51.100.24:45302";
+    initial.sequence = 1;
+    initial.l4.read_operations[3] = 1;
+    initial.l4.read_bytes[3] = 4096;  // Successful bytes in a failed batch.
+    initial.l4.read_duration_us[3] = 50000;
+    initial.l4.read_duration_buckets[3][8] = 1;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client, initial));
+    auto invalid = initial;
+    invalid.l4.restore_bytes[0] = 1;  // Conflicting retry of the same sequence.
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client, invalid));
+    invalid = initial;
+    invalid.sequence = 2;
+    invalid.l4.read_bytes[3] = 4095;
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client, invalid));
+    invalid = initial;
+    invalid.sequence = 2;
+    invalid.l4.read_duration_buckets[3][9] =
+        1;  // More samples than operations.
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client, invalid));
+    invalid = initial;
+    invalid.sequence = 2;
+    invalid.l4.read_duration_us[3]++;
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client, invalid));
+    invalid = initial;
+    invalid.sequence = 2;
+    invalid.dual_write_both_success = 9;
+    invalid.l4.restore_bytes[0] = std::numeric_limits<uint64_t>::max();
+    EXPECT_FALSE(metrics.ReportServiceMetrics(client, invalid));
+    const auto serialized = metrics.serialize_metrics();
+    EXPECT_EQ(FindServiceMetricValue(
+                  serialized, "mooncake_master_service_dual_write_total",
+                  initial.service_endpoint, "outcome=\"both_success\"")
+                  .value_or(-1),
+              0);
+    EXPECT_EQ(
+        FindServiceMetricValue(
+            serialized, "mooncake_master_service_l4_read_bytes_total",
+            initial.service_endpoint, "mode=\"on_demand\",result=\"failure\"")
+            .value_or(-1),
+        4096);
+    EXPECT_EQ(FindServiceMetricValue(
+                  serialized, "mooncake_master_service_l4_restore_bytes_total",
+                  initial.service_endpoint, "mode=\"prefetched\"")
+                  .value_or(-1),
+              0);
+}
+
+TEST_F(MasterMetricsTest, ServiceL4ReporterExpiryAndResumeDoNotReplayCounters) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto client = generate_uuid();
+    ServiceMetricsSnapshot snapshot;
+    snapshot.service_endpoint = "198.51.100.24:45303";
+    snapshot.sequence = 1;
+    snapshot.l4.restore_bytes[0] = 1024;
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client, snapshot));
+    auto value = [&](const std::string& name) {
+        return FindServiceMetricValue(
+                   metrics.serialize_metrics(), name, snapshot.service_endpoint,
+                   name.find("restore_bytes") != std::string::npos
+                       ? "mode=\"prefetched\""
+                       : "")
+            .value_or(-1);
+    };
+    const std::string reporters = "mooncake_master_service_reporting_clients";
+    const std::string bytes = "mooncake_master_service_l4_restore_bytes_total";
+    EXPECT_EQ(value(reporters), 1);
+    metrics.ExpireServiceMetricsPending(std::chrono::steady_clock::now() +
+                                        std::chrono::seconds(31));
+    EXPECT_EQ(value(reporters), 0);
+    ASSERT_TRUE(metrics.ReportServiceMetrics(client, snapshot));
+    EXPECT_EQ(value(reporters), 1);
+    EXPECT_EQ(value(bytes), 1024);
 }
 
 TEST_F(MasterMetricsTest, InitialStatusTest) {

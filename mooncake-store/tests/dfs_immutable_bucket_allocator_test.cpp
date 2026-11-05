@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -300,6 +301,79 @@ TEST(ImmutableBucketAllocatorTest, AllocateRejectsInvalidRequests) {
     auto duplicate = alloc.Allocate("dup", 100);
     ASSERT_FALSE(duplicate.has_value());
     EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     RetirePreservesInflightSynchronousBucketCreationState) {
+    TempDir tmp("bucket_retire_inflight_creation");
+    auto config = MakeBucketConfig(tmp.path(), kBucketCapacity, 8);
+    ASSERT_EQ(config.ready_bucket_target, 0u);
+
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+
+    std::mutex hook_mutex;
+    std::condition_variable hook_cv;
+    bool creation_started = false;
+    bool allow_creation = false;
+    alloc.SetBeforeBucketPreallocateHookForTesting([&] {
+        std::unique_lock<std::mutex> lock(hook_mutex);
+        creation_started = true;
+        hook_cv.notify_all();
+        hook_cv.wait(lock, [&] { return allow_creation; });
+    });
+
+    std::vector<BatchAllocateResult> retired_results;
+    std::thread allocation([&] {
+        retired_results = alloc.BatchAllocate({{"retired_key", kAlignment}});
+    });
+
+    bool reached_preallocate = false;
+    {
+        std::unique_lock<std::mutex> lock(hook_mutex);
+        reached_preallocate = hook_cv.wait_for(
+            lock, std::chrono::seconds(2), [&] { return creation_started; });
+    }
+    if (!reached_preallocate) {
+        {
+            std::lock_guard<std::mutex> lock(hook_mutex);
+            allow_creation = true;
+        }
+        hook_cv.notify_all();
+        allocation.join();
+        FAIL() << "allocation did not reach the preallocation hook";
+        return;
+    }
+
+    auto replacement = alloc.RetireAndCreateReplacementAllocator();
+    const bool replacement_initialized =
+        replacement != nullptr && replacement->Init(config).has_value();
+
+    auto rejected = alloc.Allocate("post_retire", kAlignment);
+    const bool post_retire_rejected =
+        !rejected.has_value() &&
+        rejected.error() == ErrorCode::DFS_SERVICE_UNAVAILABLE;
+
+    {
+        std::lock_guard<std::mutex> lock(hook_mutex);
+        allow_creation = true;
+    }
+    hook_cv.notify_all();
+    allocation.join();
+
+    ASSERT_NE(replacement, nullptr);
+    ASSERT_TRUE(replacement_initialized);
+    EXPECT_TRUE(post_retire_rejected);
+    ASSERT_EQ(retired_results.size(), 1u);
+    EXPECT_FALSE(retired_results[0].success);
+    EXPECT_EQ(retired_results[0].error,
+              ErrorCode::DFS_SERVICE_UNAVAILABLE);
+
+    auto replacement_allocation =
+        replacement->Allocate("replacement_key", kAlignment);
+    ASSERT_TRUE(replacement_allocation.has_value())
+        << toString(replacement_allocation.error());
+    EXPECT_EQ(replacement_allocation->shard_idx, 1);
 }
 
 std::string BucketDataFile(const TempDir& tmp, int64_t bucket_id) {

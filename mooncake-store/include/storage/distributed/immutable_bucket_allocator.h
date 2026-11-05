@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -148,6 +150,20 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     tl::expected<void, ErrorCode> Init(
         const DistributedStorageConfig& config) override;
+
+    // Stop this allocator after the configured DFS root was replaced and
+    // return a fresh, uninitialized allocator whose bucket ids and entry
+    // generations continue this allocator's sequence. The retired allocator
+    // performs no filesystem cleanup: paths in the replacement root may
+    // already belong to the new storage generation.
+    //
+    // The caller must stop publishing new DFS allocations before calling this
+    // method. Other operations may still hold a borrowed pointer to this
+    // allocator; bucket contents are detached under the allocator locks while
+    // the stopped state and in-flight bookkeeping remain latched until those
+    // operations drain. The caller keeps the retired object alive meanwhile.
+    std::unique_ptr<ImmutableBucketAllocator>
+    RetireAndCreateReplacementAllocator();
 
     bool IsInitialized() const override {
         return initialized_.load(std::memory_order_acquire);
@@ -339,9 +355,25 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     std::shared_ptr<const BucketIdSnapshot> GetBucketIdSnapshot() const;
 
     /**
+     * @brief Stop tracking a bucket whose data file is already missing, but
+     * only if it still has no live allocations.
+     *
+     * @return True when the bucket was empty and removed, or was already no
+     * longer tracked. False when it currently contains live data.
+     */
+    bool DiscardMissingBucketIfEmpty(int64_t bucket_id);
+
+    /**
      * @brief Bucket id an existing key currently lives in, if any.
      */
     std::optional<int64_t> GetBucketIdForKey(const std::string& key) const;
+
+    // Test-only synchronization point for exercising retirement while a
+    // synchronous bucket creation is outside mutex_. Install before starting
+    // the allocating thread and do not replace it concurrently.
+    void SetBeforeBucketPreallocateHookForTesting(std::function<void()> hook) {
+        before_bucket_preallocate_hook_for_testing_ = std::move(hook);
+    }
 
     static std::string FormatBucketId(int64_t bucket_id);
 
@@ -522,6 +554,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // One-shot sweep of legacy bucket files, spawned only when metadata
     // recovery is disabled. Joined by StopBucketWorkers().
     std::thread legacy_cleanup_worker_;
+    std::function<void()> before_bucket_preallocate_hook_for_testing_;
     std::unordered_map<int64_t, BucketPtr> buckets_;
     std::unordered_map<std::string, int64_t> key_index_;
     int64_t next_bucket_id_ = 0;

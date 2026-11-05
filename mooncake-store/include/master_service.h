@@ -226,7 +226,7 @@ class MasterService {
         uint32_t new_interval_seconds);
     uint64_t SetDfsBatchTimeoutFixedMs(uint64_t new_timeout_ms);
 
-    // 0 keeps DFS allocation and reads enabled; 1 filters both.
+    // 1 filters DFS allocation and existence checks; Get may still read DFS.
     uint8_t GetDfsFilterMode() const {
         return dfs_filter_mode_.load(std::memory_order_acquire);
     }
@@ -850,9 +850,7 @@ class MasterService {
         const UUID& client_id, const UUID& last_epoch, uint64_t last_version)
         -> tl::expected<DfsBucketSnapshotResponse, ErrorCode>;
 
-    UUID GetDfsMasterEpoch() const {
-        return bucket_allocator_.get() ? dfs_snapshot_epoch_ : UUID{};
-    }
+    UUID GetDfsMasterEpoch() const;
 
     /**
      * @brief Client polls whether master has requested a full SSD clear
@@ -1040,13 +1038,21 @@ class MasterService {
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
+    struct DfsBatchReservation {
+        DistributedFSDescriptor descriptor;
+        // Allocator generations are retained in retired_dfs_allocators_, so
+        // this borrowed pointer remains valid until MasterService teardown.
+        DfsAllocatorInterface* source_allocator{nullptr};
+    };
+
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
 
     /**
      * @brief PutStart implementation shared by the single-key and batch paths.
-     * `preallocated_dfs` carries a DFS reservation already made by the caller
-     * (BatchPutStart); when nullopt the DFS replica is allocated inline.
+     * `preallocated_dfs` carries a DFS reservation and its source allocator
+     * generation from BatchPutStart; when nullopt the DFS replica is allocated
+     * inline.
      * `skip_dfs_replica` retries after an eligible DFS allocation failure;
      * `dfs_fallback_reason` records the original error for successful
      * fallback metrics and logging.
@@ -1055,7 +1061,7 @@ class MasterService {
         const UUID& client_id, const std::string& key,
         const TenantId& tenant_id, const uint64_t slice_length,
         const ReplicateConfig& config,
-        const std::optional<DistributedFSDescriptor>& preallocated_dfs,
+        const std::optional<DfsBatchReservation>& preallocated_dfs,
         bool skip_dfs_replica = false,
         std::optional<ErrorCode> dfs_fallback_reason = std::nullopt,
         std::optional<bool> dfs_allocation_allowed_snapshot = std::nullopt)
@@ -2097,8 +2103,8 @@ class MasterService {
     //
     // `preallocated_dfs` lets BatchPutStart reserve the whole batch's DFS space
     // in one allocator call (keeping the batch contiguous) and hand the
-    // reservation down, instead of this function allocating per key. When it is
-    // nullopt the DFS replica is allocated here as before.
+    // reservation plus its allocator generation down. When it is nullopt the
+    // DFS replica is allocated here as before.
     auto AllocateAndInsertMetadata(
         MetadataShardAccessorRW& shard, const UUID& client_id,
         const std::string& key, uint64_t value_length,
@@ -2109,7 +2115,7 @@ class MasterService {
         uint64_t& quota_deficit_bytes,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt,
-        const std::optional<DistributedFSDescriptor>& preallocated_dfs =
+        const std::optional<DfsBatchReservation>& preallocated_dfs =
             std::nullopt,
         bool skip_dfs_replica = false,
         std::optional<ErrorCode>* dfs_allocation_error = nullptr,
@@ -2119,12 +2125,11 @@ class MasterService {
     /**
      * @brief Reserve DFS space for a whole batch in one allocator call.
      *
-     * Returns a per-key descriptor map for the keys that need a DFS replica.
-     * On partial failure every successful reservation is released before
-     * returning, so the batch is all-or-nothing from the allocator's point of
-     * view. `errors_out` receives per-key errors for reporting.
+     * Returns a per-key reservation map for the keys successfully allocated;
+     * each entry records the allocator generation that produced it.
+     * `errors_out` receives per-key errors for reporting.
      */
-    std::unordered_map<std::string, DistributedFSDescriptor>
+    std::unordered_map<std::string, DfsBatchReservation>
     ReserveDfsSpaceForBatch(
         const std::vector<std::string>& keys,
         const std::vector<uint64_t>& value_lengths,
@@ -2175,6 +2180,9 @@ class MasterService {
     size_t dfs_backfill_shard_{0};  // owned by the DFS eviction thread
     bool InitializeDfsRootGuard(const std::string& root,
                                 const std::string& identity);
+    bool RecoverDfsRootAfterReplacement(const std::string& root,
+                                        const std::string& identity);
+    size_t DropDfsReplicasAfterRootReplacement();
     void ReconcileDfsRootFiles();
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -2862,6 +2870,12 @@ class MasterService {
     // default) or ImmutableBucketAllocator (BUCKET). The master only ever talks
     // to it through DfsAllocatorInterface.
     std::unique_ptr<DfsAllocatorInterface> dfs_allocator_owner_;
+    // Allocators replaced after a DFS root generation change remain alive
+    // until service shutdown. Some maintenance paths borrow allocator pointers
+    // without snapshot_mutex_; retirement makes the old object inert, while
+    // retaining ownership prevents those already-running paths from observing
+    // a dangling pointer.
+    std::vector<std::unique_ptr<DfsAllocatorInterface>> retired_dfs_allocators_;
     AtomicBorrowedPtr<DfsAllocatorInterface> dfs_allocator_;
     // Non-owning downcast of dfs_allocator_, set only in BUCKET mode. Used for
     // the bucket-specific lifecycle calls (MarkCommitted, two-phase eviction,
@@ -2870,6 +2884,7 @@ class MasterService {
     std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{300};
     std::atomic<uint64_t> dfs_batch_timeout_fixed_ms_{
         kDefaultDfsBatchTimeoutFixedMs};
+    mutable std::mutex dfs_epoch_mutex_;
     UUID dfs_snapshot_epoch_{};
     AtomicBorrowedPtr<ImmutableBucketAllocator> bucket_allocator_;
     std::atomic<bool> dfs_retry_running_{false};
@@ -2883,6 +2898,18 @@ class MasterService {
     uint64_t dfs_root_guard_device_{0};
     uint64_t dfs_root_guard_inode_{0};
     bool dfs_root_guard_ready_{false};
+    bool dfs_root_recovery_needed_{false};
+    bool dfs_root_replacement_lost_data_{false};
+    std::atomic<bool> dfs_root_recovery_in_progress_{false};
+    // Test-only synchronization point after slow recovery preparation and
+    // before the short snapshot commit barrier.
+    std::function<void()> dfs_root_recovery_before_commit_hook_;
+    // Test-only synchronization point after a batch reservation and before
+    // any per-key metadata insertion.
+    std::function<void()> dfs_batch_reservation_hook_;
+    // Test-only fault injection for the root stat call. A non-zero value is
+    // treated as the errno from a failed stat; zero uses the real filesystem.
+    std::atomic<int> dfs_root_stat_error_for_testing_{0};
     std::chrono::seconds dfs_root_guard_interval_{5};
 
     // Segment management

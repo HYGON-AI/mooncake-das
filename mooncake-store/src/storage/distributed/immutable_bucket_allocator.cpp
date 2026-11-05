@@ -348,6 +348,8 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     size_t ready_bucket_count = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // Heartbeats also carry runtime configuration before any bucket exists.
+        if (!GetBucketIdSnapshot()) PublishBucketIdSnapshotLocked();
         ready_bucket_count = ready_bucket_ids_.size();
     }
     LOG(INFO) << "DFS bucket allocator initialized, fsdir=" << fsdir_
@@ -361,6 +363,52 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
               << ", recovered_replicas=" << recovered_replicas_.size()
               << ", rewritten_buckets=" << rewritten;
     return {};
+}
+
+std::unique_ptr<ImmutableBucketAllocator>
+ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
+    initialized_.store(false, std::memory_order_release);
+    StopBucketWorkers();
+
+    auto replacement = std::make_unique<ImmutableBucketAllocator>();
+
+    // No bucket from the old directory is valid in the replacement root. Do
+    // not run normal eviction cleanup here: an fd may still name an unlinked
+    // file from the deleted directory, while paths in the recreated root may
+    // already belong to the replacement generation.
+    {
+        std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
+        std::lock_guard<std::mutex> lock(mutex_);
+        replacement->next_bucket_id_ = next_bucket_id_;
+        replacement->next_generation_ = next_generation_;
+        ready_bucket_ids_.clear();
+        buckets_.clear();
+        key_index_.clear();
+        lru_list_.clear();
+        lru_index_.clear();
+        recovered_replicas_.clear();
+        active_bucket_id_ = -1;
+        // Keep bucket ids and entry generations monotonic across recovery.
+        // An RPC that completed against the old allocator immediately before
+        // the master's exclusive recovery barrier may be stamped with the new
+        // epoch by its wrapper. Never let that stale path alias a new bucket.
+        eviction_active_ = false;
+        PublishBucketIdSnapshotLocked();
+        UpdateBucketPoolMetricsLocked();
+        // StopBucketWorkers() deliberately leaves the stop flag set. Calls
+        // that passed the initialized_ check before retirement may still be
+        // waiting for mutex_ or own an in-flight creation reservation. Wake
+        // them without resetting their state: each call must release its own
+        // counters and observe DFS_SERVICE_UNAVAILABLE.
+        bucket_pool_cv_.notify_all();
+    }
+
+    // Keep the adapter alive with the retired allocator. A maintenance path
+    // may already be inside an adapter call using a borrowed pointer, and a
+    // synchronous creation may still own a reservation while outside mutex_.
+    // It may finish and discard that file, but the latched stop state prevents
+    // any new reservation. Shutting the adapter down here would race both.
+    return replacement;
 }
 
 PersistedBucketMetadata ImmutableBucketAllocator::SnapshotLocked(
@@ -848,6 +896,9 @@ ImmutableBucketAllocator::CreateBucketUnlocked(
     bool publish = false;
     try {
         lock.unlock();
+        if (before_bucket_preallocate_hook_for_testing_) {
+            before_bucket_preallocate_hook_for_testing_();
+        }
         const auto create_started = std::chrono::steady_clock::now();
         auto result = fs_adapter_->PreallocateFile(
             BucketDataPath(reservation->bucket_id), bucket_capacity_);
@@ -878,6 +929,8 @@ ImmutableBucketAllocator::CreateBucketUnlocked(
             active_bucket_id_ = bucket->bucket_id;
             TouchLruLocked(bucket->bucket_id, bucket->last_access_ns);
             PublishBucketIdSnapshotLocked();
+        } else if (stop_bucket_workers_) {
+            error = ErrorCode::DFS_SERVICE_UNAVAILABLE;
         } else if (preallocated) {
             error = ErrorCode::NO_AVAILABLE_HANDLE;
         }
@@ -1659,6 +1712,33 @@ ImmutableBucketAllocator::GetBucketIdSnapshot() const {
                                      std::memory_order_acquire);
 }
 
+bool ImmutableBucketAllocator::DiscardMissingBucketIfEmpty(int64_t bucket_id) {
+    std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = buckets_.find(bucket_id);
+        if (it == buckets_.end()) return true;
+        if (it->second->live_bytes != 0) return false;
+
+        auto ready_it = std::find(ready_bucket_ids_.begin(),
+                                  ready_bucket_ids_.end(), bucket_id);
+        if (ready_it != ready_bucket_ids_.end()) {
+            ready_bucket_ids_.erase(ready_it);
+        }
+        buckets_.erase(it);
+        RemoveFromLruLocked(bucket_id);
+        if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
+        PublishBucketIdSnapshotLocked();
+        UpdateBucketPoolMetricsLocked();
+    }
+    // The data file was already observed missing. Remove a possible stale
+    // metadata file and wake the refill worker so discarded ready capacity is
+    // replaced.
+    DeleteBucketFiles(bucket_id);
+    bucket_pool_cv_.notify_all();
+    return true;
+}
+
 void ImmutableBucketAllocator::PublishBucketIdSnapshotLocked() {
     auto snapshot = std::make_shared<BucketIdSnapshot>();
     snapshot->version = bucket_snapshot_version_.load(
@@ -2015,7 +2095,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
         // reclaim them and they would keep occupying the DFS directory. Record
         // the id sequence, then delete exactly the scanned ids off the startup
         // path so a large legacy directory does not stall initialization.
-        next_bucket_id_ = max_seen_id + 1;
+        next_bucket_id_ = std::max(next_bucket_id_, max_seen_id + 1);
         std::unordered_set<int64_t> legacy_ids(meta_ids.begin(), meta_ids.end());
         legacy_ids.insert(data_ids.begin(), data_ids.end());
         std::vector<int64_t> sweep(legacy_ids.begin(), legacy_ids.end());
@@ -2318,8 +2398,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
         DeleteBucketFiles(data_id);
     }
 
-    next_bucket_id_ = max_seen_id + 1;
-    next_generation_ = std::max<uint64_t>(1, max_generation);
+    next_bucket_id_ = std::max(next_bucket_id_, max_seen_id + 1);
+    next_generation_ =
+        std::max(next_generation_, std::max<uint64_t>(1, max_generation));
 
     // Every recovered bucket is sealed, so none of them is resumed: the next
     // allocation opens a fresh bucket. This is what keeps a sealed bucket's

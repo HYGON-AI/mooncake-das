@@ -561,7 +561,34 @@ MasterMetricManager::MasterMetricManager()
       service_read_failures_total_(
           "mooncake_master_service_read_failures_total",
           "Foreground key transfer failures by selected replica tier",
-          {"service_endpoint", "replica_type"}) {
+          {"service_endpoint", "replica_type"}),
+      service_l4_read_operations_total_(
+          "mooncake_master_service_l4_read_operations_total",
+          "Reported DFS BatchGet calls by service endpoint",
+          {"service_endpoint", "mode", "result"}),
+      service_l4_read_bytes_total_(
+          "mooncake_master_service_l4_read_bytes_total",
+          "Reported successfully read DFS bytes by service endpoint",
+          {"service_endpoint", "mode", "result"}),
+      service_l4_read_duration_seconds_(
+          "mooncake_master_service_l4_read_duration_seconds",
+          "Reported DFS BatchGet duration in seconds by service endpoint",
+          {kL4ReadLatencySecondsBuckets.begin(),
+           kL4ReadLatencySecondsBuckets.end()},
+          {}, {"service_endpoint", "mode", "result"}),
+      service_l4_restore_ranges_total_(
+          "mooncake_master_service_l4_restore_ranges_total",
+          "Reported successfully restored DFS ranges by service endpoint",
+          {"service_endpoint", "mode"}),
+      service_l4_restore_bytes_total_(
+          "mooncake_master_service_l4_restore_bytes_total",
+          "Reported successfully restored DFS payload bytes by service "
+          "endpoint",
+          {"service_endpoint", "mode"}),
+      service_reporting_clients_("mooncake_master_service_reporting_clients",
+                                 "Clients with an accepted service metrics "
+                                 "report in the last 30 seconds",
+                                 {"service_endpoint"}) {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
 }
@@ -593,7 +620,8 @@ tl::expected<void, ErrorCode> MasterMetricManager::ReportServiceMetrics(
     if (previous && snapshot.sequence == previous->sequence) {
         if (dual_write != previous->dual_write ||
             read_failures != previous->read_failures ||
-            snapshot.dual_write_pending != previous->pending) {
+            snapshot.dual_write_pending != previous->pending ||
+            snapshot.l4 != previous->l4) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
@@ -620,6 +648,54 @@ tl::expected<void, ErrorCode> MasterMetricManager::ReportServiceMetrics(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         read_delta[i] = read_failures[i] - old_value;
+    }
+
+    ServiceL4Metrics l4_delta;
+    const ServiceL4Metrics empty_l4;
+    const auto& old_l4 = previous ? previous->l4 : empty_l4;
+    auto counter_delta = [](const auto& current, const auto& old, auto& delta) {
+        for (size_t i = 0; i < current.size(); ++i) {
+            if (current[i] < old[i] ||
+                current[i] - old[i] >
+                    static_cast<uint64_t>(
+                        std::numeric_limits<int64_t>::max())) {
+                return false;
+            }
+            delta[i] = current[i] - old[i];
+        }
+        return true;
+    };
+    if (!counter_delta(snapshot.l4.read_operations, old_l4.read_operations,
+                       l4_delta.read_operations) ||
+        !counter_delta(snapshot.l4.read_bytes, old_l4.read_bytes,
+                       l4_delta.read_bytes) ||
+        !counter_delta(snapshot.l4.read_duration_us, old_l4.read_duration_us,
+                       l4_delta.read_duration_us) ||
+        !counter_delta(snapshot.l4.restore_ranges, old_l4.restore_ranges,
+                       l4_delta.restore_ranges) ||
+        !counter_delta(snapshot.l4.restore_bytes, old_l4.restore_bytes,
+                       l4_delta.restore_bytes)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (size_t i = 0; i < snapshot.l4.read_operations.size(); ++i) {
+        if (!counter_delta(snapshot.l4.read_duration_buckets[i],
+                           old_l4.read_duration_buckets[i],
+                           l4_delta.read_duration_buckets[i])) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        uint64_t observations = 0;
+        for (const auto count : snapshot.l4.read_duration_buckets[i]) {
+            if (count > snapshot.l4.read_operations[i] - observations) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            observations += count;
+        }
+        if (observations != snapshot.l4.read_operations[i] ||
+            (l4_delta.read_operations[i] == 0 &&
+             (l4_delta.read_bytes[i] != 0 ||
+              l4_delta.read_duration_us[i] != 0))) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     if (snapshot.dual_write_pending >
@@ -666,6 +742,29 @@ tl::expected<void, ErrorCode> MasterMetricManager::ReportServiceMetrics(
                 static_cast<int64_t>(read_delta[i]));
         }
     }
+    for (size_t i = 0; i < l4_delta.read_operations.size(); ++i) {
+        const std::array<std::string, 3> labels = {
+            snapshot.service_endpoint, i < 2 ? "prefetch" : "on_demand",
+            i % 2 == 0 ? "success" : "failure"};
+        service_l4_read_operations_total_.inc(labels,
+                                              l4_delta.read_operations[i]);
+        service_l4_read_bytes_total_.inc(labels, l4_delta.read_bytes[i]);
+        if (l4_delta.read_operations[i] != 0) {
+            service_l4_read_duration_seconds_.merge(
+                labels, l4_delta.read_duration_buckets[i],
+                static_cast<double>(l4_delta.read_duration_us[i]) / 1e6);
+        }
+    }
+    for (size_t i = 0; i < l4_delta.restore_bytes.size(); ++i) {
+        const std::array<std::string, 2> labels = {
+            snapshot.service_endpoint, i == 0 ? "prefetched" : "on_demand"};
+        service_l4_restore_ranges_total_.inc(labels,
+                                             l4_delta.restore_ranges[i]);
+        service_l4_restore_bytes_total_.inc(labels, l4_delta.restore_bytes[i]);
+    }
+    if (!previous || !previous->pending_active) {
+        service_reporting_clients_.inc({snapshot.service_endpoint}, 1);
+    }
     endpoint_pending = new_endpoint_pending;
     service_dual_write_pending_.update({snapshot.service_endpoint},
                                        new_endpoint_pending);
@@ -676,6 +775,7 @@ tl::expected<void, ErrorCode> MasterMetricManager::ReportServiceMetrics(
     state.dual_write = dual_write;
     state.pending = snapshot.dual_write_pending;
     state.read_failures = read_failures;
+    state.l4 = snapshot.l4;
     state.last_report = std::chrono::steady_clock::now();
     service_metric_clients_[client_id] = std::move(state);
     return {};
@@ -693,6 +793,7 @@ void MasterMetricManager::ExpireServiceMetricsPending(
         pending -= static_cast<int64_t>(state.pending);
         service_dual_write_pending_.update({state.endpoint}, pending);
         state.pending_active = false;
+        service_reporting_clients_.dec({state.endpoint}, 1);
     }
 }
 
@@ -2352,6 +2453,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(service_dual_write_total_);
     serialize_metric(service_dual_write_pending_);
     serialize_metric(service_read_failures_total_);
+    serialize_metric(service_l4_read_operations_total_);
+    serialize_metric(service_l4_read_bytes_total_);
+    serialize_metric(service_l4_read_duration_seconds_);
+    serialize_metric(service_l4_restore_ranges_total_);
+    serialize_metric(service_l4_restore_bytes_total_);
+    serialize_metric(service_reporting_clients_);
 
     return ss.str();
 }

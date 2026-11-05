@@ -235,6 +235,7 @@ std::optional<double> WaitForServiceMetricValue(
 class DfsBucketClientTest : public ::testing::Test {
    protected:
     virtual void ConfigureClientEnvironment() {}
+    virtual size_t UnifiedBufferSize() const { return 8 * 1024 * 1024; }
 
     void SetUp() override {
         root_ = (std::filesystem::temp_directory_path() /
@@ -324,7 +325,13 @@ class DfsBucketClientTest : public ::testing::Test {
     std::shared_ptr<Client> CreateClient(const std::string& hostname) {
         auto client = Client::Create(hostname, "P2PHANDSHAKE", "tcp",
                                      std::nullopt, master_.master_address());
-        return client ? *client : nullptr;
+        if (!client || !*client) return nullptr;
+        // Every client created by this fixture needs a unified DFS buffer:
+        // tests recreate writer_ after SetUp() for per-case timeout settings.
+        (*client)->SetUnifiedDfsBuffer(
+            ClientBufferAllocator::create(UnifiedBufferSize()),
+            UnifiedBufferSize());
+        return *client;
     }
 
     void PauseHolderPolling() {
@@ -721,6 +728,7 @@ TEST_F(DfsBucketEpochClientTest,
 
 TEST_F(DfsBucketEpochClientTest,
        HealthyRestartRefreshesOnlyUnchangedReadViews) {
+    SetEnv("MOONCAKE_DFS_BUCKET_RECOVERY_ENABLED", "true");
     const std::string key = "healthy_restart_read";
     std::string value(4096, 'R');
     std::vector<Slice> slices{{value.data(), value.size()}};
@@ -873,7 +881,7 @@ TEST_F(DfsBucketClientTest, StaleReadsRejectChangedObjectViewBeforeRetry) {
     }
 }
 
-TEST_F(DfsBucketClientTest, StaleDfsReadRetryHonorsRuntimeFilter) {
+TEST_F(DfsBucketClientTest, StaleDfsReadRetryAllowsExistenceFilteredDfs) {
     const std::string key = "stale_read_runtime_filter";
     std::string value(4096, 'F');
     std::vector<Slice> slices{{value.data(), value.size()}};
@@ -889,22 +897,19 @@ TEST_F(DfsBucketClientTest, StaleDfsReadRetryHonorsRuntimeFilter) {
 
     ASSERT_TRUE(master_.service()->SetDfsFilterMode(1));
     std::string output(value.size(), '?');
-    const auto untouched = output;
     std::vector<Slice> output_slices{{output.data(), output.size()}};
     auto single = writer_->Get(key, queries[0], output_slices);
-    ASSERT_FALSE(single);
-    EXPECT_EQ(single.error(), ErrorCode::DFS_STALE_HANDLE);
-    EXPECT_EQ(output, untouched);
+    ASSERT_TRUE(single);
+    EXPECT_EQ(output, value);
+    std::fill(output.begin(), output.end(), '?');
     std::unordered_map<std::string, std::vector<Slice>> batch{
         {key, output_slices}};
     auto results = writer_->BatchGet({key}, queries, batch);
     ASSERT_EQ(results.size(), 1u);
-    ASSERT_FALSE(results[0]);
-    EXPECT_EQ(results[0].error(), ErrorCode::DFS_STALE_HANDLE);
-    EXPECT_EQ(output, untouched);
+    ASSERT_TRUE(results[0]);
+    EXPECT_EQ(output, value);
 
-    // Filtering preserves the existing DFS metadata; switching back permits
-    // the same bounded retry, with no stale fallback to a different tier.
+    // Both filter modes allow Get to refresh a stale DFS descriptor.
     ASSERT_TRUE(master_.service()->SetDfsFilterMode(0));
     ASSERT_TRUE(writer_->Get(key, queries[0], output_slices));
     EXPECT_EQ(output, value);
@@ -1154,7 +1159,14 @@ TEST_F(DfsBucketClientTest, EmptyStartupIdentityRecoversFromMasterWithoutRestart
     master_.Stop();
     SetEnv("MOONCAKE_ENABLE_DFS", "0");
     ASSERT_TRUE(master_.Start(master_config));
-    writer_ = CreateClient("127.0.0.1:18201");
+    // The old master may have left an EOF in the shared connection pool.
+    const auto create_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        writer_ = CreateClient("127.0.0.1:18201");
+        if (writer_) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } while (std::chrono::steady_clock::now() < create_deadline);
     ASSERT_NE(writer_, nullptr);
     ASSERT_TRUE(writer_->GetDfsRootIdentity().empty());
 
@@ -1214,7 +1226,6 @@ class DfsBucketClientChunkLimitTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "16384");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
     }
 };
 
@@ -1237,9 +1248,11 @@ class DfsBucketClientSlotTimeoutTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
+        SetEnv("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "8192");
         SetEnv("MC_STORE_DFS_WRITE_ARENA_WAIT_MS", "1");
     }
+
+    size_t UnifiedBufferSize() const override { return 8192; }
 };
 
 TEST_F(DfsBucketClientSlotTimeoutTest,
@@ -1273,7 +1286,6 @@ class DfsBucketClientMultiChunkTest : public DfsBucketClientTest {
    protected:
     void ConfigureClientEnvironment() override {
         SetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
-        SetEnv("MC_STORE_DFS_WRITE_ARENA_COUNT", "1");
     }
 };
 

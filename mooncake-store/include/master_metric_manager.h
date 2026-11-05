@@ -10,6 +10,8 @@
 #include <unordered_map>
 
 #include "types.h"
+#include "service_metrics.h"
+#include "hybrid_metric.h"
 #include "ylt/util/tl/expected.hpp"
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
@@ -579,6 +581,7 @@ class MasterMetricManager {
         std::array<uint64_t, 4> dual_write{};
         uint64_t pending = 0;
         std::array<uint64_t, 2> read_failures{};
+        ServiceL4Metrics l4;
         bool pending_active = true;
         std::chrono::steady_clock::time_point last_report;
     };
@@ -834,6 +837,13 @@ class MasterMetricManager {
     ylt::metric::dynamic_counter_2t service_dual_write_total_;
     ylt::metric::dynamic_gauge_1t service_dual_write_pending_;
     ylt::metric::dynamic_counter_2t service_read_failures_total_;
+    ylt::metric::basic_dynamic_counter<int64_t, 3>
+        service_l4_read_operations_total_;
+    ylt::metric::basic_dynamic_counter<int64_t, 3> service_l4_read_bytes_total_;
+    ylt::metric::hybrid_histogram_3d service_l4_read_duration_seconds_;
+    ylt::metric::dynamic_counter_2t service_l4_restore_ranges_total_;
+    ylt::metric::dynamic_counter_2t service_l4_restore_bytes_total_;
+    ylt::metric::dynamic_gauge_1t service_reporting_clients_;
 };
 
 }  // namespace mooncake

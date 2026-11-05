@@ -1,7 +1,10 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <string>
 #include <vector>
@@ -9,6 +12,7 @@
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
 #include "replica.h"
+#include "dfs_buffer_usage.h"
 
 namespace mooncake {
 
@@ -39,7 +43,9 @@ class ClientBufferAllocator
     static std::shared_ptr<ClientBufferAllocator> create(
         void* addr, size_t size, const std::string& protocol = "",
         void* device_addr = nullptr,
-        std::shared_ptr<void> backing_owner = nullptr);
+        std::shared_ptr<void> backing_owner = nullptr,
+        std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
+        DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead);
 
     ~ClientBufferAllocator();
 
@@ -57,6 +63,10 @@ class ClientBufferAllocator
 
     [[nodiscard]] size_t size() const { return buffer_size_; }
 
+    [[nodiscard]] size_t allocation_size_for_request(size_t size) const;
+    [[nodiscard]] size_t allocation_size_for_aligned_request(
+        size_t size, size_t alignment) const;
+
     [[nodiscard]] std::optional<BufferHandle> allocate(size_t size);
 
     // Allocate a host view with the requested address alignment. If this
@@ -64,10 +74,27 @@ class ClientBufferAllocator
     // the device alias at the same sub-allocation offset.
     [[nodiscard]] std::optional<BufferHandle> allocate_aligned(
         size_t size, size_t alignment);
+    [[nodiscard]] std::optional<BufferHandle> allocate_aligned(
+        size_t size, size_t alignment, DfsBufferUsageKind kind);
+    [[nodiscard]] std::optional<BufferHandle> allocate_aligned_wait(
+        size_t size, size_t alignment, DfsBufferUsageKind kind,
+        std::chrono::milliseconds timeout, bool* timed_out = nullptr,
+        bool* request_exceeds_limit = nullptr);
+    void SetUsageTracker(std::shared_ptr<DfsBufferUsageTracker> tracker,
+                         DfsBufferUsageKind kind);
+
+    [[nodiscard]] std::shared_ptr<DfsBufferUsageTracker> usage_tracker() const {
+        return usage_tracker_;
+    }
+
+    [[nodiscard]] DfsBufferUsageKind usage_kind() const { return usage_kind_; }
 
     // Free space and a conservative lower bound of the largest free region
     // (taken from the largest non-empty bin). All zero when the allocator has
     // no backing buffer.
+    void NotifyAllocationReleased();
+    void ShutdownAllocationWaiters();
+
     [[nodiscard]] offset_allocator::OffsetAllocStorageReport storageReport()
         const;
 
@@ -88,6 +115,12 @@ class ClientBufferAllocator
     // Declared before allocator_ so the backing outlives allocator teardown.
     std::shared_ptr<void> backing_owner_;
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
+    std::shared_ptr<DfsBufferUsageTracker> usage_tracker_;
+    DfsBufferUsageKind usage_kind_ = DfsBufferUsageKind::kRead;
+    mutable std::mutex allocation_wait_mutex_;
+    std::condition_variable allocation_wait_cv_;
+    uint64_t allocation_generation_ = 0;
+    bool allocation_wait_shutdown_ = false;
 
     std::string protocol;
     bool is_external_memory_ = false;
@@ -106,16 +139,19 @@ class BufferHandle {
    public:
     // Owning mode: backed by allocator
     BufferHandle(std::shared_ptr<ClientBufferAllocator> allocator,
-                 offset_allocator::OffsetAllocationHandle handle);
+                 offset_allocator::OffsetAllocationHandle handle,
+                 std::shared_ptr<DfsBufferUsageTracker> usage_tracker = nullptr,
+                 DfsBufferUsageKind usage_kind = DfsBufferUsageKind::kRead,
+                 size_t reserved_size = 0);
 
     // View mode: non-owning, calls release_fn on destruction
     BufferHandle(void* ptr, size_t size, std::function<void()> release_fn,
-                 void* device_ptr = nullptr);
+                 void* device_ptr = nullptr, size_t allocation_size = 0);
 
     ~BufferHandle();
 
-    BufferHandle(BufferHandle&&) = default;  // Allow move operations
-    BufferHandle& operator=(BufferHandle&&) = default;
+    BufferHandle(BufferHandle&& other) noexcept;
+    BufferHandle& operator=(BufferHandle&& other) noexcept;
 
     // Disable copy constructor and copy assignment operator
     BufferHandle(const BufferHandle&) = delete;
@@ -123,17 +159,22 @@ class BufferHandle {
 
     [[nodiscard]] void* ptr() const;
     [[nodiscard]] size_t size() const;
+    [[nodiscard]] size_t allocation_size() const;
     // Device-visible alias for a mapped host view, when one is available.
     [[nodiscard]] void* device_ptr() const;
 
    private:
+    friend class ClientBufferAllocator;
+
     // Owning mode members
     std::shared_ptr<ClientBufferAllocator> allocator_;
     offset_allocator::OffsetAllocationHandle handle_;
+    std::unique_ptr<DfsBufferAllocationUsage> usage_;
 
     // View mode members
     void* view_ptr_ = nullptr;
     size_t view_size_ = 0;
+    size_t view_allocation_size_ = 0;
     std::function<void()> release_fn_;
     void* view_device_ptr_ = nullptr;
 };
