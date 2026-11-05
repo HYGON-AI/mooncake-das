@@ -1220,6 +1220,15 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    // Called while session_mutex_ is held; detached owners stay in the caller.
+    void CollectOrphanedDfsPrefetchBuffers(
+        bool prefetch_cache_enabled, SessionRangeReadContext &context,
+        std::vector<std::shared_ptr<BufferHandle>> &detached_prefetch_buffers);
+    void DetachDfsPrefetchBuffers(
+        std::vector<std::shared_ptr<BufferHandle>> &detached_prefetch_buffers);
+    std::vector<std::vector<SessionRangeReadRequest *>> PlanDfsReadChunks(
+        const std::vector<SessionRangeReadRequest *> &entries,
+        size_t chunk_limit_bytes, size_t &request_planned_bytes);
     ErrorCode execute_session_dfs_range_reads_batch(
         std::vector<SessionRangeReadRequest *> &entries,
         std::vector<int> &results, uint64_t trace_id, bool prefetch_only,

@@ -1123,6 +1123,7 @@ class Client {
      * Called from the destructor before the master client goes away.
      */
     void DrainAsyncDfsWrites();
+    void StopDfsWritesAndBufferLogging();
     void LogUnifiedDfsBufferUsage();
 
     void StopServiceMetricsReporter();

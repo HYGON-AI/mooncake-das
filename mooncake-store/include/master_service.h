@@ -79,6 +79,7 @@ class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }  // namespace ha
 
 class EtcdOpLogStore;
+struct DistributedStorageConfig;
 class DfsGlobalAllocator;
 class ImmutableBucketAllocator;
 class DfsAllocatorInterface;
@@ -2150,6 +2151,7 @@ class MasterService {
     // validation, then remove replicas and bucket files after revalidation.
     // Aborting eviction restores reads for the matching replica generations.
     void RunBucketDfsEviction();
+    void RunLowUtilizationDfsEviction();
     bool RunBucketDfsEvictionInternal(
         bool force_one,
         std::optional<int64_t> invalidated_bucket_id = std::nullopt,
@@ -2173,6 +2175,8 @@ class MasterService {
     // including retry initialization and snapshot mode, because allocator
     // state is required before allocation, free, or eviction can proceed.
     void RestoreRecoveredDfsReplicas(bool rebuild_metadata);
+    bool PrepareDfsRootForInitialization(
+        const DistributedStorageConfig& dfs_config);
     DfsInitResult InitDfsAllocatorFromEnvironment(
         const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();

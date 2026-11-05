@@ -15,6 +15,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     etcd_helper.cpp
     uds_transport.cpp
     storage/distributed/distributed_storage_backend.cpp
+    l4/distributed_storage_backend_l4.cpp
     storage/distributed/posix_fs_adapter.cpp
     storage/distributed/immutable_bucket_allocator.cpp
     utils/file_util.cpp)
@@ -23,6 +24,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
     master_service.cpp
+    l4/master_service_l4.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
@@ -72,6 +74,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
 set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer_allocation.cpp
     client_service.cpp
+    l4/client_service_l4.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
@@ -88,6 +91,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
+    l4/real_client_l4.cpp
     read_layout.cpp
     read_plan.cpp
     registered_pinned_memory.cpp

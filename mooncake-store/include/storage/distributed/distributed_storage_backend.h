@@ -410,6 +410,7 @@ class DistributedStorageBackend
         bucket_id_direct_cache_;
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
+    tl::expected<void, ErrorCode> InitBucketModeLocked();
     tl::expected<void, ErrorCode> InitLocked();
     tl::expected<void, ErrorCode> ValidateRootIdentity() const;
     void ResetFailedInitializationLocked();
