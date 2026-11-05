@@ -31,6 +31,8 @@ Options:
   --jobs N      Override build parallelism
   -h, --help    Show this help
 
+All variants enable multi-protocol support and disable unit-test builds.
+Only rpc enables USE_HYLINK; standard/shca explicitly disable it.
 Exactly one build variant must be specified.
 EOF
 }
@@ -152,19 +154,22 @@ setup_shca_env() {
 build_variant() {
     local variant="$1"
     local package_basename=""
-    local -a cmake_args=(-DUSE_ETCD=ON -DSTORE_USE_ETCD=ON)
+    # ENABLE_MULTI_PROTOCOL keeps RDMA+HIP on the same segment (e.g. "rdma,hip")
+    # so cross-node VRAM traffic can fall back to RDMA instead of HIP IPC.
+    local -a cmake_args=(-DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DBUILD_UNIT_TESTS=OFF
+                         -DENABLE_MULTI_PROTOCOL=ON)
 
     case "${variant}" in
         standard)
             package_basename="mooncake_transfer_engine"
-            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=OFF -DUSE_FAKE_HIP_RPC=ON)
+            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=OFF -DUSE_FAKE_HIP_RPC=ON -DUSE_HYLINK=OFF)
             if [ "${DRY_RUN}" -eq 0 ]; then
                 restore_pyproject
             fi
             ;;
         rpc)
             package_basename="mooncake_transfer_engine_rpc"
-            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=OFF -DUSE_FAKE_HIP_RPC=OFF)
+            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=OFF -DUSE_FAKE_HIP_RPC=OFF -DUSE_HYLINK=ON)
             if [ "${DRY_RUN}" -eq 0 ]; then
                 patch_pyproject \
                     "mooncake-transfer-engine-rpc" \
@@ -174,7 +179,7 @@ build_variant() {
             ;;
         shca)
             package_basename="mooncake_transfer_engine_shca"
-            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=ON -DUSE_FAKE_HIP_RPC=ON)
+            cmake_args+=(-DUSE_HYGON=ON -DUSE_SHCA=ON -DUSE_FAKE_HIP_RPC=ON -DUSE_HYLINK=OFF)
             setup_shca_env
             if [ "${DRY_RUN}" -eq 0 ]; then
                 patch_pyproject \

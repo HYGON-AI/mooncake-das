@@ -34,7 +34,7 @@
 #include "replica.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
-#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/shard_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage/distributed/posix_fs_adapter.h"
@@ -2015,7 +2015,7 @@ TEST(DfsAllocatorInterfaceTest, BothImplementationsWorkPolymorphically) {
         allocators.push_back(std::move(bucket));
     }
     {
-        auto shard = std::make_unique<DfsGlobalAllocator>();
+        auto shard = std::make_unique<ShardAllocator>();
         ASSERT_TRUE(
             shard->Init(MakeShardConfig(shard_dir.path(), 4, 1024 * 1024)));
         allocators.push_back(std::move(shard));
@@ -2044,9 +2044,9 @@ TEST(DfsAllocatorInterfaceTest, BothImplementationsWorkPolymorphically) {
     }
 }
 
-TEST(DfsGlobalAllocatorCompatTest, ShardBehaviourIsUnchanged) {
+TEST(ShardAllocatorCompatTest, ShardBehaviourIsUnchanged) {
     TempDir tmp("shard_compat");
-    DfsGlobalAllocator alloc;
+    ShardAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeShardConfig(tmp.path(), 4, 1024 * 1024)));
     EXPECT_EQ(alloc.Type(), DfsAllocatorType::SHARD);
 
@@ -2065,15 +2065,15 @@ TEST(DfsGlobalAllocatorCompatTest, ShardBehaviourIsUnchanged) {
     alloc.Free(desc->offset, desc->aligned_size, desc->shard_idx, "key1");
     EXPECT_TRUE(alloc.Allocate("key2", 100).has_value());
 
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(0, 64), "00");
-    EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(63, 64), "63");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(0, 64), "00");
+    EXPECT_EQ(ShardAllocator::FormatShardIdx(63, 64), "63");
 }
 
-TEST(DfsGlobalAllocatorCompatTest, BatchAllocateIsAllOrNothing) {
+TEST(ShardAllocatorCompatTest, BatchAllocateIsAllOrNothing) {
     TempDir tmp("shard_batch");
-    DfsGlobalAllocator alloc;
-    // One shard with room for exactly two allocations (each reserves
-    // aligned_size + alignment - 1, so the allocator rounds up).
+    ShardAllocator alloc;
+    // One shard with room for three aligned allocations; the fourth must
+    // fail and roll back the successful reservations.
     ASSERT_TRUE(alloc.Init(MakeShardConfig(tmp.path(), 1, 3 * kAlignment)));
 
     std::vector<BatchAllocateRequest> requests{

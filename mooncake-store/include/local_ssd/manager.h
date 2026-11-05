@@ -11,7 +11,6 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
-#include "local_ssd/persisted_state.h"
 #include "mutex.h"
 #include "tenant_id.h"
 #include "types.h"
@@ -72,6 +71,10 @@ class LocalSsdManager {
     ErrorCode RegisterClient(const UUID& client_id, bool enable_offloading);
     std::optional<int64_t> UnregisterClient(const UUID& client_id);
 
+    // UUIDs of all registered LocalSSD clients. Used to rebuild client
+    // liveness records after an HA snapshot restore.
+    std::vector<UUID> GetClientIds() const;
+
     tl::expected<CapacityChange, ErrorCode> ReportCapacity(
         const UUID& client_id, int64_t bytes);
 
@@ -102,8 +105,6 @@ class LocalSsdManager {
     void RequestRemoveAll(const std::vector<UUID>& clients);
     tl::expected<bool, ErrorCode> ConsumeRemoveAll(const UUID& client_id);
 
-    LocalSsdPersistedState ExportPersistedState() const;
-    void RestorePersistedState(LocalSsdPersistedState state);
     void Clear();
 
    private:

@@ -94,6 +94,20 @@ option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
 option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
 option(USE_FAKE_HIP_RPC "option for using fake HIP RPC implementation" OFF)
+option(USE_RISCV "Enable RISC-V build compatibility settings" OFF)
+if(USE_RISCV)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+    message(
+      WARNING
+        "USE_RISCV is enabled, but CMAKE_SYSTEM_PROCESSOR is '${CMAKE_SYSTEM_PROCESSOR}'"
+    )
+  endif()
+  # Define this before any pybind11 module is created. Otherwise pybind11 adds
+  # its default full-LTO target, which is prohibitively resource-intensive on
+  # RISC-V build hosts.
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+  message(STATUS "RISC-V: IPO disabled for Mooncake Python extensions")
+endif()
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -112,15 +126,24 @@ option(
   USE_TPU
   "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
   OFF)
+option(
+  USE_XPU
+  "option for enabling Intel XPU (oneAPI SYCL) staging support in TENT; this is a direct-link (native) build that requires USE_TENT and the Intel DPC++ compiler (icpx / IntelLLVM) at build time -- there is no dlopen shim"
+  OFF)
+option(
+  USE_XPU_GDS
+  "GDS on Intel XPU through a cuFile-compatible library (cufile.h + libcufile.so)"
+  OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
-option(USE_SHCA "option for using TianLong SHCA InfiniBand" OFF)
+option(USE_FABRIC
+       "option for the libfabric transport in TENT (implied by USE_EFA/USE_CXI)"
+       OFF)
+option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
+option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
+option(USE_MEMFABRIC "option for using memfabric transport" OFF)
 
-if (USE_SHCA)
-  message(STATUS "TianLong SHCA InfiniBand is enabled")
-endif()
-
-if (USE_FAKE_HIP_RPC)
+if(USE_FAKE_HIP_RPC)
   # Fake HIP RPC stubs live under USE_HYGON paths in hip_transport.
   set(USE_HYGON ON)
   add_compile_definitions(USE_FAKE_HIP_RPC)
@@ -134,30 +157,52 @@ if(USE_UB)
 endif()
 
 if(USE_EFA)
-  # Find libfabric headers and library; default to AWS EFA installer path
+  # The EFA transport dlopens libfabric at runtime, so only the headers are
+  # needed here; default to the AWS EFA installer path.
   find_path(
     LIBFABRIC_INCLUDE_DIR rdma/fabric.h
     HINTS /opt/amazon/efa/include
     PATH_SUFFIXES include)
-  find_library(
-    LIBFABRIC_LIBRARY fabric
-    HINTS /opt/amazon/efa/lib
-    PATH_SUFFIXES lib lib64)
 
-  if(NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+  if(NOT LIBFABRIC_INCLUDE_DIR)
     message(
       FATAL_ERROR
-        "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY."
+        "libfabric headers not found. Install libfabric-dev or AWS EFA, or set LIBFABRIC_INCLUDE_DIR."
     )
   endif()
 
-  get_filename_component(LIBFABRIC_LIB_DIR ${LIBFABRIC_LIBRARY} DIRECTORY)
   include_directories(${LIBFABRIC_INCLUDE_DIR})
-  link_directories(${LIBFABRIC_LIB_DIR})
   add_compile_definitions(USE_EFA)
+
+  # AWS Neuron device memory needs both the FI_HMEM_NEURON enumerator and
+  # fi_mr_attr::device.neuron, which arrive together and are absent from older
+  # libfabric -- including distro packages such as Ubuntu 22.04's libfabric-dev.
+  # Probed rather than gated on a version so that a build against any libfabric
+  # keeps working; when it is missing, efa_neuron.cpp reports Neuron as
+  # unsupported instead of registering its HBM as host memory.
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${LIBFABRIC_INCLUDE_DIR})
+  check_cxx_source_compiles(
+    "
+    #include <rdma/fabric.h>
+    #include <rdma/fi_domain.h>
+    int main() {
+      struct fi_mr_attr attr = {};
+      attr.iface = FI_HMEM_NEURON;
+      attr.device.neuron = 0;
+      return 0;
+    }
+    "
+    MOONCAKE_HAVE_FI_HMEM_NEURON)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  if(MOONCAKE_HAVE_FI_HMEM_NEURON)
+    add_compile_definitions(MOONCAKE_HAVE_FI_HMEM_NEURON)
+  endif()
+
   message(STATUS "AWS EFA (libfabric) transport is enabled")
   message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
-  message(STATUS "  libfabric library: ${LIBFABRIC_LIBRARY}")
+  message(STATUS "  libfabric is loaded at runtime (dlopen)")
+  message(STATUS "  Neuron (FI_HMEM_NEURON): ${MOONCAKE_HAVE_FI_HMEM_NEURON}")
 endif()
 if(USE_CXI)
   # Find libfabric headers and library; default to AWS EFA installer path
@@ -287,8 +332,30 @@ if(USE_SUPA)
     endif()
   endif()
   message(STATUS "  BIREN_HOME: ${BIREN_HOME}")
-  include_directories(${BIREN_HOME}/supa/include)
+  # The SUPA SDK ships generic header names (e.g. version.h) that must not
+  # shadow Mooncake's own headers, so expose it as a system include directory.
+  include_directories(SYSTEM ${BIREN_HOME}/supa/include)
   link_directories(${BIREN_HOME}/supa/lib ${BIREN_HOME}/brumd/lib)
+  # Resolve the runtime library by name: older SUPA SDKs ship libsupa.so with a
+  # separate libsupart.so, while newer SDKs ship a single libsupa-runtime.so.
+  find_library(
+    SUPA_RUNTIME_LIBRARY
+    NAMES supa supa-runtime
+    PATHS ${BIREN_HOME}/supa/lib)
+  find_library(
+    SUPA_PART_LIBRARY
+    NAMES supart
+    PATHS ${BIREN_HOME}/supa/lib)
+  if(NOT SUPA_RUNTIME_LIBRARY)
+    message(
+      FATAL_ERROR
+        "SUPA runtime library not found under ${BIREN_HOME}/supa/lib (expected libsupa.so, libsupa-runtime.so, or libsupart.so)"
+    )
+  endif()
+  set(SUPA_LIBRARIES ${SUPA_RUNTIME_LIBRARY})
+  if(SUPA_PART_LIBRARY)
+    list(APPEND SUPA_LIBRARIES ${SUPA_PART_LIBRARY})
+  endif()
 endif()
 
 if(USE_TPU)
@@ -303,6 +370,56 @@ if(USE_TPU)
   endif()
   add_compile_definitions(USE_TPU)
   message(STATUS "TPU (PJRT) staging support is enabled")
+endif()
+
+if(USE_XPU)
+  # XPU sources live under mooncake-transfer-engine/tent and mooncake-ep, which
+  # are only added when USE_TENT or WITH_EP is ON. Without this guard
+  # -DUSE_XPU=ON configures and builds cleanly while compiling no XPU code. An
+  # EP build without TENT must also leave out the Store; the top-level
+  # CMakeLists.txt checks that once WITH_STORE is defined.
+  if(NOT USE_TENT AND NOT WITH_EP)
+    message(
+      FATAL_ERROR
+        "USE_XPU=ON requires USE_TENT=ON (Transfer Engine) or WITH_EP=ON (Mooncake EP). Re-run cmake with either."
+    )
+  endif()
+  # The XPU platform links oneAPI SYCL directly (native / direct-link): its
+  # translation units include <sycl/sycl.hpp> and are compiled with -fsycl, so
+  # the whole build must use the Intel DPC++ compiler. Configure with icpx, e.g.
+  # CXX=icpx cmake -DUSE_TENT=ON -DUSE_XPU=ON ... (from an intel/oneapi-basekit
+  # or intel/pytorch:xpu image, or after `source /opt/intel/oneapi/setvars.sh`).
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM" AND NOT CMAKE_CXX_COMPILER
+                                                       MATCHES "icpx|icx|dpcpp")
+    message(
+      FATAL_ERROR
+        "USE_XPU=ON requires the Intel DPC++ compiler (icpx): the XPU platform "
+        "links SYCL directly. Re-run cmake with CXX=icpx (detected "
+        "'${CMAKE_CXX_COMPILER_ID}' at ${CMAKE_CXX_COMPILER}).")
+  endif()
+  add_compile_definitions(USE_XPU)
+  message(
+    STATUS "Intel XPU (oneAPI SYCL, direct-link) staging support is enabled")
+endif()
+
+if(USE_XPU_GDS)
+  # The GDS transport links libcufile.so; with USE_XPU_GDS it must come from a
+  # cuFile-compatible library for Intel XPU (for example Intel xFile) instead of
+  # NVIDIA GDS. A process can load only one libcufile.so, so the two GDS
+  # flavours are mutually exclusive.
+  if(NOT USE_XPU)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON requires USE_XPU=ON (and therefore USE_TENT=ON).")
+  endif()
+  if(USE_CUDA)
+    message(
+      FATAL_ERROR
+        "USE_XPU_GDS=ON cannot be combined with USE_CUDA=ON: both resolve "
+        "libcufile.so, and a process can load only one of them.")
+  endif()
+  add_compile_definitions(USE_XPU_GDS)
+  message(STATUS "Intel XPU GDS (cuFile-compatible library) is enabled")
 endif()
 
 if(NOT DEFINED NEUWARE_ROOT OR NEUWARE_ROOT STREQUAL "")
@@ -454,13 +571,20 @@ if(USE_COREX)
   endif()
 endif()
 
+# Hylink builds on the HIP runtime; enable it automatically.
+if(USE_HYLINK AND NOT USE_HIP)
+  set(USE_HIP ON)
+endif()
+
 if(USE_HIP)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
   find_package(HIP REQUIRED)
   include_directories(${HIP_INCLUDE_DIRS})
   add_compile_definitions(USE_HIP __HIP_PLATFORM_AMD__)
-  if (USE_HYGON)
-    set(CMAKE_VERBOSE_MAKEFILE OFF CACHE BOOL "" FORCE)
+  if(USE_HYGON)
+    set(CMAKE_VERBOSE_MAKEFILE
+        OFF
+        CACHE BOOL "" FORCE)
   endif()
   message(STATUS "HIP support is enabled")
 
@@ -588,13 +712,19 @@ if(USE_TCP)
   add_compile_definitions(USE_TCP)
 endif()
 
+if(USE_MEMFABRIC)
+  add_compile_definitions(USE_MEMFABRIC)
+  message(STATUS "memfabric transport is enabled")
+endif()
+
 if(USE_BAREX)
   add_compile_definitions(USE_BAREX)
 endif()
 
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT
-   OR USE_UBSHMEM)
+   OR USE_UBSHMEM
+   OR USE_MEMFABRIC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
   string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)
@@ -693,6 +823,7 @@ if(NOT TARGET gflags::gflags)
     endif()
   endforeach()
 endif()
+
 set(GH_MIRROR "")
 if(DEFINED ENV{ASCEND_GITHUB_MIRROR_URLS})
   set(GH_MIRROR $ENV{ASCEND_GITHUB_MIRROR_URLS})
@@ -703,7 +834,9 @@ endif()
 
 # SHCA uses extended 17-bit LIDs incompatible with yalantinglibs ib_socket.
 if(USE_SHCA)
-  set(YLT_ENABLE_IBV OFF CACHE BOOL "Enable yalantinglibs ibverbs support" FORCE)
+  set(YLT_ENABLE_IBV
+      OFF
+      CACHE BOOL "Enable yalantinglibs ibverbs support" FORCE)
   add_compile_definitions(USE_SHCA)
 endif()
 
@@ -745,9 +878,22 @@ if(USE_FLAGCX)
       PROPERTIES IMPORTED_LOCATION "${FLAGCX_LIBRARY}"
                  INTERFACE_INCLUDE_DIRECTORIES "${FLAGCX_INCLUDE_DIR}")
   endif()
+  include_directories(${FLAGCX_INCLUDE_DIR})
   add_compile_definitions(USE_FLAGCX)
   message(
     STATUS
       "FlagCX transport enabled, include=${FLAGCX_INCLUDE_DIR}, library=${FLAGCX_LIBRARY}"
   )
+endif()
+
+if(USE_SHCA)
+  add_compile_definitions(USE_SHCA)
+elseif(YLT_ENABLE_IBV)
+  # YLT_ENABLE_IBV is set in FindYLT.cmake (OFF on macOS).
+  add_compile_definitions(YLT_ENABLE_IBV)
+endif()
+
+if(USE_HYLINK)
+  add_compile_definitions(USE_HYLINK)
+  message(STATUS "Hylink transport is enabled")
 endif()

@@ -32,11 +32,14 @@ readme = "README.md"   # local copy of ../README.md, materialized at build time 
 dependencies = ["aiohttp", "requests", "msgpack", "typing_extensions>=4.0; python_version < '3.10'"]
 # Single-line arrays: sed-substituted by scripts/build_wheel.sh for each variant.
 keywords = ["mooncake", "transfer engine", "kv cache", "llm inference", "rdma"]
-classifiers = ["Development Status :: 5 - Production/Stable", "Environment :: GPU :: NVIDIA CUDA", "Intended Audience :: Developers", "Intended Audience :: Science/Research", "License :: OSI Approved :: Apache Software License", "Operating System :: POSIX :: Linux", "Programming Language :: C++", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only", "Programming Language :: Python :: 3.10", "Programming Language :: Python :: 3.11", "Programming Language :: Python :: 3.12", "Programming Language :: Python :: 3.13", "Programming Language :: Python :: Implementation :: CPython", "Topic :: Scientific/Engineering :: Artificial Intelligence", "Topic :: System :: Distributed Computing"]
+classifiers = ["Development Status :: 5 - Production/Stable", "Environment :: GPU :: NVIDIA CUDA", "Intended Audience :: Developers", "Intended Audience :: Science/Research", "License :: OSI Approved :: Apache Software License", "Operating System :: POSIX :: Linux", "Programming Language :: C++", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only", "Programming Language :: Python :: 3.10", "Programming Language :: Python :: 3.11", "Programming Language :: Python :: 3.12", "Programming Language :: Python :: 3.13", "Programming Language :: Python :: 3.14", "Programming Language :: Python :: Implementation :: CPython", "Topic :: Scientific/Engineering :: Artificial Intelligence", "Topic :: System :: Distributed Computing"]
 dynamic = [ "version" ]
 
+[project.optional-dependencies]
+administration = ["paramiko"]
+
 [tool.mooncake]
-base-version = "0.3.13.post1"
+base-version = "0.3.14"
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
@@ -65,4 +68,4 @@ include = ["mooncake*"]
 
 [tool.setuptools.package-data]
 # *.co: Hygon HCU mc_copy_kernel (packaged only when present; built with -DUSE_HYGON=ON)
-mooncake = ["*.so", "*.co", "mooncake_master", "mooncake_client", "transfer_engine_bench"]
+mooncake = ["*.so", "*.co", "*.pyi", "py.typed", "mooncake_master", "mooncake_client", "transfer_engine_bench", "_pg_jit/*.cpp", "_pg_jit/*.h"]

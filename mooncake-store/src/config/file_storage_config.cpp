@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <locale>
 #include <sstream>
 #include <string>
@@ -9,6 +10,8 @@
 #include <unistd.h>
 
 #include "bool_parser.h"
+#include "config.h"
+#include "config/distributed_storage_config.h"
 #include "environ.h"
 #include "environment_variables.h"
 
@@ -36,6 +39,19 @@ double ParseDiskEvictionRatioOr(const std::string& raw_value,
     return value;
 }
 
+// FabricMem host allocations must be 1GiB-aligned. Zero and negative sizes
+// are left alone. A positive size that is already a multiple of 1GiB stays
+// unchanged; any other positive size rounds up to the next boundary.
+int64_t AlignUpToOneGiB(int64_t size) {
+    constexpr int64_t kOneGiB = static_cast<int64_t>(kGB);
+    if (size <= 0) return size;
+    const int64_t remainder = size % kOneGiB;
+    if (remainder == 0) return size;
+    const int64_t padding = kOneGiB - remainder;
+    if (size > std::numeric_limits<int64_t>::max() - padding) return size;
+    return size + padding;
+}
+
 bool ParseStrictBoolOr(const std::string& raw_value, bool default_value) {
     return TryParseBool(raw_value, {.token_set = BoolTokenSet::kTrueFalse,
                                     .trim_ascii_whitespace = false})
@@ -61,7 +77,6 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     } else if (storage_backend_descriptor == "distributed_storage_backend") {
         config.storage_backend_type = StorageBackendType::kDistributed;
-        config.enable_dfs = true;
     } else if (storage_backend_descriptor == "nvme_kv_storage_backend") {
         config.storage_backend_type = StorageBackendType::kNvmeKv;
     } else {
@@ -74,6 +89,11 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.local_buffer_size =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES,
                         config.local_buffer_size);
+    // FabricMem host allocations must be 1GiB-aligned. Round the resolved
+    // size up to that boundary. An aligned size stays unchanged.
+    if (globalConfig().ascend_use_fabric_mem) {
+        config.local_buffer_size = AlignUpToOneGiB(config.local_buffer_size);
+    }
 
     config.unified_buffer_size = Environ::ReadOr(
         Variables::MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES,
@@ -248,7 +268,11 @@ bool FileStorageConfig::ValidatePath(std::string path,
 bool FileStorageConfig::Validate() const {
     const bool require_storage_path_available =
         storage_backend_type != StorageBackendType::kDistributed;
-    if (!ValidatePath(storage_filepath, require_storage_path_available)) {
+    const bool uses_kvcs =
+        storage_backend_type == StorageBackendType::kDistributed &&
+        DistributedStorageConfig::FromEnvironment().UsesKvcs();
+    if (!uses_kvcs &&
+        !ValidatePath(storage_filepath, require_storage_path_available)) {
         return false;
     }
     if (total_keys_limit <= 0) {

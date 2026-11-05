@@ -328,7 +328,8 @@ tl::expected<QueryResult, ErrorCode> Client::PrepareDfsReadRetry(
     // The caller still owns buffers and session state based on the old query.
     // Only retry the same replica type, size and checksum view. If the caller
     // omitted a checksum, do not silently introduce one from a new query.
-    if (original.object_checksum != refreshed.object_checksum) {
+    if (original.object_checksum != refreshed.object_checksum ||
+        original.resolved_tenant_id != refreshed.resolved_tenant_id) {
         return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
     }
     for (const auto& replica : refreshed.replicas) {
@@ -340,7 +341,8 @@ tl::expected<QueryResult, ErrorCode> Client::PrepareDfsReadRetry(
             return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
         }
         return QueryResult({replica}, refreshed.lease_timeout,
-                           original.object_checksum);
+                           original.object_checksum,
+                           original.resolved_tenant_id);
     }
     return tl::unexpected(ErrorCode::DFS_STALE_HANDLE);
 }
@@ -457,6 +459,19 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             } else {
                 all_succeeded = false;
             }
+        }
+    }
+
+    // Count physical backend outcomes before the publication deadline can
+    // turn an otherwise successful write into a logical timeout.
+    if (auto* dfs_metric = GetDfsMetricPtr()) {
+        const auto successful_keys = static_cast<int64_t>(std::count(outcomes.begin(), outcomes.end(), ErrorCode::OK));
+        if (successful_keys > 0) {
+            dfs_metric->ObserveWrite(successful_keys, successful_bytes,
+                                     static_cast<uint64_t>(write_duration_seconds * 1e6));
+        }
+        for (auto outcome : outcomes) {
+            if (outcome != ErrorCode::OK) dfs_metric->RecordWriteErrors(toString(outcome));
         }
     }
 

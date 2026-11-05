@@ -13,6 +13,7 @@ USE_HIPCC=false
 USE_MCC=false
 USE_MACA=false
 CI_BUILD=false
+WITH_HYLINK=false
 
 if [[ "$1" == "--use-nvcc" ]]; then
     USE_NVCC=true
@@ -28,6 +29,12 @@ elif [[ "$1" == "--use-maca" ]]; then
     shift
 elif [[ "$1" == "--ci-build" ]]; then
     CI_BUILD=true
+    shift
+fi
+
+# Optional feature flags may follow the compiler flag.
+if [[ "$1" == "--with-hylink" ]]; then
+    WITH_HYLINK=true
     shift
 fi
 
@@ -48,9 +55,11 @@ elif [ "$USE_NVCC" = true ]; then
     # Regular nvcc build with cuda linking
     nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -lcuda -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1
 elif [ "$USE_HIPCC" = true ]; then
+    HIPCC_DEFINES="-DUSE_HIP=1"
+    [ "$WITH_HYLINK" = true ] && HIPCC_DEFINES="$HIPCC_DEFINES -DUSE_HYLINK=1"
     hipify-perl "$CPP_FILE" > "${OUTPUT_DIR}/nvlink_allocator.cpp"
     HIPCC_ERR=$(mktemp)
-    if ! hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} -DUSE_HIP=1 -DUSE_HYGON=1 >"$HIPCC_ERR" 2>&1; then
+    if ! hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} ${HIPCC_DEFINES} -DUSE_HYGON=1 >"$HIPCC_ERR" 2>&1; then
         grep -vE 'amdhip64|libamdhip64' "$HIPCC_ERR" >&2 || true
         rm -f "$HIPCC_ERR"
         echo "Failed to build nvlink_allocator.so (HIP link error)"

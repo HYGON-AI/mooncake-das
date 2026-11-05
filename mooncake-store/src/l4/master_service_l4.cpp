@@ -1,77 +1,21 @@
 #include "master_service.h"
+#include "master_metric_manager.h"
+#include "environ.h"
+#include "config/distributed_storage_config.h"
+#include "random.h"
 #include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/dfs_log_limiter.h"
-
-#include <algorithm>
-#include <array>
-#include <algorithm>
-#include <atomic>
-#include <bitset>
-#include <cassert>
-#include <cerrno>
-#include <cctype>
-#include <chrono>
-#include <cmath>
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <future>
-#include <filesystem>
-#include <limits>
-#include <set>
-#include <shared_mutex>
-#include <sstream>
-#include <stdexcept>
-#include <thread>
-#include <tuple>
-#include <regex>
-#include <unordered_set>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <fcntl.h>
-#include <ylt/util/tl/expected.hpp>
-#include <boost/algorithm/string.hpp>
-
-#include "http_metadata_server.h"
-#include "master_metric_manager.h"
-#include "common.h"
-#include "environ.h"
-#include "environment_variables.h"
-#include "segment.h"
-#ifdef USE_HTTP
-#include "transfer_metadata_plugin.h"
-#endif
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
-#ifdef STORE_USE_ETCD
-#include "etcd_helper.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
-#endif
-#include "ha/oplog/oplog_batch_storage.h"
-#include "ha/oplog/ordered_oplog_writer.h"
-#include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
-#include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
-#include "ha/snapshot/object/snapshot_object_store.h"
-#include "ha/snapshot/snapshot_constants.h"
-#include "types.h"
-#include "serialize/serializer.h"
-#include "ha/snapshot/snapshot_logger.h"
-#include "utils/zstd_util.h"
-#include "utils/file_util.h"
-#include "storage/distributed/immutable_bucket_allocator.h"
-#include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
-#include "storage/distributed/distributed_storage_backend.h"
-#include "random.h"
-#include "utils.h"
-#include "kv_event/kv_event_config.h"
-#include "master_snapshot_manager.h"
-#include "master_snapshot_repository.h"
-#include "ha_metric_manager.h"
-#include "metadata_store.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
+#include "storage/distributed/shard_allocator.h"
+#include <algorithm>
+#include <cerrno>
+#include <filesystem>
+#include <fstream>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace mooncake {
 
@@ -407,8 +351,7 @@ void MasterService::DfsAllocatorRetryThreadFunc() {
             MasterServiceConfig retry_config;
             // The runtime snapshot policy is fixed at construction. Retry the
             // same configured allocator against the current DFS environment.
-            retry_config.enable_snapshot = !dfs_restore_from_bucket_metadata_;
-            retry_config.enable_snapshot_restore = false;
+            retry_config.enable_ha = !dfs_restore_from_bucket_metadata_;
             const DfsInitResult result =
                 InitDfsAllocatorFromEnvironment(retry_config);
             if (result != DfsInitResult::kRetryableFailure) break;
@@ -472,39 +415,28 @@ bool MasterService::InitializeDfsRootGuard(const std::string& root,
 
 size_t MasterService::DropDfsReplicasAfterRootReplacement() {
     size_t removed_replicas = 0;
-    for (size_t shard_index = 0; shard_index < kNumShards; ++shard_index) {
-        MetadataShardAccessorRW shard(this, shard_index);
-        for (auto& [tenant_id, tenant_state] : shard->tenants) {
-            for (auto it = tenant_state.metadata.begin();
-                 it != tenant_state.metadata.end();) {
-                auto& metadata = it->second;
-                const size_t removed = EraseReplicasWithCacheTotalAccounting(
-                    metadata, [](const Replica& replica) {
-                        return replica.is_dfs_replica();
-                    });
-                if (removed == 0) {
-                    ++it;
-                    continue;
-                }
-                removed_replicas += removed;
-                const std::string key = it->first;
-                if (!metadata.IsValid()) {
-                    PublishKvRemoved(key, metadata, tenant_id);
-                    it = EraseMetadata(tenant_state, it, tenant_id,
-                                       QuotaEraseMode::kFull, &shard);
-                    continue;
-                }
-                if (metadata.HasReplica([](const Replica& replica) {
-                        return replica.is_memory_replica() &&
-                               replica.is_completed() &&
-                               !replica.has_invalid_mem_handle();
-                    })) {
-                    tenant_state.dfs_backfill[key] = {};
-                }
-                ++it;
+    VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
+        std::vector<route::ObjectRef> objects;
+        for (auto object : ns.objects.ReadCursor()) objects.push_back(object.ref());
+        for (const auto& ref : objects) {
+            MetadataAccessorRW accessor(this, tenant_id, ref);
+            if (!accessor.IsPublished()) continue;
+            auto& metadata = accessor.Get();
+            const auto previous_media = KvMediaSnapshot(metadata);
+            const auto removed = EraseReplicasWithCacheTotalAccounting(
+                metadata, [](const Replica& replica) { return replica.is_dfs_replica(); });
+            removed_replicas += removed;
+            if (!removed) continue;
+            if (!metadata.IsValid()) {
+                accessor.Erase();
+            } else {
+                // A prior completed DFS replica may already have consumed its
+                // backfill candidate. This lost generation needs a fresh one.
+                if (!accessor.GetState().dfs_backfill) ScheduleDfsBackfill(accessor);
+                SyncKvObjectState(ref.key, metadata, tenant_id, previous_media);
             }
         }
-    }
+    });
     return removed_replicas;
 }
 
@@ -522,7 +454,7 @@ bool MasterService::RecoverDfsRootAfterReplacement(
     } recovery_flag_reset{dfs_root_recovery_in_progress_};
 
     // Everything through allocator construction and guard publication is
-    // deliberately outside snapshot_mutex_. DFS publication is gated by
+    // deliberately outside master_state_mutex_. DFS publication is gated by
     // dfs_root_recovery_in_progress_, while L3-only metadata requests remain
     // available throughout slow DFS inspection and bucket creation.
     const std::string identity_path = root + "/" + kDfsRootIdentityFileName;
@@ -666,7 +598,7 @@ bool MasterService::RecoverDfsRootAfterReplacement(
         // The commit barrier excludes metadata requests only while DFS replicas
         // are removed and the fully initialized allocator generation is
         // published. No DFS filesystem I/O or bucket creation occurs here.
-        std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         if (root_lost_data) {
             removed_replicas = DropDfsReplicasAfterRootReplacement();
 
@@ -888,30 +820,11 @@ tl::expected<uint8_t, ErrorCode> MasterService::SetDfsFilterMode(
 }
 
 bool MasterService::IsReplicaReadableForGet(const Replica& replica) const {
-    if (!replica.is_completed() || replica.is_eviction_pending() ||
-        replica.has_invalid_mem_handle() || replica.has_invalid_nof_handle()) {
-        return false;
-    }
-    // Get may read DFS replicas while the existence filter is enabled, but a
-    // disabled DFS root cannot serve its old bucket generation. Keep those
-    // replicas hidden from Get throughout root recovery (including retries).
-    if (replica.is_dfs_replica() &&
-        (!enable_dfs_.load(std::memory_order_acquire) ||
-         dfs_root_recovery_in_progress_.load(std::memory_order_acquire))) {
-        return false;
-    }
-    const auto descriptor = replica.get_descriptor();
-    std::optional<std::string> endpoint;
-    if (descriptor.is_memory_replica()) {
-        endpoint = descriptor.get_memory_descriptor()
-                       .buffer_descriptor.transport_endpoint_;
-    } else if (descriptor.is_nof_replica()) {
-        endpoint = descriptor.get_nof_descriptor()
-                       .buffer_descriptor.transport_endpoint_;
-    } else if (descriptor.is_local_disk_replica()) {
-        endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
-    }
-    return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
+    if (!replica.is_completed() || !replica.is_available() ||
+        replica.is_eviction_pending() || IsAwaitingRemount(replica)) return false;
+    return !replica.is_dfs_replica() ||
+           (enable_dfs_.load(std::memory_order_acquire) &&
+            !dfs_root_recovery_in_progress_.load(std::memory_order_acquire));
 }
 
 std::unordered_map<std::string, MasterService::DfsBatchReservation>
@@ -1058,146 +971,87 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::DfsBackfillStart(
     const std::string& src_segment, const UUID& task_id) {
     auto tenant = ResolveTenantIdForWrite(tenant_id);
     if (!tenant) return tl::make_unexpected(tenant.error());
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto record = FindClientRecord(client_id);
+    auto retaining_guard = record ? record->TryAcquireRetainingGuard() : std::nullopt;
+    if (!retaining_guard) return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
     MetadataAccessorRW accessor(this, ObjectIdentity{*tenant, key});
-    if (!accessor.Exists()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    auto& state = accessor.GetTenantState();
-    auto candidate = state.dfs_backfill.find(key);
-    if (candidate == state.dfs_backfill.end() || task_id == UUID{} ||
-        candidate->second.task_id != task_id) {
+    if (!accessor.Exists()) return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    auto& state = accessor.GetState();
+    if (!state.dfs_backfill || task_id == UUID{} || state.dfs_backfill->task_id != task_id)
         return tl::make_unexpected(ErrorCode::INVALID_VERSION);
-    }
     auto assignment = task_manager_.get_read_access().find_task_by_id(task_id);
     if (!assignment || assignment->assigned_client != client_id ||
-        assignment->type != TaskType::DFS_BACKFILL ||
-        assignment->status != TaskStatus::PROCESSING) {
+        assignment->type != TaskType::DFS_BACKFILL || assignment->status != TaskStatus::PROCESSING)
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
-    }
     auto& metadata = accessor.Get();
-    if (accessor.InProcessing() || accessor.HasReplicationTask() ||
-        state.dynamic_replication_pending.contains(key)) {
+    if (accessor.InProcessing() || accessor.HasReplicationTask() || state.dynamic_replication_pending)
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    }
-    if (metadata.HasReplica(&Replica::is_dfs_replica)) {
-        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-    }
+    if (metadata.HasReplica(&Replica::is_dfs_replica)) return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     auto source = metadata.GetReplicaBySegmentName(src_segment);
     UUID owner;
-    if (!source || !source->is_memory_replica() || !source->is_completed() ||
-        source->has_invalid_mem_handle() ||
-        segment_manager_.getSegmentAccess().GetClientIdBySegmentName(
-            src_segment, owner) != ErrorCode::OK || owner != client_id) {
+    if (!source || !source->is_memory_replica() || !source->is_completed() || !source->is_available() ||
+        segment_manager_.getSegmentAccess().GetClientIdBySegmentName(src_segment, owner) != ErrorCode::OK || owner != client_id)
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
-    }
     if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0 ||
-        dfs_root_recovery_in_progress_.load(std::memory_order_acquire)) {
+        dfs_root_recovery_in_progress_.load(std::memory_order_acquire))
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized())
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    }
-    auto allocated = dfs_allocator_->Allocate(key, metadata.size);
+    auto allocated = dfs_allocator_->Allocate(key, metadata.GetPart(0).length());
     if (!allocated) return tl::make_unexpected(allocated.error());
     std::vector<Replica> replicas;
     replicas.emplace_back(std::move(*allocated), ReplicaStatus::PROCESSING);
     CopyStartResponse response;
     response.source = source->get_descriptor();
     response.targets.push_back(replicas.front().get_descriptor());
-    state.replication_tasks.emplace(
-        key, ReplicationTask{client_id, std::chrono::system_clock::now(),
-                             ReplicationTask::Type::COPY, source->id(),
-                             {replicas.front().id()}, 0, task_id, 0});
+    state.replication_task.emplace(ReplicationTask{
+        client_id, std::chrono::system_clock::now(), ReplicationTask::Type::COPY,
+        source->id(), {replicas.front().id()}, task_id, 0, false});
     source->inc_refcnt();
     metadata.AddReplicas(std::move(replicas));
     return response;
 }
 
 void MasterService::RestoreRecoveredDfsReplicas(bool rebuild_metadata) {
-    if (bucket_allocator_ == nullptr) return;
-
-    auto recovered = bucket_allocator_->TakeRecoveredReplicas();
-    if (recovered.empty()) return;
-
-    const TenantId tenant_id = TenantId::Default();
+    auto* allocator = bucket_allocator_.get();
+    if (!allocator) return;
+    auto recovered = allocator->TakeRecoveredReplicas();
+    std::vector<ImmutableBucketAllocator::RecoveredReplica> stale;
     size_t restored = 0;
-    size_t superseded = 0;
-    const size_t candidates = recovered.size();
-    size_t preserved_live = 0;
-
     if (rebuild_metadata) {
-        std::vector<ImmutableBucketAllocator::RecoveredReplica>
-            stale_recovered;
-        std::unordered_map<size_t, std::vector<size_t>> indices_by_shard;
-        for (size_t i = 0; i < recovered.size(); ++i) {
-            indices_by_shard[getMetadataShardIndex(tenant_id,
-                                                   recovered[i].key)]
-                .push_back(i);
-        }
-
-        for (auto& [shard_idx, indices] : indices_by_shard) {
-            MetadataShardAccessorRW shard(this, shard_idx);
-            auto& tenant_state = shard->tenants[tenant_id];
-            for (const size_t i : indices) {
-                auto& entry = recovered[i];
-                auto existing = tenant_state.metadata.find(entry.key);
-                if (existing != tenant_state.metadata.end()) {
-                    const auto& metadata = existing->second;
-                    const bool installed_by_this_recovery =
-                        metadata.client_id == UUID{0, 0} &&
-                        metadata.CountReplicas() == 1 &&
-                        metadata.HasReplica(&Replica::fn_is_dfs_replica);
-                    if (installed_by_this_recovery) {
-                        tenant_state.metadata.erase(existing);
-                        ++superseded;
-                    } else {
-                        // A retry can race with a successful memory-only write.
-                        // Keep the live value and tombstone only the stale DFS
-                        // extent after releasing all metadata shard locks.
-                        ++preserved_live;
-                        static DfsLogLimiter log_limiter;
-                        if (auto suppressed = log_limiter.ShouldLog()) {
-                            LOG(WARNING)
-                                << "Skipping stale DFS recovery for key="
-                                << entry.key
-                                << ": live metadata already present, recovered "
-                                   "extent tombstoned, suppressed="
-                                << *suppressed;
-                        }
-                        stale_recovered.push_back(std::move(entry));
-                        continue;
-                    }
+        const TenantId tenant = TenantId::Default();
+        std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+        for (auto& entry : recovered) {
+            MetadataAccessorRW accessor(this, {tenant, entry.key},
+                MetadataAccessorRW::CreateKey{.cleanup_invalid = false});
+            if (accessor.IsPublished()) {
+                const auto& metadata = accessor.Get();
+                if (metadata.client_id == UUID{} && metadata.CountReplicas() == 1 &&
+                    metadata.HasReplica(&Replica::fn_is_dfs_replica)) {
+                    accessor.Erase();
+                } else {
+                    stale.push_back(std::move(entry));
+                    continue;
                 }
-
-                const uint64_t object_size = entry.descriptor.object_size;
-                std::vector<Replica> replicas;
-                replicas.emplace_back(entry.descriptor,
-                                      ReplicaStatus::COMPLETE);
-                tenant_state.metadata.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(entry.key),
-                    std::forward_as_tuple(
-                        UUID{0, 0}, std::chrono::system_clock::now(),
-                        object_size, std::move(replicas), std::nullopt,
-                        /*enable_hard_pin=*/false, ObjectDataType::UNKNOWN,
-                        std::string(), tenant_id, entry.key));
-                ++restored;
             }
-        }
-
-        // Never nest allocator and metadata-shard locks.
-        for (const auto& entry : stale_recovered) {
-            bucket_allocator_->Free(entry.key, entry.descriptor);
+            if (!accessor.Grow(0)) {
+                stale.push_back(std::move(entry));
+                continue;
+            }
+            std::vector<Replica> replicas;
+            replicas.emplace_back(entry.descriptor, ReplicaStatus::COMPLETE);
+            accessor.Publish(UUID{}, std::chrono::system_clock::now(),
+                entry.descriptor.object_size, std::move(replicas), std::nullopt,
+                false, ObjectDataType::UNKNOWN, std::string(), tenant, entry.key);
+            ++restored;
         }
     }
-
-    LOG(INFO) << "Restored " << restored
-              << " DFS replicas from bucket metadata (" << candidates
-              << " candidates, " << superseded
-              << " superseded, " << preserved_live
-              << " live entries preserved, metadata_rebuilt="
-              << (rebuild_metadata ? "true" : "false") << ")";
+    // Tombstone stale extents after every key and the state barrier are released.
+    for (const auto& entry : stale) allocator->Free(entry.key, entry.descriptor);
+    LOG(INFO) << "Restored " << restored << " DFS replicas from bucket metadata ("
+              << recovered.size() << " candidates, " << stale.size()
+              << " live entries preserved, metadata_rebuilt=" << rebuild_metadata << ")";
 }
 
 UUID MasterService::GetDfsMasterEpoch() const {
@@ -1213,7 +1067,7 @@ auto MasterService::GetDfsBucketSnapshot(
     const UUID& client_id, const UUID& last_epoch, uint64_t last_version)
     -> tl::expected<DfsBucketSnapshotResponse, ErrorCode> {
     (void)client_id;
-    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
     const UUID current_epoch = GetDfsMasterEpoch();
     if (current_epoch == UUID{} || bucket_allocator_ == nullptr) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
@@ -1238,73 +1092,65 @@ auto MasterService::GetDfsBucketSnapshot(
     return response;
 }
 
+void MasterService::ScheduleDfsBackfill(MetadataAccessorRW& accessor) {
+    if (accessor.GetState().dfs_backfill) return;
+    accessor.GetState().dfs_backfill.emplace();
+    std::lock_guard lock(dfs_backfill_mutex_);
+    dfs_backfill_candidates_.push_back({accessor.GetTenantId(), accessor.GetRef()});
+}
+
 void MasterService::RunDfsBackfill() {
     if ((dfs_filter_mode_.load(std::memory_order_acquire) & 1) != 0 ||
         dfs_root_recovery_in_progress_.load(std::memory_order_acquire) ||
-        !dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
-        return;
+        !dfs_allocator_ || !dfs_allocator_->IsInitialized()) return;
+    size_t count;
+    {
+        std::lock_guard lock(dfs_backfill_mutex_);
+        count = std::min<size_t>(256, dfs_backfill_candidates_.size());
     }
-    // Bound recovery traffic and rotate shards so a large degraded workload
-    // cannot monopolize scheduling. Failed attempts wait before reallocation.
-    constexpr size_t kBatchSize = 256;
-    size_t attempted = 0;
     const auto now = std::chrono::steady_clock::now();
-    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
-    for (size_t visited = 0; visited < kNumShards; ++visited) {
-        const size_t index = dfs_backfill_shard_;
-        dfs_backfill_shard_ = (dfs_backfill_shard_ + 1) % kNumShards;
-        MetadataShardAccessorRW shard(this, index);
-        for (auto& [tenant_id, state] : shard->tenants) {
-            for (auto it = state.dfs_backfill.begin();
-                 it != state.dfs_backfill.end();) {
-                auto object = state.metadata.find(it->first);
-                if (object == state.metadata.end() ||
-                    object->second.HasReplica([](const Replica& replica) {
-                        return replica.is_dfs_replica() &&
-                               replica.is_completed();
-                    })) {
-                    it = state.dfs_backfill.erase(it);
-                    continue;
-                }
-                auto& retry = it->second;
-                auto& metadata = object->second;
-                const auto& key = it->first;
-                ++it;
-                if (retry.retry_after > now ||
-                    state.processing_keys.contains(key) ||
-                    state.replication_tasks.contains(key) ||
-                    metadata.HasReplica(&Replica::is_dfs_replica)) continue;
-                if (retry.task_id != UUID{}) {
-                    auto task = task_manager_.get_read_access()
-                                    .find_task_by_id(retry.task_id);
-                    if (task && !task->is_finished()) continue;
-                }
-                retry.retry_after = now + std::chrono::seconds(5);
-                ++attempted;
-                const auto sources = metadata.GetReplicaSegmentNames();
-                for (const auto& source : sources) {
-                    auto replica = metadata.GetReplicaBySegmentName(source);
-                    if (!replica || !replica->is_memory_replica() ||
-                        !replica->is_completed() ||
-                        replica->has_invalid_mem_handle()) continue;
-                    UUID owner;
-                    if (segment_manager_.getSegmentAccess()
-                            .GetClientIdBySegmentName(source, owner) !=
-                        ErrorCode::OK) continue;
-                    auto task = task_manager_.get_write_access()
-                                    .submit_task_typed<TaskType::DFS_BACKFILL>(
-                                        owner, {tenant_id.value(), key, source});
-                    if (task) {
-                        retry.task_id = *task;
-                    } else if (task.error() ==
-                               ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
-                        // Capacity is global: scanning more keys cannot help.
-                        return;
-                    }
-                    break;
-                }
-                if (attempted >= kBatchSize) return;
-            }
+    std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+    for (size_t i = 0; i < count; ++i) {
+        DfsBackfillCandidate candidate;
+        {
+            std::lock_guard queue_lock(dfs_backfill_mutex_);
+            candidate = std::move(dfs_backfill_candidates_.front());
+            dfs_backfill_candidates_.pop_front();
+        }
+        MetadataAccessorRW accessor(this, candidate.tenant_id, candidate.ref);
+        if (!accessor.IsPublished() || !accessor.GetState().dfs_backfill) continue;
+        auto& metadata = accessor.Get();
+        auto& state = accessor.GetState();
+        if (metadata.HasReplica([](const Replica& replica) {
+                return replica.is_dfs_replica() && replica.is_completed();
+            })) {
+            state.dfs_backfill.reset();
+            continue;
+        }
+        // Requeue only this publication; a recreated key never inherits its task.
+        {
+            std::lock_guard queue_lock(dfs_backfill_mutex_);
+            dfs_backfill_candidates_.push_back(candidate);
+        }
+        auto& retry = *state.dfs_backfill;
+        if (retry.retry_after > now || state.is_processing || state.replication_task ||
+            metadata.HasReplica(&Replica::is_dfs_replica)) continue;
+        if (retry.task_id != UUID{}) {
+            auto task = task_manager_.get_read_access().find_task_by_id(retry.task_id);
+            if (task && !task->is_finished()) continue;
+        }
+        retry.retry_after = now + std::chrono::seconds(5);
+        for (const auto& source : metadata.GetReplicaSegmentNames()) {
+            auto replica = metadata.GetReplicaBySegmentName(source);
+            UUID owner;
+            if (!replica || !replica->is_memory_replica() || !replica->is_completed() ||
+                !replica->is_available() || segment_manager_.getSegmentAccess()
+                .GetClientIdBySegmentName(source, owner) != ErrorCode::OK) continue;
+            auto task = task_manager_.get_write_access().submit_task_typed<TaskType::DFS_BACKFILL>(
+                owner, {candidate.tenant_id.value(), candidate.ref.key, source});
+            if (task) retry.task_id = *task;
+            else if (task.error() == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) return;
+            break;
         }
     }
 }

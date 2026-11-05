@@ -2,6 +2,7 @@
 #include "storage_backend.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -24,11 +25,10 @@
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
-#include "nvme_kv_backend.h"
-#include "utils.h"
+#include "nvme_kv/backend.h"
+#include "common/timestamp.h"
+#include "common/file_util.h"
 #include "crc32c.h"
-#include "ascii_string.h"
-#include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -51,226 +51,19 @@ struct FdGuard {
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/kvcs/kvcs_object_storage_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#ifdef HAVE_OSS_ADAPTER
+#include "storage/distributed/oss_adapter.h"
+#endif
+#ifdef HAVE_S3_ADAPTER
+#include "storage/distributed/s3_adapter.h"
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
 
 namespace mooncake {
-
-namespace {
-
-struct OffsetAllocatorBackendEnvironmentVariables {
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetEvictionPolicy{"MOONCAKE_OFFSET_EVICTION_POLICY"};
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetHighRatio{"MOONCAKE_OFFSET_HIGH_RATIO"};
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetLowRatio{"MOONCAKE_OFFSET_LOW_RATIO"};
-    inline static constexpr EnvironmentVariable<int64_t>
-        kMooncakeOffsetMaxCapacityNodes{"MOONCAKE_OFFSET_MAX_CAPACITY_NODES"};
-    inline static constexpr EnvironmentVariable<int64_t>
-        kMooncakeOffsetMaxEvictPerOffload{
-            "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD"};
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetPersistMode{"MOONCAKE_OFFSET_PERSIST_MODE"};
-    inline static constexpr EnvironmentVariable<int64_t>
-        kMooncakeOffsetPersistIntervalSeconds{
-            "MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS"};
-    inline static constexpr EnvironmentVariable<bool> kMooncakeOffsetRecordCrc{
-        "MOONCAKE_OFFSET_RECORD_CRC"};
-};
-
-}  // namespace
-
-bool FilePerKeyConfig::Validate() const {
-    if (fsdir.empty()) {
-        LOG(ERROR) << "FilePerKeyConfig: fsdir is invalid";
-        return false;
-    }
-    return true;
-}
-
-bool BucketBackendConfig::Validate() const {
-    if (bucket_keys_limit <= 0) {
-        LOG(ERROR) << "BucketBackendConfig: bucket_keys_limit must > 0";
-        return false;
-    }
-    if (bucket_size_limit <= 0) {
-        LOG(ERROR) << "BucketBackendConfig: bucket_size_limit must > 0";
-        return false;
-    }
-    return true;
-}
-
-FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
-    FilePerKeyConfig config;
-
-    config.fsdir = Environ::GetString("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
-
-    config.enable_eviction = Environ::GetBool(
-        "MOONCAKE_OFFLOAD_ENABLE_EVICTION",
-        Environ::GetBool("ENABLE_EVICTION", config.enable_eviction));
-
-    return config;
-}
-
-BucketBackendConfig BucketBackendConfig::FromEnvironment() {
-    BucketBackendConfig config;
-
-    config.bucket_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
-
-    config.bucket_size_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
-
-    config.max_total_size =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
-                          Environ::GetInt64("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
-                                            config.max_total_size));
-
-    config.max_physical_bytes =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES",
-                          config.max_physical_bytes);
-
-    config.disk_scan_cache_ms =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS",
-                          config.disk_scan_cache_ms);
-
-    const auto policy_str = Environ::GetString(
-        "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
-        Environ::GetString("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
-    if (policy_str == "fifo") {
-        config.eviction_policy = BucketEvictionPolicy::FIFO;
-    } else if (policy_str == "lru") {
-        config.eviction_policy = BucketEvictionPolicy::LRU;
-    } else {
-        config.eviction_policy = BucketEvictionPolicy::NONE;
-    }
-
-    return config;
-}
-
-bool OffsetAllocatorBackendConfig::Validate() const {
-    if (persist_mode == OffsetPersistMode::kRelaxed) {
-        if (persist_interval_seconds < 5) {
-            LOG(ERROR) << "OffsetAllocatorBackendConfig: "
-                          "persist_interval_seconds must be >= 5 for "
-                          "kRelaxed mode";
-            return false;
-        }
-    }
-    if (high_ratio <= 0.0 || high_ratio > 1.0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: high_ratio must be in (0,1]";
-        return false;
-    }
-    if (low_ratio <= 0.0 || low_ratio >= high_ratio) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: low_ratio must be in (0, "
-                      "high_ratio)";
-        return false;
-    }
-    if (keys_high_ratio <= 0.0 || keys_high_ratio > 1.0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: keys_high_ratio must be in (0,1]";
-        return false;
-    }
-    if (keys_low_ratio <= 0.0 || keys_low_ratio >= keys_high_ratio) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: keys_low_ratio must be in "
-                      "(0, keys_high_ratio)";
-        return false;
-    }
-    if (max_evict_per_offload == 0) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: max_evict_per_offload "
-                      "must be > 0";
-        return false;
-    }
-    if (fallback_evict_batch == 0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: fallback_evict_batch must be > 0";
-        return false;
-    }
-    if (max_capacity_nodes < 0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: max_capacity_nodes must be >= 0";
-        return false;
-    }
-    return true;
-}
-
-OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
-    OffsetAllocatorBackendConfig cfg;
-    using Variables = OffsetAllocatorBackendEnvironmentVariables;
-
-    const auto policy = Environ::Read(Variables::kMooncakeOffsetEvictionPolicy);
-    if (policy.has_value()) {
-        if (AsciiCaseInsensitiveEquals(*policy, "fifo")) {
-            cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
-        }
-        // NONE is default; LRU reserved for phase 2
-    }
-
-    constexpr EnvironmentDoubleParseOptions kLegacyRatioParsing{
-        .allow_trailing_characters = true,
-        .allow_non_finite = true,
-    };
-    if (const auto value = Environ::Read(Variables::kMooncakeOffsetHighRatio)) {
-        cfg.high_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
-                             .value_or(cfg.high_ratio);
-    }
-    if (const auto value = Environ::Read(Variables::kMooncakeOffsetLowRatio)) {
-        cfg.low_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
-                            .value_or(cfg.low_ratio);
-    }
-    // Both byte and key watermarks derive from the same ratio pair.
-    cfg.keys_high_ratio = cfg.high_ratio;
-    cfg.keys_low_ratio = cfg.low_ratio;
-
-    cfg.max_capacity_nodes = Environ::ReadOr(
-        Variables::kMooncakeOffsetMaxCapacityNodes, cfg.max_capacity_nodes);
-
-    // Read eviction cap as int64_t to guard against negative env values
-    // which would wrap to SIZE_MAX with an unsigned parser.
-    auto max_evict_raw =
-        Environ::ReadOr(Variables::kMooncakeOffsetMaxEvictPerOffload,
-                        static_cast<int64_t>(cfg.max_evict_per_offload));
-    if (max_evict_raw > 0) {
-        cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
-    } else if (max_evict_raw <= 0) {
-        LOG(WARNING) << "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD="
-                     << max_evict_raw << " is non-positive; using default "
-                     << cfg.max_evict_per_offload;
-    }
-
-    // Persistence mode
-    const auto persist = Environ::Read(Variables::kMooncakeOffsetPersistMode);
-    if (persist.has_value()) {
-        const std::string& s = *persist;
-        if (AsciiCaseInsensitiveEquals(s, "disabled")) {
-            cfg.persist_mode = OffsetPersistMode::kDisabled;
-        } else if (AsciiCaseInsensitiveEquals(s, "relaxed")) {
-            cfg.persist_mode = OffsetPersistMode::kRelaxed;
-        } else if (AsciiCaseInsensitiveEquals(s, "strict")) {
-            cfg.persist_mode = OffsetPersistMode::kStrict;
-        } else {
-            LOG(WARNING) << "Unknown MOONCAKE_OFFSET_PERSIST_MODE=" << s
-                         << "; using default (disabled)";
-        }
-    }
-
-    cfg.persist_interval_seconds =
-        Environ::ReadOr(Variables::kMooncakeOffsetPersistIntervalSeconds,
-                        cfg.persist_interval_seconds);
-
-    // Record CRC-32C: "0"/"false"/"off" disables per-record checksums.
-    if (const auto record_crc =
-            Environ::Read(Variables::kMooncakeOffsetRecordCrc);
-        record_crc.has_value() && !*record_crc) {
-        cfg.enable_record_crc = false;
-    }
-
-    return cfg;
-}
 
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
@@ -344,23 +137,7 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                    << e.what();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    std::sort(existing_files.begin(), existing_files.end(),
-              [](const auto& a, const auto& b) {
-                  struct statx stx_a, stx_b;
-                  bool success_a = (statx(AT_FDCWD, a.path().c_str(), 0,
-                                          STATX_BTIME, &stx_a) == 0);
-                  bool success_b = (statx(AT_FDCWD, b.path().c_str(), 0,
-                                          STATX_BTIME, &stx_b) == 0);
-
-                  if (!success_a || !success_b) {
-                      return false;
-                  }
-
-                  if (stx_a.stx_btime.tv_sec == stx_b.stx_btime.tv_sec) {
-                      return stx_a.stx_btime.tv_nsec < stx_b.stx_btime.tv_nsec;
-                  }
-                  return stx_a.stx_btime.tv_sec < stx_b.stx_btime.tv_sec;
-              });
+    FileUtil::SortByCreationTime(existing_files);
     bool eviction_needed = false;
     {
         std::unique_lock<std::shared_mutex> space_lock(space_mutex_);
@@ -579,8 +356,57 @@ tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
     return evicted_keys;
 }
 
+tl::expected<void, ErrorCode> StorageBackendInterface::BatchLoadSpans(
+    std::unordered_map<std::string, StorageValueSpan>& spans) {
+    bool partial = false;
+    std::unordered_map<std::string, Slice> full;
+    full.reserve(spans.size());
+    for (const auto& [key, span] : spans) {
+        if (span.offset != 0 ||
+            (span.object_size != 0 && span.object_size != span.slice.size)) {
+            partial = true;
+            break;
+        }
+        full.emplace(key, span.slice);
+    }
+    if (!partial) {
+        auto loaded = BatchLoad(full);
+        if (!loaded) return loaded;
+        for (auto& [key, slice] : full) {
+            spans.at(key).slice.ptr = slice.ptr;
+        }
+        return {};
+    }
+
+    // Backends without a seek override still return the requested window.
+    // They read the whole value first; bucket and offset-allocator overrides
+    // avoid that.
+    for (auto& [key, span] : spans) {
+        if (span.slice.ptr == nullptr || span.object_size == 0 ||
+            span.offset > span.object_size ||
+            span.slice.size > span.object_size - span.offset) {
+            LOG(ERROR) << "Invalid value span for key: " << key;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::vector<char> object(static_cast<size_t>(span.object_size));
+        std::unordered_map<std::string, Slice> one{
+            {key, Slice{object.data(), object.size()}}};
+        auto loaded = BatchLoad(one);
+        if (!loaded) return loaded;
+        std::memcpy(span.slice.ptr,
+                    static_cast<const char*>(one.at(key).ptr) + span.offset,
+                    span.slice.size);
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
-    const std::string& path, std::vector<Slice>& slices, int64_t length) {
+    const std::string& path, std::vector<Slice>& slices, int64_t length,
+    int64_t file_offset) {
+    if (file_offset < 0) {
+        LOG(ERROR) << "Negative file offset for: " << path;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
@@ -588,7 +414,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    off_t current_offset = 0;
+    off_t current_offset = static_cast<off_t>(file_offset);
     int64_t total_bytes_processed = 0;
 
     std::vector<iovec> iovs_chunk;
@@ -684,14 +510,9 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
 
 void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
-    // TODO: attention: this function is not thread-safe, need to add lock if
-    // used in multi-thread environment Check if the file exists before
-    // attempting to remove it
-    // TODO: add a sleep to ensure the write thread has time to create the
-    // corresponding file it will be fixed in the next version
-    std::this_thread::sleep_for(
-        std::chrono::microseconds(50));  // sleep for 50 us
-
+    // StoreObject holds the same striped path lock across file creation, write,
+    // and queue insertion. Acquiring it here serializes deletion with those
+    // operations without relying on a timing delay.
     MutexLocker path_locker(&GetFilePathMutex(path));
 
     // Eviction disabled, use simple delete (no queue tracking)
@@ -1098,6 +919,11 @@ FileRecord StorageBackend::PopFileToEvictByFIFO() {
 }
 
 void StorageBackend::RestoreFileToWriteQueueFront(const FileRecord& record) {
+    RestoreFileToWriteQueue(record, true);
+}
+
+void StorageBackend::RestoreFileToWriteQueue(const FileRecord& record,
+                                             bool to_front) {
     if (record.path.empty()) {
         return;
     }
@@ -1110,8 +936,10 @@ void StorageBackend::RestoreFileToWriteQueueFront(const FileRecord& record) {
         if (file_queue_map_.find(record.path) != file_queue_map_.end()) {
             was_replaced = true;
         } else {
-            file_write_queue_.push_front(record);
-            file_queue_map_[record.path] = file_write_queue_.begin();
+            const auto position =
+                to_front ? file_write_queue_.begin() : file_write_queue_.end();
+            file_queue_map_[record.path] =
+                file_write_queue_.insert(position, record);
         }
     }
 
@@ -1314,11 +1142,56 @@ StorageBackend::EvictAboveDiskWatermark(
     if (eviction_handler && !evicted_keys.empty()) {
         auto notify_result = eviction_handler(evicted_keys);
         if (!notify_result) {
-            for (auto it = pending_evictions.rbegin();
-                 it != pending_evictions.rend(); ++it) {
-                RestoreFileToWriteQueueFront(*it);
+            auto restore_all = [&] {
+                for (auto it = pending_evictions.rbegin();
+                     it != pending_evictions.rend(); ++it) {
+                    RestoreFileToWriteQueueFront(*it);
+                }
+            };
+            if (notify_result.error() !=
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+                restore_all();
+                return tl::make_unexpected(notify_result.error());
             }
-            return tl::make_unexpected(notify_result.error());
+
+            // A protected file must not pin unrelated orphan files. Retry
+            // authorization per physical file only after an explicit refusal.
+            // Keep all records pending until every retry finishes so an RPC
+            // failure can still roll back the entire physical deletion batch.
+            std::vector<FileRecord> approved;
+            std::vector<FileRecord> retained;
+            evicted_keys.clear();
+            for (const auto& pending : pending_evictions) {
+                if (pending.key.empty()) {
+                    retained.push_back(pending);
+                    continue;
+                }
+                auto result = eviction_handler({pending.key});
+                if (result) {
+                    approved.push_back(pending);
+                    evicted_keys.push_back(pending.key);
+                } else if (result.error() ==
+                           ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+                    retained.push_back(pending);
+                } else {
+                    restore_all();
+                    return tl::make_unexpected(result.error());
+                }
+            }
+            for (auto it = retained.rbegin(); it != retained.rend(); ++it) {
+                if (it->key.empty()) RestoreFileToWriteQueueFront(*it);
+            }
+            // Rotate confirmed protected files so later heartbeat batches
+            // can reach ordinary files behind a protected FIFO prefix.
+            for (const auto& record : retained) {
+                if (!record.key.empty()) {
+                    RestoreFileToWriteQueue(record, false);
+                }
+            }
+            pending_evictions = std::move(approved);
+            if (pending_evictions.empty()) {
+                return tl::make_unexpected(notify_result.error());
+            }
         }
     }
 
@@ -1472,9 +1345,9 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             continue;  // Simulate StoreObject failure
         }
 
-        auto path =
-            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
-                               file_per_key_config_.fsdir);
+        auto path = FileUtil::ResolvePathFromKey(
+            kv.key, file_storage_config_.storage_filepath,
+            file_per_key_config_.fsdir);
         kv.value = ConcatSlicesToString(value);
 
         std::string kv_buf;
@@ -1531,8 +1404,8 @@ StorageBackendAdaptor::EvictAboveDiskWatermark(
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
-    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath,
-                                   file_per_key_config_.fsdir);
+    auto path = FileUtil::ResolvePathFromKey(
+        key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
     namespace fs = std::filesystem;
     return fs::exists(path);
 }
@@ -1542,9 +1415,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     for (const auto& [key, slice] : batched_slices) {
         KVEntry kv;
         kv.key = key;
-        auto path =
-            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
-                               file_per_key_config_.fsdir);
+        auto path = FileUtil::ResolvePathFromKey(
+            kv.key, file_storage_config_.storage_filepath,
+            file_per_key_config_.fsdir);
 
         kv.value.resize(slice.size);
 
@@ -1689,7 +1562,10 @@ void StorageBackendAdaptor::RemoveAll() {
 BucketIdGenerator::BucketIdGenerator(int64_t start) {
     if (start <= 0) {
         auto cur_time_stamp = time_gen();
-        current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) | SEQUENCE_ID_SHIFT;
+        // Salt with pid so two clients starting in the same second do not
+        // share an identical id sequence (Mooncake #3528).
+        const int64_t salt = static_cast<int64_t>(::getpid()) & SEQUENCE_MASK;
+        current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) | salt;
     } else {
         current_id_ = start;
     }
@@ -1730,6 +1606,11 @@ BucketStorageBackend::~BucketStorageBackend() {
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
+    if (owner_lock_fd_ >= 0) {
+        ::flock(owner_lock_fd_, LOCK_UN);
+        ::close(owner_lock_fd_);
+        owner_lock_fd_ = -1;
+    }
 }
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
@@ -1805,6 +1686,10 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // Save a copy of bucket->keys before std::move(bucket) into buckets_
     // consumes the shared_ptr. Needed for complete_handler and rollback.
     const auto bucket_keys = bucket->keys;
+    // Keys/metadatas actually committed below (duplicates skipped). The
+    // complete handler and the rollback path must only see these.
+    std::vector<std::string> committed_keys;
+    std::vector<StorageObjectMetadata> committed_metadatas;
 
     // Commit to metadata maps under exclusive lock FIRST.
     // This ensures any concurrent BatchLoad arriving after Master redirects
@@ -1816,44 +1701,63 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
 
         ReleasePreparedWriteLocked(pending);
 
-        // Pre-check for duplicates before modifying any state
-        bool duplicate_found = false;
-        for (const auto& key : bucket_keys) {
-            if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
-                duplicate_found = true;
-                break;
+        // Duplicate safety net under mutex_: skip keys that PrepareEviction
+        // flagged as already persisted or in flight, plus anything that got
+        // committed since (defense in depth). GroupOffloadingKeysByBucket
+        // filters persisted keys under offloading_mutex_, but a key can
+        // still be committed by a concurrent BatchOffload between that
+        // check and this one. Re-offloading an already persisted key is an
+        // idempotent no-op (same as Put), not an error.
+        const std::unordered_set<std::string> skipped_keys(
+            pending.skipped_keys.begin(), pending.skipped_keys.end());
+        std::vector<size_t> committed_indices;
+        for (size_t i = 0; i < bucket_keys.size(); ++i) {
+            if (skipped_keys.find(bucket_keys[i]) != skipped_keys.end() &&
+                object_bucket_map_.find(bucket_keys[i]) !=
+                    object_bucket_map_.end()) {
+                continue;  // Still persisted elsewhere: idempotent skip.
+            }
+            if (object_bucket_map_.find(bucket_keys[i]) ==
+                object_bucket_map_.end()) {
+                committed_indices.push_back(i);
+            } else {
+                VLOG(1) << "Key already committed by a concurrent offload, "
+                           "skipping: "
+                        << bucket_keys[i];
             }
         }
 
-        if (!duplicate_found) {
-            total_size_ += bucket->data_size + bucket->meta_size;
-            object_bucket_map_.reserve(object_bucket_map_.size() +
-                                       bucket_keys.size());
-            for (size_t i = 0; i < bucket_keys.size(); ++i) {
-                auto [it, inserted] =
-                    object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
-                CHECK(inserted)
-                    << "Reserved key became duplicated: " << bucket_keys[i];
-            }
-            auto ts = 0LL;
-            // Update LRU timestamp for in case of eviction.
-            if (bucket_backend_config_.eviction_policy ==
-                BucketEvictionPolicy::LRU) {
-                ts =
-                    std::chrono::steady_clock::now().time_since_epoch().count();
-                bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
-            }
-            buckets_.emplace(bucket_id, std::move(bucket));
-            lru_index_.emplace(ts, bucket_id);
-        }
-        if (duplicate_found) {
-            LOG(ERROR) << "Reserved key became duplicated before commit, "
-                          "bucket_id="
-                       << bucket_id;
+        if (committed_indices.empty()) {
+            // Every key was already persisted: nothing new to commit or
+            // notify, the written bucket file is redundant.
             lock.unlock();
             CleanupOrphanedBucket(bucket_id);
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            return bucket_id;
         }
+
+        int64_t committed_data_size = bucket->meta_size;
+        object_bucket_map_.reserve(object_bucket_map_.size() +
+                                   committed_indices.size());
+        for (size_t i : committed_indices) {
+            auto [it, inserted] =
+                object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
+            CHECK(inserted)
+                << "Reserved key became duplicated: " << bucket_keys[i];
+            committed_data_size +=
+                metadatas[i].data_size + metadatas[i].key_size;
+            committed_keys.push_back(bucket_keys[i]);
+            committed_metadatas.push_back(metadatas[i]);
+        }
+        total_size_ += committed_data_size;
+        auto ts = 0LL;
+        // Update LRU timestamp for in case of eviction.
+        if (bucket_backend_config_.eviction_policy ==
+            BucketEvictionPolicy::LRU) {
+            ts = std::chrono::steady_clock::now().time_since_epoch().count();
+            bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
+        }
+        buckets_.emplace(bucket_id, std::move(bucket));
+        lru_index_.emplace(ts, bucket_id);
     }
     // Lock released. From this point forward, concurrent BatchLoad
     // can find the keys and read from the committed bucket files.
@@ -1863,17 +1767,17 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // complete_handler before the RPC); int64_t fields carry the metadata
     // from BuildBucket unchanged.
     if (complete_handler != nullptr) {
-        auto error_code = complete_handler(bucket_keys, metadatas);
+        auto error_code = complete_handler(committed_keys, committed_metadatas);
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << bucket_keys.size()
+                       << ", Key count: " << committed_keys.size()
                        << ", Bucket id: " << bucket_id;
             // Master was NOT notified. The local index has entries that
             // Master doesn't know about — a "client can read but Master
             // doesn't know" ghost replica. Rollback the local commit
             // (removes index entries + waits for inflight reads + deletes
             // on-disk files).
-            RollbackCommittedBucket(bucket_id, bucket_keys);
+            RollbackCommittedBucket(bucket_id, committed_keys);
             return tl::make_unexpected(error_code);
         }
     }
@@ -1900,6 +1804,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    spans.reserve(batch_object.size());
+    for (const auto& [key, slice] : batch_object) {
+        spans.emplace(key, StorageValueSpan{0, slice.size, slice});
+    }
+    auto loaded = ReadBucketValues(spans, true);
+    if (!loaded) return loaded;
+    for (const auto& [key, span] : spans) {
+        batch_object.at(key).ptr = span.slice.ptr;
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadSpans(
+    std::unordered_map<std::string, StorageValueSpan>& spans) {
+    return ReadBucketValues(spans, false);
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
+    std::unordered_map<std::string, StorageValueSpan>& spans,
+    bool require_exact_size) {
     // Step 1: Build read plan by copying metadata under lock
     // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
     // When the guard goes out of scope, it decrements the counter.
@@ -1909,6 +1834,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         int64_t offset;
         int64_t key_size;
         int64_t data_size;
+        int64_t value_offset;
         Slice dest_slice;
     };
 
@@ -1919,7 +1845,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
-        for (const auto& [key, dest_slice] : batch_object) {
+        for (const auto& [key, span] : spans) {
+            const Slice& dest_slice = span.slice;
             // Lookup key -> metadata
             auto object_it = object_bucket_map_.find(key);
             if (object_it == object_bucket_map_.end()) {
@@ -1936,11 +1863,31 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
             }
 
-            // Validate size
-            if (metadata.data_size != static_cast<int64_t>(dest_slice.size)) {
-                LOG(ERROR) << "Size mismatch for key: " << key
-                           << ", expected: " << metadata.data_size
-                           << ", got: " << dest_slice.size;
+            if (span.offset > static_cast<uint64_t>(
+                                  std::numeric_limits<int64_t>::max()) ||
+                metadata.data_size < 0) {
+                LOG(ERROR) << "Invalid span for key: " << key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const auto value_offset = static_cast<int64_t>(span.offset);
+            // A full BatchLoad still requires the destination to be the whole
+            // value. A span read may be any window inside it.
+            if (require_exact_size) {
+                if (value_offset != 0 ||
+                    metadata.data_size !=
+                        static_cast<int64_t>(dest_slice.size)) {
+                    LOG(ERROR) << "Size mismatch for key: " << key
+                               << ", expected: " << metadata.data_size
+                               << ", got: " << dest_slice.size;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+            } else if (value_offset > metadata.data_size ||
+                       static_cast<int64_t>(dest_slice.size) >
+                           metadata.data_size - value_offset) {
+                LOG(ERROR) << "Span out of range for key: " << key
+                           << ", offset=" << value_offset
+                           << ", length=" << dest_slice.size
+                           << ", data_size=" << metadata.data_size;
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
 
@@ -1962,9 +1909,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             }
 
             // Copy metadata into read plan
-            bucket_read_plans[metadata.bucket_id].push_back(
-                ReadPlan{key, metadata.bucket_id, metadata.offset,
-                         metadata.key_size, metadata.data_size, dest_slice});
+            bucket_read_plans[metadata.bucket_id].push_back(ReadPlan{
+                key, metadata.bucket_id, metadata.offset, metadata.key_size,
+                metadata.data_size, value_offset, dest_slice});
         }
     }
     // Lock released here - bucket files protected by BucketReadGuards
@@ -2004,7 +1951,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             batch_read_plans.reserve(read_plans.size());
 
             for (const auto& plan : read_plans) {
-                int64_t actual_offset = plan.offset + plan.key_size;
+                int64_t actual_offset =
+                    plan.offset + plan.key_size + plan.value_offset;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
                 int64_t data_end =
@@ -2057,7 +2005,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                         << "), got: " << desc.bytes_read;
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
-                batch_object.at(plan.key).ptr =
+                spans.at(plan.key).slice.ptr =
                     static_cast<char*>(plan.dest_slice.ptr) +
                     batch_plan.offset_in_buffer;
             }
@@ -2066,7 +2014,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 #endif
 
         for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
+            int64_t actual_offset =
+                plan.offset + plan.key_size + plan.value_offset;
             iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
             auto read_result = file->vector_read(&iov, 1, actual_offset);
             if (!read_result) {
@@ -2108,6 +2057,33 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+
+        // One live client per storage_path (standalone contract). Fail fast
+        // instead of silently colliding on bucket ids (#3528).
+        if (owner_lock_fd_ < 0) {
+            fs::create_directories(storage_path_);
+            const auto lock_path =
+                (fs::path(storage_path_) / ".mooncake_local_disk.lock")
+                    .string();
+            owner_lock_fd_ =
+                ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+            if (owner_lock_fd_ < 0) {
+                LOG(ERROR) << "Failed to open storage_path lock: " << lock_path
+                           << ", errno=" << errno;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            if (::flock(owner_lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+                LOG(ERROR)
+                    << "storage_path already held by another live client: "
+                    << storage_path_
+                    << ". LOCAL_DISK requires one client per storage_path "
+                       "(use standalone store or per-client directories).";
+                ::close(owner_lock_fd_);
+                owner_lock_fd_ = -1;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+        }
+
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
@@ -2342,7 +2318,34 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     const std::string& key) {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    return object_bucket_map_.find(key) != object_bucket_map_.end();
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end()) {
+        return false;
+    }
+    // The index alone cannot see an externally wiped bucket file: writes
+    // commit file-then-index, so an index hit with no file behind it means
+    // the backing data is gone and the answer must be false, not "present".
+    auto path = GetBucketDataPath(it->second.bucket_id);
+    if (!path) {
+        return tl::make_unexpected(path.error());
+    }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const bool on_disk = fs::exists(*path, ec);
+    if (ec) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return on_disk;
+}
+
+std::optional<int64_t> BucketStorageBackend::GetObjectDataSize(
+    const std::string& key) const {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end() || it->second.data_size <= 0) {
+        return std::nullopt;
+    }
+    return it->second.data_size;
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
@@ -2431,13 +2434,21 @@ BucketStorageBackend::GetStoreMetadata() {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
-    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
+    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys,
+                                       deferred_keys);
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
     MutexLocker locker(&offloading_mutex_);
     ungrouped_offloading_objects_.clear();
+}
+
+bool BucketStorageBackend::RemoveUngroupedOffloadingObject(
+    const std::string& key) {
+    MutexLocker locker(&offloading_mutex_);
+    return ungrouped_offloading_objects_.erase(key) > 0;
 }
 
 size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
@@ -2447,7 +2458,8 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
     if (offloading_objects.empty()) {
         return {};
@@ -2485,9 +2497,25 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
+                if (bucket_backend_config_.flush_partial_buckets) {
+                    // Keep these keys in the current cycle, while FileStorage
+                    // still has their tasks and source replicas are pinned.
+                    if (!bucket_keys.empty()) {
+                        buckets_keys.push_back(std::move(bucket_keys));
+                    }
+                    return {};
+                }
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
                                                          bucket_object.second);
+                    // Report the deferral so the caller can keep these keys'
+                    // offload tasks alive until a later call re-emits them in
+                    // a bucket (upstream #3006: without this the tasks are
+                    // NACKed at deferral and the keys are silently dropped on
+                    // re-emission).
+                    if (deferred_keys != nullptr) {
+                        deferred_keys->push_back(bucket_object.first);
+                    }
                 }
                 VLOG(1) << "Add offloading objects to ungrouped pool. "
                         << "Total ungrouped count: "
@@ -2661,21 +2689,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     } else
 #endif
     {
@@ -2693,13 +2706,32 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     }
+
+    // Flush bucket data to stable storage before writing metadata.
+    // This prevents a crash from leaving valid metadata pointing at
+    // incomplete data (write-ordering durability guarantee).
+    // StorageFile declares a virtual datasync() overridden by both PosixFile
+    // (fdatasync) and UringFile, so a single call covers both write paths and
+    // the branches above only keep their own write logic.
+    auto sync_result = file->datasync();
+    // Test-only: override sync result to exercise the same !sync_result
+    // cleanup path as a real fdatasync() failure.
+    if (test_datasync_failure_.load(std::memory_order_relaxed)) {
+        sync_result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (!sync_result) {
+        LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+        CleanupOrphanedBucket(bucket_id);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    // Invalidate cache for this file since content changed
+    {
+        MutexLocker cache_locker(&file_cache_mutex_);
+        file_cache_.erase(bucket_data_path);
+    }
+
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
@@ -2960,16 +2992,27 @@ BucketStorageBackend::PrepareEviction(
     if (!write_keys.empty()) {
         for (const auto& key : write_keys) {
             if (object_bucket_map_.find(key) != object_bucket_map_.end() ||
-                pending_eviction_keys_.find(key) !=
-                    pending_eviction_keys_.end() ||
                 pending_write_keys_.find(key) != pending_write_keys_.end()) {
+                // Already persisted, or being persisted by a concurrent
+                // offload: re-offloading is an idempotent no-op (Put
+                // semantics), skip it instead of failing the whole batch.
+                result.skipped_keys.push_back(key);
+                continue;
+            }
+            if (pending_eviction_keys_.find(key) !=
+                pending_eviction_keys_.end()) {
+                // About to be evicted: the old copy is on its way out, so a
+                // skip could lose the only replica. Fail loudly here.
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
+            result.write_keys.push_back(key);
         }
-        result.write_keys = write_keys;
-        result.write_size = required_size;
-        pending_write_size_ += required_size;
-        pending_write_keys_.insert(write_keys.begin(), write_keys.end());
+        if (!result.write_keys.empty()) {
+            result.write_size = required_size;
+            pending_write_size_ += required_size;
+            pending_write_keys_.insert(result.write_keys.begin(),
+                                       result.write_keys.end());
+        }
     }
 
     if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
@@ -2997,7 +3040,7 @@ BucketStorageBackend::PrepareEviction(
             // Watermark eviction passes a synthetic required_size to drive
             // quota-based cleanup. It is not a real incoming write, so it
             // should not be counted as physical disk free-space demand.
-            uint64_t req_sz = (!write_keys.empty() && required_size > 0)
+            uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
                                   ? static_cast<uint64_t>(required_size)
                                   : 0;
             initial_disk_full = actual_available < req_sz + kMinFreeSpace;
@@ -3080,7 +3123,10 @@ BucketStorageBackend::PrepareEviction(
         buckets_.erase(evict_it);
 
         int64_t evicted_size = evict_meta->meta_size;
-        // Remove all keys belonging to this bucket from the object map.
+        // Remove all keys belonging to this bucket from the object map, and
+        // report ONLY those to the master: a key skipped as a duplicate at
+        // commit time keeps pointing at its authoritative bucket, so
+        // reporting it here would make the master drop a live replica.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
@@ -3090,16 +3136,13 @@ BucketStorageBackend::PrepareEviction(
                 total_size_ -= object_size;
                 evicted_size += object_size;
                 object_bucket_map_.erase(obj_it);
+                pending_eviction_keys_.insert(key);
+                result.keys.push_back(key);
             }
         }
         total_size_ -= evict_meta->meta_size;
         result.evicted_size += evicted_size;
 
-        // Collect for notification and file deletion.
-        for (const auto& key : evict_meta->keys) {
-            pending_eviction_keys_.insert(key);
-            result.keys.push_back(key);
-        }
         accumulated_freed_space +=
             static_cast<uint64_t>(evict_meta->data_size) +
             static_cast<uint64_t>(evict_meta->meta_size);
@@ -3116,7 +3159,7 @@ BucketStorageBackend::PrepareEviction(
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     pending_eviction_size_ += result.evicted_size;
-    if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
+    if (!result.write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -3144,6 +3187,8 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
     for (const auto& key : pending.keys) {
         pending_eviction_keys_.erase(key);
     }
+    const std::unordered_set<std::string> restore_keys(pending.keys.begin(),
+                                                       pending.keys.end());
     for (auto& [bucket_id, bucket_meta] : pending.buckets) {
         if (!bucket_meta || buckets_.find(bucket_id) != buckets_.end()) {
             continue;
@@ -3151,6 +3196,11 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
 
         for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
             const auto& key = bucket_meta->keys[i];
+            if (restore_keys.find(key) == restore_keys.end()) {
+                // matched-only mirror of the prepare phase: skipped duplicates
+                // stay pointed at their authoritative bucket, never re-pointed
+                continue;
+            }
             const auto& object_meta = bucket_meta->metadatas[i];
             object_bucket_map_[key] = StorageObjectMetadata{
                 bucket_id, object_meta.offset, object_meta.key_size,
@@ -3574,7 +3624,14 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
             access_mode = O_RDONLY;
             break;
         case FileMode::Write:
-            access_mode = O_WRONLY | O_CREAT | O_TRUNC;
+            // New path: exclusive create so a colliding bucket id cannot
+            // silently O_TRUNC another client's file (#3528). Existing path:
+            // in-place rewrite (same client).
+            if (::access(path.c_str(), F_OK) == 0) {
+                access_mode = O_WRONLY | O_TRUNC;
+            } else {
+                access_mode = O_WRONLY | O_CREAT | O_EXCL;
+            }
             break;
     }
 
@@ -3674,6 +3731,8 @@ BucketStorageBackend::GetFileInstance() const {
 
     std::string temp_path =
         (fs::path(storage_path_) / "temp_for_registration").string();
+    std::error_code temp_ec;
+    fs::remove(temp_path, temp_ec);
 
     auto open_result = OpenFile(temp_path, FileMode::Write);
     if (!open_result) {
@@ -3768,6 +3827,22 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
                        << capacity_ << ". Capacity must be > 0";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+
+#ifdef USE_URING
+        // O_DIRECT vector I/O rounds writes up to 4 KiB. An unaligned capacity
+        // can let an end-of-file write grow the data file past capacity_, after
+        // which recovery's exact size check rejects the file.
+        constexpr uint64_t kDirectIoAlignment = 4096;
+        if (file_storage_config_.use_uring &&
+            (capacity_ % kDirectIoAlignment) != 0) {
+            LOG(ERROR)
+                << "Invalid capacity for OffsetAllocatorStorageBackend with "
+                   "uring/O_DIRECT: "
+                << capacity_ << ". Capacity must be a multiple of "
+                << kDirectIoAlignment;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+#endif
 
         // Ensure storage path exists
         {
@@ -3910,6 +3985,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 
         // Open/truncate data file in read-write mode
         int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
             LOG(ERROR) << "Failed to open data file: " << data_file_path_;
@@ -4685,6 +4765,11 @@ OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
         // Open data file without truncation
         data_file_path_ = GetDataFilePath();
         int flags = O_CLOEXEC | O_RDWR;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
             const int open_errno = errno;
@@ -5348,6 +5433,22 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    std::unordered_map<std::string, StorageValueSpan> spans;
+    spans.reserve(batched_slices.size());
+    for (const auto& [key, slice] : batched_slices) {
+        spans.emplace(key, StorageValueSpan{0, slice.size, slice});
+    }
+    return ReadOffsetValues(spans, true);
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoadSpans(
+    std::unordered_map<std::string, StorageValueSpan>& spans) {
+    return ReadOffsetValues(spans, false);
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ReadOffsetValues(
+    std::unordered_map<std::string, StorageValueSpan>& spans,
+    bool require_exact_size) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -5360,6 +5461,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         std::string key;
         uint64_t offset;
         uint32_t value_size;
+        uint64_t value_offset;
         AllocationPtr allocation;  // Refcounted handle keeps allocation alive
         Slice dest_slice;
         // Pin the data file so a concurrent RemoveAll() rebuild (which rebinds
@@ -5369,9 +5471,10 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     };
 
     std::vector<ReadPlan> read_plans;
-    read_plans.reserve(batched_slices.size());
+    read_plans.reserve(spans.size());
 
-    for (const auto& [key, dest_slice] : batched_slices) {
+    for (const auto& [key, span] : spans) {
+        const Slice& dest_slice = span.slice;
         size_t shard_idx = ShardForKey(key);
         auto& shard = shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, /*shared_mode=*/shared_lock);
@@ -5385,8 +5488,16 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
 
         const auto& entry = it->second;
 
-        // Validate destination size matches stored value size
-        if (dest_slice.size != entry.value_size) {
+        if (span.offset > entry.value_size ||
+            dest_slice.size > entry.value_size - span.offset) {
+            LOG(ERROR) << "Span out of range for key: " << key
+                       << ", offset=" << span.offset
+                       << ", length=" << dest_slice.size
+                       << ", value_size=" << entry.value_size;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (require_exact_size &&
+            (span.offset != 0 || dest_slice.size != entry.value_size)) {
             LOG(ERROR) << "Size mismatch for key: " << key
                        << ", expected: " << entry.value_size
                        << ", got: " << dest_slice.size;
@@ -5398,7 +5509,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         // Also pin data_file_ (shared_ptr copy) so a concurrent RemoveAll
         // rebuild cannot close it before our phase-2 I/O completes.
         read_plans.push_back(
-            ReadPlan{key, entry.offset, entry.value_size,
+            ReadPlan{key, entry.offset, entry.value_size, span.offset,
                      entry.allocation,  // shared_ptr copy, increments refcount
                      dest_slice, data_file_});
 
@@ -5458,20 +5569,23 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             return tl::make_unexpected(validate_result.error());
         }
 
-        // Read value into destination slice (at its aligned offset)
+        // Read only the requested value window. The header and key are still
+        // checked so a span read cannot return bytes from the wrong record.
         iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
-        auto read_value_result = plan.data_file->vector_read(
-            &value_iov, 1,
-            plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len));
+        const uint64_t value_pos =
+            plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len) +
+            plan.value_offset;
+        auto read_value_result =
+            plan.data_file->vector_read(&value_iov, 1, value_pos);
         if (!read_value_result) {
             LOG(ERROR) << "Failed to read value for key: " << plan.key
                        << ", error: " << read_value_result.error();
             return tl::make_unexpected(read_value_result.error());
         }
 
-        if (read_value_result.value() != header.value_len) {
+        if (read_value_result.value() != plan.dest_slice.size) {
             LOG(ERROR) << "Value read size mismatch for key: " << plan.key
-                       << ", expected: " << header.value_len
+                       << ", expected: " << plan.dest_slice.size
                        << ", got: " << read_value_result.value();
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
@@ -5633,8 +5747,13 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     // BatchLoad/BatchStore that pinned the old data_file_ keeps it alive until
     // its I/O completes — no use-after-free.
     if (!data_file_path_.empty()) {
-        int fd = open(data_file_path_.c_str(),
-                      O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
+        int fd = open(data_file_path_.c_str(), flags, 0644);
         if (fd >= 0) {
 #ifdef USE_URING
             if (file_storage_config_.use_uring) {
@@ -5706,21 +5825,44 @@ CreateStorageBackend(const FileStorageConfig& config,
                 throw std::invalid_argument(
                     "Invalid DistributedStorage configuration");
             }
-            std::unique_ptr<FileSystemAdapter> adapter;
+            std::unique_ptr<FileSystemAdapter> fs_adapter;
+            std::unique_ptr<ObjectStorageAdapter> object_storage_adapter;
             if (distributed_config.fs_adapter_type == "posix") {
-                adapter = std::make_unique<PosixFsAdapter>();
+                fs_adapter = std::make_unique<PosixFsAdapter>();
             } else if (distributed_config.fs_adapter_type == "hf3fs") {
 #ifdef USE_3FS
-                adapter = std::make_unique<Hf3fsAdapter>();
+                fs_adapter = std::make_unique<Hf3fsAdapter>();
 #else
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
+            } else if (distributed_config.fs_adapter_type == "oss") {
+#ifdef HAVE_OSS_ADAPTER
+                object_storage_adapter =
+                    std::make_unique<OssObjectStorageAdapter>(
+                        distributed_config.fsdir);
+#else
+                LOG(ERROR) << "OSS adapter requires libcurl and OpenSSL";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (distributed_config.fs_adapter_type == "s3") {
+#ifdef HAVE_S3_ADAPTER
+                object_storage_adapter =
+                    std::make_unique<S3ObjectStorageAdapter>(
+                        distributed_config.fsdir);
+#else
+                LOG(ERROR) << "S3 adapter requires libcurl and OpenSSL";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (distributed_config.UsesKvcs()) {
+                object_storage_adapter =
+                    std::make_unique<KvcsObjectStorageAdapter>(
+                        distributed_config.object_storage_config_path);
             } else {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             return std::make_shared<DistributedStorageBackend>(
-                config, distributed_config, std::move(adapter),
-                dfs_root_identity);
+                config, distributed_config, std::move(fs_adapter),
+                std::move(object_storage_adapter), dfs_root_identity);
         }
         default: {
             LOG(ERROR) << "Unsupported backend type: "

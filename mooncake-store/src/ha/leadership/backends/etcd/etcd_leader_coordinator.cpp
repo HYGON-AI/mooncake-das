@@ -4,8 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -14,6 +12,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
+#include "config/ha_cluster_namespace_config.h"
 
 namespace mooncake {
 namespace ha {
@@ -25,14 +24,6 @@ namespace {
 constexpr int kKeepAliveReadyTimeoutMs = 1000;
 constexpr std::string_view kServiceWarmingPrefix =
     "__mooncake_service_warming__:";
-
-std::string MakeServiceWarmingValue(const OwnerToken& owner_token) {
-    return std::string(kServiceWarmingPrefix) + owner_token;
-}
-
-bool IsServiceWarmingValue(const std::string& value) {
-    return value.rfind(kServiceWarmingPrefix, 0) == 0;
-}
 // Fallback poll interval used only when a watch cannot be armed (e.g. the watch
 // RPC fails, or the remaining timeout is too small to be worth a watch). The
 // steady-state path blocks on an etcd watch and does not poll.
@@ -54,6 +45,14 @@ struct ViewChangeWatchState {
     bool changed = false;
     bool broken = false;
 };
+
+std::string MakeServiceWarmingValue(const OwnerToken& owner_token) {
+    return std::string(kServiceWarmingPrefix) + owner_token;
+}
+
+bool IsServiceWarmingValue(std::string_view value) {
+    return value.starts_with(kServiceWarmingPrefix);
+}
 
 // C-style trampoline invoked by the etcd watch goroutine for every event on the
 // watched prefix (PUT / DELETE / WATCH_BROKEN). Any event is treated as "the
@@ -195,6 +194,9 @@ EtcdLeaderCoordinator::ReadCurrentView() {
         return tl::make_unexpected(err);
     }
 
+    // The key exists during leader warmup to preserve election fencing, but
+    // its value is not a routable endpoint until PublishServiceReady updates
+    // it after the RPC listener starts.
     if (IsServiceWarmingValue(leader_address)) {
         return std::optional<MasterView>{std::nullopt};
     }
@@ -211,8 +213,11 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         return tl::make_unexpected(err);
     }
 
+    const int64_t lease_ttl_sec = spec_.leader_lease_ttl_sec > 0
+                                      ? spec_.leader_lease_ttl_sec
+                                      : DEFAULT_MASTER_VIEW_LEASE_TTL_SEC;
     EtcdLeaseId lease_id = 0;
-    err = EtcdHelper::GrantLease(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC, lease_id);
+    err = EtcdHelper::GrantLease(lease_ttl_sec, lease_id);
     if (err != ErrorCode::OK) {
         (void)ResetConnection();
         return tl::make_unexpected(err);
@@ -254,8 +259,8 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
     LeadershipSession session{
         .view = MasterView{.leader_address = leader_address,
                            .view_version = view_version},
-        .owner_token = MakeOwnerToken(lease_id),
-        .lease_ttl = std::chrono::seconds(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC),
+        .owner_token = owner_token,
+        .lease_ttl = std::chrono::seconds(lease_ttl_sec),
     };
 
     {
@@ -281,19 +286,34 @@ ErrorCode EtcdLeaderCoordinator::PublishServiceReady(
     if (err != ErrorCode::OK) {
         return err;
     }
-    const auto owner_token = session.owner_token;
-    const auto warming_value = MakeServiceWarmingValue(owner_token);
-    auto lease_id = ParseLeaseId(session.owner_token);
-    if (!lease_id) {
-        return lease_id.error();
+    if (session.view.leader_address.empty()) {
+        return ErrorCode::INVALID_PARAMS;
     }
-    return EtcdHelper::TxnCompareAndPutWithLease(
+
+    const auto warming_value = MakeServiceWarmingValue(session.owner_token);
+    err = EtcdHelper::TxnCompareAndPut(
         {{.key = master_view_key_,
           .kind = EtcdHelper::TxnCompareKind::kValueEquals,
           .expected_value = warming_value}},
         {{.key = master_view_key_,
-          .value = session.view.leader_address}},
-        lease_id.value());
+          .value = session.view.leader_address,
+          .preserve_lease = true}});
+    if (err == ErrorCode::OK) {
+        return err;
+    }
+    if (err != ErrorCode::ETCD_TRANSACTION_FAIL) {
+        return err;
+    }
+
+    // Publication is intentionally idempotent because a retry may observe a
+    // successful etcd write after the client-side RPC timed out.
+    auto current_view = ReadCurrentView();
+    if (current_view && current_view->has_value() &&
+        current_view->value().leader_address == session.view.leader_address &&
+        current_view->value().view_version == session.view.view_version) {
+        return ErrorCode::OK;
+    }
+    return ErrorCode::ETCD_TRANSACTION_FAIL;
 }
 
 tl::expected<bool, ErrorCode> EtcdLeaderCoordinator::RenewLeadership(
@@ -601,14 +621,7 @@ ClusterNamespace EtcdLeaderCoordinator::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    std::string resolved_namespace;
-    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
-    if (env_cluster_id != nullptr && std::strlen(env_cluster_id) > 0) {
-        resolved_namespace = env_cluster_id;
-    } else {
-        resolved_namespace = DEFAULT_CLUSTER_ID;
-    }
-    return resolved_namespace;
+    return HaClusterNamespaceConfig::FromEnvironment().cluster_namespace;
 }
 
 std::string EtcdLeaderCoordinator::BuildMasterViewKey(

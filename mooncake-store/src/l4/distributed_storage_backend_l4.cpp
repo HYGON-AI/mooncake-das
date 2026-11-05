@@ -23,7 +23,7 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/dfs_root_identity.h"
 #include "storage/distributed/dfs_read_probe.h"
-#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/shard_allocator.h"
 #include "thread_pool.h"
 #include "types.h"
 #include "utils.h"
@@ -38,12 +38,6 @@ std::string CanonicalizePath(const std::string& path) {
     if (ec) return {};
     return canonical.lexically_normal().string();
 }
-
-// Upper bound on MOONCAKE_DFS_BATCH_READ_THREADS. Each parallel bucket read
-// can hold a staging buffer of up to kMaxMergedIo, so an unbounded thread
-// count would blow up both the thread and the memory budget.
-constexpr int kMaxBatchReadThreads = 256;
-constexpr int kMaxBucketCreateConcurrency = 8;
 
 // Bound temporary memory and I/O latency while still collapsing the common
 // BatchAllocate output to one read. Larger batches become a few contiguous
@@ -64,67 +58,6 @@ thread_local MergedReadScratch merged_read_scratch;
 
 using l4::kBucketFilePrefix;
 using l4::kBucketDataSuffix;
-
-bool DistributedStorageConfig::ValidateForBucketAllocator() const {
-    if (bucket_capacity == 0) {
-        LOG(ERROR) << "DistributedStorageConfig: bucket_capacity must > 0";
-        return false;
-    }
-    if (!IsValidBucketAlignment(alignment)) {
-        LOG(ERROR) << "DistributedStorageConfig: alignment must be a power of "
-                      "2, alignment="
-                   << alignment;
-        return false;
-    }
-    if (bucket_capacity % alignment != 0) {
-        LOG(ERROR) << "DistributedStorageConfig: bucket_capacity ("
-                   << bucket_capacity << ") must be a multiple of alignment ("
-                   << alignment << ")";
-        return false;
-    }
-    if (max_bucket_count <= 0) {
-        // A fixed denominator is required for stable eviction watermarks.
-        LOG(ERROR) << "DistributedStorageConfig: max_bucket_count must > 0 in "
-                      "bucket allocator mode, max_bucket_count="
-                   << max_bucket_count;
-        return false;
-    }
-    if (max_bucket_count > kMaxBucketId) {
-        LOG(ERROR) << "DistributedStorageConfig: max_bucket_count ("
-                   << max_bucket_count << ") exceeds the addressable maximum ("
-                   << kMaxBucketId << ")";
-        return false;
-    }
-    if (static_cast<uint64_t>(max_bucket_count) >
-        std::numeric_limits<uint64_t>::max() / bucket_capacity) {
-        LOG(ERROR) << "DistributedStorageConfig: max_bucket_count * "
-                      "bucket_capacity overflows";
-        return false;
-    }
-    if (ready_bucket_target < 0) {
-        LOG(ERROR) << "DistributedStorageConfig: ready_bucket_target must be "
-                      "non-negative, ready_bucket_target="
-                   << ready_bucket_target;
-        return false;
-    }
-    if (bucket_create_concurrency < 1 ||
-        bucket_create_concurrency > kMaxBucketCreateConcurrency) {
-        LOG(ERROR)
-            << "DistributedStorageConfig: bucket_create_concurrency must be "
-               "in [1, "
-            << kMaxBucketCreateConcurrency
-            << "], bucket_create_concurrency=" << bucket_create_concurrency;
-        return false;
-    }
-    if (batch_read_threads < 1 || batch_read_threads > kMaxBatchReadThreads) {
-        LOG(ERROR) << "DistributedStorageConfig: batch_read_threads must be in "
-                      "[1, "
-                   << kMaxBatchReadThreads
-                   << "], batch_read_threads=" << batch_read_threads;
-        return false;
-    }
-    return true;
-}
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::EnsureInitialized() {
     if (initialized_.load(std::memory_order_acquire)) {
@@ -170,7 +103,7 @@ DistributedStorageBackend::ValidateRootIdentity() const {
 }
 
 void DistributedStorageBackend::ResetFailedInitializationLocked() {
-    for (auto& shard : shard_files_) {
+    for (auto& [_, shard] : shard_files_) {
         if (shard && fs_adapter_) {
             const int write_fd = shard->write_fd.load();
             if (write_fd >= 0) {
@@ -289,26 +222,32 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ProbeWrite() {
     active_health_probe_path_ = new_probe_path;
 
     if (!IsBucketMode()) {
-        std::vector<int> new_write_fds;
-        new_write_fds.reserve(shard_files_.size());
-        for (const auto& shard : shard_files_) {
-            if (shard->write_fd.load(std::memory_order_acquire) >= 0) {
-                new_write_fds.push_back(-1);
-                continue;
+        std::vector<ShardFile*> shards;
+        {
+            std::lock_guard cache_lock(shard_files_mutex_);
+            for (const auto& [_, shard] : shard_files_) {
+                shards.push_back(shard.get());
             }
-            auto fd = fs_adapter_->OpenFile(shard->path);
+        }
+        std::vector<std::pair<ShardFile*, int>> opened;
+        for (auto* shard : shards) {
+            std::lock_guard shard_lock(shard->mutex);
+            if (shard->path.empty() || shard->write_fd.load() >= 0) continue;
+            auto fd = ValidateAndOpenShardFile(shard->path);
             if (!fd) {
-                for (int opened_fd : new_write_fds) {
-                    if (opened_fd >= 0) (void)fs_adapter_->CloseFile(opened_fd);
+                for (const auto& [_, new_fd] : opened) {
+                    (void)fs_adapter_->CloseFile(new_fd);
                 }
                 return tl::make_unexpected(fd.error());
             }
-            new_write_fds.push_back(*fd);
+            opened.emplace_back(shard, *fd);
         }
-        for (size_t i = 0; i < shard_files_.size(); ++i) {
-            if (new_write_fds[i] >= 0) {
-                shard_files_[i]->write_fd.store(new_write_fds[i],
-                                                std::memory_order_release);
+        for (const auto& [shard, fd] : opened) {
+            std::lock_guard shard_lock(shard->mutex);
+            if (shard->write_fd.load() < 0) {
+                shard->write_fd.store(fd);
+            } else {
+                (void)fs_adapter_->CloseFile(fd);
             }
         }
     }
@@ -751,18 +690,38 @@ DistributedStorageBackend::PrepareReadTasks(
             }
             capacity += slice.size;
         }
-        if (invalid || capacity < request.descriptor.object_size) continue;
+        uint64_t value_offset = 0;
+        uint64_t read_bytes = request.descriptor.object_size;
+        if (request.range_read) {
+            value_offset = request.value_offset;
+            if (value_offset > request.descriptor.object_size ||
+                capacity > request.descriptor.object_size - value_offset) {
+                invalid = true;
+            }
+            read_bytes = capacity;
+            auto size = fs_adapter_->GetFileSize(target->keepalive->path);
+            if (!size || *size < request.descriptor.offset +
+                                    request.descriptor.object_size) {
+                results[i] = tl::make_unexpected(
+                    size ? ErrorCode::FILE_READ_FAIL : size.error());
+                continue;
+            }
+        }
+        if (invalid || capacity < read_bytes) continue;
 
         ReadTask task;
         task.target = std::move(*target);
-        task.io_offset = request.descriptor.offset;
-        task.total_size = IsBucketMode() ? request.descriptor.aligned_size
-                                         : request.descriptor.object_size;
+        task.io_offset = request.descriptor.offset + value_offset;
+        task.total_size = request.range_read
+                              ? read_bytes
+                              : (IsBucketMode() ? request.descriptor.aligned_size
+                                                : request.descriptor.object_size);
         task.direct_read = distributed_config_.direct_read_enabled &&
                            task.target.direct_read;
-        task.entries.push_back({i, request.descriptor.offset});
+        task.entries.push_back({i, task.io_offset});
         const bool merge_candidate =
-            IsBucketMode() && distributed_config_.batch_read_merge_enabled &&
+            !request.range_read && IsBucketMode() &&
+            distributed_config_.batch_read_merge_enabled &&
             task.total_size <= kMaxMergedIo;
         if (merge_candidate) {
             tasks.push_back(std::move(task));

@@ -48,6 +48,9 @@ class Hf3fsAdapter : public FileSystemAdapter {
     tl::expected<int, ErrorCode> OpenFileDirectStrict(
         const std::string& path) override;
 
+    tl::expected<int, ErrorCode> OpenExistingFile(
+        const std::string& path) override;
+
     tl::expected<void, ErrorCode> CloseFile(int fd) override;
 
     tl::expected<void, ErrorCode> PreallocateFile(const std::string& path,
@@ -59,6 +62,8 @@ class Hf3fsAdapter : public FileSystemAdapter {
 
     tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
                                            int64_t offset) override;
+
+    bool SupportsBatchIo() const override { return true; }
 
     tl::expected<void, ErrorCode> Init(const std::string& mount_path) override;
 

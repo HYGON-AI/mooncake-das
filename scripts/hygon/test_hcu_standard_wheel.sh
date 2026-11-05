@@ -14,7 +14,6 @@ over SSH. Hostnames are resolved at runtime; no node IP is stored in this file.
 
 Required environment variables:
   HCU_TEST_IMAGE            Container image used on both nodes
-  HCU_TEST_DTK_PKG_URL      DTK tarball URL installed in both containers
 
 Optional environment variables:
   HCU_TEST_TARGET_HOST      Target host (default: nmz4)
@@ -48,20 +47,14 @@ require_env() {
 
 # This function runs inside both test containers. A fresh container must have
 # the same DTK runtime before the wheel or transfer_engine_bench can be used.
+# The CI images are expected to ship DTK under /opt/dtk; there is no fallback.
 prepare_container_runtime() {
     local wheel_path="$1"
-    local dtk_tarball="/tmp/$(basename "${HCU_TEST_DTK_PKG_URL}")"
-    local dtk_dir=""
 
-    echo "Installing DTK from ${HCU_TEST_DTK_PKG_URL}..."
-    wget -q "${HCU_TEST_DTK_PKG_URL}" -O "${dtk_tarball}"
-    tar -xzf "${dtk_tarball}" -C /opt
-    dtk_dir="$(find /opt -mindepth 1 -maxdepth 1 -type d -name 'dtk-*' -print -quit)"
-    if [ -z "${dtk_dir}" ]; then
-        echo "ERROR: the DTK archive did not create /opt/dtk-*" >&2
+    if [ ! -f /opt/dtk/env.sh ]; then
+        echo "ERROR: DTK is not installed in this container image (/opt/dtk/env.sh is missing)." >&2
         exit 1
     fi
-    ln -s "${dtk_dir}" /opt/dtk
     # DTK's env.sh reads variables such as CMAKE_PREFIX_PATH before assigning
     # them, so nounset must be disabled while the vendor script is sourced.
     set +u
@@ -124,7 +117,6 @@ run_container_initiator() {
 # The same file is mounted into each container and used as its entry point.
 case "${1:-}" in
     __container_prepare)
-        require_env HCU_TEST_DTK_PKG_URL
         prepare_container_runtime "$2"
         exit 0
         ;;
@@ -145,7 +137,6 @@ if [ "$#" -ne 1 ]; then
 fi
 
 require_env HCU_TEST_IMAGE
-require_env HCU_TEST_DTK_PKG_URL
 
 for command_name in awk docker flock getent grep realpath scp sed ssh timeout; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
@@ -250,9 +241,7 @@ if [ -n "${HCU_TEST_KNOWN_HOSTS_FILE:-}" ]; then
     SCP_OPTIONS+=(-o "UserKnownHostsFile=${HCU_TEST_KNOWN_HOSTS_FILE}")
 fi
 
-DOCKER_ENV_ARGS=(
-    -e "HCU_TEST_DTK_PKG_URL=${HCU_TEST_DTK_PKG_URL}"
-)
+DOCKER_ENV_ARGS=()
 if [ -n "${PIP_INDEX_URL:-}" ]; then
     DOCKER_ENV_ARGS+=(-e "PIP_INDEX_URL=${PIP_INDEX_URL}")
 fi
@@ -405,7 +394,7 @@ docker run -d \
 echo "Creating initiator container ${INITIATOR_CONTAINER} on ${INITIATOR_HOST}..."
 ssh "${SSH_OPTIONS[@]}" "${REMOTE}" bash -s -- \
     "${REMOTE_WORK_DIR}" "${WHEEL_BASENAME}" "$(basename "${SELF_PATH}")" \
-    "${INITIATOR_CONTAINER}" "${HCU_TEST_IMAGE}" "${HCU_TEST_DTK_PKG_URL}" \
+    "${INITIATOR_CONTAINER}" "${HCU_TEST_IMAGE}" \
     "${PIP_INDEX_URL:-}" "${PIP_TRUSTED_HOST:-}" <<'REMOTE_START' >/dev/null
 set -Eeuo pipefail
 remote_dir="$1"
@@ -413,11 +402,10 @@ wheel_basename="$2"
 script_basename="$3"
 container_name="$4"
 image="$5"
-dtk_pkg_url="$6"
-pip_index_url="$7"
-pip_trusted_host="$8"
+pip_index_url="$6"
+pip_trusted_host="$7"
 
-docker_env_args=(-e "HCU_TEST_DTK_PKG_URL=${dtk_pkg_url}")
+docker_env_args=()
 [ -n "${pip_index_url}" ] && docker_env_args+=(-e "PIP_INDEX_URL=${pip_index_url}")
 [ -n "${pip_trusted_host}" ] && docker_env_args+=(-e "PIP_TRUSTED_HOST=${pip_trusted_host}")
 

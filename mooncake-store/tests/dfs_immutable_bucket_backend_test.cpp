@@ -372,6 +372,46 @@ TEST_F(DfsBucketBackendTest, WriteThenReadRoundTrip) {
     EXPECT_EQ(ReadObject(key, desc), value);
 }
 
+TEST_F(DfsBucketBackendTest, RangeReadPreservesSliceBoundariesWithMergeEnabled) {
+    const std::string key = "range_window";
+    const std::string value = "0123456789abcdef";
+    const auto desc = WriteObject(key, value);
+    config_.batch_read_merge_enabled = true;
+    FileStorageConfig file_config;
+    auto backend = MakeTestBackend(file_config, config_,
+                                   std::make_unique<PosixFsAdapter>());
+    ASSERT_TRUE(backend->Init());
+    std::string first(5, '?'), second(6, '?');
+    auto results = backend->BatchRead(
+        {{key, desc, {{first.data() + 1, 3}, {second.data() + 1, 4}},
+          nullptr, 3, true}});
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0]);
+    EXPECT_EQ(first, "?345?");
+    EXPECT_EQ(second, "?6789?");
+}
+
+TEST_F(DfsBucketBackendTest, RangeReadRejectsOverflowAndTruncatedWholeObject) {
+    const std::string key = "range_invalid";
+    const auto desc = WriteObject(key, "0123456789abcdef");
+    std::string out(4, '?');
+    auto results = backend_->BatchRead(
+        {{key, desc, {{out.data(), out.size()}}, nullptr, 14, true}});
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(out, "????");
+
+    // The requested prefix still exists; the missing tail must invalidate it.
+    std::filesystem::resize_file(desc.file_path, desc.offset + 8);
+    results = backend_->BatchRead(
+        {{key, desc, {{out.data(), out.size()}}, nullptr, 0, true}});
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0]);
+    EXPECT_EQ(results[0].error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_EQ(out, "????");
+}
+
 TEST_F(DfsBucketBackendTest, CleanupDropsMissingInactiveBucketWithoutRecreatingIt) {
     const std::string value(4096, 'C');
     auto desc = WriteObject("cleanup_missing", value);

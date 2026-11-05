@@ -13,6 +13,7 @@
 #include "types.h"
 #include "replica.h"
 #include "dfs_buffer_usage.h"
+#include "nof/dma_buffer_allocator.h"
 
 namespace mooncake {
 
@@ -35,7 +36,8 @@ class ClientBufferAllocator
     // Create for heap-allocated memory
     static std::shared_ptr<ClientBufferAllocator> create(
         size_t size, const std::string& protocol = "",
-        bool use_hugepage = false, bool use_spdk_dma = false);
+        bool use_hugepage = false,
+        std::shared_ptr<DmaBufferAllocator> dma_allocator = nullptr);
 
     // Create for external memory. An optional owner keeps the backing
     // allocation alive until this allocator and every outstanding BufferHandle
@@ -110,7 +112,8 @@ class ClientBufferAllocator
 
    private:
     ClientBufferAllocator(size_t size, const std::string& protocol,
-                          bool use_hugepage, bool use_spdk_dma);
+                          bool use_hugepage,
+                          std::shared_ptr<DmaBufferAllocator> dma_allocator);
 
     // Declared before allocator_ so the backing outlives allocator teardown.
     std::shared_ptr<void> backing_owner_;
@@ -124,7 +127,7 @@ class ClientBufferAllocator
 
     std::string protocol;
     bool is_external_memory_ = false;
-    bool use_spdk_dma_ = false;
+    std::shared_ptr<DmaBufferAllocator> dma_allocator_;  // was use_spdk_dma_
 };
 
 /**

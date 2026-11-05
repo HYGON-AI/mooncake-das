@@ -26,8 +26,7 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
     tl::expected<AcquireLeadershipResult, ErrorCode> TryAcquireLeadership(
         const std::string& leader_address) override;
 
-    ErrorCode PublishServiceReady(
-        const LeadershipSession& session) override;
+    ErrorCode PublishServiceReady(const LeadershipSession& session) override;
 
     tl::expected<bool, ErrorCode> RenewLeadership(
         const LeadershipSession& session) override;

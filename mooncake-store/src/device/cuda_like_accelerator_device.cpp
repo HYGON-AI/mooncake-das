@@ -8,7 +8,8 @@
 #include "cuda_alike.h"
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
-    defined(USE_COREX) || (defined(USE_HYGON) && !defined(USE_HIP))
+    defined(USE_COREX) || defined(USE_SUPA) || \
+    (defined(USE_HYGON) && !defined(USE_HIP))
 
 namespace mooncake {
 namespace device {
@@ -133,6 +134,10 @@ REGISTER_CUDA_LIKE_ACCELERATOR_DEVICE(hygon, AcceleratorVendor::kHygon);
 
 #if defined(USE_COREX)
 REGISTER_CUDA_LIKE_ACCELERATOR_DEVICE(corex, AcceleratorVendor::kCorex);
+#endif
+
+#if defined(USE_SUPA)
+REGISTER_CUDA_LIKE_ACCELERATOR_DEVICE(supa, AcceleratorVendor::kSupa);
 #endif
 
 #undef REGISTER_CUDA_LIKE_ACCELERATOR_DEVICE

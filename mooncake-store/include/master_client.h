@@ -12,7 +12,6 @@
 #include <type_traits>
 #include <vector>
 #include <variant>
-#include <cstdlib>
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
@@ -21,6 +20,8 @@
 #endif
 
 #include "client_metric.h"
+#include "config/rpc_protocol_config.h"
+#include "config/rpc_timeout_config.h"
 #include "replica.h"
 #include "segment.h"
 #include "types.h"
@@ -58,17 +59,16 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
 
 // Applies the RPC timeout overrides to any mooncake-store RPC client config.
 // Shared by the client->master pool and the store->store offload pool so the
-// two cannot drift. Unset variables leave coro_rpc's built-in 30s defaults in
-// place. A negative request timeout disables the per-request timer.
+// two cannot drift. Absent overrides leave the caller's defaults in place.
+// A negative request timeout disables the per-request timer.
 template <typename ClientConfig>
-inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
-    if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
-        client_config.request_timeout_duration =
-            std::chrono::milliseconds(std::atoll(timeout_ms));
+inline void ApplyRpcTimeoutOverrides(ClientConfig& client_config,
+                                     const RpcTimeoutConfig& config) {
+    if (config.request_timeout.has_value()) {
+        client_config.request_timeout_duration = *config.request_timeout;
     }
-    if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
-        client_config.connect_timeout_duration =
-            std::chrono::milliseconds(std::atoll(connect_ms));
+    if (config.connect_timeout.has_value()) {
+        client_config.connect_timeout_duration = *config.connect_timeout;
     }
 }
 
@@ -85,7 +85,6 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
     // Keep the parameter to preserve the HA/non-HA policy construction API;
     // both modes currently use the same bounded connection policy.
     (void)ha_enabled;
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
     if (const char* retry_count = std::getenv("MC_RPC_CONNECT_RETRY_COUNT")) {
         const auto parsed = std::atoll(retry_count);
         config.connect_retry_count =
@@ -98,13 +97,14 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
         config.reconnect_wait_time =
             std::chrono::milliseconds(parsed > 0 ? parsed : 0);
     }
-    if (value && std::string_view(value) == "rdma") {
+    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
     // Unset MC_RPC_* variables keep the configured pool defaults; explicit
     // values override those defaults for both HA and non-HA pools.
-    ApplyRpcTimeoutEnvOverrides(config.client_config);
+    ApplyRpcTimeoutOverrides(config.client_config,
+                             RpcTimeoutConfig::FromEnvironment());
     return config;
 }
 
@@ -131,6 +131,7 @@ class MasterClient {
           client_id_(client_id),
           tenant_id_(std::move(tenant_id)),
           metrics_(metrics) {}
+    // Drains in-flight RPCs before the pool member is released (#3909).
     ~MasterClient();
 
     void EnableHaConnectionPolicy();
@@ -157,6 +158,15 @@ class MasterClient {
         const std::string& object_key);
 
     /**
+     * @brief Point-in-time existence check that grants no read lease
+     * @param object_key Key to query
+     * @return tl::expected<bool, ErrorCode> indicating exist or not at the
+     * time of the call; the object may still be evicted afterwards
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> ProbeKey(
+        const std::string& object_key);
+
+    /**
      * @brief Checks if multiple objects exist
      * @param object_keys Vector of keys to query
      * @return Vector containing existence status for each key
@@ -169,6 +179,16 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>>
     BatchExistKeyByReplicaType(const std::vector<std::string>& object_keys,
                                ReplicaType replica_type);
+
+    /**
+     * @brief Probe multiple objects, optionally leasing the last complete
+     * candidate. LastHitOnly leases the last all-true candidate in the results.
+     * @param object_keys Vector of keys to query
+     * @return Per-key existence results in input order
+     */
+    [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchProbeKey(
+        const std::vector<std::string>& object_keys,
+        const GrantLeasePolicy& policy = {});
 
     /**
      * @brief Calculate Store-observed cache reuse metrics
@@ -239,6 +259,29 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys,
                         const std::string& tenant_id);
+
+    /**
+     * @brief Read-only variants of GetReplicaList / BatchGetReplicaList.
+     *
+     * Backed by the admin read-only RPCs: the master grants no lease, does
+     * not trigger promotion-on-hit, and does not update valid_get metrics.
+     * Note the response still carries the master's default lease_ttl_ms
+     * value; callers that need lease semantics must force it to 0 (see
+     * Client::QueryReadOnly).
+     *
+     * Intended for best-effort background paths (e.g. SSD prefetch metadata
+     * classification) that must not perturb hot-path state.
+     */
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListReadOnly(const std::string& object_key);
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListReadOnly(const std::string& object_key,
+                           const std::string& tenant_id);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys,
+                                const std::string& tenant_id);
 
     /**
      * @brief Starts a put operation
@@ -512,6 +555,29 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<bool, ErrorCode> PollRemoveAll();
 
+    WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    WeightRpcResult<WeightRevisionView> GetWeightRevision(
+        const GetWeightRevisionRequest& request);
+    WeightRpcResult<ListWeightRevisionsResponse> ListWeightRevisions(
+        const ListWeightRevisionsRequest& request);
+    WeightRpcResult<WeightRevisionLease> AcquireWeightRevisionLease(
+        const AcquireWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightRevisionLease> RenewWeightRevisionLease(
+        const RenewWeightRevisionLeaseRequest& request);
+    WeightRpcResult<void> ReleaseWeightRevisionLease(
+        const ReleaseWeightRevisionLeaseRequest& request);
+    WeightRpcResult<WeightResidencyOperation> StartWeightResidencyOperation(
+        const StartWeightResidencyOperationRequest& request);
+    WeightRpcResult<WeightResidencyOperation> QueryWeightOperation(
+        const QueryWeightOperationRequest& request);
+    WeightRpcResult<WeightRevisionMetadata> DeleteWeightRevision(
+        const DeleteWeightRevisionRequest& request);
+
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
@@ -537,6 +603,22 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
+
+    /**
+     * @brief Registers a prefetch (SSD->DRAM promotion) task on the master.
+     *
+     * Creates a promotion_tasks entry consumed by PromotionAllocStart, but
+     * deliberately bypasses the promotion-on-hit admission gate and the
+     * holder's heartbeat mailbox, keeping the dedicated prefetch path
+     * separate from promotion-on-hit. The caller must be the holder of the
+     * key's LOCAL_DISK replica (the master checks holder_id == client_id).
+     * Best-effort: PROMOTION_ALREADY_EXISTS means a MEMORY replica or an
+     * in-flight promotion already exists and the caller should skip quietly.
+     * The client's own tenant is used.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
@@ -730,6 +812,23 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
         const std::string& key, const std::string& tenant_id,
         ReplicaType replica_type);
+
+    /**
+     * @brief Evict a disk replica only if the master still records the
+     * replica the caller failed on. A master that predates this RPC answers
+     * with an unknown-handler error, so the caller can tell the precondition
+     * was never enforced.
+     * @param key The object key whose disk replica was evicted
+     * @param tenant_id The tenant scope of the object
+     * @param replica_type DISK, LOCAL_DISK, or DFS. DFS is accepted only for
+     * a KVCS object-storage replica through this conditional API.
+     * @param expected_replica_id The replica id the caller failed on
+     * @return true if evicted, false if the current record is a different
+     * replica (left untouched)
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> EvictDiskReplicaIfCurrent(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type, ReplicaID expected_replica_id);
 
     /**
      * @brief Batch notify master that disk replicas were evicted locally.

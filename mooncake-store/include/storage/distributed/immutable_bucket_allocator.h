@@ -191,6 +191,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     uint64_t GetUsedBytes() const override;
 
+    uint64_t GetFileCount() const override;
+
     /**
      * @brief Dynamically change the maximum number of buckets at runtime.
      *

@@ -21,6 +21,14 @@ struct FileInfo {
     size_t size;
 };
 
+// One positional I/O for FileSystemAdapter::BatchWriteAt/BatchReadAt.
+struct FdIoRequest {
+    int fd;
+    iovec* iov;
+    int iovcnt;
+    int64_t offset;
+};
+
 /**
  * @brief Abstract interface for distributed filesystem adapters.
  *
@@ -33,9 +41,13 @@ class FileSystemAdapter {
     virtual ~FileSystemAdapter() = default;
 
     // === File I/O ===
+    // Optional path-based I/O for root markers, probes and metadata sidecars.
+    // Adapters that only implement fd-based I/O may leave these unsupported.
 
     virtual tl::expected<size_t, ErrorCode> WriteFile(
-        const std::string& path, std::span<const char> data) = 0;
+        const std::string& /*path*/, std::span<const char> /*data*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     // Overwrite a stable file in place. Unlike WriteFile, implementations
     // should not unlink the previous contents when a write fails.
@@ -45,16 +57,22 @@ class FileSystemAdapter {
     }
 
     // Read file into a pre-allocated buffer (zero-copy into Slice.ptr)
-    virtual tl::expected<size_t, ErrorCode> ReadFile(const std::string& path,
-                                                     void* buf, size_t len) = 0;
+    virtual tl::expected<size_t, ErrorCode> ReadFile(
+        const std::string& /*path*/, void* /*buf*/, size_t /*len*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     virtual tl::expected<size_t, ErrorCode> VectorWriteFile(
-        const std::string& path, const iovec* iov, int iovcnt,
-        off_t offset) = 0;
+        const std::string& /*path*/, const iovec* /*iov*/, int /*iovcnt*/,
+        off_t /*offset*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     virtual tl::expected<size_t, ErrorCode> VectorReadFile(
-        const std::string& path, const iovec* iov, int iovcnt,
-        off_t offset) = 0;
+        const std::string& /*path*/, const iovec* /*iov*/, int /*iovcnt*/,
+        off_t /*offset*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
 
     // === File management ===
 
@@ -121,6 +139,13 @@ class FileSystemAdapter {
     }
 
     virtual tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    // Open a file that must already exist. Implementations must not use
+    // O_CREAT: bucket descriptors can arrive after whole-bucket eviction.
+    virtual tl::expected<int, ErrorCode> OpenExistingFile(
         const std::string& /*path*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
@@ -238,6 +263,46 @@ class FileSystemAdapter {
                                            : ErrorCode::FILE_WRITE_FAIL);
         }
         return {};
+    }
+
+    // Whether a hard WriteAt/ReadAt failure can be recovered by closing and
+    // reopening the fd (stale-fd self-healing). Only meaningful for adapters
+    // backed by a plain long-lived positional fd (POSIX). Adapters whose I/O
+    // failures are unrelated to the file fd (e.g. 3FS USRBIO submit/completion
+    // or per-thread ior/iov state) must leave this false so the backend does
+    // not perform a pointless close/reopen/retry under the shard lock.
+    virtual bool SupportsFdReopen() const { return false; }
+
+    // Opt in to backend batching and concurrent positional I/O on cached
+    // shard fds. Other adapters retain per-request bucket handles and
+    // serialized shard I/O.
+    virtual bool SupportsBatchIo() const { return false; }
+
+    // Batched positional I/O. Adapters may override these to keep several
+    // requests in flight; the defaults issue one WriteAt/ReadAt per request,
+    // in order. Return exactly one result per request, in the same order,
+    // with the same short-transfer semantics as WriteAt/ReadAt. Requests may
+    // target the same fd and may be issued concurrently by multiple callers.
+    virtual std::vector<tl::expected<size_t, ErrorCode>> BatchWriteAt(
+        std::span<const FdIoRequest> requests) {
+        std::vector<tl::expected<size_t, ErrorCode>> results;
+        results.reserve(requests.size());
+        for (const auto& request : requests) {
+            results.push_back(WriteAt(request.fd, request.iov, request.iovcnt,
+                                      request.offset));
+        }
+        return results;
+    }
+
+    virtual std::vector<tl::expected<size_t, ErrorCode>> BatchReadAt(
+        std::span<const FdIoRequest> requests) {
+        std::vector<tl::expected<size_t, ErrorCode>> results;
+        results.reserve(requests.size());
+        for (const auto& request : requests) {
+            results.push_back(ReadAt(request.fd, request.iov, request.iovcnt,
+                                     request.offset));
+        }
+        return results;
     }
 
     // === Lifecycle ===

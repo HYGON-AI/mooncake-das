@@ -130,8 +130,11 @@ Status NVLinkTransport::install(std::string& local_segment_name,
     conf_ = conf;
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
     installed_ = true;
+    // Copies below this size run as a blocking cudaMemcpy instead of the
+    // async stream + completion-event pipeline (see startTransfer). KiB
+    // units; 0 disables the sync fast path.
     async_memcpy_threshold_ =
-        conf_->get("transports/nvlink/async_memcpy_threshold", 0) * 1024;
+        conf_->get("transports/nvlink/async_memcpy_threshold", 2048) * 1024;
     host_register_ = conf_->get("transports/nvlink/host_register", false);
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;
@@ -202,12 +205,21 @@ Status NVLinkTransport::submitTransferTasks(
     // Determine device for this batch and validate all requests
     int batch_device_id = -1;
     std::vector<NVLinkTask*> new_tasks;
+    // No I/O is started until startTransfer() below, so a synchronous
+    // failure must also roll back the half-appended task entries: the engine
+    // fails such tasks over to another transport, and stale never-started
+    // entries must not linger in the sub-batch (failover.md, hazard 2).
+    const size_t original_task_count = shm_batch->task_list.size();
+    auto rollback_tasks = [&shm_batch, original_task_count]() {
+        shm_batch->task_list.resize(original_task_count);
+    };
 
     for (auto& request : request_list) {
         // Find the buffer this source pointer belongs to
         BufferDesc* buf = local_segment->findBuffer(
             reinterpret_cast<uint64_t>(request.source), request.length);
         if (!buf) {
+            rollback_tasks();
             return Status::InvalidArgument(
                 "Unregistered buffer: source pointer not in any registered "
                 "buffer" LOC_MARK);
@@ -234,7 +246,10 @@ Status NVLinkTransport::submitTransferTasks(
         if (request.target_id != LOCAL_SEGMENT_ID) {
             auto status = relocateSharedMemoryAddress(
                 target_addr, request.length, request.target_id);
-            if (!status.ok()) return status;
+            if (!status.ok()) {
+                rollback_tasks();
+                return status;
+            }
         }
 
         task.target_addr = target_addr;
@@ -250,10 +265,16 @@ Status NVLinkTransport::submitTransferTasks(
             // CPU-only batch: use current CUDA device
             cudaGetDevice(&stream_device);
         }
-        CHECK_STATUS(platform_->getStreamFromPool(shm_batch->sync_stream,
-                                                  stream_device));
-        CHECK_STATUS(platform_->getStreamFromPool(shm_batch->async_stream,
-                                                  stream_device));
+        auto status =
+            platform_->getStreamFromPool(shm_batch->sync_stream, stream_device);
+        if (status.ok()) {
+            status = platform_->getStreamFromPool(shm_batch->async_stream,
+                                                  stream_device);
+        }
+        if (!status.ok()) {
+            rollback_tasks();
+            return status;
+        }
         shm_batch->stream_device_id = stream_device;
     }
 
@@ -264,6 +285,59 @@ Status NVLinkTransport::submitTransferTasks(
 void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
                                     NVLinkSubBatch* batch) {
     if (tasks.empty()) return;
+
+    // A single small copy completes faster with a blocking cudaMemcpy than
+    // with the async stream + completion-event pipeline: the sync call
+    // returns already-completed and saves the fixed event record/poll
+    // notification latency, while the copy itself runs at the same speed.
+    // Only single-task batches take this path: batched submissions amortize
+    // the per-copy submit cost across tasks, and blocking copies serialize
+    // inside the driver under concurrency, so multi-task batches and sizes
+    // at/above async_memcpy_threshold_ keep the async pipeline.
+    if (async_memcpy_threshold_ > 0 && tasks.size() == 1 &&
+        tasks[0]->request.length < async_memcpy_threshold_) {
+        NVLinkTask* task = tasks[0];
+        void* src = nullptr;
+        void* dst = nullptr;
+        if (task->request.opcode == Request::READ) {
+            dst = task->request.source;
+            src = (void*)task->target_addr;
+        } else {
+            src = task->request.source;
+            dst = (void*)task->target_addr;
+        }
+        // Match the async path's device discipline (fix for #2722): run the
+        // copy on the stream's device, then restore the caller's device.
+        int saved_device = -1;
+        if (batch->stream_device_id >= 0) {
+            auto dev_err = cudaGetDevice(&saved_device);
+            if (dev_err == cudaSuccess &&
+                saved_device != batch->stream_device_id) {
+                dev_err = cudaSetDevice(batch->stream_device_id);
+            }
+            if (dev_err != cudaSuccess) {
+                LOG(ERROR) << "NVLinkTransport: cudaGetDevice/cudaSetDevice "
+                              "failed for sync copy: "
+                           << cudaGetErrorString(dev_err);
+                task->status_word = TransferStatusEnum::FAILED;
+                return;
+            }
+        }
+        auto err =
+            cudaMemcpy(dst, src, task->request.length, cudaMemcpyDefault);
+        if (saved_device >= 0 && saved_device != batch->stream_device_id) {
+            cudaSetDevice(saved_device);
+        }
+        if (err == cudaSuccess) {
+            task->transferred_bytes = task->request.length;
+            task->status_word = TransferStatusEnum::COMPLETED;
+        } else {
+            LOG(ERROR) << "NVLinkTransport: synchronous cudaMemcpy failed: "
+                       << cudaGetErrorString(err);
+            task->status_word = TransferStatusEnum::FAILED;
+        }
+        return;
+    }
 
     std::vector<void*> srcs;
     std::vector<void*> dsts;
@@ -456,10 +530,18 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
 
         {
             std::lock_guard<std::mutex> lock(register_mutex_);
-            if (registered_base_addrs_.count((uint64_t)base_ptr)) {
-                // Already registered this cudaMalloc block, just tag transport
+            auto iter = registered_base_addrs_.find((uint64_t)base_ptr);
+            if (iter != registered_base_addrs_.end()) {
+                // Already registered this cudaMalloc block: expand to the
+                // segment granularity and REUSE its IPC handle. The handle
+                // must be stamped on this desc too -- torch's caching
+                // allocator sub-allocates many logical buffers (KV pool, aux
+                // pool, mamba state pool, ...) inside one cudaMalloc segment,
+                // and every desc covering the segment needs the handle or
+                // cross-process NVLink submission for that buffer fails.
                 desc.addr = (uint64_t)base_ptr;
                 desc.length = alloc_size;
+                desc.shm_path = iter->second;
                 desc.transports.push_back(TransportType::NVLINK);
                 CHECK_STATUS(restoreCudaDeviceForLocation(location, saved_dev));
                 return Status::OK();
@@ -486,7 +568,7 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc& desc,
 
         {
             std::lock_guard<std::mutex> lock(register_mutex_);
-            registered_base_addrs_.insert((uint64_t)base_ptr);
+            registered_base_addrs_.emplace((uint64_t)base_ptr, desc.shm_path);
         }
     } else if (location.type() == "cpu" ||
                location.type() == kWildcardLocation) {
@@ -565,9 +647,26 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
     CHECK_STATUS(segment_manager.withCachedSegment(
         target_id, pin, [&](SegmentDesc* segment) {
             buffer = segment->findBuffer(dest_addr, length);
-            if (!buffer || buffer->shm_path.empty())
+            if (!buffer) {
+                LOG_EVERY_N(WARNING, 1000)
+                    << "NVLink relocation: no buffer covers target_addr=0x"
+                    << std::hex << dest_addr << std::dec << " length=" << length
+                    << " in segment " << target_id;
                 return Status::NeedsRefreshCache(
                     "Requested address is not in registered buffer" LOC_MARK);
+            }
+            if (buffer->shm_path.empty()) {
+                // cudaMalloc-segment dedup used to drop the IPC handle for
+                // every desc after the first one in the same segment; this
+                // log is the fingerprint of that (fixed) bug.
+                LOG_EVERY_N(WARNING, 1000)
+                    << "NVLink relocation: target buffer at 0x" << std::hex
+                    << buffer->addr << std::dec
+                    << " (location=" << buffer->location
+                    << ") has no CUDA IPC handle; NVLink unavailable for it";
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            }
             return Status::OK();
         }));
 
@@ -575,6 +674,9 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         void* shm_addr = nullptr;
         LocationParser location(buffer->location);
         if (location.type() != "cuda") {
+            LOG_EVERY_N(WARNING, 1000)
+                << "NVLink relocation: target buffer location "
+                << buffer->location << " is not cuda; NVLink unavailable";
             return Status::InvalidArgument(
                 "Requested address is not in registered CUDA buffer" LOC_MARK);
         }
@@ -582,16 +684,24 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         deserializeBinaryData(buffer->shm_path, output_buffer);
         cudaIpcMemHandle_t handle;
         memcpy(&handle, output_buffer.data(), sizeof(handle));
+        // Open the IPC handle on the CALLER's current device. Never switch to
+        // buffer->location's device index: that ordinal is the PEER's device
+        // index, relative to the peer's CUDA_VISIBLE_DEVICES. In the local
+        // process it may be an invalid ordinal (when the peer process sees
+        // more devices than we do), and even when numerically valid it may
+        // denote a different physical GPU. cudaIpcOpenMemHandle with
+        // cudaIpcMemLazyEnablePeerAccess is valid on the current device: the
+        // lazy flag enables peer access between the current device and the
+        // allocation's source device as needed, and subsequent copies already
+        // run cross-device via P2P (see startTransfer).
         int cuda_dev = 0;
         CHECK_CUDA(cudaGetDevice(&cuda_dev));
-        cudaSetDevice(location.index());
         CHECK_CUDA(cudaIpcOpenMemHandle(&shm_addr, handle,
                                         cudaIpcMemLazyEnablePeerAccess));
-        cudaSetDevice(cuda_dev);
         OpenedShmEntry shm_entry;
         shm_entry.shm_addr = shm_addr;
         shm_entry.length = buffer->length;
-        shm_entry.cuda_id = location.index();
+        shm_entry.cuda_id = cuda_dev;
         relocate_map_[target_id][buffer->addr] = shm_entry;
         tl_relocate_map = relocate_map_;
     }

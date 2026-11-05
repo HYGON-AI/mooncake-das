@@ -8,6 +8,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -19,7 +20,7 @@
 
 #include "crc32c.h"
 #include "master_metric_manager.h"
-#include "storage/distributed/distributed_storage_backend.h"
+#include "config/distributed_storage_config.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
@@ -177,7 +178,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     if (!config.ValidateForAllocator()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (!config.ValidateForBucketAllocator()) {
+    if (!config.ValidateForBucketAllocator() ||
+        config.bucket_capacity >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -1704,6 +1707,10 @@ int64_t ImmutableBucketAllocator::SetMaxBucketCount(int64_t new_max_bucket_count
 size_t ImmutableBucketAllocator::GetBucketCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return buckets_.size();
+}
+
+uint64_t ImmutableBucketAllocator::GetFileCount() const {
+    return static_cast<uint64_t>(GetBucketCount());
 }
 
 std::shared_ptr<const ImmutableBucketAllocator::BucketIdSnapshot>

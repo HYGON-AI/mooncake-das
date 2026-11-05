@@ -11,7 +11,14 @@
 #include <utility>
 #include <vector>
 
+#include <asio/executor_work_guard.hpp>
 #include <glog/logging.h>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
+#include <ylt/coro_io/coro_io.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
@@ -23,6 +30,7 @@
 #include "runtime_log_config.h"
 #include "rpc_service.h"
 #include "types.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -172,6 +180,12 @@ std::string EscapePrometheusLabel(std::string_view input) {
     }
     return escaped;
 }
+
+struct HttpDfsShardCountResponse {
+    bool success{true};
+    int shard_count{0};
+};
+YLT_REFL(HttpDfsShardCountResponse, success, shard_count);
 
 struct HttpTenantQuotaSnapshot {
     std::string tenant_id;
@@ -658,6 +672,20 @@ void MasterAdminServer::HandleHealth(coro_http::coro_http_request&,
     WriteJsonResponse(resp, coro_http::status_type::ok, payload);
 }
 
+struct HttpVersionResponse {
+    std::string version;
+    std::string display_version;
+};
+YLT_REFL(HttpVersionResponse, version, display_version);
+
+void MasterAdminServer::HandleVersion(coro_http::coro_http_request&,
+                                      coro_http::coro_http_response& resp) {
+    WriteJsonResponse(
+        resp, coro_http::status_type::ok,
+        HttpVersionResponse{.version = GetMooncakeStoreVersion(),
+                            .display_version = MOONCAKE_DISPLAY_VERSION});
+}
+
 struct HttpLeaderResponse {
     bool present{false};
     std::optional<std::string> leader_address;
@@ -746,10 +774,10 @@ struct HttpKvEventsStatusResponse {
     uint64_t published_batches{0};
     uint64_t published_events{0};
     uint64_t dropped_events{0};
-    uint64_t skipped_unparsed_keys{0};
+    uint64_t skipped_keyless_events{0};
 };
 YLT_REFL(HttpKvEventsStatusResponse, enabled, published_batches,
-         published_events, dropped_events, skipped_unparsed_keys);
+         published_events, dropped_events, skipped_keyless_events);
 
 void MasterAdminServer::HandleKvEventsStatus(
     coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
@@ -761,7 +789,7 @@ void MasterAdminServer::HandleKvEventsStatus(
             payload.published_batches = stats.published_batches;
             payload.published_events = stats.published_events;
             payload.dropped_events = stats.dropped_events;
-            payload.skipped_unparsed_keys = stats.skipped_unparsed_keys;
+            payload.skipped_keyless_events = stats.skipped_keyless_events;
             WriteJsonResponse(resp, coro_http::status_type::ok, payload);
         });
 }
@@ -952,6 +980,87 @@ struct HttpCreateDrainJobResponse {
 YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
          error_message);
 
+void MasterAdminServer::HandleGetDfsShardCount(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->GetDfsShardCount();
+        if (!result) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpDfsShardCountResponse{true, *result});
+    });
+}
+
+async_simple::coro::Lazy<void> MasterAdminServer::HandleExpandDfsShards(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    Json::CharReaderBuilder builder;
+    builder["rejectDupKeys"] = true;
+    builder["failIfExtra"] = true;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    Json::Value body;
+    std::string errors;
+    const auto text = req.get_body();
+    const bool parsed =
+        reader->parse(text.data(), text.data() + text.size(), &body, &errors);
+    if (!parsed || !body.isObject() || !body.isMember("shard_count") ||
+        (body["shard_count"].type() != Json::intValue &&
+         body["shard_count"].type() != Json::uintValue) ||
+        !body["shard_count"].isInt() || body["shard_count"].asInt() <= 0) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "shard_count must be an integer in [1, INT_MAX]");
+        co_return;
+    }
+    const int shard_count = body["shard_count"].asInt();
+    auto service = GetActiveService();
+    if (!service) {
+        SetServiceUnavailable(resp, "Master service is not available");
+        co_return;
+    }
+    auto running = dfs_expansion_running_;
+    if (running->exchange(true)) {
+        WriteErrorResponse(resp, coro_http::status_type::conflict,
+                           ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+                           "A DFS expansion is already in progress");
+        co_return;
+    }
+    struct ResetRunning {
+        std::shared_ptr<std::atomic<bool>> flag;
+        ~ResetRunning() { flag->store(false); }
+    } reset{running};
+    // Filesystem preparation can block, especially on a shared filesystem.
+    // Retain the HTTP executor until the worker finishes: server stop() drains
+    // that executor, but does not wait for the global blocking pool itself.
+    const auto io_executor =
+        req.get_conn()->get_executor()->get_asio_executor();
+    auto work = asio::make_work_guard(io_executor);
+    // Keep the owning callable and pending operation in the coroutine frame.
+    auto expand = [service, shard_count]() {
+        return service->ExpandDfsShards(shard_count);
+    };
+    auto pending = coro_io::post(expand);
+    auto completion = co_await std::move(pending);
+    // post() resumes on the worker. Response/socket handling must return to
+    // the connection's executor before releasing its outstanding work.
+    co_await coro_io::dispatch(io_executor);
+    if (completion.hasError()) {
+        WriteErrorResponse(resp, coro_http::status_type::internal_server_error,
+                           ErrorCode::INTERNAL_ERROR);
+        co_return;
+    }
+    auto result = std::move(completion).value();
+    if (!result) {
+        WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                           result.error());
+        co_return;
+    }
+    WriteJsonResponse(resp, coro_http::status_type::ok,
+                      HttpDfsShardCountResponse{true, *result});
+}
+
 void MasterAdminServer::HandleCreateDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
     CreateDrainJobRequest request;
@@ -1120,6 +1229,59 @@ void MasterAdminServer::HandleSegmentStatus(
         payload.segment = std::string(segment_name);
         payload.status = static_cast<int32_t>(result.value());
         payload.status_name = EnumToString(result.value());
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+struct HttpSetSegmentStatusRequest {
+    std::string status;
+};
+YLT_REFL(HttpSetSegmentStatusRequest, status);
+
+void MasterAdminServer::HandleSetSegmentStatus(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    const std::string segment_name(req.get_decode_query_value("segment"));
+    if (segment_name.empty()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "Missing segment query parameter");
+        return;
+    }
+
+    HttpSetSegmentStatusRequest request;
+    try {
+        struct_json::from_json(request, req.get_body());
+    } catch (const std::exception& e) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+    SegmentStatus status;
+    if (request.status == "OK") {
+        status = SegmentStatus::OK;
+    } else if (request.status == "DRAINING") {
+        status = SegmentStatus::DRAINING;
+    } else {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "status must be OK or DRAINING");
+        return;
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->SetSegmentStatus(segment_name, status);
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+
+        HttpSegmentStatusResponse payload;
+        payload.success = true;
+        payload.segment = segment_name;
+        payload.status = static_cast<int32_t>(status);
+        payload.status_name = EnumToString(status);
         WriteJsonResponse(resp, coro_http::status_type::ok, payload);
     });
 }
@@ -1360,6 +1522,71 @@ void MasterAdminServer::HandleDeleteTenantQuota(
     });
 }
 
+struct HttpSoftPinRequest {
+    std::string tenant_id{"default"};
+    std::vector<std::string> keys;
+    std::optional<uint64_t> ttl_ms;
+};
+YLT_REFL(HttpSoftPinRequest, tenant_id, keys, ttl_ms);
+
+struct HttpSoftPinResult {
+    std::string key;
+    int32_t error_code{0};
+};
+YLT_REFL(HttpSoftPinResult, key, error_code);
+
+struct HttpSoftPinResponse {
+    std::vector<HttpSoftPinResult> results;
+};
+YLT_REFL(HttpSoftPinResponse, results);
+
+void MasterAdminServer::HandleSoftPin(coro_http::coro_http_request& req,
+                                      coro_http::coro_http_response& resp,
+                                      bool unpin) {
+    HttpSoftPinRequest request;
+    try {
+        const auto body = req.get_body();
+        auto cursor = body.begin();
+        auto end = body.end();
+        struct_json::from_json(request, cursor, end);
+        if (!std::all_of(cursor, end, [](char ch) {
+                return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+            })) {
+            WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                               ErrorCode::INVALID_PARAMS,
+                               "Unexpected content after JSON body");
+            return;
+        }
+    } catch (const std::exception& e) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           std::string("Invalid JSON body: ") + e.what());
+        return;
+    }
+    if (request.keys.empty() || request.keys.size() > 4096 ||
+        !TenantId(request.tenant_id).IsValid() ||
+        (unpin ? request.ttl_ms.has_value() : !request.ttl_ms.has_value())) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "Expected 1..4096 keys, a valid tenant, and ttl_ms "
+                           "only for soft_pin");
+        return;
+    }
+    WithActiveService(resp, [&](auto service) {
+        const auto results = service->BatchUpdateSoftPin(
+            request.keys, unpin ? 0 : *request.ttl_ms, request.tenant_id);
+        HttpSoftPinResponse payload;
+        payload.results.reserve(results.size());
+        for (size_t i = 0; i < results.size(); ++i) {
+            payload.results.push_back(
+                {request.keys[i],
+                 static_cast<int32_t>(results[i] ? ErrorCode::OK
+                                                 : results[i].error())});
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
 struct HttpRemoveAllResponse {
     bool success{true};
     long removed_count{0};
@@ -1490,6 +1717,17 @@ void MasterAdminServer::HandleSetDfsFilterMode(
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
+    http_server_.set_http_handler<POST>(
+        "/api/v1/soft_pin",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSoftPin(req, resp, false);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/soft_unpin",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSoftPin(req, resp, true);
+        });
+
     http_server_.set_http_handler<GET>(
         "/metrics", [this](coro_http_request& req, coro_http_response& resp) {
             HandleMetrics(req, resp);
@@ -1502,6 +1740,10 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/health", [this](coro_http_request& req, coro_http_response& resp) {
             HandleHealth(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/version", [this](coro_http_request& req, coro_http_response& resp) {
+            HandleVersion(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/role", [this](coro_http_request& req, coro_http_response& resp) {
@@ -1545,6 +1787,16 @@ void MasterAdminServer::RegisterHandler() {
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleQuerySegment(req, resp);
         });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/dfs/shard_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetDfsShardCount(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/dfs/shard_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            return HandleExpandDfsShards(req, resp);
+        });
     http_server_.set_http_handler<POST>(
         "/api/v1/drain_jobs",
         [this](coro_http_request& req, coro_http_response& resp) {
@@ -1564,6 +1816,11 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/segments/status",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleSegmentStatus(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/segments/status",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleSetSegmentStatus(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/api/v1/tenant_quotas",

@@ -48,13 +48,14 @@ Mooncake Store may generate various types of errors during execution. For most A
 |                          | OBJECT_ALREADY_EXISTS (-705)   | Object already exists                                                                                     |
 |                          | OBJECT_HAS_LEASE (-706)        | Object has lease                                                                                          |
 |                          | LEASE_EXPIRED (-707)           | Legacy generic-read and same-node batch-read lease expiry; retained with its original value and string       |
-|                          | BATCH_GET_LEASE_EXPIRED (-715) | Lease expired after a validated batch read, excluding the same-node path; successful immutable BUCKET DFS reads are exempt |
-|                          | SESSION_START_LEASE_EXPIRED (-716) | Initial get-session query lease is already expired |
-|                          | SESSION_REFRESH_QUERY_LEASE_EXPIRED (-717) | Fresh refresh query lease expired before replica selection |
-|                          | SESSION_REFRESH_COMMIT_LEASE_EXPIRED (-718) | Refreshed lease expired before committing the session |
-|                          | SESSION_PREFETCH_LEASE_EXPIRED (-719) | Session lease expired at prefetch entry |
-|                          | SESSION_RANGE_LEASE_EXPIRED (-720) | Session lease expired at range-get entry |
-|                          | SESSION_MEMORY_TRANSFER_LEASE_EXPIRED (-721) | Session lease expired after a successful memory range transfer |
+|                          | BATCH_GET_LEASE_EXPIRED (-70701) | Lease expired after a validated batch read, excluding the same-node path; successful immutable BUCKET DFS reads are exempt |
+|                          | SESSION_START_LEASE_EXPIRED (-70702) | Initial get-session query lease is already expired |
+|                          | SESSION_REFRESH_QUERY_LEASE_EXPIRED (-70703) | Fresh refresh query lease expired before replica selection |
+|                          | SESSION_REFRESH_COMMIT_LEASE_EXPIRED (-70704) | Refreshed lease expired before committing the session |
+|                          | SESSION_PREFETCH_LEASE_EXPIRED (-70705) | Session lease expired at prefetch entry |
+|                          | SESSION_RANGE_LEASE_EXPIRED (-70706) | Session lease expired at range-get entry |
+|                          | SESSION_MEMORY_TRANSFER_LEASE_EXPIRED (-70707) | Session lease expired after a successful memory range transfer |
+|                          | PROMOTION_ALREADY_EXISTS (-715) | A MEMORY replica or an in-flight promotion exists; best-effort prefetch treats this as a no-op |
 | Transfer                 | TRANSFER_FAIL (-800)           | Transfer operation failed                                                                                 |
 | Checksum                 | CHECKSUM_MISMATCH (-801)       | Retrieved object data does not match its stored checksum                                                  |
 | RPC                      | RPC_FAIL (-900)                | RPC operation failed                                                                                      |
@@ -79,10 +80,17 @@ Lease-code compatibility: `LEASE_EXPIRED` retains integer `-707` and its string
 for generic single/direct reads and the preferred same-node batch path. Other
 batch reads and the get-session stages now
 return the distinct codes above; callers that previously compared only `-707`
-for these APIs must accept the relevant `-715` through `-721` codes as well.
+for these APIs must accept the relevant `-70701` through `-70707` codes as well.
 Python returns these per-key integers directly. The C API also forwards negative
 read results unchanged (batch statuses are in `results_out`); it has no separate
 error enum or session API. No compatibility remapping to `-707` is performed.
+
+The seven L4 stage codes use the fork range `-70701` through `-70707` to
+avoid the upstream sequential object-code range. They previously used `-715`
+through `-721`; update clients, numeric checks and monitoring rules together
+with the library. Upstream `PROMOTION_ALREADY_EXISTS` now uses `-715`, so an
+old L4 `-715` cannot be interpreted safely without knowing the producer version.
+No alias or automatic remapping from the old stage codes is provided.
 
 Only successful DFS batch reads from an initialized `BUCKET` backend skip the
 completion lease check, after existing I/O, descriptor, epoch and checksum

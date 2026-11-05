@@ -48,13 +48,14 @@ Mooncake Store 在执行期间可能会产生各种类型的错误，对于绝�
 |       | OBJECT\_ALREADY\_EXISTS (-705)           | 对象已存在            |
 |       | OBJECT\_HAS\_LEASE (-706)                | 对象存在租约           |
 |       | LEASE\_EXPIRED (-707)                    | 保留的通用读取及优先同节点批量读取租约错误码，整数值和字符串不变 |
-|       | BATCH_GET_LEASE_EXPIRED (-715)           | 非优先同节点路径的批量读取校验完成后租约过期；成功的 immutable BUCKET DFS 读取豁免 |
-|       | SESSION_START_LEASE_EXPIRED (-716)       | session start 查询租约已过期 |
-|       | SESSION_REFRESH_QUERY_LEASE_EXPIRED (-717) | refresh fresh query 在选择副本前已过期 |
-|       | SESSION_REFRESH_COMMIT_LEASE_EXPIRED (-718) | refresh 提交 session 前二次检查过期 |
-|       | SESSION_PREFETCH_LEASE_EXPIRED (-719)    | prefetch 入口租约已过期 |
-|       | SESSION_RANGE_LEASE_EXPIRED (-720)       | range-get 入口租约已过期 |
-|       | SESSION_MEMORY_TRANSFER_LEASE_EXPIRED (-721) | memory range transfer 成功完成后租约过期 |
+|       | BATCH_GET_LEASE_EXPIRED (-70701)           | 非优先同节点路径的批量读取校验完成后租约过期；成功的 immutable BUCKET DFS 读取豁免 |
+|       | SESSION_START_LEASE_EXPIRED (-70702)       | session start 查询租约已过期 |
+|       | SESSION_REFRESH_QUERY_LEASE_EXPIRED (-70703) | refresh fresh query 在选择副本前已过期 |
+|       | SESSION_REFRESH_COMMIT_LEASE_EXPIRED (-70704) | refresh 提交 session 前二次检查过期 |
+|       | SESSION_PREFETCH_LEASE_EXPIRED (-70705)    | prefetch 入口租约已过期 |
+|       | SESSION_RANGE_LEASE_EXPIRED (-70706)       | range-get 入口租约已过期 |
+|       | SESSION_MEMORY_TRANSFER_LEASE_EXPIRED (-70707) | memory range transfer 成功完成后租约过期 |
+|       | PROMOTION_ALREADY_EXISTS (-715) | 已有 MEMORY 副本或正在提升副本；尽力预取时视为无需操作 |
 | 数据传输  | TRANSFER\_FAIL (-800)                    | 数据传输失败           |
 | RPC   | RPC\_FAIL (-900)                         | RPC 操作失败         |
 | 高可用相关 | ETCD\_OPERATION\_ERROR (-1000)           | etcd 操作失败        |
@@ -73,8 +74,13 @@ Mooncake Store 在执行期间可能会产生各种类型的错误，对于绝�
 
 兼容策略：保留 `LEASE_EXPIRED = -707` 及原字符串，通用单次/直接读取及优先同节点批量读取仍可返回旧码。
 其他批量读取和 get-session 各阶段改为返回上表的独立错误码；原先仅比较 `-707` 的调用方
-需按调用阶段接受 `-715` 至 `-721`，不做回映射。Python 直接返回每个 key 的整数状态；
+需按调用阶段接受 `-70701` 至 `-70707`，不做回映射。Python 直接返回每个 key 的整数状态；
 C API 原样传递负值读取结果，批量状态位于 `results_out`，没有独立错误枚举或 session 接口。
+
+七种 L4 阶段错误码使用 fork 区间 `-70701` 至 `-70707`，避开上游顺序增长的对象错误码。
+旧版使用 `-715` 至 `-721`，升级库时需同步更新调用方的数字判断及监控规则。
+上游 `PROMOTION_ALREADY_EXISTS` 现在占用 `-715`，因此脱离生产端版本无法安全解释旧 L4 的 `-715`。
+不提供旧阶段错误码的别名或自动回映射。
 
 仅已初始化 BUCKET 后端中通过现有读取、descriptor、epoch 和 checksum 校验的 DFS
 批量读取豁免完成后租约检查。低层 `Client::BatchGet` 没有入口租约检查，已过期的 BUCKET

@@ -130,6 +130,13 @@ bool SameReplicaForSessionCache(const Replica::Descriptor &lhs,
             lhs.get_nof_descriptor().buffer_descriptor,
             rhs.get_nof_descriptor().buffer_descriptor);
     }
+    if (lhs.is_local_disk_replica() && rhs.is_local_disk_replica()) {
+        const auto &left = lhs.get_local_disk_descriptor();
+        const auto &right = rhs.get_local_disk_descriptor();
+        return left.client_id == right.client_id &&
+               left.object_size == right.object_size &&
+               left.transport_endpoint == right.transport_endpoint;
+    }
     if (lhs.is_disk_replica() && rhs.is_disk_replica()) {
         const auto &left = lhs.get_disk_descriptor();
         const auto &right = rhs.get_disk_descriptor();
@@ -151,7 +158,8 @@ bool SameReplicaForSessionCache(const Replica::Descriptor &lhs,
 
 bool CompatibleSessionCacheRefresh(const QueryResult &old_session,
                                           const QueryResult &fresh_session) {
-    if (old_session.replicas.size() != 1 ||
+    if (old_session.resolved_tenant_id != fresh_session.resolved_tenant_id ||
+        old_session.replicas.size() != 1 ||
         fresh_session.replicas.size() != 1 ||
         !SameReplicaForSessionCache(old_session.replicas.front(),
                                     fresh_session.replicas.front())) {
@@ -163,7 +171,8 @@ bool CompatibleSessionCacheRefresh(const QueryResult &old_session,
 
 bool SameGetSessionSnapshot(const QueryResult &lhs,
                                    const QueryResult &rhs) {
-    if (lhs.lease_timeout != rhs.lease_timeout ||
+    if (lhs.resolved_tenant_id != rhs.resolved_tenant_id ||
+        lhs.lease_timeout != rhs.lease_timeout ||
         lhs.object_checksum != rhs.object_checksum ||
         lhs.replicas.size() != rhs.replicas.size()) {
         return false;

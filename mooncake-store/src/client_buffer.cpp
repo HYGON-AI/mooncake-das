@@ -10,7 +10,7 @@
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
 
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -20,9 +20,9 @@ namespace mooncake {
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
     size_t size, const std::string& protocol, bool use_hugepage,
-    bool use_spdk_dma) {
-    return std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(size, protocol, use_hugepage, use_spdk_dma));
+    std::shared_ptr<DmaBufferAllocator> dma_allocator) {
+    return std::shared_ptr<ClientBufferAllocator>(new ClientBufferAllocator(
+        size, protocol, use_hugepage, std::move(dma_allocator)));
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
@@ -37,14 +37,13 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
     return allocator;
 }
 
-ClientBufferAllocator::ClientBufferAllocator(size_t size,
-                                             const std::string& protocol,
-                                             bool use_hugepage,
-                                             bool use_spdk_dma)
+ClientBufferAllocator::ClientBufferAllocator(
+    size_t size, const std::string& protocol, bool use_hugepage,
+    std::shared_ptr<DmaBufferAllocator> dma_allocator)
     : buffer_size_(size),
       use_hugepage_(use_hugepage),
       protocol(protocol),
-      use_spdk_dma_(use_spdk_dma) {
+      dma_allocator_(std::move(dma_allocator)) {
     if (size == 0) {
         buffer_ = nullptr;
         allocator_ = nullptr;
@@ -62,7 +61,7 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
 #endif
         {
             buffer_ = allocate_buffer_allocator_memory(
-                size, protocol, alignment, use_spdk_dma_);
+                size, protocol, alignment, dma_allocator_.get());
         }
     }
     if (!buffer_) {
@@ -91,7 +90,7 @@ ClientBufferAllocator::~ClientBufferAllocator() {
         if (use_hugepage_) {
             free_buffer_mmap_memory(buffer_, buffer_size_);
         } else {
-            free_memory(protocol, buffer_, use_spdk_dma_);
+            free_memory(protocol, buffer_, dma_allocator_.get());
         }
     }
 }

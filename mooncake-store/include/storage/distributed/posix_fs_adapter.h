@@ -40,6 +40,9 @@ class PosixFsAdapter : public FileSystemAdapter {
     tl::expected<int, ErrorCode> OpenFileReadWriteExisting(
         const std::string& path) override;
 
+    tl::expected<int, ErrorCode> OpenExistingFile(
+        const std::string& path) override;
+
     tl::expected<void, ErrorCode> CloseFile(int fd) override;
 
     tl::expected<void, ErrorCode> PreallocateFile(const std::string& path,
@@ -63,6 +66,8 @@ class PosixFsAdapter : public FileSystemAdapter {
     tl::expected<void, ErrorCode> Init(const std::string& mount_path) override;
 
     tl::expected<void, ErrorCode> Shutdown() override;
+
+    bool SupportsFdReopen() const override { return true; }
 
     const char* GetName() const override { return "posix"; }
 

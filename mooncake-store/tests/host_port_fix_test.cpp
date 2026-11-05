@@ -8,7 +8,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "common.h"
-#include "utils.h"
+#include "common/network.h"
 
 namespace mooncake {
 namespace {

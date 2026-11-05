@@ -462,16 +462,7 @@ tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFileReadOnly(
 
 tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFileReadWriteExisting(
     const std::string& path) {
-    int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-        return tl::make_unexpected(errno == ENOENT ? ErrorCode::FILE_NOT_FOUND
-                                                   : ErrorCode::FILE_OPEN_FAIL);
-    }
-    if (hf3fs_reg_fd(fd, 0) > 0) {
-        close(fd);
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-    return fd;
+    return OpenExistingFile(path);
 }
 
 tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFileDirectStrict(
@@ -483,6 +474,23 @@ tl::expected<int, ErrorCode> Hf3fsAdapter::OpenFileDirectStrict(
     errno = EOPNOTSUPP;
     const int fd = -1;
 #endif
+    if (fd < 0) {
+        return tl::make_unexpected(errno == ENOENT ? ErrorCode::FILE_NOT_FOUND
+                                                   : ErrorCode::FILE_OPEN_FAIL);
+    }
+    if (hf3fs_reg_fd(fd, 0) > 0) {
+        close(fd);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    return fd;
+}
+
+tl::expected<int, ErrorCode> Hf3fsAdapter::OpenExistingFile(
+    const std::string& path) {
+    int fd;
+    do {
+        fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0) {
         return tl::make_unexpected(errno == ENOENT ? ErrorCode::FILE_NOT_FOUND
                                                    : ErrorCode::FILE_OPEN_FAIL);

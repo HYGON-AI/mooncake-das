@@ -29,6 +29,10 @@
 #include <cstring>
 #include <sstream>
 
+#ifdef USE_SHCA
+#include <infiniband/shca_17b_types.h>
+#endif
+
 #include "common.h"
 #include "config.h"
 #include "error.h"

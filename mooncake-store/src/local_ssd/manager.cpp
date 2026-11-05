@@ -146,6 +146,16 @@ std::vector<LocalSsdManager::ClientAccess> LocalSsdManager::SnapshotClients()
     return clients;
 }
 
+std::vector<UUID> LocalSsdManager::GetClientIds() const {
+    std::vector<UUID> client_ids;
+    std::shared_lock lock(mutex_);
+    client_ids.reserve(clients_.size());
+    for (const auto& [client_id, record] : clients_) {
+        client_ids.push_back(client_id);
+    }
+    return client_ids;
+}
+
 void LocalSsdManager::WaitForOperations(const ClientMap& clients) {
     for (const auto& [_, record] : clients) {
         std::unique_lock lifecycle_lock(record->lifecycle_mutex);
@@ -341,46 +351,6 @@ tl::expected<bool, ErrorCode> LocalSsdManager::ConsumeRemoveAll(
         return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     return client->record->mailbox.ConsumeRemoveAll();
-}
-
-LocalSsdPersistedState LocalSsdManager::ExportPersistedState() const {
-    auto clients = SnapshotClients();
-    LocalSsdPersistedState state;
-    for (const auto& client_access : clients) {
-        const auto& record = client_access.record;
-        LocalSsdPersistedClient client;
-        {
-            MutexLocker stats_lock(&record->stats_mutex);
-            MutexLocker mailbox_lock(&record->mailbox.mutex_);
-            client.total_capacity_bytes = record->total_capacity_bytes;
-            client.enable_offloading = record->mailbox.enable_offloading_;
-            client.pending_offloads.insert(
-                record->mailbox.pending_offloads_.begin(),
-                record->mailbox.pending_offloads_.end());
-        }
-        state.emplace(client_access.client_id, std::move(client));
-    }
-    return state;
-}
-
-void LocalSsdManager::RestorePersistedState(LocalSsdPersistedState state) {
-    ClientMap clients;
-    for (auto& [client_id, persisted] : state) {
-        auto record =
-            std::make_shared<ClientRecord>(persisted.enable_offloading);
-        record->total_capacity_bytes = persisted.total_capacity_bytes;
-        record->mailbox.pending_offloads_.insert(
-            std::make_move_iterator(persisted.pending_offloads.begin()),
-            std::make_move_iterator(persisted.pending_offloads.end()));
-        clients.emplace(client_id, std::move(record));
-    }
-    ClientMap previous;
-    {
-        std::unique_lock lock(mutex_);
-        previous.swap(clients_);
-        clients_ = std::move(clients);
-    }
-    WaitForOperations(previous);
 }
 
 void LocalSsdManager::Clear() {
