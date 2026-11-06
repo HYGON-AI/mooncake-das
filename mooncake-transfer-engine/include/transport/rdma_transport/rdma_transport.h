@@ -207,6 +207,12 @@ class RdmaTransport : public Transport {
     std::mutex kfd_pin_anchor_mutex_;
     std::unordered_map<uintptr_t, KfdPinAnchor> kfd_pin_anchors_;
     std::unordered_map<uintptr_t, uintptr_t> kfd_pin_anchor_of_buffer_;
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    // Device addresses skipped at register when HyLink is installed. Unregister
+    // must no-op for these so RDMA does not erase HyLink's metadata entry.
+    std::mutex skipped_hylink_fabric_mutex_;
+    std::unordered_set<uint64_t> skipped_hylink_fabric_addrs_;
+#endif
 };
 
 using TransferRequest = Transport::TransferRequest;

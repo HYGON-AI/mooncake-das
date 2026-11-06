@@ -532,9 +532,27 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
         // TODO: install other transports automatically
 
-#ifdef USE_HIP
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+        // Opt-in: MC_ENABLE_HYLINK=1 (default off). After RDMA/TCP so the
+        // segment protocol becomes "rdma,hylink" or "tcp,hylink". A USE_HYLINK
+        // build does not install HipTransport.
+        if (envFlagEnabled("MC_ENABLE_HYLINK")) {
+            Transport* hylink_transport =
+                multi_transports_->installTransport("hylink", nullptr);
+            if (!hylink_transport) {
+                LOG(WARNING) << "MC_ENABLE_HYLINK is set but failed to install "
+                                "HyLink transport (HSL unavailable)";
+            } else {
+                LOG(INFO) << "MC_ENABLE_HYLINK is set, HyLink transport "
+                             "installed";
+            }
+        }
+#endif
+
+#if defined(USE_HIP) && !defined(USE_HYLINK)
         // HIP transport handles intra-node GPU P2P via XGMI/IPC and can
         // coexist with the cross-node transport (RDMA/TCP) selected above.
+        // USE_HYLINK installs HylinkTransport instead of HipTransport.
         {
             Transport* hip_transport =
                 multi_transports_->installTransport("hip", nullptr);
