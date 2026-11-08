@@ -1149,29 +1149,74 @@ TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     auto config = FileStorageConfig::FromEnvironment();
     config.storage_filepath = data_path;
     config.local_buffer_size = 4 * 1024 * 1024;
+    config.unified_buffer_size = 256 * 1024;
+    config.read_chunk_size = 16 * 1024;
+    config.write_chunk_size = 16 * 1024;
     EXPECT_FALSE(config.enable_dfs);
+    auto probe = PinnedBufferPool::AllocatePinned(config.unified_buffer_size,
+                                                  false);
 
     SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "posix");
-    {
+    if (!probe.pinned_host.addr) {
+        EXPECT_THROW(FileStorage(config, nullptr, "localhost:9003"),
+                     std::runtime_error);
+    } else {
         FileStorage file_storage(config, nullptr, "localhost:9003");
         EXPECT_TRUE(FileStorageUsesDfsControlPlane(file_storage));
+        ASSERT_TRUE(file_storage.UnifiedBufferAllocator());
+        EXPECT_EQ(file_storage.UnifiedBufferCapacity(),
+                  config.unified_buffer_size);
+        EXPECT_TRUE(file_storage.AllocatePinnedStagingBuffer(4096, 4096));
+        EXPECT_TRUE(file_storage.AllocatePinnedPrefetchBuffer(4096, 4096));
+        EXPECT_TRUE(file_storage.UnifiedBufferAllocator()->allocate_aligned(
+            4096, 4096, DfsBufferUsageKind::kWrite));
     }
 
 #ifdef HAVE_OSS_ADAPTER
     SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "oss");
-    FileStorage file_storage(config, nullptr, "localhost:9003");
-    EXPECT_FALSE(FileStorageUsesDfsControlPlane(file_storage));
+    {
+        auto object_config = config;
+        object_config.enable_dfs = true;
+        FileStorage file_storage(object_config, nullptr, "localhost:9003");
+        EXPECT_FALSE(FileStorageUsesDfsControlPlane(file_storage));
+        EXPECT_FALSE(file_storage.UnifiedBufferAllocator());
+        EXPECT_EQ(file_storage.UnifiedBufferCapacity(), 0);
 
-    auto enable_offloading = FileStorageIsEnableOffloading(file_storage);
-    ASSERT_TRUE(enable_offloading);
-    EXPECT_TRUE(*enable_offloading);
+        auto enable_offloading = FileStorageIsEnableOffloading(file_storage);
+        ASSERT_TRUE(enable_offloading);
+        EXPECT_TRUE(*enable_offloading);
+    }
 #endif
 
     SetEnv("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
-    {
+    if (!probe.pinned_host.addr) {
+        EXPECT_THROW(FileStorage(config, nullptr, "localhost:9003"),
+                     std::runtime_error);
+    } else {
         FileStorage file_storage(config, nullptr, "localhost:9003");
         EXPECT_TRUE(FileStorageUsesDfsControlPlane(file_storage));
+        ASSERT_TRUE(file_storage.UnifiedBufferAllocator());
+        EXPECT_EQ(file_storage.UnifiedBufferCapacity(),
+                  config.unified_buffer_size);
+        EXPECT_TRUE(file_storage.AllocatePinnedStagingBuffer(4096, 4096));
     }
+}
+
+TEST_F(FileStorageTest, DistributedBackendHonorsDisabledUnifiedBuffer) {
+    SetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "distributed_storage_backend");
+    SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "posix");
+    SetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR", data_path + "/distributed");
+    SetEnv("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "0");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    ASSERT_FALSE(config.enable_dfs);
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    EXPECT_TRUE(FileStorageUsesDfsControlPlane(file_storage));
+    EXPECT_FALSE(file_storage.UnifiedBufferAllocator());
+    EXPECT_EQ(file_storage.UnifiedBufferCapacity(), 0);
 }
 
 TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {

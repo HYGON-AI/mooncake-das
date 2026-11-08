@@ -66,6 +66,23 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
+    // Resolve the backend mode before allocating DFS staging: filesystem and
+    // KVCS need the unified buffer, while other object stores use offloading.
+    auto create_storage_backend_result = CreateStorageBackend(
+        config_, client_ ? client_->GetDfsRootIdentity() : std::string{});
+    if (!create_storage_backend_result) {
+        LOG(ERROR) << "Failed to create storage backend";
+        throw std::runtime_error("Failed to create storage backend");
+    }
+
+    storage_backend_ = create_storage_backend_result.value();
+    distributed_backend_ =
+        std::dynamic_pointer_cast<DistributedStorageBackend>(storage_backend_);
+    if (distributed_backend_) {
+        config_.enable_dfs = !distributed_backend_->UsesObjectStorage() ||
+                             distributed_backend_->UsesKvcs();
+    }
+
     if (config_.enable_dfs && config_.unified_buffer_size > 0) {
         const size_t arena_size =
             static_cast<size_t>(config_.unified_buffer_size);
@@ -216,20 +233,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                         "synchronous writes still reach DFS";
     }
 
-    auto create_storage_backend_result = CreateStorageBackend(
-        config_, client_ ? client_->GetDfsRootIdentity() : std::string{});
-    if (!create_storage_backend_result) {
-        LOG(ERROR) << "Failed to create storage backend";
-        throw std::runtime_error("Failed to create storage backend");
-    }
-
-    storage_backend_ = create_storage_backend_result.value();
-    if (auto distributed_backend =
-            std::dynamic_pointer_cast<DistributedStorageBackend>(
-                storage_backend_)) {
-        distributed_backend_ = distributed_backend;
-        config_.enable_dfs = !distributed_backend->UsesObjectStorage() ||
-                             distributed_backend->UsesKvcs();
+    if (auto distributed_backend = distributed_backend_) {
         if (client_) {
             distributed_backend->SetRootIdentityProvider(
                 [weak_client = std::weak_ptr<Client>(client_)]()
