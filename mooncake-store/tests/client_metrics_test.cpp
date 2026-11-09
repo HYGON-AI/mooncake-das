@@ -3,9 +3,9 @@
 
 // csignal must precede coro_http_client.hpp: the bundled ylt's coro_io.hpp
 // calls std::signal without including <csignal> itself.
+#include <atomic>
 #include <chrono>
 #include <csignal>
-#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
@@ -940,6 +940,35 @@ TEST_F(ClientMetricsTest, EmbeddedSnapshotDoesNotRequireHttpListener) {
     EXPECT_NE(client->get_client_metrics()->find("mooncake_build_info"),
               std::string::npos);
     EXPECT_EQ(client->tearDownAll(), 0);
+    EXPECT_FALSE(client->get_client_metrics().has_value());
+}
+
+TEST_F(ClientMetricsTest, EmbeddedSnapshotCanRaceWithTeardown) {
+    ScopedEnv metrics_env("MC_STORE_CLIENT_METRIC");
+    setenv("MC_STORE_CLIENT_METRIC", "1", 1);
+    mooncake::testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(mooncake::InProcMasterConfigBuilder()
+                                 .set_http_metadata_port(0)
+                                 .build()));
+    auto client = RealClient::create();
+    ASSERT_TRUE(SetupClientWithHttp(client, "127.0.0.1",
+                                    master.master_address(), false, 0)
+                    .has_value());
+    std::atomic<bool> stopped{false};
+    std::atomic<bool> started{false};
+    std::atomic<size_t> snapshots{0};
+    std::thread reporter([&] {
+        while (!stopped.load()) {
+            if (client->get_client_metrics()) snapshots.fetch_add(1);
+            started.store(true);
+        }
+    });
+    while (!started.load()) std::this_thread::yield();
+    const auto result = client->tearDownAll();
+    stopped.store(true);
+    reporter.join();
+    EXPECT_EQ(result, 0);
+    EXPECT_GT(snapshots.load(), 0);
     EXPECT_FALSE(client->get_client_metrics().has_value());
 }
 

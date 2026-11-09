@@ -2875,9 +2875,11 @@ PYBIND11_MODULE(_store, m) {
         .def(
             "get_client_metrics",
             [](MooncakeStorePyWrapper &self) -> std::optional<std::string> {
-                if (!self.store_) return std::nullopt;
+                // close() may clear the wrapper after we release the GIL.
+                auto store = self.store_;
+                if (!store) return std::nullopt;
                 py::gil_scoped_release release;
-                return self.store_->get_client_metrics();
+                return store->get_client_metrics();
             },
             "Return the embedded client's Prometheus snapshot, or None when unavailable. "
             "Does not require a client HTTP listener; unsupported for standalone clients.")

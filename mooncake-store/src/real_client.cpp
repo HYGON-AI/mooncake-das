@@ -2742,7 +2742,10 @@ int RealClient::health_check() {
 }
 
 std::optional<std::string> RealClient::get_client_metrics() {
-    if (!client_) return std::nullopt;
+    // Teardown takes this lock exclusively before resetting client_.
+    std::shared_lock<std::shared_mutex> lock(dfs_read_lifecycle_mutex_);
+    if (closed_.load(std::memory_order_acquire) || !client_)
+        return std::nullopt;
     auto result = client_->SerializeMetrics();
     if (!result) return std::nullopt;
     return std::move(*result);

@@ -6,6 +6,7 @@ MOONCAKE_MASTER=host:port additionally enables isolated TCP put/get cases.
 
 import ctypes
 import os
+import threading
 import unittest
 from uuid import uuid4
 
@@ -71,6 +72,48 @@ class StoreCapabilitiesTest(unittest.TestCase):
     os.environ.get("MOONCAKE_MASTER"), "set MOONCAKE_MASTER for native I/O"
 )
 class OldStoreCallerTest(unittest.TestCase):
+    def test_snapshot_thread_can_overlap_close(self):
+        store = MooncakeDistributedStore()
+        self.assertEqual(
+            store.setup(
+                "127.0.0.1",
+                "P2PHANDSHAKE",
+                0,
+                0,
+                "tcp",
+                "",
+                os.environ["MOONCAKE_MASTER"],
+                enable_dfs_prefetch=False,
+            ),
+            0,
+        )
+        self.assertIsNotNone(store.get_client_metrics())
+        stopped = threading.Event()
+        started = threading.Event()
+        errors = []
+
+        def report():
+            try:
+                while not stopped.is_set():
+                    store.get_client_metrics()
+                    started.set()
+            except Exception as error:
+                errors.append(error)
+            finally:
+                started.set()
+
+        reporter = threading.Thread(target=report)
+        reporter.start()
+        try:
+            self.assertTrue(started.wait(timeout=10))
+            self.assertEqual(store.close(), 0)
+        finally:
+            stopped.set()
+            reporter.join(timeout=10)
+        self.assertFalse(reporter.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIsNone(store.get_client_metrics())
+
     def test_old_and_new_setup_shapes_preserve_registered_range_reads(self):
         for shape in (
             "community_positional",
