@@ -5407,6 +5407,13 @@ TEST_F(MasterServiceTest, DfsReplicaRemovalDecrementsStatusGaugeOnce) {
         complete.mark_removed();
         EXPECT_EQ(capture_gauges().complete, baseline.complete);
 
+        complete.cancel_remove();
+        EXPECT_EQ(capture_gauges().complete, baseline.complete + 1);
+        complete.cancel_remove();
+        EXPECT_EQ(capture_gauges().complete, baseline.complete + 1);
+        complete.mark_removed();
+        EXPECT_EQ(capture_gauges().complete, baseline.complete);
+
         Replica moved(std::move(complete));
         EXPECT_TRUE(moved.is_dfs_replica());
         EXPECT_EQ(moved.status(), ReplicaStatus::REMOVED);

@@ -785,6 +785,9 @@ class Replica {
 
     void cancel_remove() {
         if (status_ == ReplicaStatus::REMOVED) {
+            if (is_dfs_replica()) {
+                MasterMetricManager::instance().inc_dfs_replica("complete");
+            }
             status_ = ReplicaStatus::COMPLETE;
         } else {
             LOG(ERROR) << "Cannot cancel_remove from status: " << status_;

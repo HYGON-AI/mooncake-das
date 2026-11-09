@@ -86,6 +86,21 @@ std::optional<double> FindServiceMetricValue(
 
 }  // namespace
 
+TEST_F(MasterMetricsTest, HistogramsDoNotContainSyntheticSamples) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto serialized = metrics.serialize_metrics();
+    EXPECT_EQ(serialized.find("master_value_size_bytes_count"),
+              std::string::npos);
+    EXPECT_EQ(serialized.find("master_client_offboarding_duration_ms_count"),
+              std::string::npos);
+    EXPECT_EQ(serialized.find("master_nof_heartbeat_probe_latency_ms_count"),
+              std::string::npos);
+    metrics.observe_value_size(4096);
+    EXPECT_NE(
+        metrics.serialize_metrics().find("master_value_size_bytes_count 1\n"),
+        std::string::npos);
+}
+
 TEST_F(MasterMetricsTest,
        ServiceMetricsAggregateClientsAndApplyCumulativeSnapshotsOnce) {
     auto& metrics = MasterMetricManager::instance();
@@ -342,6 +357,16 @@ TEST_F(MasterMetricsTest, ServiceL4ReporterExpiryAndResumeDoNotReplayCounters) {
     ASSERT_TRUE(metrics.ReportServiceMetrics(client, snapshot));
     EXPECT_EQ(value(reporters), 1);
     EXPECT_EQ(value(bytes), 1024);
+}
+
+TEST_F(MasterMetricsTest, PromotionExecutionGiveUpIsExported) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto previous = metrics.get_promotion_execution_gave_up();
+    metrics.inc_promotion_execution_gave_up();
+    EXPECT_NE(metrics.serialize_metrics().find(
+                  "master_promotion_execution_gave_up_total " +
+                  std::to_string(previous + 1) + "\n"),
+              std::string::npos);
 }
 
 TEST_F(MasterMetricsTest, InitialStatusTest) {
@@ -1655,6 +1680,36 @@ TEST_F(MasterMetricsTest, DuplicatePutResponsesCountItemsWithoutPerKeyLogs) {
     EXPECT_EQ(response.http_status, 200);
     EXPECT_NE(response.body.find(sample), std::string::npos);
     EXPECT_NE(response.body.find(batch_sample), std::string::npos);
+}
+
+TEST_F(MasterMetricsTest, EmptyBatchesDoNotCountAsFailures) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto failures = [&] {
+        return std::array{metrics.get_batch_exist_key_failures(),
+                          metrics.get_batch_query_ip_failures(),
+                          metrics.get_batch_replica_clear_failures(),
+                          metrics.get_batch_get_replica_list_failures(),
+                          metrics.get_batch_put_start_failures(),
+                          metrics.get_batch_put_end_failures(),
+                          metrics.get_batch_put_revoke_failures()};
+    };
+    const auto before = failures();
+    WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 100;
+    WrappedMasterService service(config);
+    const auto client = generate_uuid();
+    service.BatchExistKey({});
+    service.BatchProbeKey(GrantLeasePolicy{}, {});
+    service.BatchQueryIp({});
+    service.BatchReplicaClear({}, client, "unused");
+    service.BatchGetReplicaList({});
+    service.BatchPutStart(client, {}, {}, ReplicateConfig{});
+    service.BatchPutEnd(client, {});
+    service.BatchPutRevoke(client, {});
+    service.BatchUpsertStart(client, {}, {}, ReplicateConfig{});
+    service.BatchUpsertEnd(client, {});
+    service.BatchUpsertRevoke(client, {});
+    EXPECT_EQ(failures(), before);
 }
 
 }  // namespace mooncake::test

@@ -1239,6 +1239,8 @@ TEST_F(RealClientDfsPrefetchTest, UsesDedicatedArenaAndFailsPerKeyWhenFull) {
     ASSERT_NE(py_client_->file_storage_, nullptr);
     ASSERT_EQ(py_client_->file_storage_->UnifiedPrefetchLimitBytes(),
               size_t{6144});
+    const std::string endpoint = "198.51.100.88:45305";
+    ASSERT_EQ(py_client_->client_->SetServiceEndpoint(endpoint), 0);
     ASSERT_EQ(py_client_->batch_get_session_start(keys),
               std::vector<int>(keys.size(), 0));
 
@@ -1270,6 +1272,25 @@ TEST_F(RealClientDfsPrefetchTest, UsesDedicatedArenaAndFailsPerKeyWhenFull) {
     EXPECT_EQ(py_client_->batch_get_session_prefetch({keys[1]}),
               std::vector<int>{0});
     EXPECT_EQ(py_client_->batch_get_session_end({keys[1]}), 0);
+
+    // Flush the real range-read observations, including consumption of a
+    // prefetched buffer, through the client -> master reporting path.
+    ASSERT_EQ(py_client_->tearDownAll(), 0);
+    py_client_.reset();
+    const auto metrics = MasterMetricManager::instance().serialize_metrics();
+    const std::string label = "{service_endpoint=\"" + endpoint + "\",mode=\"";
+    EXPECT_NE(metrics.find("mooncake_master_service_l4_read_operations_total" +
+                           label + "prefetch\",result=\"success\"} 2\n"),
+              std::string::npos);
+    EXPECT_NE(metrics.find("mooncake_master_service_l4_read_operations_total" +
+                           label + "on_demand\",result=\"success\"} 1\n"),
+              std::string::npos);
+    EXPECT_NE(metrics.find("mooncake_master_service_l4_restore_bytes_total" +
+                           label + "prefetched\"} 1024\n"),
+              std::string::npos);
+    EXPECT_NE(metrics.find("mooncake_master_service_l4_restore_bytes_total" +
+                           label + "on_demand\"} 1024\n"),
+              std::string::npos);
 }
 
 TEST_F(RealClientDfsPrefetchTest, SharedRootRegionIsReleasedAfterLastKey) {
