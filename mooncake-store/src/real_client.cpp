@@ -2741,6 +2741,13 @@ int RealClient::health_check() {
     return HC_HEALTHY;
 }
 
+std::optional<std::string> RealClient::get_client_metrics() {
+    if (!client_) return std::nullopt;
+    auto result = client_->SerializeMetrics();
+    if (!result) return std::nullopt;
+    return std::move(*result);
+}
+
 int RealClient::start_http_server(int port) {
     using namespace coro_http;
 

@@ -13,6 +13,9 @@ from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 
 
 class StoreCapabilitiesTest(unittest.TestCase):
+    def test_embedded_metrics_snapshot_is_unavailable_before_setup(self):
+        self.assertIsNone(MooncakeDistributedStore().get_client_metrics())
+
     def test_query_before_setup_requires_no_master_and_returns_independent_dicts(self):
         store = MooncakeDistributedStore()
         capabilities = store.get_capabilities()

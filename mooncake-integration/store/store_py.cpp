@@ -2872,6 +2872,15 @@ PYBIND11_MODULE(_store, m) {
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
              "2 if master unreachable.")
+        .def(
+            "get_client_metrics",
+            [](MooncakeStorePyWrapper &self) -> std::optional<std::string> {
+                if (!self.store_) return std::nullopt;
+                py::gil_scoped_release release;
+                return self.store_->get_client_metrics();
+            },
+            "Return the embedded client's Prometheus snapshot, or None when unavailable. "
+            "Does not require a client HTTP listener; unsupported for standalone clients.")
         .def("probe_dfs_health", &MooncakeStorePyWrapper::probe_dfs_health,
              "Probe DFS read/write health. Returns "
              "[read_error_code, write_error_code, backend_ready].")
