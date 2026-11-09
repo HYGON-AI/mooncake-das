@@ -2741,6 +2741,16 @@ int RealClient::health_check() {
     return HC_HEALTHY;
 }
 
+std::optional<std::string> RealClient::get_client_metrics() {
+    // Teardown takes this lock exclusively before resetting client_.
+    std::shared_lock<std::shared_mutex> lock(dfs_read_lifecycle_mutex_);
+    if (closed_.load(std::memory_order_acquire) || !client_)
+        return std::nullopt;
+    auto result = client_->SerializeMetrics();
+    if (!result) return std::nullopt;
+    return std::move(*result);
+}
+
 int RealClient::start_http_server(int port) {
     using namespace coro_http;
 

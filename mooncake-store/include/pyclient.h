@@ -698,6 +698,12 @@ class PyClient {
 
     virtual int health_check() = 0;
 
+    // Embedded clients can export the same snapshot as their HTTP /metrics.
+    // No snapshot is available before setup or when local metrics are disabled.
+    virtual std::optional<std::string> get_client_metrics() {
+        return std::nullopt;
+    }
+
     // DFS health/policy control. The probe result is
     // [read_error_code, write_error_code, backend_ready].
     virtual int probe_dfs_read() {

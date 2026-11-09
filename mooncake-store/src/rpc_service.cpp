@@ -766,8 +766,10 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
         MasterMetricManager::instance().inc_batch_put_end_requests(
             object_metas.size());
-        MasterMetricManager::instance().inc_batch_put_end_failures(
-            object_metas.size());
+        if (!object_metas.empty()) {
+            MasterMetricManager::instance().inc_batch_put_end_failures(
+                object_metas.size());
+        }
         LOG(WARNING) << "Rejecting stale DFS allocation in BatchPutEnd";
         return std::vector<tl::expected<void, ErrorCode>>(
             object_metas.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
@@ -818,8 +820,10 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
         MasterMetricManager::instance().inc_batch_put_revoke_requests(
             keys.size());
-        MasterMetricManager::instance().inc_batch_put_revoke_failures(
-            keys.size());
+        if (!keys.empty()) {
+            MasterMetricManager::instance().inc_batch_put_revoke_failures(
+                keys.size());
+        }
         LOG(WARNING) << "Rejecting stale DFS allocation in BatchPutRevoke";
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
@@ -1023,8 +1027,10 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
         MasterMetricManager::instance().inc_batch_put_end_requests(
             object_metas.size());
-        MasterMetricManager::instance().inc_batch_put_end_failures(
-            object_metas.size());
+        if (!object_metas.empty()) {
+            MasterMetricManager::instance().inc_batch_put_end_failures(
+                object_metas.size());
+        }
         LOG(WARNING) << "Rejecting stale DFS allocation in BatchUpsertEnd";
         return std::vector<tl::expected<void, ErrorCode>>(
             object_metas.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));
@@ -1076,8 +1082,10 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
         dfs_epoch != master_service_.GetDfsMasterEpoch()) {
         MasterMetricManager::instance().inc_batch_put_revoke_requests(
             keys.size());
-        MasterMetricManager::instance().inc_batch_put_revoke_failures(
-            keys.size());
+        if (!keys.empty()) {
+            MasterMetricManager::instance().inc_batch_put_revoke_failures(
+                keys.size());
+        }
         LOG(WARNING) << "Rejecting stale DFS allocation in BatchUpsertRevoke";
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::make_unexpected(ErrorCode::INVALID_WRITE));

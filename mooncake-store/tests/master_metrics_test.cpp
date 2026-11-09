@@ -1710,6 +1710,27 @@ TEST_F(MasterMetricsTest, EmptyBatchesDoNotCountAsFailures) {
     service.BatchUpsertEnd(client, {});
     service.BatchUpsertRevoke(client, {});
     EXPECT_EQ(failures(), before);
+
+    // Epoch rejection must follow the same empty-batch accounting rule.
+    auto stale_epoch = generate_uuid();
+    ASSERT_NE(stale_epoch, service.GetDfsMasterEpoch().value());
+    service.BatchPutEnd(client, {}, ReplicaType::MEMORY, "default",
+                        stale_epoch);
+    service.BatchPutRevoke(client, {}, ReplicaType::MEMORY, "default",
+                           stale_epoch);
+    service.BatchUpsertEnd(client, {}, "default", stale_epoch);
+    service.BatchUpsertRevoke(client, {}, "default", stale_epoch);
+    EXPECT_EQ(failures(), before);
+
+    // Nonempty stale batches still count as failed requests and items.
+    service.BatchPutEnd(client, {ObjectMeta{}}, ReplicaType::MEMORY, "default",
+                        stale_epoch);
+    service.BatchPutRevoke(client, {"key"}, ReplicaType::MEMORY, "default",
+                           stale_epoch);
+    service.BatchUpsertEnd(client, {ObjectMeta{}}, "default", stale_epoch);
+    service.BatchUpsertRevoke(client, {"key"}, "default", stale_epoch);
+    EXPECT_EQ(metrics.get_batch_put_end_failures(), before[5] + 2);
+    EXPECT_EQ(metrics.get_batch_put_revoke_failures(), before[6] + 2);
 }
 
 }  // namespace mooncake::test

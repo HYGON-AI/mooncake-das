@@ -507,6 +507,7 @@ class RealClient : public PyClient {
         std::function<tl::expected<void, ErrorCode>(void *)> hook);
 
     int health_check() override;
+    std::optional<std::string> get_client_metrics() override;
     int probe_dfs_read() override;
     int probe_dfs_write() override;
     async_simple::coro::Lazy<int> probe_dfs_read_rpc();
