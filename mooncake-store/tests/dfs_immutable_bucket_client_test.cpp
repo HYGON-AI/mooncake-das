@@ -290,7 +290,7 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         DistributedStorageConfig distributed_config;
         distributed_config.fsdir = root_;
         distributed_config.fs_adapter_type = "posix";
-        distributed_config.allocator_type = "bucket";
+        distributed_config.allocator_type = DfsAllocatorType::BUCKET;
         distributed_config.alignment = 4096;
         distributed_config.bucket_capacity = 4096;
         distributed_config.max_bucket_count = MaxBucketCount();

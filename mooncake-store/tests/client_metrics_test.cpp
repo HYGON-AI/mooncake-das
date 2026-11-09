@@ -332,6 +332,23 @@ TEST_F(ClientMetricsTest, ZeroSumHybridHistogramPreservesExistingMetrics) {
 
     histogram.serialize(serialized);
 
+    EXPECT_EQ(serialized.find("existing_metric 1\n"), 0u);
+    EXPECT_NE(serialized.find("request_latency_count{route=\"idle\"} 1\n"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("request_latency_sum{route=\"idle\"} 0\n"),
+              std::string::npos);
+    EXPECT_NE(serialized.find(
+                  "request_latency_bucket{route=\"idle\",le=\"+Inf\"} 1\n"),
+              std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, EmptyMergedHybridHistogramPreservesExistingMetrics) {
+    ylt::metric::hybrid_histogram_1t histogram(
+        "request_latency", "Request latency", {10.0}, {}, {"route"});
+    const std::array<uint64_t, 2> buckets{};
+    histogram.merge({"idle"}, buckets, 0);
+    std::string serialized = "existing_metric 1\n";
+    histogram.serialize(serialized);
     EXPECT_EQ(serialized, "existing_metric 1\n");
 }
 

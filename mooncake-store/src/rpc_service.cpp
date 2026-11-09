@@ -228,7 +228,7 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
         }
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_exist_key_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -270,7 +270,7 @@ WrappedMasterService::BatchExistKeyByReplicaType(
         }
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_exist_key_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -341,7 +341,7 @@ WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
         }
     }
 
-    if (failure_count == total_client_ids) {
+    if (failure_count != 0 && failure_count == total_client_ids) {
         MasterMetricManager::instance().inc_batch_query_ip_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -388,7 +388,7 @@ WrappedMasterService::BatchReplicaClear(
                           ", failed=", failure_count);
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_replica_clear_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -503,7 +503,7 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_get_replica_list_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -743,7 +743,7 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                      << " keys" << PUT_NO_SPACE_HELPER_STR;
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_put_start_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -796,7 +796,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
         }
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_put_end_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -853,7 +853,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
         }
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_put_revoke_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -1001,7 +1001,7 @@ WrappedMasterService::BatchUpsertStart(
         }
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_put_start_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -1053,7 +1053,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
         }
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_put_end_failures(
             failure_count);
     } else if (failure_count != 0) {
@@ -1106,7 +1106,7 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
         }
     }
 
-    if (failure_count == total_keys) {
+    if (failure_count != 0 && failure_count == total_keys) {
         MasterMetricManager::instance().inc_batch_put_revoke_failures(
             failure_count);
     } else if (failure_count != 0) {

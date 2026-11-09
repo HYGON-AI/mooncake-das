@@ -336,9 +336,6 @@ class basic_hybrid_histogram : public dynamic_metric {
         for (auto& e : value_map) {
             auto& labels_value = e->label;
             auto& value = e->value;
-            if (value == 0) {
-                continue;
-            }
 
             value_str.clear();
             value_type count = 0;
@@ -364,6 +361,9 @@ class basic_hybrid_histogram : public dynamic_metric {
                 value_str.append("\n");
             }
 
+            if (count == 0) {
+                continue;
+            }
             str.append(value_str);
             emitted_any = true;
 
@@ -414,9 +414,6 @@ class basic_hybrid_histogram : public dynamic_metric {
         for (auto& e : value_map) {
             auto& labels_value = e->label;
             auto& value = e->value;
-            if (value == 0) {
-                continue;
-            }
 
             size_t count = 0;
             json_histogram_metric_t metric{};
@@ -433,6 +430,9 @@ class basic_hybrid_histogram : public dynamic_metric {
                         bucket_boundaries_[i],
                         (int64_t)counter->value(labels_value));
                 }
+            }
+            if (count == 0) {
+                continue;
             }
             metric.count = (int64_t)count;
             metric.sum = sum_->value(labels_value);

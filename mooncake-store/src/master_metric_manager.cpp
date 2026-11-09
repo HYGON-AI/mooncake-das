@@ -1067,10 +1067,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     put_start_discard_cnt_.inc(0);
     put_start_release_cnt_.inc(0);
 
-    // Update Histogram (use observe(0) to mark as changed)
-    value_size_distribution_.observe(0);
-    client_offboarding_duration_ms_.observe(0);
-    nof_heartbeat_probe_latency_ms_.observe(0);
+    // Histograms remain absent until a real observation; observe(0) would
+    // fabricate a sample and bias counts and latency distributions.
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
     // mem_total_capacity_per_segment_) are not initialized here because they
@@ -2777,6 +2775,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_completed_bytes_);
     serialize_metric(promotion_expired_);
     serialize_metric(promotion_failed_);
+    serialize_metric(promotion_execution_gave_up_);
     serialize_metric(promotion_cancelled_);
     serialize_metric(promotion_rejected_frequency_);
     serialize_metric(promotion_rejected_watermark_);
