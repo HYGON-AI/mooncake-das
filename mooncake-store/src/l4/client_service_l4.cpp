@@ -638,21 +638,20 @@ void Client::LogUnifiedDfsBufferUsage() {
         }
         if (!dfs_read_trace_enabled()) continue;
         LOG(INFO) << "action=dfs_unified_buffer_usage scope=process"
-                  << " unified_capacity_bytes=" << unified_buffer_capacity_
-                  << " read_bytes=" << snapshot.read_bytes
-                  << " prefetch_bytes=" << snapshot.prefetch_bytes
-                  << " write_bytes=" << snapshot.write_bytes
-                  << " total_bytes=" << snapshot.total_bytes
-                  << " read_utilization=" << std::fixed << std::setprecision(1)
+                  << " cap=" << unified_buffer_capacity_
+                  << " rd=" << snapshot.read_bytes
+                  << " pf=" << snapshot.prefetch_bytes
+                  << " wr=" << snapshot.write_bytes
+                  << " total=" << snapshot.total_bytes
+                  << " rd_util=" << std::fixed << std::setprecision(1)
                   << utilization(snapshot.read_bytes) << "%"
-                  << " prefetch_utilization="
-                  << utilization(snapshot.prefetch_bytes) << "%"
-                  << " write_utilization=" << utilization(snapshot.write_bytes)
-                  << "% total_utilization=" << utilization(snapshot.total_bytes)
-                  << "% peak_total_bytes=" << snapshot.peak_total_bytes
-                  << " peak_total_utilization="
+                  << " pf_util=" << utilization(snapshot.prefetch_bytes) << "%"
+                  << " wr_util=" << utilization(snapshot.write_bytes) << "%"
+                  << " total_util=" << utilization(snapshot.total_bytes) << "%"
+                  << " peak=" << snapshot.peak_total_bytes
+                  << " peak_util="
                   << utilization(snapshot.peak_total_bytes) << "%"
-                  << " write_backlog=" << write_backlog;
+                  << " wr_backlog=" << write_backlog;
     }
 }
 

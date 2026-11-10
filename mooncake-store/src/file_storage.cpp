@@ -4,6 +4,7 @@
 #include <memory>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -293,14 +294,16 @@ std::optional<BufferHandle> FileStorage::AllocatePinnedStagingBuffer(
     size_t size, size_t alignment) const {
     if (!pinned_restore_arena_allocator_) {
         LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=read size="
-                   << size << " alignment=" << alignment;
+                   << size << " alignment=" << alignment
+                   << " reason=unified_buffer_unavailable";
         return std::nullopt;
     }
     auto allocation = pinned_restore_arena_allocator_->allocate_aligned(
         size, alignment, DfsBufferUsageKind::kRead);
     if (!allocation) {
         LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=read size="
-                   << size << " alignment=" << alignment;
+                   << size << " alignment=" << alignment << ", "
+                   << UnifiedBufferDiagnostics();
     }
     return allocation;
 }
@@ -309,7 +312,8 @@ std::optional<BufferHandle> FileStorage::AllocatePinnedPrefetchBuffer(
     size_t size, size_t alignment) const {
     if (!pinned_restore_arena_allocator_ || size == 0 || alignment == 0) {
         LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
-                   << size << " alignment=" << alignment;
+                   << size << " alignment=" << alignment
+                   << " reason=invalid_request_or_unavailable";
         return std::nullopt;
     }
     std::lock_guard<std::mutex> lock(unified_prefetch_mutex_);
@@ -317,7 +321,8 @@ std::optional<BufferHandle> FileStorage::AllocatePinnedPrefetchBuffer(
         size, alignment, DfsBufferUsageKind::kPrefetch);
     if (!allocation) {
         LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
-                   << size << " alignment=" << alignment;
+                   << size << " alignment=" << alignment << ", "
+                   << UnifiedBufferDiagnostics();
     }
     return allocation;
 }
@@ -328,6 +333,13 @@ offset_allocator::OffsetAllocStorageReport FileStorage::UnifiedBufferReport()
     return pinned_restore_arena_allocator_->storageReport();
 }
 
+std::string FileStorage::UnifiedBufferDiagnostics() const {
+    if (!pinned_restore_arena_) return {};
+    std::ostringstream out;
+    out << "unified_capacity=" << pinned_restore_arena_->capacity << ", "
+        << DescribeUnifiedBufferState(pinned_restore_arena_allocator_);
+    return out.str();
+}
 
 tl::expected<void, ErrorCode> FileStorage::InitDfs() {
     dfs_heartbeat_interval_seconds_.store(300, std::memory_order_release);

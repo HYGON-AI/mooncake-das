@@ -184,6 +184,16 @@ class BufferHandle {
 
 // Utility functions for buffer and slice management
 /**
+ * @brief Describe a unified-buffer allocation failure for logging: live usage
+ *        per kind, admission limits, and the allocator's free space and largest
+ *        contiguous region. Returns an empty string when the allocator is null.
+ * @param allocator The unified-buffer allocator that refused the request
+ * @return One-line diagnostic string
+ */
+std::string DescribeUnifiedBufferState(
+    const std::shared_ptr<ClientBufferAllocator>& allocator);
+
+/**
  * @brief Split a BufferHandle into slices of maximum size kMaxSliceSize
  * @param handle The buffer handle to split
  * @return Vector of slices covering the entire buffer

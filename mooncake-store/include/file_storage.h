@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <optional>
+#include <string>
 #include <unordered_set>
 
 #include "client_service.h"
@@ -131,6 +132,11 @@ class FileStorage {
     UnifiedBufferUsageTracker() const {
         return usage_tracker_;
     }
+
+    // One-line description of the unified buffer state for allocation-failure
+    // logs: live usage per kind, admission limits, and the allocator's free
+    // space / largest contiguous region. Empty when the buffer is absent.
+    [[nodiscard]] std::string UnifiedBufferDiagnostics() const;
 
     // Allocate request-scoped staging from the fixed-capacity pinned restore
     // arena. The handle returns its sub-allocation to the arena on destruction.
