@@ -122,12 +122,22 @@ std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 constexpr size_t kDefaultDfsWriteChunkSize = 1ULL * 1024 * 1024 * 1024;
+constexpr size_t kDefaultDfsWriteThreads = 8;
 
 size_t ReadDfsWriteChunkSize() {
     const auto configured = Environ::Read(
         FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES);
     if (!configured.has_value() || *configured <= 0) {
         return kDefaultDfsWriteChunkSize;
+    }
+    return static_cast<size_t>(*configured);
+}
+
+size_t ReadDfsWriteThreads() {
+    const auto configured = Environ::Read(
+        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_THREADS);
+    if (!configured.has_value() || *configured <= 0) {
+        return kDefaultDfsWriteThreads;
     }
     return static_cast<size_t>(*configured);
 }
@@ -642,7 +652,7 @@ Client::Client(const std::string& local_hostname,
               DistributedStorageEnvironmentVariables::
                   MC_STORE_DFS_PINNED_POOL_BYTES,
               PinnedBufferPool::kDefaultMaxCachedBytes))),
-      write_thread_pool_(2),
+      write_thread_pool_(ReadDfsWriteThreads()),
       task_thread_pool_(4),
       dfs_backfill_thread_pool_(1) {
     LOG(INFO) << "client_id=" << client_id_;

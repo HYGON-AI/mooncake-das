@@ -138,6 +138,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES` | `1073741824` (1 GiB) | DFS write chunk size; values `<= 0` use the default |
 | `MC_STORE_DFS_PREFETCH_CAPACITY_RATIO` | `0.5` | Maximum fraction of the unified buffer retained by prefetch allocations; truncated to what remains after one read chunk and one write chunk |
 | `MC_STORE_DFS_WRITE_ARENA_WAIT_MS` | `10000` | Maximum time DFS write staging waits for unified-buffer space |
+| `MC_STORE_DFS_WRITE_THREADS` | `8` | Number of client threads performing asynchronous DFS writes; values `<= 0` use the default |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | `2199023255552` (2 TB) | Maximum disk usage |
 | `MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` | `10000000` | Maximum number of objects on disk |
