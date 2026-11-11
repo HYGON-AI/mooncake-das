@@ -15,11 +15,6 @@ namespace route {
 //
 // Every object carries one, and almost every object carries neither a task nor
 // a candidate, so each lives on the heap and costs a pointer while absent.
-struct DfsBackfillState {
-    std::chrono::steady_clock::time_point retry_after{};
-    UUID task_id{};
-};
-
 struct ObjectState {
     // A primary write or a background task is in flight for this key.
     bool is_processing{false};
@@ -34,9 +29,6 @@ struct ObjectState {
     // A promotion a transient gate turned away, waiting for a retry. It is
     // not work in flight: no task holds anything for it.
     HeapOptional<PromotionCandidate> promotion_candidate;
-
-    // A retry candidate owns no resources; an active backfill uses replication_task.
-    HeapOptional<DfsBackfillState> dfs_backfill;
 
     bool HasWorkInFlight() const {
         return is_processing || replication_task || offloading_task ||

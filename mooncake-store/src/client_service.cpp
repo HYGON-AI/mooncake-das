@@ -636,25 +636,24 @@ Client::Client(const std::string& local_hostname,
           ClientHostIdentityConfig::FromEnvironment(local_hostname).host_id),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
-      object_checksum_enabled_(ClientObjectChecksumConfig::IsEnabledAtFirstUse()),
-      dfs_batch_put_timeout_ms_(Environ::ReadOr(
-          DistributedStorageEnvironmentVariables::
-              MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS,
-          uint64_t{10000})),
-      dfs_batch_timeout_fixed_ms_(Environ::ReadOr(
-          DistributedStorageEnvironmentVariables::
-              MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS,
-          kDefaultDfsBatchTimeoutFixedMs)),
+      object_checksum_enabled_(
+          ClientObjectChecksumConfig::IsEnabledAtFirstUse()),
+      dfs_batch_put_timeout_ms_(
+          Environ::ReadOr(DistributedStorageEnvironmentVariables::
+                              MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS,
+                          uint64_t{10000})),
+      dfs_batch_timeout_fixed_ms_(
+          Environ::ReadOr(DistributedStorageEnvironmentVariables::
+                              MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS,
+                          kDefaultDfsBatchTimeoutFixedMs)),
       dfs_write_arena_wait_(ReadDfsWriteArenaWait()),
       dfs_write_chunk_size_(ReadDfsWriteChunkSize()),
-      pinned_buffer_pool_(
-          std::make_shared<PinnedBufferPool>(Environ::ReadOr(
-              DistributedStorageEnvironmentVariables::
-                  MC_STORE_DFS_PINNED_POOL_BYTES,
-              PinnedBufferPool::kDefaultMaxCachedBytes))),
+      pinned_buffer_pool_(std::make_shared<PinnedBufferPool>(
+          Environ::ReadOr(DistributedStorageEnvironmentVariables::
+                              MC_STORE_DFS_PINNED_POOL_BYTES,
+                          PinnedBufferPool::kDefaultMaxCachedBytes))),
       write_thread_pool_(ReadDfsWriteThreads()),
-      task_thread_pool_(4),
-      dfs_backfill_thread_pool_(1) {
+      task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
@@ -711,7 +710,6 @@ Client::~Client() {
     // Stop queued timer/task callbacks before tearing down segment state.
     task_running_ = false;
     task_thread_pool_.stop();
-    dfs_backfill_thread_pool_.stop();
 
     // Make copies to avoid modifying while iterating
     std::vector<Segment> mounted_segments_copy;
@@ -5643,8 +5641,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     std::function<tl::expected<void, ErrorCode>()> end_fn,
     std::function<tl::expected<void, ErrorCode>()> revoke_fn,
     const Replica::Descriptor& source,
-    const std::vector<Replica::Descriptor>& targets,
-    std::shared_ptr<DistributedStorageBackend> dfs_backend) {
+    const std::vector<Replica::Descriptor>& targets) {
     auto revoke_lambda = [&]() {
         auto revoke_result = revoke_fn();
         if (!revoke_result.has_value()) {
@@ -5683,7 +5680,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
         const auto result =
             target.is_dfs_replica()
                 ? WriteDfsReplicas({key}, {&slices},
-                                   {target.get_dfs_descriptor()}, dfs_backend,
+                                   {target.get_dfs_descriptor()}, nullptr,
                                    dfs_write_arena_wait_)
                       .front()
                 : TransferWrite(target, slices, TransferIntent::kMigration);
@@ -6559,34 +6556,23 @@ ErrorCode Client::TransferReadRange(
 }
 
 void Client::PollAndDispatchTasks() {
-    // Drain a few full backfill batches per tick without an unbounded fetch
-    // loop or changing the normal copy/move polling cadence.
-    constexpr size_t kMaxBackfillBatches = 4;
-    for (size_t batch = 0; batch < kMaxBackfillBatches && task_running_.load();
-         ++batch) {
-        auto fetch_result = FetchTasks(kTaskBatchSize);
-        if (fetch_result.has_value()) {
-            const auto& tasks = fetch_result.value();
-            bool has_backfill = false;
-            if (!tasks.empty()) {
-                LOG(INFO) << "action=task_poll_success"
-                          << ", task_count=" << tasks.size();
-                for (const auto& task_assignment : tasks) {
-                    has_backfill |=
-                        task_assignment.type == TaskType::DFS_BACKFILL;
-                    SubmitTask(task_assignment);
-                }
+    if (!task_running_.load()) return;
+    auto fetch_result = FetchTasks(kTaskBatchSize);
+    if (fetch_result.has_value()) {
+        const auto& tasks = fetch_result.value();
+        if (!tasks.empty()) {
+            LOG(INFO) << "action=task_poll_success"
+                      << ", task_count=" << tasks.size();
+            for (const auto& task_assignment : tasks) {
+                SubmitTask(task_assignment);
             }
-            if (tasks.size() < kTaskBatchSize || !has_backfill) return;
-        } else {
-            ErrorCode error = fetch_result.error();
-            // Only log if it's not an RPC failure (which is expected
-            // during connection failures)
-            if (error != ErrorCode::RPC_FAIL) {
-                LOG(WARNING)
-                    << "action=task_poll_failed" << ", error_code=" << error;
-            }
-            return;
+        }
+    } else {
+        ErrorCode error = fetch_result.error();
+        // RPC failures are expected during connection failures.
+        if (error != ErrorCode::RPC_FAIL) {
+            LOG(WARNING) << "action=task_poll_failed"
+                         << ", error_code=" << error;
         }
     }
 }
@@ -6612,69 +6598,16 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
     client_task.assignment = assignment;
     client_task.retry_count = 0;
 
-    auto& executor = assignment.type == TaskType::DFS_BACKFILL
-                         ? dfs_backfill_thread_pool_
-                         : task_thread_pool_;
-    executor.enqueue([this, client_task]() { ExecuteTask(client_task); });
+    task_thread_pool_.enqueue(
+        [this, client_task]() { ExecuteTask(client_task); });
 }
 
 void Client::ExecuteTask(const ClientTask& client_task) {
     const auto& assignment = client_task.assignment;
     ErrorCode result = ErrorCode::OK;
-    bool backfill_attempted = false;
-    bool backfill_storage_failure = false;
 
     try {
         switch (assignment.type) {
-            case TaskType::DFS_BACKFILL: {
-                if (!DfsWriteAllowed() ||
-                    !BeginDfsBackfillAttempt(assignment.id)) {
-                    result = ErrorCode::DFS_SERVICE_UNAVAILABLE;
-                    break;
-                }
-                backfill_attempted = true;
-                backfill_storage_failure = true;
-                auto backend = GetDfsBackfillBackend();
-                if (!backend) {
-                    result = backend.error();
-                    break;
-                }
-                auto initialized = (*backend)->EnsureInitialized();
-                if (!initialized) {
-                    result = initialized.error();
-                    break;
-                }
-                DfsBackfillPayload payload;
-                struct_json::from_json(payload, assignment.payload);
-                backfill_storage_failure = false;
-                auto start = master_client_.DfsBackfillStart(
-                    payload.key, payload.tenant_id, payload.source,
-                    assignment.id);
-                if (!start) {
-                    result = start.error();
-                    backfill_storage_failure =
-                        result <= ErrorCode::DFS_NETWORK_TIMEOUT &&
-                        result >= ErrorCode::DFS_PARTIAL_WRITE;
-                    break;
-                }
-                auto finish = [&](bool success) {
-                    return master_client_.DfsBackfillFinish(
-                        payload.key, payload.tenant_id, assignment.id, success);
-                };
-                backfill_storage_failure = true;
-                auto copied = ExecuteReplicaTransfer(
-                    payload.key, "dfs_backfill", [&] { return finish(true); },
-                    [&] { return finish(false); }, start->source,
-                    start->targets, *backend);
-                result = copied ? ErrorCode::OK : copied.error();
-                backfill_storage_failure =
-                    result == ErrorCode::TRANSFER_FAIL ||
-                    result == ErrorCode::FILE_OPEN_FAIL ||
-                    result == ErrorCode::FILE_WRITE_FAIL ||
-                    (result <= ErrorCode::DFS_NETWORK_TIMEOUT &&
-                     result >= ErrorCode::DFS_PARTIAL_WRITE);
-                break;
-            }
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
@@ -6719,11 +6652,6 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         result = ErrorCode::INTERNAL_ERROR;
     }
 
-    if (backfill_attempted) {
-        FinishDfsBackfillAttempt(assignment.id, result,
-                                 backfill_storage_failure);
-    }
-
     if (result == ErrorCode::OK) {
         TaskCompleteRequest complete_request;
         complete_request.id = assignment.id;
@@ -6742,7 +6670,6 @@ void Client::ExecuteTask(const ClientTask& client_task) {
         // Other errors (e.g., OBJECT_NOT_FOUND, REPLICA_NOT_FOUND) should
         // not be retried
         bool should_retry =
-            assignment.type != TaskType::DFS_BACKFILL &&
             (result == ErrorCode::NO_AVAILABLE_HANDLE) &&
             (current_retry_count < assignment.max_retry_attempts);
 
@@ -6765,20 +6692,11 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             task_thread_pool_.enqueue(
                 [this, retry_task]() { ExecuteTask(retry_task); });
         } else {
-            // DFS recovery is retried by the master after a cooldown. A
-            // persistent outage must not produce one error per degraded key.
-            static DfsLogLimiter dfs_backfill_limiter;
-            auto suppressed = assignment.type == TaskType::DFS_BACKFILL
-                                  ? dfs_backfill_limiter.ShouldLog()
-                                  : std::optional<uint64_t>(0);
-            if (suppressed)
-                LOG(ERROR) << "action=task_execution_failed"
-                           << ", task_id=" << assignment.id
-                           << ", error_code=" << result
-                           << ", retry_count=" << current_retry_count
-                           << ", max_retry_count="
-                           << assignment.max_retry_attempts
-                           << ", suppressed=" << *suppressed;
+            LOG(ERROR) << "action=task_execution_failed"
+                       << ", task_id=" << assignment.id
+                       << ", error_code=" << result
+                       << ", retry_count=" << current_retry_count
+                       << ", max_retry_count=" << assignment.max_retry_attempts;
             TaskCompleteRequest complete_request;
             complete_request.id = assignment.id;
             complete_request.status = TaskStatus::FAILED;

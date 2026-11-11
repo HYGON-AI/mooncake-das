@@ -1458,13 +1458,6 @@ class Client {
     std::shared_ptr<StorageBackend> storage_backend_;
     std::string master_dfs_root_dir_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
-    // Native memory holders need not attach a foreground DFS backend.
-    std::mutex dfs_backfill_backend_mutex_;
-    std::shared_ptr<DistributedStorageBackend> dfs_backfill_backend_;
-    // Holder-wide I/O backoff, protected by dfs_backfill_backend_mutex_.
-    uint32_t dfs_backfill_failures_{0};
-    std::chrono::steady_clock::time_point dfs_backfill_retry_after_{};
-    UUID dfs_backfill_probe_task_{};
     // Preserve existing behavior for non-SGLang callers. SGLang explicitly
     // installs memory-only immediately after setup and before warmup.
     std::atomic<bool> dfs_read_allowed_{true};
@@ -1520,19 +1513,12 @@ class Client {
 
     void ExecuteTask(const ClientTask& client_task);
 
-    tl::expected<std::shared_ptr<DistributedStorageBackend>, ErrorCode>
-    GetDfsBackfillBackend();
-    bool BeginDfsBackfillAttempt(const UUID& task_id);
-    void FinishDfsBackfillAttempt(const UUID& task_id, ErrorCode result,
-                                 bool storage_failure);
-
     tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
         const std::string& key, const std::string& action_name,
         std::function<tl::expected<void, ErrorCode>()> end_fn,
         std::function<tl::expected<void, ErrorCode>()> revoke_fn,
         const Replica::Descriptor& source,
-        const std::vector<Replica::Descriptor>& targets,
-        std::shared_ptr<DistributedStorageBackend> dfs_backend = nullptr);
+        const std::vector<Replica::Descriptor>& targets);
 
     /**
      * @brief Copy an object's replica to target segments
@@ -1571,8 +1557,6 @@ class Client {
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;
-    // Blocking DFS recovery must not occupy COPY/MOVE or unmount workers.
-    ThreadPool dfs_backfill_thread_pool_;
     std::atomic<bool> task_running_{true};
 
     // Task polling configuration

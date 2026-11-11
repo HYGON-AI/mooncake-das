@@ -677,64 +677,6 @@ tl::expected<std::string, ErrorCode> Client::FetchDfsRootIdentity() {
     return config->dfs_root_identity;
 }
 
-tl::expected<std::shared_ptr<DistributedStorageBackend>, ErrorCode>
-Client::GetDfsBackfillBackend() {
-    if (dfs_storage_backend_) return dfs_storage_backend_;
-    std::lock_guard<std::mutex> lock(dfs_backfill_backend_mutex_);
-    if (dfs_backfill_backend_) return dfs_backfill_backend_;
-
-    auto storage = master_client_.GetStorageConfig();
-    if (!storage) return tl::make_unexpected(storage.error());
-    if (storage->dfs_fsdir.empty() || storage->dfs_root_identity.empty()) {
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    }
-    FileStorageConfig config;
-    config.storage_backend_type = StorageBackendType::kDistributed;
-    auto backend = CreateStorageBackend(config, storage->dfs_root_identity,
-                                        storage->dfs_fsdir);
-    if (!backend) return tl::make_unexpected(backend.error());
-    dfs_backfill_backend_ =
-        std::dynamic_pointer_cast<DistributedStorageBackend>(*backend);
-    if (dfs_backfill_backend_) {
-        dfs_backfill_backend_->SetDescriptorRootDir(storage->dfs_fsdir);
-        dfs_backfill_backend_->SetMasterEpochProvider(
-            master_client_.MakeDfsMasterEpochProvider());
-    }
-    // The executor checks initialization before acquiring a source pin.
-    return dfs_backfill_backend_;
-}
-
-bool Client::BeginDfsBackfillAttempt(const UUID& task_id) {
-    std::lock_guard<std::mutex> lock(dfs_backfill_backend_mutex_);
-    if (dfs_backfill_failures_ != 0) {
-        if (std::chrono::steady_clock::now() < dfs_backfill_retry_after_ ||
-            dfs_backfill_probe_task_ != UUID{})
-            return false;
-        // After a cooldown only one real write probes this holder's mount.
-        dfs_backfill_probe_task_ = task_id;
-    }
-    return true;
-}
-
-void Client::FinishDfsBackfillAttempt(const UUID& task_id, ErrorCode result,
-                                      bool storage_failure) {
-    std::lock_guard<std::mutex> lock(dfs_backfill_backend_mutex_);
-    const bool probe = dfs_backfill_probe_task_ == task_id;
-    if (probe) dfs_backfill_probe_task_ = UUID{};
-    if (result == ErrorCode::OK) {
-        dfs_backfill_failures_ = 0;
-        dfs_backfill_retry_after_ = {};
-    } else if (storage_failure && (dfs_backfill_failures_ == 0 || probe)) {
-        // Concurrent failures from the initial healthy batch do not keep
-        // extending the pause. Missing keys/source races do not open it.
-        dfs_backfill_failures_ = std::min(dfs_backfill_failures_ + 1, 4u);
-        dfs_backfill_retry_after_ =
-            std::chrono::steady_clock::now() +
-            std::chrono::seconds(
-                std::min(5u << (dfs_backfill_failures_ - 1), 30u));
-    }
-}
-
 void Client::StopDfsWritesAndBufferLogging() {
     // Stop accepting new asynchronous DFS writes before draining tasks already
     // submitted. Their BufferHandles retain the unified allocator.

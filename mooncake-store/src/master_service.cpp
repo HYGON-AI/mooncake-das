@@ -5337,9 +5337,6 @@ auto MasterService::InsertMetadata(
                                         *deadline_to_index);
     }
     accessor.GetState().is_processing = true;
-    if (config.dfs_replica_num > 0 && !use_kvcs_ &&
-        (dfs_filter_mode_.load(std::memory_order_acquire) & 1) == 0)
-        ScheduleDfsBackfill(accessor);
 
     return replica_list;
 }
@@ -6198,7 +6195,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     writer_host_id, allocation_group_id,
                     allocation_residency_affinity_id, now, soft_pin_request,
                     allocation_committed_soft_pin_timeout,
-                    dfs_allocation_failed);
+                    dfs_allocation_failed, std::nullopt, skip_dfs_replica);
                 if (result) {
                     accessor.Get().session_id = allocation_session_id;
                 }
@@ -6294,7 +6291,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                       previous_kv_media);
 
                     accessor.GetState().is_processing = true;
-                    if (config.dfs_replica_num > 0 && !use_kvcs_) ScheduleDfsBackfill(accessor);
 
                     // Return the existing descriptors — same buffer addresses
                     // as before.
@@ -12244,7 +12240,6 @@ void MasterService::DfsEvictionThreadFunc() {
     VLOG(1) << "action=dfs_eviction_thread_started";
 
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
-    auto next_dfs_backfill_time = std::chrono::steady_clock::now();
     auto next_dfs_root_guard_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         if (!AdmitsBusinessWorkers()) {
@@ -12277,12 +12272,6 @@ void MasterService::DfsEvictionThreadFunc() {
         if (guard_now >= next_dfs_root_guard_time) {
             ReconcileDfsRootFiles();
             next_dfs_root_guard_time = guard_now + dfs_root_guard_interval_;
-        }
-
-        if (std::chrono::steady_clock::now() >= next_dfs_backfill_time) {
-            RunDfsBackfill();
-            next_dfs_backfill_time = std::chrono::steady_clock::now() +
-                                     std::chrono::seconds(1);
         }
 
         std::this_thread::sleep_for(
