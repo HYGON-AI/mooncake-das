@@ -1222,13 +1222,13 @@ TEST_F(RealClientTest, DfsPrefetchArenaUnavailableWithoutFileStorage) {
 
 TEST_F(RealClientDfsPrefetchTest, UsesDedicatedArenaAndFailsPerKeyWhenFull) {
     DfsPrefetchTestEnv dfs_env;
-    // 24 KiB buffer, 4 KiB chunks: read and write protection are 8 KiB each
-    // (aligned allocation of a 4 KiB request), leaving 8 KiB. A 0.25 ratio
-    // then caps prefetch at 6144 bytes, which holds one 4 KiB object but not
-    // two.
+    // 64 KiB buffer, 4 KiB chunks. Read protection is four aligned chunks
+    // (4 x 8 KiB = 32 KiB, exactly C/2 so it is not clamped) and write
+    // protection is one (8 KiB), leaving 24 KiB. A 0.125 ratio caps prefetch
+    // at 8 KiB, which holds one staged object but not two.
     ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
-                                "24576");
-    ScopedEnvVar prefetch_ratio("MC_STORE_DFS_PREFETCH_CAPACITY_RATIO", "0.25");
+                                "65536");
+    ScopedEnvVar prefetch_ratio("MC_STORE_DFS_PREFETCH_CAPACITY_RATIO", "0.125");
     const std::vector<std::string> keys = {"dfs_prefetch_cached",
                                            "dfs_prefetch_overflow"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17827", keys));
@@ -1238,7 +1238,7 @@ TEST_F(RealClientDfsPrefetchTest, UsesDedicatedArenaAndFailsPerKeyWhenFull) {
     // ever change, this fails here instead of looking like an arena bug.
     ASSERT_NE(py_client_->file_storage_, nullptr);
     ASSERT_EQ(py_client_->file_storage_->UnifiedPrefetchLimitBytes(),
-              size_t{6144});
+              size_t{8192});
     const std::string endpoint = "198.51.100.88:45305";
     ASSERT_EQ(py_client_->client_->SetServiceEndpoint(endpoint), 0);
     ASSERT_EQ(py_client_->batch_get_session_start(keys),
@@ -1295,9 +1295,11 @@ TEST_F(RealClientDfsPrefetchTest, UsesDedicatedArenaAndFailsPerKeyWhenFull) {
 
 TEST_F(RealClientDfsPrefetchTest, SharedRootRegionIsReleasedAfterLastKey) {
     DfsPrefetchTestEnv dfs_env;
-    // Room for exactly the two objects read by one prefetch call.
+    // Room for exactly the two objects read by one prefetch call. The budget
+    // is what is left after four read chunks and one write chunk of
+    // protection, so the buffer has to be 48 KiB to leave 16 KiB of prefetch.
     ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
-                                "24576");
+                                "49152");
     const std::vector<std::string> keys = {
         "dfs_prefetch_root_a", "dfs_prefetch_root_b", "dfs_prefetch_root_c"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17828", keys));
@@ -1328,8 +1330,10 @@ TEST_F(RealClientDfsPrefetchTest, SharedRootRegionIsReleasedAfterLastKey) {
 
 TEST_F(RealClientDfsPrefetchTest, TearDownWithLivePrefetchedBuffers) {
     DfsPrefetchTestEnv dfs_env;
+    // Two live prefetched objects need 16 KiB of prefetch budget, which a
+    // 48 KiB buffer leaves after the read and write protections.
     ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
-                                "24576");
+                                "49152");
     const std::vector<std::string> keys = {"dfs_prefetch_teardown_a",
                                            "dfs_prefetch_teardown_b"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17829", keys));

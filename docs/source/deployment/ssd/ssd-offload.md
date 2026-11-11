@@ -133,11 +133,11 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory |
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
-| `MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES` | `8589934592` (8 GiB) | Shared pinned unified buffer for DFS read, prefetch, and write staging |
+| `MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES` | `12884901888` (12 GiB) | Shared pinned unified buffer for DFS read, prefetch, and write staging |
 | `MC_STORE_DFS_READ_CHUNK_SIZE_BYTES` | `1073741824` (1 GiB) | DFS read chunk size; values `<= 0` use the default |
-| `MC_STORE_DFS_READ_ARENA_WAIT_MS` | `1000` | Maximum time a DFS read staging allocation waits for unified-buffer space before falling back to the ordinary client buffer; `0` disables the wait |
+| `MC_STORE_DFS_READ_ARENA_WAIT_MS` | `10000` | Maximum time a DFS read staging allocation waits for unified-buffer space before falling back to the ordinary client buffer; `0` disables the wait |
 | `MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES` | `1073741824` (1 GiB) | DFS write chunk size; values `<= 0` use the default |
-| `MC_STORE_DFS_PREFETCH_CAPACITY_RATIO` | `0.5` | Maximum fraction of the unified buffer retained by prefetch allocations; truncated to what remains after two read chunks and one write chunk |
+| `MC_STORE_DFS_PREFETCH_CAPACITY_RATIO` | `0.5` | Maximum fraction of the unified buffer retained by prefetch allocations; truncated to what remains after four read chunks and one write chunk |
 | `MC_STORE_DFS_WRITE_ARENA_WAIT_MS` | `10000` | Maximum time DFS write staging waits for unified-buffer space |
 | `MC_STORE_DFS_WRITE_THREADS` | `8` | Number of client threads performing asynchronous DFS writes; values `<= 0` use the default |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
@@ -163,15 +163,15 @@ The unified buffer is not physically partitioned; three byte budgets are enforce
 
 | Budget | Value | Effect |
 |---|---|---|
-| Read protection | Two read chunks after alignment, capped at half the buffer | Non-read usage must always leave this many bytes free, whether or not a read is in flight |
+| Read protection | Four read chunks after alignment, capped at half the buffer | Non-read usage must always leave this many bytes free, whether or not a read is in flight |
 | Write protection | One write chunk after alignment, capped by the space left after the read protection | Carved out of the prefetch budget, so admission always reserves room for one write chunk when prefetch is admitted |
 | Prefetch limit | `MC_STORE_DFS_PREFETCH_CAPACITY_RATIO × buffer size`, truncated to `buffer − read protection − write protection` | Prefetch never retains more than this |
 
 Both protections are resolved once at startup. The prefetch limit is `min(ratio × buffer, buffer − read protection − write protection)`; when the ratio asks for more, the limit is silently truncated and a warning records both values. If the two protections consume the whole buffer, the prefetch limit becomes `0`, prefetch is disabled, and a warning says so — raise `MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES` or reduce the chunk sizes. Write protection is a configuration-time reservation only: writes wait for space, bounded by `MC_STORE_DFS_WRITE_ARENA_WAIT_MS` (default 10 s), rather than failing immediately, so a write proceeds as soon as reads release memory. Per-request admission therefore does not re-check the write protection.
 
-Read protection is a byte-level floor, not a guarantee of a contiguous free region. The effective read protection is `max(two read chunks, in-flight read bytes)`: with no reads in flight it holds room for two concurrent reads, and it grows further when concurrent reads exceed that so they are not crowded out by prefetch or writes. The floor is always held, even when no read is in flight: prefetch and writes together may use at most `buffer − read protection`, and the remainder stays reserved for reads that arrive later. This is intentional — a read holds the floor for at most `MC_STORE_DFS_READ_ARENA_WAIT_MS` before falling back, so most of the space must already be there when it starts. A single read request is never rejected by these budgets; only non-read requests can be refused at admission time.
+Read protection is a byte-level floor, not a guarantee of a contiguous free region. The effective read protection is `max(four read chunks, in-flight read bytes)`: with no reads in flight it holds room for four concurrent reads, and it grows further when concurrent reads exceed that so they are not crowded out by prefetch or writes. The floor is always held, even when no read is in flight: prefetch and writes together may use at most `buffer − read protection`, and the remainder stays reserved for reads that arrive later. This is intentional — a read holds the floor for at most `MC_STORE_DFS_READ_ARENA_WAIT_MS` before falling back, so most of the space must already be there when it starts. A single read request is never rejected by these budgets; only non-read requests can be refused at admission time.
 
-If the read protection exceeds half the buffer, it is clamped to half the buffer and a warning is logged. This happens when two aligned read chunks exceed `buffer / 2`, that is, when a read chunk is larger than a quarter of the buffer. In that configuration writes and prefetch can fill the remaining half, which may leave too little contiguous space for a full read chunk. Size the buffer to at least four times the aligned read chunk, or reduce `MC_STORE_DFS_READ_CHUNK_SIZE_BYTES`, to keep the full read protection.
+If the read protection exceeds half the buffer, it is clamped to half the buffer and a warning is logged. This happens when four aligned read chunks exceed `buffer / 2`, that is, when a read chunk is larger than an eighth of the buffer. In that configuration writes and prefetch can fill the remaining half, which may leave too little contiguous space for a full read chunk. Size the buffer to at least eight times the aligned read chunk, or reduce `MC_STORE_DFS_READ_CHUNK_SIZE_BYTES`, to keep the full read protection.
 
 Note that the aligned allocation size of a chunk is larger than the chunk size itself: a request is padded by up to `MOONCAKE_DFS_ALIGNMENT - 1` bytes and then rounded up to the allocator bin size, so a 4 KiB read chunk with 4 KiB alignment reserves 8 KiB. Size the buffer against the aligned sizes, not the raw chunk sizes.
 

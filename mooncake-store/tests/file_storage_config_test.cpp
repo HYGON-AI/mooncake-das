@@ -83,7 +83,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.storage_backend_type, StorageBackendType::kBucket);
     EXPECT_EQ(config.storage_filepath, "/data/file_storage");
     EXPECT_EQ(config.local_buffer_size, 1280 * 1024 * 1024);
-    EXPECT_EQ(config.unified_buffer_size, 8LL * 1024 * 1024 * 1024);
+    EXPECT_EQ(config.unified_buffer_size, 12LL * 1024 * 1024 * 1024);
     EXPECT_EQ(config.read_chunk_size, 1LL * 1024 * 1024 * 1024);
     EXPECT_EQ(config.write_chunk_size, 1LL * 1024 * 1024 * 1024);
     EXPECT_DOUBLE_EQ(config.prefetch_capacity_ratio, 0.5);

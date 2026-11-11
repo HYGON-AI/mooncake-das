@@ -149,7 +149,7 @@ class FileStorage {
             std::chrono::milliseconds::zero()) const;
 
     // How long a DFS read staging allocation may wait for space, resolved once
-    // from MC_STORE_DFS_READ_ARENA_WAIT_MS (default 1000 ms, 0 disables the
+    // from MC_STORE_DFS_READ_ARENA_WAIT_MS (default 10000 ms, 0 disables the
     // wait). Kept as a member so the read hot path does not re-parse the
     // environment on every allocation.
     [[nodiscard]] std::chrono::milliseconds ReadArenaWait() const {
