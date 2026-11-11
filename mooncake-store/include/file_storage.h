@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <optional>
+#include <string>
 #include <unordered_set>
 
 #include "client_service.h"
@@ -132,10 +134,27 @@ class FileStorage {
         return usage_tracker_;
     }
 
+    // One-line description of the unified buffer state for allocation-failure
+    // logs: live usage per kind, admission limits, and the allocator's free
+    // space / largest contiguous region. Empty when the buffer is absent.
+    [[nodiscard]] std::string UnifiedBufferDiagnostics() const;
+
     // Allocate request-scoped staging from the fixed-capacity pinned restore
     // arena. The handle returns its sub-allocation to the arena on destruction.
+    // With max_wait > 0 the call waits up to that long for another holder to
+    // release enough room before reporting failure.
     [[nodiscard]] std::optional<BufferHandle> AllocatePinnedStagingBuffer(
-        size_t size, size_t alignment = 1) const;
+        size_t size, size_t alignment = 1,
+        std::chrono::milliseconds max_wait =
+            std::chrono::milliseconds::zero()) const;
+
+    // How long a DFS read staging allocation may wait for space, resolved once
+    // from MC_STORE_DFS_READ_ARENA_WAIT_MS (default 10000 ms, 0 disables the
+    // wait). Kept as a member so the read hot path does not re-parse the
+    // environment on every allocation.
+    [[nodiscard]] std::chrono::milliseconds ReadArenaWait() const {
+        return read_arena_wait_;
+    }
 
     // Allocate from the unified restore arena for prefetch and enforce the
     // caller's active-capacity limit before publishing the handle.
@@ -354,6 +373,8 @@ class FileStorage {
     // finish after FileStorage is destroyed.
     std::shared_ptr<PinnedBufferPool::Buffer> pinned_restore_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
+    // Resolved once at construction; the read hot path reads the member.
+    const std::chrono::milliseconds read_arena_wait_;
     mutable std::mutex unified_prefetch_mutex_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> distributed_backend_;

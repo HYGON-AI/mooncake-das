@@ -4,6 +4,7 @@
 #include <memory>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -13,6 +14,8 @@
 #include "client_metric.h"
 #include "common/client_buffer_allocation.h"
 #include "device/accelerator_registry.h"
+#include "environment_variables.h"
+#include "environ.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
@@ -45,6 +48,16 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     return tasks;
 }
 
+// Resolved once at construction so the read hot path does not re-parse the
+// environment on every staging allocation.
+std::chrono::milliseconds ResolveReadArenaWait() {
+    constexpr int64_t kDefaultWaitMs = 10000;
+    const auto configured = Environ::Read(
+        FileStorageEnvironmentVariables::MC_STORE_DFS_READ_ARENA_WAIT_MS);
+    return std::chrono::milliseconds(std::max<int64_t>(
+        configured.value_or(kDefaultWaitMs), 0));
+}
+
 }  // namespace
 
 FileStorage::FileStorage(const FileStorageConfig& config,
@@ -60,6 +73,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
               : 0)),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
+      read_arena_wait_(ResolveReadArenaWait()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
     if (!config_.Validate()) {
@@ -122,28 +136,47 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                     static_cast<size_t>(std::max<int64_t>(
                         config_.write_chunk_size, 0)),
                     dfs_alignment);
+            // Reserve room for four concurrent reads. A single chunk only
+            // protects one read; further concurrent reads then compete with
+            // prefetch and write staging for the shared headroom and fail
+            // whenever that headroom is fragmented or already taken.
+            constexpr size_t kReadProtectionChunks = 4;
+            const auto desired_read_protection =
+                read_chunk_allocation_bytes >
+                        std::numeric_limits<size_t>::max() /
+                            kReadProtectionChunks
+                    ? std::numeric_limits<size_t>::max()
+                    : read_chunk_allocation_bytes * kReadProtectionChunks;
             const auto read_min_protection_bytes = std::min(
-                read_chunk_allocation_bytes,
+                desired_read_protection,
                 pinned_restore_arena_->capacity / 2);
-            if (read_chunk_allocation_bytes > read_min_protection_bytes) {
+            if (desired_read_protection > read_min_protection_bytes) {
                 LOG(WARNING)
-                    << "DFS read free reserve was clamped to half of the "
-                       "unified buffer: requested_read_min_protection_bytes="
-                    << read_chunk_allocation_bytes
-                    << ", effective_read_min_protection_bytes="
+                    << "DFS read protection was clamped to half of the "
+                       "unified buffer: requested_read_protection_bytes="
+                    << desired_read_protection
+                    << ", effective_read_protection_bytes="
                     << read_min_protection_bytes
                     << ", unified_capacity_bytes="
                     << pinned_restore_arena_->capacity;
             }
-            // Carve one write chunk out of the prefetch budget so prefetch can
-            // never fill the whole non-read region and leave DFS write staging
-            // without space. This is a configuration-time reservation only:
-            // writes wait for space (bounded by MC_STORE_DFS_WRITE_ARENA_WAIT_MS,
-            // default 10s) instead of failing immediately, so once reads
-            // release memory the write proceeds. No per-request write
-            // protection is therefore needed in the admission path.
+            // Carve room for one write chunk out of the prefetch budget so
+            // prefetch can never fill the whole non-read region and leave DFS
+            // write staging without space. This is a configuration-time
+            // reservation only: writes wait for space (bounded by
+            // MC_STORE_DFS_WRITE_ARENA_WAIT_MS, default 10s) instead of failing
+            // immediately, so once reads release memory the write proceeds. No
+            // per-request write protection is therefore needed in the
+            // admission path.
+            constexpr size_t kWriteProtectionChunks = 1;
+            const auto desired_write_protection =
+                write_chunk_allocation_bytes >
+                        std::numeric_limits<size_t>::max() /
+                            kWriteProtectionChunks
+                    ? std::numeric_limits<size_t>::max()
+                    : write_chunk_allocation_bytes * kWriteProtectionChunks;
             const auto write_min_protection_bytes = std::min(
-                write_chunk_allocation_bytes,
+                desired_write_protection,
                 pinned_restore_arena_->capacity - read_min_protection_bytes);
             const auto prefetch_limit_bytes = static_cast<uint64_t>(
                 static_cast<double>(pinned_restore_arena_->capacity) *
@@ -290,17 +323,41 @@ FileStorage::~FileStorage() {
 }
 
 std::optional<BufferHandle> FileStorage::AllocatePinnedStagingBuffer(
-    size_t size, size_t alignment) const {
+    size_t size, size_t alignment,
+    std::chrono::milliseconds max_wait) const {
     if (!pinned_restore_arena_allocator_) {
         LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=read size="
-                   << size << " alignment=" << alignment;
+                   << size << " alignment=" << alignment
+                   << " reason=unified_buffer_unavailable";
         return std::nullopt;
     }
-    auto allocation = pinned_restore_arena_allocator_->allocate_aligned(
-        size, alignment, DfsBufferUsageKind::kRead);
+    if (max_wait <= std::chrono::milliseconds::zero()) {
+        auto allocation = pinned_restore_arena_allocator_->allocate_aligned(
+            size, alignment, DfsBufferUsageKind::kRead);
+        if (!allocation) {
+            LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=read size="
+                       << size << " alignment=" << alignment << ", "
+                       << UnifiedBufferDiagnostics();
+        }
+        return allocation;
+    }
+    // Wait for another holder to release instead of failing outright: reads
+    // never trigger the wait, so a bounded wait is the only way to survive a
+    // transient peak without falling back to pageable memory.
+    bool timed_out = false;
+    bool request_exceeds_limit = false;
+    auto allocation = pinned_restore_arena_allocator_->allocate_aligned_wait(
+        size, alignment, DfsBufferUsageKind::kRead, max_wait, &timed_out,
+        &request_exceeds_limit);
     if (!allocation) {
         LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=read size="
-                   << size << " alignment=" << alignment;
+                   << size << " alignment=" << alignment
+                   << " reason="
+                   << (request_exceeds_limit ? "request_exceeds_limit"
+                                             : (timed_out ? "timeout"
+                                                          : "allocator_failure"))
+                   << ", "
+                   << UnifiedBufferDiagnostics();
     }
     return allocation;
 }
@@ -308,16 +365,20 @@ std::optional<BufferHandle> FileStorage::AllocatePinnedStagingBuffer(
 std::optional<BufferHandle> FileStorage::AllocatePinnedPrefetchBuffer(
     size_t size, size_t alignment) const {
     if (!pinned_restore_arena_allocator_ || size == 0 || alignment == 0) {
-        LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
-                   << size << " alignment=" << alignment;
+        LOG_EVERY_N(WARNING, 64)
+            << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
+            << size << " alignment=" << alignment
+            << " reason=invalid_request_or_unavailable";
         return std::nullopt;
     }
     std::lock_guard<std::mutex> lock(unified_prefetch_mutex_);
     auto allocation = pinned_restore_arena_allocator_->allocate_aligned(
         size, alignment, DfsBufferUsageKind::kPrefetch);
     if (!allocation) {
-        LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
-                   << size << " alignment=" << alignment;
+        LOG_EVERY_N(WARNING, 64)
+            << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
+            << size << " alignment=" << alignment << ", "
+            << UnifiedBufferDiagnostics();
     }
     return allocation;
 }
@@ -328,6 +389,13 @@ offset_allocator::OffsetAllocStorageReport FileStorage::UnifiedBufferReport()
     return pinned_restore_arena_allocator_->storageReport();
 }
 
+std::string FileStorage::UnifiedBufferDiagnostics() const {
+    if (!pinned_restore_arena_) return {};
+    std::ostringstream out;
+    out << "unified_capacity=" << pinned_restore_arena_->capacity << ", "
+        << DescribeUnifiedBufferState(pinned_restore_arena_allocator_);
+    return out.str();
+}
 
 tl::expected<void, ErrorCode> FileStorage::InitDfs() {
     dfs_heartbeat_interval_seconds_.store(300, std::memory_order_release);

@@ -61,14 +61,15 @@ class DfsBufferUsageTracker {
             std::min(read_min_protection_bytes, capacity_bytes_);
         const auto read_free_capacity =
             capacity_bytes_ - read_min_protection_bytes_;
-        const auto write_protection =
+        write_min_protection_bytes_ =
             std::min(write_min_protection_bytes, read_free_capacity);
-        const auto prefetch_capacity = read_free_capacity - write_protection;
+        const auto prefetch_capacity =
+            read_free_capacity - write_min_protection_bytes_;
         prefetch_limit_bytes_ =
             std::min(prefetch_limit_bytes, prefetch_capacity);
         admission_configured_ = true;
         return DfsBufferAdmissionLimits{read_min_protection_bytes_,
-                                        write_protection,
+                                        write_min_protection_bytes_,
                                         prefetch_limit_bytes_};
     }
 
@@ -266,12 +267,22 @@ class DfsBufferUsageTracker {
         return prefetch_limit_bytes_;
     }
 
+    // Configured budgets, for diagnostics. All zeros until
+    // ConfigureAdmission runs.
+    [[nodiscard]] DfsBufferAdmissionLimits AdmissionLimits() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return DfsBufferAdmissionLimits{read_min_protection_bytes_,
+                                        write_min_protection_bytes_,
+                                        prefetch_limit_bytes_};
+    }
+
    private:
     mutable std::mutex mutex_;
     std::array<uint64_t, 3> bytes_{};
     std::array<uint64_t, 3> reserved_{};
     uint64_t reserved_total_ = 0;
     uint64_t read_min_protection_bytes_ = 0;
+    uint64_t write_min_protection_bytes_ = 0;
     uint64_t prefetch_limit_bytes_ = 0;
     uint64_t total_bytes_ = 0;
     uint64_t peak_total_bytes_ = 0;

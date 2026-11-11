@@ -3985,7 +3985,9 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
                            << (request_exceeds_limit
                                    ? "request_exceeds_limit"
                                    : (stage_timed_out ? "timeout"
-                                                      : "allocator_failure"));
+                                                      : "allocator_failure"))
+                           << ", "
+                           << DescribeUnifiedBufferState(unified_buffer_allocator_);
                 ObserveUnifiedDfsBufferAllocationFailure(
                     DfsBufferUsageKind::kWrite);
                 staging_succeeded = false;
@@ -7336,7 +7338,15 @@ void Client::SubmitDfsWriteChunk(
         if (!context->staging_buffer) {
             LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=write "
                           "mode=asynchronous size="
-                       << payload_size;
+                       << payload_size
+                       << (staging_request_exceeds_limit
+                               ? " reason=request_exceeds_limit"
+                               : (staging_allocation_timed_out
+                                      ? " reason=timeout"
+                                      : " reason=allocator_failure"))
+                       << ", "
+                       << DescribeUnifiedBufferState(
+                              context->unified_buffer_allocator);
             ObserveUnifiedDfsBufferAllocationFailure(
                 DfsBufferUsageKind::kWrite);
             throw std::runtime_error("Unified DFS write buffer unavailable");

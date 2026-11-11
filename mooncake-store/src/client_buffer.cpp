@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <sstream>
 #include <vector>
 #include <sys/mman.h>  // For shm_open, mmap, munmap
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
@@ -469,6 +470,29 @@ void* BufferHandle::device_ptr() const {
 }
 
 // Utility functions for buffer and slice management
+std::string DescribeUnifiedBufferState(
+    const std::shared_ptr<ClientBufferAllocator>& allocator) {
+    if (!allocator) return {};
+    const auto report = allocator->storageReport();
+    std::ostringstream out;
+    // free/contig together separate fragmentation (contig too small) from a
+    // genuine shortage (free itself too small) or an admission refusal (both
+    // large enough, yet the request was rejected).
+    out << "free=" << report.totalFreeSpace
+        << ", contig=" << report.largestFreeRegion;
+    if (const auto tracker = allocator->usage_tracker()) {
+        const auto usage = tracker->Snapshot();
+        out << ", rd=" << usage.read_bytes
+            << ", pf=" << usage.prefetch_bytes
+            << ", wr=" << usage.write_bytes;
+        const auto limits = tracker->AdmissionLimits();
+        out << ", rd_prot=" << limits.read_min_protection_bytes
+            << ", wr_prot=" << limits.write_min_protection_bytes
+            << ", pf_cap=" << limits.prefetch_limit_bytes;
+    }
+    return out.str();
+}
+
 std::vector<Slice> split_into_slices(BufferHandle& handle) {
     auto base = static_cast<uint8_t*>(handle.ptr());
     auto length = handle.size();

@@ -826,12 +826,13 @@ std::shared_ptr<BufferHandle> RealClient::AllocatePrefetchArenaRegion(
     if (!dfs_prefetch_arena_available() || !file_storage_) return nullptr;
     auto allocation = file_storage_->AllocatePinnedPrefetchBuffer(size, alignment);
     if (!allocation) {
+        // AllocatePinnedPrefetchBuffer already logged the failure with the full
+        // unified-buffer state; only the metric is owed here. Logging again
+        // would double every prefetch failure under load.
         if (client_) {
             client_->ObserveUnifiedDfsBufferAllocationFailure(
                 DfsBufferUsageKind::kPrefetch);
         }
-        LOG(ERROR) << "DFS_UNIFIED_BUFFER_ALLOCATION_FAILED kind=prefetch size="
-                   << size << " alignment=" << alignment;
         return nullptr;
     }
     return std::make_shared<BufferHandle>(std::move(*allocation));
@@ -1335,21 +1336,21 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         } else {
             std::optional<BufferHandle> allocation;
             if (file_storage_) {
+                // Wait briefly for another holder to release; reads never wait
+                // on their own, so this bounded wait is what keeps a transient
+                // peak from dropping the read onto pageable memory.
                 allocation = file_storage_->AllocatePinnedStagingBuffer(
-                    arena_size, dfs_alignment);
+                    arena_size, dfs_alignment, file_storage_->ReadArenaWait());
                 pinned_restore_arena_used = allocation.has_value();
             }
-            const bool has_dfs_reads = std::any_of(
-                arena_views.begin(), arena_views.end(), [](const auto &view) {
-                    return view.entry->replica.is_dfs_replica();
-                });
-            // Enforce an active unified budget while preserving ordinary reads
-            // when it is explicitly disabled or this batch only uses local SSD.
-            const bool unified_budget_active =
-                has_dfs_reads && file_storage_ &&
-                file_storage_->HasPinnedRestoreArena();
-            if (!allocation && !unified_budget_active &&
-                client_buffer_allocator_) {
+            // Fall back to client_buffer_allocator_ when the unified buffer
+            // refused. That pool is sized by the local_buffer_size argument of
+            // setup(), independent of the unified buffer, so the fallback is
+            // not bounded by the admission budgets and only fails when that
+            // buffer is exhausted too. Writes and prefetch never take this
+            // path: they wait within their own budget or fail, so they cannot
+            // silently exceed the unified buffer.
+            if (!allocation && client_buffer_allocator_) {
                 allocation = client_buffer_allocator_->allocate_aligned(
                     arena_size, dfs_alignment);
             }
@@ -1361,17 +1362,20 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             arena_capacity = arena->size();
         }
         if (!arena) {
-            // Prefetch failures are reported (rate-limited) by
-            // AllocatePrefetchArenaRegion.
+            // Reached only when the unified buffer and the generic allocator
+            // both failed. The unified buffer already logged its own refusal
+            // with full state, so this only records that the fallback failed
+            // too, which is what makes the read itself fail.
             if (!prefetch_only) {
                 if (client_) {
                     client_->ObserveUnifiedDfsBufferAllocationFailure(
                         DfsBufferUsageKind::kRead);
                 }
-                LOG(ERROR) << "DFS staging arena allocation failed, size: "
+                LOG(ERROR) << "DFS staging arena allocation failed, size="
                            << arena_size << ", pinned_restore_available="
                            << (file_storage_ &&
-                               file_storage_->HasPinnedRestoreArena());
+                               file_storage_->HasPinnedRestoreArena())
+                           << ", generic_buffer_fallback_failed=1";
             }
             for (const auto &view : arena_views) {
                 results[view.entry->original_idx] =

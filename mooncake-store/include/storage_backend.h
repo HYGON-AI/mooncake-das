@@ -214,7 +214,7 @@ struct FileStorageConfig {
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
     // Unified pinned+mapped backing shared by DFS read, prefetch and write.
-    int64_t unified_buffer_size = 8LL * 1024 * 1024 * 1024;
+    int64_t unified_buffer_size = 12LL * 1024 * 1024 * 1024;
     double prefetch_capacity_ratio = 0.5;
 
     // Read/write request chunk sizes; these are not backing capacities.
