@@ -1427,51 +1427,6 @@ WrappedMasterService::DynamicReplicaCopyStart(
         [] { MasterMetricManager::instance().inc_copy_start_failures(); });
 }
 
-tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::DfsBackfillStart(
-    const UUID& client_id, const std::string& key,
-    const std::string& tenant_id, const std::string& source,
-    const UUID& task_id) {
-    auto result = execute_rpc(
-        "DfsBackfillStart",
-        [&] {
-            return WithWriteTenant(
-                tenant_id, master_service_.IsTenantQuotaEnabled(),
-                [&](const TenantId& tenant) {
-                    return master_service_.DfsBackfillStart(
-                        client_id, key, tenant, source, task_id);
-                });
-        },
-        [&](auto& timer) { timer.LogRequest("key=", key, ", task=", task_id); },
-        [] { MasterMetricManager::instance().inc_copy_start_requests(); },
-        [] { MasterMetricManager::instance().inc_copy_start_failures(); });
-    if (result) {
-        StampDfsEpoch(result->targets, master_service_.GetDfsMasterEpoch());
-    }
-    return result;
-}
-
-tl::expected<void, ErrorCode> WrappedMasterService::DfsBackfillFinish(
-    const UUID& client_id, const std::string& key,
-    const std::string& tenant_id, const UUID& task_id, bool success) {
-    return execute_rpc(
-        "DfsBackfillFinish",
-        [&] {
-            return WithRequestTenant(
-                master_service_.IsTenantQuotaEnabled()
-                    ? std::string_view(tenant_id) : TenantId::kDefaultValue,
-                [&](const TenantId& tenant) {
-                    return success
-                        ? master_service_.CopyEnd(client_id, key, tenant,
-                                                  task_id)
-                        : master_service_.CopyRevoke(client_id, key, tenant,
-                                                     task_id);
-                });
-        },
-        [&](auto& timer) { timer.LogRequest("key=", key, ", task=", task_id); },
-        [] { MasterMetricManager::instance().inc_copy_end_requests(); },
-        [] { MasterMetricManager::instance().inc_copy_end_failures(); });
-}
-
 tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
     const UUID& client_id, const std::string& key,
     const std::string& tenant_id) {
@@ -2374,8 +2329,6 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
     RegisterPooledHandlers<
         &WrappedMasterService::BatchExistKeyByReplicaType,
         &WrappedMasterService::BatchInvalidateDfsBuckets,
-        &WrappedMasterService::DfsBackfillFinish,
-        &WrappedMasterService::DfsBackfillStart,
         &WrappedMasterService::GetDfsBucketSnapshot,
         &WrappedMasterService::GetDfsMasterEpoch,
         &WrappedMasterService::ReportServiceMetrics,

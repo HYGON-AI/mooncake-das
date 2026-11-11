@@ -684,13 +684,6 @@ class MasterService {
         const UUID& dynamic_replication_lease_id = UUID{},
         uint64_t dynamic_replication_version_epoch = 0);
 
-    // Backfill uses the copy lifecycle, including source pinning and timeout
-    // cleanup. The task ID fences stale workers after replacement/retry.
-    tl::expected<CopyStartResponse, ErrorCode> DfsBackfillStart(
-        const UUID& client_id, const std::string& key,
-        const TenantId& tenant_id, const std::string& src_segment,
-        const UUID& task_id);
-
     tl::expected<void, ErrorCode> CopyEnd(
         const UUID& client_id, const std::string& key,
         const TenantId& tenant_id,
@@ -1695,14 +1688,6 @@ class MasterService {
     DfsInitResult InitDfsAllocatorFromEnvironment(
         const MasterServiceConfig& config);
     void DfsAllocatorRetryThreadFunc();
-    void RunDfsBackfill();
-    void ScheduleDfsBackfill(MetadataAccessorRW& accessor);
-    struct DfsBackfillCandidate {
-        TenantId tenant_id;
-        route::ObjectRef ref;
-    };
-    std::mutex dfs_backfill_mutex_;
-    std::deque<DfsBackfillCandidate> dfs_backfill_candidates_;
     bool InitializeDfsRootGuard(const std::string& root,
                                 const std::string& identity);
     bool RecoverDfsRootAfterReplacement(const std::string& root,

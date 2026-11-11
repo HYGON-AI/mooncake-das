@@ -16,7 +16,6 @@ namespace mooncake {
 enum class TaskType {
     REPLICA_COPY,
     REPLICA_MOVE,
-    DFS_BACKFILL,
 };
 
 inline std::ostream& operator<<(std::ostream& os, const TaskType& type) {
@@ -26,9 +25,6 @@ inline std::ostream& operator<<(std::ostream& os, const TaskType& type) {
             break;
         case TaskType::REPLICA_MOVE:
             os << "REPLICA_MOVE";
-            break;
-        case TaskType::DFS_BACKFILL:
-            os << "DFS_BACKFILL";
             break;
         default:
             os << "UNKNOWN_TASK_TYPE";
@@ -116,13 +112,6 @@ struct ReplicaMovePayload {
 };
 YLT_REFL(ReplicaMovePayload, tenant_id, key, source, target);
 
-struct DfsBackfillPayload {
-    std::string tenant_id = "default";
-    std::string key;
-    std::string source;
-};
-YLT_REFL(DfsBackfillPayload, tenant_id, key, source);
-
 template <TaskType T>
 struct TaskPayloadTraits;
 
@@ -136,12 +125,6 @@ template <>
 struct TaskPayloadTraits<TaskType::REPLICA_MOVE> {
     using type = ReplicaMovePayload;
     static constexpr const char* name = "ReplicaMovePayload";
-};
-
-template <>
-struct TaskPayloadTraits<TaskType::DFS_BACKFILL> {
-    using type = DfsBackfillPayload;
-    static constexpr const char* name = "DfsBackfillPayload";
 };
 
 template <typename T>

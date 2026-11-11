@@ -6242,52 +6242,22 @@ TEST_F(MasterServiceTest, DfsAllocatorRetriesInitializationAfterRecovery) {
         ASSERT_EQ(conflict_rewrite->size(), 2u);
         EXPECT_NE(FindDfsDescriptor(*conflict_rewrite), nullptr);
 
-        std::optional<TaskAssignment> backfill;
-        DfsBackfillPayload payload;
-        const auto task_deadline = std::chrono::steady_clock::now() +
-                                   std::chrono::seconds(5);
-        while (!backfill && std::chrono::steady_clock::now() < task_deadline) {
+        // Recovery leaves earlier degraded writes in memory without repair
+        // tasks.
+        const auto task_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        do {
             auto tasks = service.FetchTasks(context.client_id, 16);
             ASSERT_TRUE(tasks.has_value());
-            for (const auto& task : *tasks) {
-                if (task.type != TaskType::DFS_BACKFILL) continue;
-                DfsBackfillPayload candidate;
-                struct_json::from_json(candidate, task.payload);
-                if (candidate.key == "retry_degraded") {
-                    payload = std::move(candidate);
-                    backfill = task;
-                    break;
-                }
-            }
-            if (!backfill) std::this_thread::sleep_for(
-                std::chrono::milliseconds(20));
-        }
-        ASSERT_TRUE(backfill.has_value());
-        EXPECT_EQ(payload.key, "retry_degraded");
-        ASSERT_TRUE(service.SetDfsFilterMode(1).has_value());
-        auto filtered_copy = service.DfsBackfillStart(
-            context.client_id, payload.key, TenantId::Default(), payload.source,
-            backfill->id);
-        ASSERT_FALSE(filtered_copy.has_value());
-        EXPECT_EQ(filtered_copy.error(),
-                  ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-        ASSERT_TRUE(service.SetDfsFilterMode(0).has_value());
-        EXPECT_FALSE(service.DfsBackfillStart(
-            generate_uuid(), payload.key, TenantId::Default(),
-            payload.source, backfill->id));
-        auto copy = service.DfsBackfillStart(
-            context.client_id, payload.key, TenantId::Default(),
-            payload.source, backfill->id);
-        ASSERT_TRUE(copy.has_value());
-        ASSERT_EQ(copy->targets.size(), 1u);
-        EXPECT_TRUE(copy->targets.front().is_dfs_replica());
-        EXPECT_FALSE(service.CopyEnd(context.client_id, payload.key,
-                                     TenantId::Default(), generate_uuid()));
-        ASSERT_TRUE(service.CopyEnd(context.client_id, payload.key,
-                                    TenantId::Default(), backfill->id));
-        auto repaired = service.GetReplicaList(payload.key, TenantId::Default());
-        ASSERT_TRUE(repaired.has_value());
-        EXPECT_NE(FindDfsDescriptor(repaired->replicas), nullptr);
+            EXPECT_TRUE(tasks->empty());
+            auto degraded_metadata =
+                service.GetReplicaList("retry_degraded", TenantId::Default());
+            ASSERT_TRUE(degraded_metadata.has_value());
+            ASSERT_EQ(degraded_metadata->replicas.size(), 1u);
+            EXPECT_TRUE(
+                degraded_metadata->replicas.front().is_memory_replica());
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } while (std::chrono::steady_clock::now() < task_deadline);
 
         auto recovered = service.PutStart(context.client_id, "retry_recovered",
                                           TenantId::Default(), 4096, config);
@@ -6322,7 +6292,6 @@ TEST_F(MasterServiceTest,
             MasterMetricManager::instance().serialize_metrics(),
             "master_dfs_replica_skipped_total{reason=\""
             "DFS_SERVICE_UNAVAILABLE\"}");
-        ASSERT_TRUE(skipped_before.has_value());
 
         const auto expect_memory_only = [](const auto& result) {
             ASSERT_TRUE(result.has_value()) << toString(result.error());
@@ -6403,7 +6372,7 @@ TEST_F(MasterServiceTest,
             "master_dfs_replica_skipped_total{reason=\""
             "DFS_SERVICE_UNAVAILABLE\"}");
         ASSERT_TRUE(skipped_after.has_value());
-        EXPECT_EQ(*skipped_after, *skipped_before + 8);
+        EXPECT_EQ(*skipped_after, skipped_before.value_or(0) + 8);
     }
 
     std::error_code ec;
