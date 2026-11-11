@@ -4,11 +4,6 @@
 name: HCU PR Build & Test
 
 on:
-  # pull_request_target is required for fork PRs: GitHub always runs the
-  # workflow definition from the default branch, so a fork cannot edit this
-  # file to bypass the authorization gate below. PR code is only ever used
-  # through the explicitly pinned `ref:` checkouts. The workflow must exist on
-  # the default branch (v0.3.14_dev) for this event to fire.
   pull_request_target:
     branches:
       - v0.3.14_dev
@@ -17,20 +12,12 @@ on:
 permissions:
   contents: read
 
-# Non-label events share one concurrency group so a new push cancels the
-# previous run. Label events get their own group so unrelated labels (for
-# example the auto-labeling bot) cannot cancel a running build.
 concurrency:
   group: >-
     hcu-pr-${{ github.event.pull_request.number }}-${{ github.event.action == 'labeled' && github.event.label.name || 'run' }}
   cancel-in-progress: true
 
 jobs:
-  # Runs on a GitHub-hosted runner for every pull_request_target event.
-  # Same-repository PRs are authorized automatically; fork PRs require a
-  # repository maintainer to apply the `run-hygon-ci` label (or re-run the
-  # workflow from the UI). This keeps untrusted fork code off the self-hosted
-  # HCU runners until a maintainer explicitly opts in.
   authorize:
     name: Authorize HCU CI
     runs-on: ubuntu-latest
@@ -46,16 +33,9 @@ jobs:
           REPO: ${{ github.repository }}
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_LABEL: ${{ github.event.label.name || '' }}
-          # Do not use `head.repo.fork` here: this repository is itself a fork
-          # of kvcache-ai/Mooncake, so that field is true for every pull
-          # request, including same-repository ones.
           IS_SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
           HAS_CI_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'run-hygon-ci') }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
-          # `github.actor` stays the actor of the original run when a
-          # maintainer re-runs the workflow; `github.triggering_actor` is the
-          # person who actually asked for this attempt. Authorize the latter,
-          # otherwise the maintainer re-run path can never pass.
           ACTOR: ${{ github.triggering_actor }}
           INITIAL_ACTOR: ${{ github.actor }}
         run: |
@@ -111,14 +91,10 @@ jobs:
       fail-fast: false
       matrix:
         build_variant: [standard, shca]
-        include:
-          - dtk_version: "26.10"
-            py: "3.12"
     runs-on: [self-hosted, Linux, X64, hcu1]
     timeout-minutes: 120
     container:
-      # DTK is pre-installed in the base image; no DTK download is needed.
-      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ matrix.dtk_version }}-ubuntu22.04-py${{ matrix.py }}
+      image: ${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ vars.HCU_DTK_VERSION }}-ubuntu22.04-py${{ vars.PYTHON_VERSION }}
       options: >-
         --volume /opt/hyhal:/opt/hyhal:ro
         --device /dev/kfd:/dev/kfd
@@ -128,16 +104,12 @@ jobs:
     env:
       CI: "false"
       FREE_BUILD_DIR: "0"
-      DTK_VERSION: ${{ matrix.dtk_version }}
+      DTK_VERSION: ${{ vars.HCU_DTK_VERSION }}
     steps:
       - name: Checkout PR source
         uses: actions/checkout@v4.4.0
         with:
-          # Pin to the head SHA from the event payload so a later push cannot
-          # swap the code under a maintainer-approved run.
           ref: ${{ github.event.pull_request.head.sha }}
-          # Required by actions/checkout before it will fetch fork PR code in a
-          # pull_request_target workflow; the authorize job is the opt-in gate.
           allow-unsafe-pr-checkout: true
           persist-credentials: false
           submodules: recursive
@@ -199,14 +171,11 @@ jobs:
     runs-on: [self-hosted, Linux, X64, hcu1]
     timeout-minutes: 30
     env:
-      # Same DTK-bundled image as the build job: the test scripts detect
-      # /opt/dtk inside the container and skip the DTK download/install.
-      HCU_TEST_IMAGE: "${{ vars.HARBOR_SITE }}/hcu/base/dtk:26.10-ubuntu22.04-py3.12"
+      HCU_TEST_IMAGE: "${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ vars.HCU_DTK_VERSION }}-ubuntu22.04-py${{ vars.PYTHON_VERSION }}"
       HCU_TEST_TARGET_HOST: github-nmz1
       HCU_TEST_INITIATOR_HOST: github-nmz2
       HCU_TEST_REMOTE_USER: github
       HCU_CROSS_NODE_LOCK_TIMEOUT: "900"
-      PIP_INDEX_URL: "${{ vars.PYPI_URL }}/nightly/dtk2610/+simple/"
     steps:
       - name: Checkout test script
         uses: actions/checkout@v4.4.0
@@ -221,6 +190,22 @@ jobs:
         with:
           name: hcu-wheel-standard
           path: ${{ runner.temp }}/hcu-artifacts/standard
+
+      - name: Configure DTK pip index
+        shell: bash
+        env:
+          DTK_VERSION: ${{ vars.HCU_DTK_VERSION }}
+          PYPI_URL: ${{ vars.PYPI_URL }}
+        run: |
+          set -Eeuo pipefail
+          : "${DTK_VERSION:?missing HCU_DTK_VERSION variable}" "${PYPI_URL:?missing PYPI_URL variable}"
+          dtk_ver="${DTK_VERSION//./}"
+          index_url="${PYPI_URL%/}/nightly/dtk${dtk_ver}/+simple/"
+          pip_host="${index_url#*://}"
+          {
+            echo "PIP_INDEX_URL=${index_url}"
+            echo "PIP_TRUSTED_HOST=${pip_host%%[:/]*}"
+          } >> "${GITHUB_ENV}"
 
       - name: Run standard wheel te-cross-node test
         shell: bash
@@ -249,7 +234,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64, hcu1]
     timeout-minutes: 45
     env:
-      HCU_TEST_IMAGE: "${{ vars.HARBOR_SITE }}/hcu/base/dtk:26.10-ubuntu22.04-py3.12"
+      HCU_TEST_IMAGE: "${{ vars.HARBOR_SITE }}/hcu/base/dtk:${{ vars.HCU_DTK_VERSION }}-ubuntu22.04-py${{ vars.PYTHON_VERSION }}"
       HCU_TEST_TARGET_HOST: github-nmz1
       HCU_TEST_INITIATOR_HOST: github-nmz2
       HCU_TEST_REMOTE_USER: github
@@ -257,7 +242,6 @@ jobs:
       HCU_STORE_PORT_RANGE_MIN: "20000"
       HCU_STORE_PORT_RANGE_MAX: "29999"
       HCU_CROSS_NODE_LOCK_TIMEOUT: "900"
-      PIP_INDEX_URL: "${{ vars.PYPI_URL }}/nightly/dtk2610/+simple/"
     steps:
       - name: Checkout Store benchmark source
         uses: actions/checkout@v4.4.0
@@ -272,6 +256,22 @@ jobs:
         with:
           name: hcu-wheel-standard
           path: ${{ runner.temp }}/hcu-artifacts/standard
+
+      - name: Configure DTK pip index
+        shell: bash
+        env:
+          DTK_VERSION: ${{ vars.HCU_DTK_VERSION }}
+          PYPI_URL: ${{ vars.PYPI_URL }}
+        run: |
+          set -Eeuo pipefail
+          : "${DTK_VERSION:?missing HCU_DTK_VERSION variable}" "${PYPI_URL:?missing PYPI_URL variable}"
+          dtk_ver="${DTK_VERSION//./}"
+          index_url="${PYPI_URL%/}/nightly/dtk${dtk_ver}/+simple/"
+          pip_host="${index_url#*://}"
+          {
+            echo "PIP_INDEX_URL=${index_url}"
+            echo "PIP_TRUSTED_HOST=${pip_host%%[:/]*}"
+          } >> "${GITHUB_ENV}"
 
       - name: Run Mooncake Store RDMA KV benchmark (run_store_kv_bench.sh)
         shell: bash
@@ -343,9 +343,6 @@ jobs:
 
           echo "Both wheels built successfully and all standard-wheel tests passed."
 
-  # Consume the approval label so every maintainer approval authorizes exactly
-  # one run. After a new commit is pushed, the maintainer applies the label
-  # again to validate the new SHA.
   cleanup-label:
     name: Cleanup HCU CI Label
     if: >
