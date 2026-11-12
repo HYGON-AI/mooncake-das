@@ -1,5 +1,7 @@
 #include <gflags/gflags.h>
-#include <csignal>
+#include <chrono>
+#include <thread>
+#include <utility>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "allocator_status.h"
@@ -9,6 +11,7 @@
 #include "common/byte_size.h"
 #include "glog_compat.h"
 #include "real_client.h"
+#include "shutdown_request.h"
 #include "version.h"
 
 using namespace mooncake;
@@ -119,11 +122,13 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
 }  // namespace mooncake
 
 int main(int argc, char *argv[]) {
-    // Attention !!!
-    // Initialization of ResourceTracker must be the most earliest.
-    // Otherwise, the main thread will not apply signal mask before other
-    // spawning threads, leading to missing signal processing.
-    mooncake::ResourceTracker::getInstance();
+    // Go c-shared libraries may have already started threads that did not
+    // inherit a signal mask from main. This executable owns signal handling.
+    if (!InstallShutdownSignalHandlers(/*include_sighup=*/true)) {
+        PLOG(ERROR) << "Failed to install client shutdown signal handlers";
+        return 1;
+    }
+    ResourceTracker::DisableSignalHandling();
 
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -170,5 +175,19 @@ int main(int argc, char *argv[]) {
     LOG(INFO) << "Starting real client service on " << rpc_bind_host << ":"
               << FLAGS_port;
 
-    return server.start();
+    if (ShutdownRequested()) {
+        return 0;
+    }
+
+    auto server_result = server.async_start();
+    while (!ShutdownRequested() && !server_result.hasResult()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (ShutdownRequested()) {
+        LOG(INFO) << "Shutdown signal received, stopping client service";
+        // Drain the RPC server before the Client destructor unmounts segments.
+        server.stop();
+        return 0;
+    }
+    return std::move(server_result).get();
 }
