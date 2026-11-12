@@ -4,37 +4,59 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JOBS="${JOBS:-$(nproc)}"
-BUILD_DIR="${REPO_ROOT}/build"
-FINAL_DIST_DIR="${FINAL_DIST_DIR:-${REPO_ROOT}/mooncake-wheel/dist}"
+BUILD_DIR="build"
+FINAL_DIST_DIR="${REPO_ROOT}/mooncake-wheel/dist"
 PYPROJECT_FILE="${REPO_ROOT}/mooncake-wheel/pyproject.toml"
 
 RUN_DEPS=1
 DRY_RUN=0
-BUILD_VARIANT=""
+BUILD_VARIANT="standard"
+USE_HYLINK=OFF
+USE_HIP=OFF
+USE_ETCD=OFF
 PYPROJECT_BACKUP=""
 BUILD_TYPE="Release"
 
 usage() {
     cat <<'EOF'
-Usage: ./scripts/variant_build.sh [options] <standard|shca>
+Usage: ./scripts/variant_build.sh [options]
 
-Build variants:
-  standard  mooncake_transfer_engine       (normal NIC + hylink; USE_HYLINK=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
-  shca      mooncake_transfer_engine_shca  (TianLong NIC + hylink; USE_HYLINK=ON, USE_SHCA=ON, USE_ETCD=ON, STORE_USE_ETCD=ON)
+Without feature flags, build for a normal RDMA NIC with HIP and HyLink disabled.
+HyLink depends on HIP, so --hylink also enables USE_HIP.
+
+USE_ETCD and STORE_USE_ETCD default to OFF; --etcd enables both.
+HIP or HyLink additionally enables ENABLE_MULTI_PROTOCOL.
 
 Options:
+  --shca        Enable USE_SHCA for TianLong SHCA NICs
+  --hylink      Enable USE_HYLINK (also enables USE_HIP)
+  --hip         Enable USE_HIP without requiring HyLink
+  --etcd        Enable USE_ETCD and STORE_USE_ETCD together
   --skip-deps   Skip `bash dependencies.sh`
   --dry-run     Print commands without executing them
   --jobs N      Override build parallelism
   -h, --help    Show this help
 
-Exactly one build variant must be specified.
+Build directory: build (shared by all configurations)
+Wheel output: mooncake-wheel/dist
+Package names depend only on the NIC: mooncake-transfer-engine for standard,
+mooncake-transfer-engine-shca for SHCA, regardless of HIP/HyLink/etcd flags.
+
+Examples:
+  bash scripts/variant_build.sh
+  bash scripts/variant_build.sh --shca
+  bash scripts/variant_build.sh --hylink
+  bash scripts/variant_build.sh --shca --hylink
+  bash scripts/variant_build.sh --hip
+  bash scripts/variant_build.sh --shca --hip
+  bash scripts/variant_build.sh --hylink --etcd
 EOF
 }
 
 restore_pyproject() {
     if [ -n "${PYPROJECT_BACKUP}" ] && [ -f "${PYPROJECT_BACKUP}" ]; then
         mv "${PYPROJECT_BACKUP}" "${PYPROJECT_FILE}"
+        PYPROJECT_BACKUP=""
     fi
 }
 
@@ -48,7 +70,7 @@ patch_pyproject() {
     fi
 
     PYPROJECT_BACKUP="$(mktemp)"
-    cp "${PYPROJECT_FILE}" "${PYPROJECT_BACKUP}"
+    cp -p "${PYPROJECT_FILE}" "${PYPROJECT_BACKUP}"
 
     python - "${PYPROJECT_FILE}" "${package_name}" "${package_description}" "${package_keywords}" <<'PY'
 import re
@@ -102,16 +124,11 @@ refresh_go_env() {
 }
 
 run_wheel_build() {
-    printf '+'
-    printf ' %q' bash "${REPO_ROOT}/scripts/build_wheel.sh"
-    printf '\n'
-
-    if [ "${DRY_RUN}" -eq 0 ]; then
-        (
-            cd "${REPO_ROOT}"
-            bash ./scripts/build_wheel.sh
-        )
-    fi
+    (
+        cd "${REPO_ROOT}"
+        run_cmd env BUILD_DIR="${BUILD_DIR}" OUTPUT_DIR=dist \
+            bash "${REPO_ROOT}/scripts/build_wheel.sh"
+    )
 }
 
 setup_shca_env() {
@@ -147,58 +164,78 @@ setup_shca_env() {
 }
 
 build_variant() {
-    local variant="$1"
-    local package_basename=""
-    # ENABLE_MULTI_PROTOCOL keeps RDMA+HIP on the same segment (e.g. "rdma,hip")
-    # so cross-node VRAM traffic can fall back to RDMA instead of HIP IPC.
-    local -a cmake_args=(-DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DBUILD_UNIT_TESTS=OFF
-                         -DENABLE_MULTI_PROTOCOL=ON)
+    local nic_type="$1"
+    local package_name="mooncake-transfer-engine"
+    local nic_description="standard RDMA"
+    local gpu_description=""
+    local use_shca=OFF
+    # HIP/HyLink share the segment with RDMA and need multi-protocol routing.
+    local -a cmake_args=(-DUSE_ETCD="${USE_ETCD}" -DSTORE_USE_ETCD="${USE_ETCD}"
+                         -DBUILD_UNIT_TESTS=OFF
+                         -DENABLE_MULTI_PROTOCOL="${USE_HIP}")
 
-    case "${variant}" in
+    case "${nic_type}" in
         standard)
-            package_basename="mooncake_transfer_engine"
-            cmake_args+=(-DUSE_HYLINK=ON -DUSE_SHCA=OFF)
-            if [ "${DRY_RUN}" -eq 0 ]; then
-                restore_pyproject
-            fi
             ;;
         shca)
-            package_basename="mooncake_transfer_engine_shca"
-            cmake_args+=(-DUSE_HYLINK=ON -DUSE_SHCA=ON)
+            package_name+="-shca"
+            nic_description="TianLong SHCA"
+            use_shca=ON
             setup_shca_env
-            if [ "${DRY_RUN}" -eq 0 ]; then
-                patch_pyproject \
-                    "mooncake-transfer-engine-shca" \
-                    "Python binding of a Mooncake library using pybind11 (TianLong SHCA version)" \
-                    '["mooncake", "data transfer", "kv cache", "llm inference", "tianlong", "shca", "hylink"]'
-            fi
             ;;
         *)
-            echo "Unknown build variant: ${variant}" >&2
+            echo "Unknown build variant: ${nic_type}" >&2
             exit 1
             ;;
     esac
 
-    echo "==> Building ${package_basename}"
-    run_cmd mkdir -p "${BUILD_DIR}" "${FINAL_DIST_DIR}"
+    case "${GPU_BACKEND}" in
+        hylink)
+            gpu_description="HyLink + HIP"
+            ;;
+        hip)
+            gpu_description="HIP"
+            ;;
+        none)
+            gpu_description="HIP/HyLink disabled"
+            ;;
+    esac
+    cmake_args+=(-DUSE_SHCA="${use_shca}" -DUSE_HYLINK="${USE_HYLINK}"
+                 -DUSE_HIP="${USE_HIP}" -DUSE_CUDA=OFF)
+
+    if [ "${DRY_RUN}" -eq 0 ] && \
+        { [ "${nic_type}" != standard ] || [ "${GPU_BACKEND}" != hylink ]; }; then
+        patch_pyproject \
+            "${package_name}" \
+            "Python binding of a Mooncake library using pybind11 (${nic_description}, ${gpu_description})" \
+            '["mooncake", "data transfer", "kv cache", "llm inference", "'"${nic_type}"'", "'"${GPU_BACKEND}"'"]'
+    fi
+
+    echo "==> Building ${package_name} (${nic_description}, ${gpu_description})"
+    echo "==> Wheel output: ${FINAL_DIST_DIR}"
+    run_cmd mkdir -p "${REPO_ROOT}/${BUILD_DIR}" "${FINAL_DIST_DIR}"
     unset VERBOSE || true
-    run_cmd cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" "${cmake_args[@]}" \
+    run_cmd cmake -S "${REPO_ROOT}" -B "${REPO_ROOT}/${BUILD_DIR}" "${cmake_args[@]}" \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_SHARED_LIBS=ON \
         -DCMAKE_VERBOSE_MAKEFILE=OFF -DCMAKE_CXX_FLAGS="" \
         -DCMAKE_IGNORE_PREFIX_PATH="${CONDA_PREFIX:-/opt/hyhal/hbm/Miniconda3}"
-    run_cmd cmake --build "${BUILD_DIR}" -j"${JOBS}"
+    run_cmd cmake --build "${REPO_ROOT}/${BUILD_DIR}" -j"${JOBS}"
     run_wheel_build
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        standard|shca)
-            if [ -n "${BUILD_VARIANT}" ]; then
-                echo "Error: exactly one build variant must be specified." >&2
-                usage >&2
-                exit 1
-            fi
-            BUILD_VARIANT="$1"
+        --shca)
+            BUILD_VARIANT="shca"
+            ;;
+        --hylink)
+            USE_HYLINK=ON
+            ;;
+        --hip)
+            USE_HIP=ON
+            ;;
+        --etcd)
+            USE_ETCD=ON
             ;;
         --skip-deps)
             RUN_DEPS=0
@@ -207,6 +244,10 @@ while [ $# -gt 0 ]; do
             DRY_RUN=1
             ;;
         --jobs)
+            if [ $# -lt 2 ]; then
+                echo "Error: --jobs requires a positive integer." >&2
+                exit 1
+            fi
             JOBS="$2"
             shift
             ;;
@@ -223,15 +264,21 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-if [ -z "${BUILD_VARIANT}" ]; then
-    echo "Error: missing build variant." >&2
-    usage >&2
+if ! [[ "${JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: --jobs/JOBS must be a positive integer." >&2
     exit 1
+fi
+
+GPU_BACKEND="none"
+if [ "${USE_HYLINK}" = ON ]; then
+    USE_HIP=ON
+    GPU_BACKEND="hylink"
+elif [ "${USE_HIP}" = ON ]; then
+    GPU_BACKEND="hip"
 fi
 
 trap restore_pyproject EXIT
 
-run_cmd rm -rf "${FINAL_DIST_DIR}"
 run_cmd mkdir -p "${FINAL_DIST_DIR}"
 
 if [ "${RUN_DEPS}" -eq 1 ]; then
