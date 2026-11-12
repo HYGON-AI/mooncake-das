@@ -51,6 +51,7 @@ jobs:
       - name: Build, repair and upload wheels
         shell: bash
         env:
+          BUILD_VARIANT: ${{ matrix.build_variant }}
           GITHUB_TOKEN: ${{ github.token }}
           CI_TOKEN: ${{ secrets.DASHUB_CI_TOKEN }}
           DASHUB_BASE: ${{ vars.DASHUB_BASE }}
@@ -64,7 +65,11 @@ jobs:
           export GOPROXY="${GOPROXY:-https://goproxy.cn,https://goproxy.io,direct}"
           source /opt/dtk/env.sh
           pip install patchelf==0.14.5
-          bash scripts/variant_build.sh ${{ matrix.build_variant }}
+          case "${BUILD_VARIANT}" in
+            standard) bash scripts/variant_build.sh --hylink --etcd ;;
+            shca) bash scripts/variant_build.sh --shca --hylink --etcd ;;
+            *) echo "Unknown build variant: ${BUILD_VARIANT}" >&2; exit 1 ;;
+          esac
           pip install ciupload
           CIUpload REPAIR --dtk_version ${DTK_VER} --git_commit $(git rev-parse --short=6 HEAD) --outputdir repaired -f mooncake-wheel/dist/*.whl
           CIUpload NIGHTLY \
