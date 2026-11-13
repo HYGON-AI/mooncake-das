@@ -25,6 +25,7 @@ Usage: ./scripts/variant_build.sh [options]
 
 Without feature flags, build for a normal RDMA NIC with HIP and HyLink disabled.
 HyLink depends on HIP, so --hylink also enables USE_HIP.
+HIP also enables USE_HYGON to build and use the Store H2D scatter kernel.
 
 USE_ETCD and STORE_USE_ETCD default to OFF; --etcd enables both.
 HIP or HyLink additionally enables ENABLE_MULTI_PROTOCOL.
@@ -32,7 +33,7 @@ HIP or HyLink additionally enables ENABLE_MULTI_PROTOCOL.
 Options:
   --shca        Enable USE_SHCA for TianLong SHCA NICs
   --hylink      Enable USE_HYLINK (also enables USE_HIP)
-  --hip         Enable USE_HIP without requiring HyLink
+  --hip         Enable USE_HIP and USE_HYGON without requiring HyLink
   --etcd        Enable USE_ETCD and STORE_USE_ETCD together
   --skip-deps   Skip `bash dependencies.sh`
   --dry-run     Print commands without executing them
@@ -51,6 +52,7 @@ Examples:
   bash scripts/variant_build.sh --shca --hylink
   bash scripts/variant_build.sh --hip
   bash scripts/variant_build.sh --shca --hip
+  bash scripts/variant_build.sh --shca --hip --etcd
   bash scripts/variant_build.sh --hylink --etcd
 EOF
 }
@@ -203,7 +205,7 @@ build_variant() {
             ;;
     esac
     cmake_args+=(-DUSE_SHCA="${use_shca}" -DUSE_HYLINK="${USE_HYLINK}"
-                 -DUSE_HIP="${USE_HIP}" -DUSE_CUDA=OFF)
+                 -DUSE_HIP="${USE_HIP}" -DUSE_HYGON="${USE_HIP}" -DUSE_CUDA=OFF)
 
     if [ "${DRY_RUN}" -eq 0 ] && \
         { [ "${nic_type}" != standard ] || [ "${GPU_BACKEND}" != hylink ]; }; then
