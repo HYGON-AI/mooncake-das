@@ -4075,6 +4075,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         return;
     }
 
+    auto* dfs_metric = GetDfsMetricPtr();
     const size_t chunk_limit = dfs_write_chunk_size_;
     std::vector<std::vector<size_t>> chunks;
     std::vector<size_t> chunk;
@@ -4090,8 +4091,12 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
-        if (op.IsResolved() || op.transfer_summary.allocated_dfs_replicas == 0 ||
-            !NonDfsTransfersSucceeded(op.transfer_summary)) {
+        if (op.IsResolved() ||
+            op.transfer_summary.allocated_dfs_replicas == 0) {
+            continue;
+        }
+        if (!NonDfsTransfersSucceeded(op.transfer_summary)) {
+            if (dfs_metric) dfs_metric->RecordSkippedWrites(1);
             continue;
         }
         size_t object_bytes = 0;
@@ -4107,6 +4112,10 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
             op.transfer_summary.RecordFailure(ReplicaType::DFS,
                                               ErrorCode::TRANSFER_FAIL);
             op.AppendFailureContext("DFS object exceeds staging chunk limit");
+            if (dfs_metric) {
+                dfs_metric->RecordWriteErrors(
+                    toString(ErrorCode::TRANSFER_FAIL));
+            }
             continue;
         }
         if (total_payload_bytes <=
@@ -4156,6 +4165,10 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
                             ReplicaType::DFS, ErrorCode::TRANSFER_FAIL);
                         op.AppendFailureContext(
                             "DFS staging allocation wait timed out");
+                        if (dfs_metric) {
+                            dfs_metric->RecordWriteErrors(
+                                toString(ErrorCode::TRANSFER_FAIL));
+                        }
                     }
                 }
             }
