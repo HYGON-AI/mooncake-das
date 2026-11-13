@@ -27,6 +27,9 @@
 namespace mooncake {
 
 struct DistributedStorageConfig;
+namespace test {
+class ImmutableBucketAllocatorTestPeer;
+}
 
 /**
  * @brief Persisted state of one entry inside a bucket.
@@ -313,12 +316,32 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     tl::expected<bool, ErrorCode> IsBucketDataFilePresent(
         int64_t bucket_id) const;
 
-    /**
-     * @brief Accept the eviction: drop the bucket and delete its files.
-     * Must only be called once the master has removed every candidate replica.
-     * @return True when the allocator removed the logical bucket. Physical file
-     * deletion is still best-effort.
-     */
+    class EvictedBucket {
+       public:
+        EvictedBucket() = default;
+        EvictedBucket(const EvictedBucket&) = delete;
+        EvictedBucket& operator=(const EvictedBucket&) = delete;
+        EvictedBucket(EvictedBucket&&) = default;
+        EvictedBucket& operator=(EvictedBucket&&) = default;
+
+       private:
+        friend class ImmutableBucketAllocator;
+        int64_t bucket_id_ = -1;
+        std::shared_ptr<void> identity_;
+    };
+
+    // Logical commit does no I/O and keeps the quota reserved. The caller then
+    // removes matching replicas and transfers the token to deletion or
+    // deferral.
+    tl::expected<EvictedBucket, ErrorCode> CommitEvictionLogical(
+        PendingEviction&& pending);
+    tl::expected<void, ErrorCode> DeleteEvictedBucket(EvictedBucket&& bucket);
+    void DeferDeletion(EvictedBucket&& bucket,
+                       std::chrono::system_clock::time_point not_before);
+    size_t RetryFailedEvictions();
+
+    // Convenience for callers with no external metadata or outstanding leases.
+    // Returns true only after physical deletion releases the quota.
     bool CommitEviction(PendingEviction&& pending);
 
     /**
@@ -381,6 +404,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
    private:
     friend class PendingEviction;
+    friend class test::ImmutableBucketAllocatorTestPeer;
 
     void PublishBucketIdSnapshotLocked();
 
@@ -419,6 +443,11 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // Set between PrepareEviction and Commit/Abort. A frozen bucket
         // accepts no new allocations and cannot be selected again.
         bool frozen = false;
+        // Logical eviction is irreversible; keep this state in buckets_ until
+        // both files are deleted. An unset deadline awaits the master's
+        // verdict.
+        bool evicting = false;
+        std::optional<std::chrono::system_clock::time_point> delete_after;
         // A ready bucket owns a fully preallocated data file but has never
         // accepted an allocation. Ready buckets are absent from the LRU.
         bool ready = false;

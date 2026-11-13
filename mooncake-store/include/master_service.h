@@ -2281,8 +2281,8 @@ class MasterService {
     // Test-only synchronization point after a batch reservation and before
     // any per-key metadata insertion.
     std::function<void()> dfs_batch_reservation_hook_;
-    // Test boundary between freezing individual keys and the commit barrier.
-    std::function<void()> dfs_bucket_after_freeze_hook_;
+    // Test boundary after per-key validation, before logical bucket commit.
+    std::function<void()> dfs_bucket_after_validation_hook_;
     // Test-only fault injection for the root stat call. A non-zero value is
     // treated as the errno from a failed stat; zero uses the real filesystem.
     std::atomic<int> dfs_root_stat_error_for_testing_{0};

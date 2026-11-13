@@ -1,8 +1,11 @@
 #pragma once
 
 #include <utility>
+#include <future>
+#include <thread>
 
 #include "master_service.h"
+#include "immutable_bucket_allocator_test_peer.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 
 namespace mooncake::test {
@@ -81,24 +84,45 @@ class MasterServiceTestPeer {
         SpinLocker lock(&hold->metadata().lock);
         return hold->metadata().EvictionDeadline();
     }
-    static bool DuringDfsEvictionAfterValidation(MasterService& service, const std::string& key,
-        const std::function<void()>& read_requests) {
+    static bool DuringDfsEvictionAfterValidation(MasterService& service, const std::function<void()>& action,
+        bool* physically_freed = nullptr) {
         bool reached = false;
-        bool all_frozen = true;
-        service.dfs_bucket_after_freeze_hook_ = [&] {
-            auto frozen = [&] {
-                auto hold = ReadObject(service, {TenantId::Default(), key});
-                return hold && hold->metadata().HasReplica([](const Replica& replica) {
-                    return replica.is_dfs_replica() && replica.is_eviction_pending();
-                });
-            }();
-            all_frozen = all_frozen && frozen;
+        service.dfs_bucket_after_validation_hook_ = [&] {
+            if (reached) return;
             reached = true;
-            read_requests();
+            action();
         };
-        service.RunDfsEvictionForTesting();
-        service.dfs_bucket_after_freeze_hook_ = {};
-        return reached && all_frozen;
+        // Hold another shared owner across the entire transaction, including
+        // metadata removal. Any exclusive master commit would deadlock this
+        // deterministic test (bounded by the native test runner's timeout).
+        std::promise<void> held;
+        std::promise<void> release;
+        auto released = release.get_future();
+        std::thread holder([&] {
+            std::shared_lock<std::shared_mutex> lock(
+                service.master_state_mutex_);
+            held.set_value();
+            released.wait();
+        });
+        held.get_future().wait();
+        if (physically_freed) {
+            *physically_freed = service.RunBucketDfsEvictionInternal(true);
+        } else {
+            service.RunDfsEvictionForTesting();
+        }
+        release.set_value();
+        holder.join();
+        service.dfs_bucket_after_validation_hook_ = {};
+        return reached;
+    }
+
+    static void ExpireDfsDeletions(MasterService& service) {
+        ImmutableBucketAllocatorTestPeer::ExpireDeletions(
+            *service.bucket_allocator_);
+    }
+
+    static size_t RetryDfsDeletions(MasterService& service) {
+        return service.bucket_allocator_->RetryFailedEvictions();
     }
 
     explicit MasterServiceTestPeer(MasterService& service)

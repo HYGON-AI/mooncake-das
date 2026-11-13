@@ -818,7 +818,7 @@ tl::expected<uint8_t, ErrorCode> MasterService::SetDfsFilterMode(
 
 bool MasterService::IsReplicaReadableForGet(const Replica& replica) const {
     if (!replica.is_completed() || !replica.is_available() ||
-        replica.is_eviction_pending() || IsAwaitingRemount(replica)) return false;
+        IsAwaitingRemount(replica)) return false;
     return !replica.is_dfs_replica() ||
            (enable_dfs_.load(std::memory_order_acquire) &&
             !dfs_root_recovery_in_progress_.load(std::memory_order_acquire));

@@ -30,6 +30,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "crc32c.h"
+#include "immutable_bucket_allocator_test_peer.h"
 #include "master_metric_manager.h"
 #include "replica.h"
 #include "storage/distributed/bucket_entry_layout.h"
@@ -1829,6 +1830,111 @@ TEST(ImmutableBucketAllocatorTest, EvictionDisabledYieldsNoCandidates) {
     ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(config));
     EXPECT_FALSE(alloc.IsEvictionEnabled());
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     LogicalEvictionRetainsQuotaAndRetriesDeletion) {
+    for (const bool fail_meta : {false, true}) {
+        SCOPED_TRACE(fail_meta);
+        TempDir tmp("bucket_deferred_retry");
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), kAlignment, 2)));
+        auto old = alloc.Allocate("victim", 100);
+        ASSERT_TRUE(old);
+        ASSERT_TRUE(alloc.MarkCommitted("victim", *old));
+        ASSERT_TRUE(alloc.Allocate("active", 100));
+        alloc.FlushDirtyMetadata();
+        auto pending = alloc.PrepareEvictionForAllocationFailure();
+        ASSERT_EQ(pending.bucket_id(), 0);
+        auto logical = alloc.CommitEvictionLogical(std::move(pending));
+        ASSERT_TRUE(logical);
+        EXPECT_EQ(alloc.GetBucketCount(), 2u);
+        const auto used = alloc.GetUsedBytes();
+        EXPECT_FALSE(alloc.GetBucketIdForKey("victim"));
+        EXPECT_FALSE(alloc.MarkCommitted("victim", *old));
+        alloc.Free("victim", *old);
+        EXPECT_TRUE(alloc.PrepareInvalidation(0).Empty());
+        EXPECT_TRUE(alloc.PrepareEvictionForAllocationFailure().Empty());
+        EXPECT_FALSE(alloc.Allocate("no_space", 100));
+        alloc.DeferDeletion(
+            std::move(*logical),
+            std::chrono::system_clock::now() + std::chrono::hours(1));
+        EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+        EXPECT_TRUE(std::filesystem::exists(old->file_path));
+        EXPECT_EQ(alloc.GetUsedBytes(), used);
+
+        // A nonempty directory at a file path makes real POSIX deletion fail.
+        const auto blocked =
+            fail_meta ? BucketMetaFile(tmp, 0) : old->file_path;
+        std::filesystem::rename(blocked, blocked + ".backup");
+        std::filesystem::create_directory(blocked);
+        std::ofstream(blocked + "/child") << "block deletion";
+        ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+        EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+        EXPECT_EQ(alloc.GetBucketCount(), 2u);
+        EXPECT_EQ(alloc.GetUsedBytes(), used);
+        EXPECT_FALSE(alloc.Allocate("still_full", 100));
+        std::filesystem::remove_all(blocked);
+        std::filesystem::rename(blocked + ".backup", blocked);
+        EXPECT_EQ(alloc.RetryFailedEvictions(), 1u);
+        EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+        EXPECT_EQ(alloc.GetBucketCount(), 1u);
+        EXPECT_LT(alloc.GetUsedBytes(), used);
+        EXPECT_FALSE(std::filesystem::exists(old->file_path));
+        auto replacement = alloc.Allocate("victim", 100);
+        ASSERT_TRUE(replacement);
+        EXPECT_NE(replacement->file_path, old->file_path);
+        alloc.Free("victim", *old);
+        EXPECT_TRUE(alloc.MarkCommitted("victim", *replacement));
+    }
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     LogicalCommitFailureCanAbortAndRetirementCancelsDeletion) {
+    TempDir tmp("bucket_logical_abort");
+    ImmutableBucketAllocator alloc;
+    ImmutableBucketAllocator other;
+    ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), kAlignment, 2)));
+    auto desc = alloc.Allocate("victim", 100);
+    ASSERT_TRUE(desc);
+    ASSERT_TRUE(alloc.MarkCommitted("victim", *desc));
+    ASSERT_TRUE(alloc.Allocate("active", 100));
+    auto pending = alloc.PrepareEvictionForAllocationFailure();
+    EXPECT_FALSE(other.CommitEvictionLogical(std::move(pending)));
+    alloc.AbortEviction(std::move(pending));
+    auto retry = alloc.PrepareEvictionForAllocationFailure();
+    ASSERT_EQ(retry.bucket_id(), 0);
+    auto logical = alloc.CommitEvictionLogical(std::move(retry));
+    ASSERT_TRUE(logical);
+    auto replacement = alloc.RetireAndCreateReplacementAllocator();
+    EXPECT_FALSE(alloc.DeleteEvictedBucket(std::move(*logical)));
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+    EXPECT_TRUE(std::filesystem::exists(desc->file_path));
+}
+
+TEST(ImmutableBucketAllocatorTest, DeferredEvictionCanRecoverIntactMetadata) {
+    TempDir tmp("bucket_deferred_restart");
+    auto config = MakeEvictionConfig(tmp.path(), kAlignment, 4);
+    {
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(config));
+        auto desc = alloc.Allocate("victim", 100);
+        ASSERT_TRUE(desc);
+        ASSERT_TRUE(alloc.MarkCommitted("victim", *desc));
+        ASSERT_TRUE(alloc.Allocate("active", 100));
+        alloc.FlushDirtyMetadata();
+        auto pending = alloc.PrepareEvictionForAllocationFailure();
+        auto logical = alloc.CommitEvictionLogical(std::move(pending));
+        ASSERT_TRUE(logical);
+        alloc.DeferDeletion(
+            std::move(*logical),
+            std::chrono::system_clock::now() + std::chrono::hours(1));
+    }
+    ImmutableBucketAllocator restarted;
+    ASSERT_TRUE(restarted.Init(config));
+    auto replicas = restarted.TakeRecoveredReplicas();
+    ASSERT_EQ(replicas.size(), 1u);
+    EXPECT_EQ(replicas[0].key, "victim");
 }
 
 TEST(ImmutableBucketAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction) {

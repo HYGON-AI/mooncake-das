@@ -7238,98 +7238,64 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRejectsLeasedBucketWithoutChanges) {
     std::filesystem::remove_all(root, ec);
 }
 
-TEST_F(MasterServiceTest, DfsBucketEvictionBlocksReadsAfterValidation) {
-    for (const bool dfs_only : {false, true}) {
-        SCOPED_TRACE(dfs_only);
-        const auto root =
-            MakeDfsTestRoot(dfs_only ? "evict_read_dfs" : "evict_read_mixed");
-        ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.25");
-        {
-            MasterService service(MasterServiceConfig::builder()
-                                      .set_default_kv_lease_ttl(60000)
-                                      .build());
-            const auto context = PrepareSimpleSegment(service);
-            ReplicateConfig config;
-            config.replica_num = 1;
-            config.dfs_replica_num = 1;
-            std::string bucket_file;
-            for (const auto* key : {"read_barrier", "read_active"}) {
-                auto start = service.PutStart(context.client_id, key,
-                                              TenantId::Default(), 100, config);
-                ASSERT_TRUE(start.has_value());
-                const auto* dfs = FindDfsDescriptor(*start);
-                ASSERT_NE(dfs, nullptr);
-                if (std::string(key) == "read_barrier") {
-                    bucket_file = dfs->get_dfs_descriptor().file_path;
-                }
-                ASSERT_TRUE(service
-                                .PutEnd(context.client_id, key,
-                                        TenantId::Default(), ReplicaType::ALL)
-                                .has_value());
+TEST_F(MasterServiceTest,
+       DfsBucketForcedEvictionPreservesRenewedLeaseAfterValidation) {
+    const auto root = MakeDfsTestRoot("evict_renewed_lease");
+    ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.25");
+    {
+        MasterService service(MasterServiceConfig::builder()
+                                  .set_default_kv_lease_ttl(60000)
+                                  .build());
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        std::string file;
+        for (const auto* key : {"read_barrier", "read_active"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 100, config);
+            ASSERT_TRUE(start.has_value());
+            if (std::string(key) == "read_barrier") {
+                file =
+                    FindDfsDescriptor(*start)->get_dfs_descriptor().file_path;
             }
-            if (dfs_only) service.RunBatchEvictForTesting(1.0, 1.0);
-            const auto lease_before =
-                MasterServiceTestPeer::GetLeaseTimeoutForTest(service, "read_barrier");
-            ASSERT_TRUE(lease_before.has_value());
-            ASSERT_TRUE(std::filesystem::exists(bucket_file));
-
-            EXPECT_TRUE(MasterServiceTestPeer::DuringDfsEvictionAfterValidation(service, "read_barrier", [&] {
-                EXPECT_TRUE(std::filesystem::exists(bucket_file));
-                auto single =
-                    service.GetReplicaList("read_barrier", TenantId::Default());
-                auto batch = service.BatchGetReplicaList({"read_barrier"},
-                                                         TenantId::Default());
-                auto regex = service.GetReplicaListByRegex("^read_barrier$",
-                                                           TenantId::Default());
-                ASSERT_EQ(batch.size(), 1u);
-                ASSERT_TRUE(regex.has_value());
-                if (dfs_only) {
-                    ASSERT_FALSE(single.has_value());
-                    EXPECT_EQ(single.error(), ErrorCode::REPLICA_IS_NOT_READY);
-                    ASSERT_FALSE(batch[0].has_value());
-                    EXPECT_EQ(batch[0].error(),
-                              ErrorCode::REPLICA_IS_NOT_READY);
-                    EXPECT_TRUE(regex->empty());
-                } else {
-                    ASSERT_TRUE(single.has_value());
-                    ASSERT_EQ(single->replicas.size(), 1u);
-                    EXPECT_TRUE(single->replicas.front().is_memory_replica());
-                    ASSERT_TRUE(batch[0].has_value());
-                    ASSERT_EQ(batch[0]->replicas.size(), 1u);
-                    EXPECT_TRUE(batch[0]->replicas.front().is_memory_replica());
-                    ASSERT_EQ(regex->count("read_barrier"), 1u);
-                    ASSERT_EQ(regex->at("read_barrier").size(), 1u);
-                    EXPECT_TRUE(
-                        regex->at("read_barrier").front().is_memory_replica());
-                }
-                auto exists =
-                    service.ExistKey("read_barrier", TenantId::Default());
-                ASSERT_TRUE(exists.has_value());
-                EXPECT_EQ(*exists, !dfs_only);
-                auto batch_exists = service.BatchExistKey({"read_barrier"},
-                                                          TenantId::Default());
-                ASSERT_EQ(batch_exists.size(), 1u);
-                ASSERT_TRUE(batch_exists[0].has_value());
-                EXPECT_EQ(*batch_exists[0], !dfs_only);
-                if (dfs_only) {
-                    EXPECT_EQ(MasterServiceTestPeer::GetLeaseTimeoutForTest(service, "read_barrier"),
-                              lease_before);
-                }
-            }));
-            EXPECT_FALSE(std::filesystem::exists(bucket_file));
-            auto after =
-                service.GetReplicaList("read_barrier", TenantId::Default());
-            if (dfs_only) {
-                ASSERT_FALSE(after.has_value());
-                EXPECT_EQ(after.error(), ErrorCode::OBJECT_NOT_FOUND);
-            } else {
-                ASSERT_TRUE(after.has_value());
-                EXPECT_EQ(FindDfsDescriptor(after->replicas), nullptr);
-            }
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
         }
-        std::error_code ec;
-        std::filesystem::remove_all(root, ec);
+        service.RunBatchEvictForTesting(1.0, 1.0);
+        bool physically_freed = true;
+        EXPECT_TRUE(MasterServiceTestPeer::DuringDfsEvictionAfterValidation(service,
+            [&] {
+                // The hook runs under the production shared master lock. A
+                // separate reader proves unrelated and candidate keys can still
+                // be accessed.
+                auto reader = std::async(std::launch::async, [&] {
+                    EXPECT_TRUE(
+                        service.ExistKey("read_active", TenantId::Default())
+                            .has_value());
+                    auto read = service.GetReplicaList("read_barrier", TenantId::Default());
+                    EXPECT_TRUE(read.has_value());
+                    if (read)
+                        EXPECT_NE(FindDfsDescriptor(read->replicas), nullptr);
+                });
+                EXPECT_EQ(reader.wait_for(std::chrono::seconds(5)),
+                          std::future_status::ready);
+                reader.get();
+            },
+            &physically_freed));
+        EXPECT_FALSE(physically_freed);
+        EXPECT_TRUE(std::filesystem::exists(file));
+        EXPECT_FALSE(service.GetReplicaList("read_barrier", TenantId::Default())
+                         .has_value());
+        EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 0u);
+        EXPECT_TRUE(std::filesystem::exists(file));
+        MasterServiceTestPeer::ExpireDfsDeletions(service);
+        EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 1u);
+        EXPECT_FALSE(std::filesystem::exists(file));
     }
+    std::filesystem::remove_all(root);
 }
 
 TEST_F(MasterServiceTest,
@@ -7384,47 +7350,64 @@ TEST_F(MasterServiceTest,
     }
 }
 
-TEST_F(MasterServiceTest,
-       DfsBucketEvictionRestoresReadsAfterRevalidationRejects) {
-    const auto root = MakeDfsTestRoot("evict_read_abort");
+TEST_F(MasterServiceTest, DfsBucketEvictionKeepsReplacementAndOldReaders) {
+    const auto root = MakeDfsTestRoot("evict_replace");
     ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.25");
     {
-        MasterService service;
+        MasterService service(MasterServiceConfig::builder()
+                                  .set_default_kv_lease_ttl(60000)
+                                  .build());
         const auto context = PrepareSimpleSegment(service);
         ReplicateConfig config;
         config.replica_num = 1;
         config.dfs_replica_num = 1;
-        for (const auto* key : {"abort_barrier", "abort_active"}) {
-            ASSERT_TRUE(service
-                            .PutStart(context.client_id, key,
-                                      TenantId::Default(), 100, config)
-                            .has_value());
-            ASSERT_TRUE(service
-                            .PutEnd(context.client_id, key, TenantId::Default(),
-                                    ReplicaType::ALL)
-                            .has_value());
+        std::string old_file;
+        for (const auto* key : {"replace", "active"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 100, config);
+            ASSERT_TRUE(start.has_value());
+            if (std::string(key) == "replace")
+                old_file =
+                    FindDfsDescriptor(*start)->get_dfs_descriptor().file_path;
+            ASSERT_TRUE(service.PutEnd(context.client_id, key, TenantId::Default(), ReplicaType::ALL));
         }
-        service.RunBatchEvictForTesting(1.0, 1.0);
-        EXPECT_TRUE(MasterServiceTestPeer::DuringDfsEvictionAfterValidation(service, "abort_barrier", [&] {
-            auto read =
-                service.GetReplicaList("abort_barrier", TenantId::Default());
-            ASSERT_FALSE(read.has_value());
-            EXPECT_EQ(read.error(), ErrorCode::REPLICA_IS_NOT_READY);
-            ASSERT_TRUE(MasterServiceTestPeer::SetProcessingKeyForTest(service, "abort_barrier", true));
-        }));
-        ASSERT_TRUE(MasterServiceTestPeer::SetProcessingKeyForTest(service, "abort_barrier", false));
-        auto read =
-            service.GetReplicaList("abort_barrier", TenantId::Default());
-        ASSERT_TRUE(read.has_value());
-        const auto* dfs = FindDfsDescriptor(read->replicas);
-        ASSERT_NE(dfs, nullptr);
-        EXPECT_TRUE(
-            std::filesystem::exists(dfs->get_dfs_descriptor().file_path));
-        EXPECT_GT(MasterServiceTestPeer::GetLeaseTimeoutForTest(service, "abort_barrier"),
-                  std::chrono::system_clock::now());
+        EXPECT_TRUE(MasterServiceTestPeer::DuringDfsEvictionAfterValidation(service, [&] {
+                auto writer = std::async(std::launch::async, [&] {
+                    ASSERT_TRUE(
+                        service.GetReplicaList("replace", TenantId::Default()));
+                    ASSERT_TRUE(
+                        service.Remove("replace", TenantId::Default(), true));
+                    auto start =
+                        service.PutStart(context.client_id, "replace",
+                                         TenantId::Default(), 100, config);
+                    ASSERT_TRUE(start);
+                    ASSERT_NE(FindDfsDescriptor(*start), nullptr);
+                    EXPECT_NE(FindDfsDescriptor(*start)
+                                  ->get_dfs_descriptor()
+                                  .file_path,
+                              old_file);
+                    ASSERT_TRUE(service.PutEnd(context.client_id, "replace",
+                                               TenantId::Default(),
+                                               ReplicaType::ALL));
+                });
+                EXPECT_EQ(writer.wait_for(std::chrono::seconds(5)),
+                          std::future_status::ready);
+                writer.get();
+            }));
+        auto read = service.GetReplicaList("replace", TenantId::Default());
+        ASSERT_TRUE(read);
+        ASSERT_NE(FindDfsDescriptor(read->replicas), nullptr);
+        EXPECT_NE(
+            FindDfsDescriptor(read->replicas)->get_dfs_descriptor().file_path,
+            old_file);
+        EXPECT_TRUE(std::filesystem::exists(old_file));
+        MasterServiceTestPeer::ExpireDfsDeletions(service);
+        EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 1u);
+        EXPECT_FALSE(std::filesystem::exists(old_file));
+        EXPECT_TRUE(std::filesystem::exists(
+            FindDfsDescriptor(read->replicas)->get_dfs_descriptor().file_path));
     }
-    std::error_code ec;
-    std::filesystem::remove_all(root, ec);
+    std::filesystem::remove_all(root);
 }
 
 TEST_F(MasterServiceTest, DfsBucketEvictionCountsEmptyTombstonedBucket) {
