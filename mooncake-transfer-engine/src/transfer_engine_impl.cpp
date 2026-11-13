@@ -37,6 +37,9 @@
 #include "transport/transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
 #include "transport/shm_transport/shm_transport.h"
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+#include "transport/rdma_transport/rdma_transport.h"
+#endif
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -567,10 +570,25 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
         // TODO: install other transports automatically
 
-#if defined(USE_HIP) && !defined(USE_HYGON)
-        // HIP transport handles intra-node GPU P2P via XGMI/IPC and can
-        // coexist with the cross-node transport (RDMA/TCP) selected above.
-        {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+        // Opt-in: MC_ENABLE_HYLINK=1 (default off). After RDMA/TCP so the
+        // segment protocol becomes "rdma,hylink" or "tcp,hylink". Install
+        // HipTransport below only if HyLink was not installed.
+        if (envFlagEnabled("MC_ENABLE_HYLINK")) {
+            Transport* hylink_transport =
+                multi_transports_->installTransport("hylink", nullptr);
+            if (!hylink_transport) {
+                LOG(WARNING) << "MC_ENABLE_HYLINK is set but failed to install "
+                                "HyLink transport (HSL unavailable)";
+            } else {
+                LOG(INFO) << "MC_ENABLE_HYLINK is set, HyLink transport "
+                             "installed";
+            }
+        }
+#endif
+
+#ifdef USE_HIP
+        if (!multi_transports_->getTransport("hylink")) {
             Transport* hip_transport =
                 multi_transports_->installTransport("hip", nullptr);
             if (!hip_transport) {
@@ -881,6 +899,7 @@ int TransferEngineImpl::unregisterLocalMemory(void* addr,
     if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    clearSkipRegistrationLocked(addr);
     eraseMemoryRegionLocked(addr);
     return 0;
 }
@@ -973,6 +992,10 @@ void TransferEngineImpl::rollbackAllRegistrations(
             record.transport->unregisterLocalMemory(record.addr, true);
         }
     }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    for (const auto& record : records) {
+        clearSkipRegistrationLocked(record.addr);
+    }
 }
 
 int TransferEngineImpl::mp_unregisterLocalMemory(
@@ -998,6 +1021,7 @@ int TransferEngineImpl::mp_unregisterLocalMemory(
 
         std::unique_lock<std::shared_mutex> lock(mutex_);
         for (const auto& buffer : buffer_list) {
+            if (protocol == "rdma") clearSkipRegistrationLocked(buffer.addr);
             eraseMemoryRegionLocked(buffer.addr);
         }
     }
@@ -1083,6 +1107,7 @@ int TransferEngineImpl::unregisterLocalMemoryBatch(
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (auto& addr : addr_list) {
+        clearSkipRegistrationLocked(addr);
         eraseMemoryRegionLocked(addr);
     }
     return 0;
@@ -1153,6 +1178,7 @@ void TransferEngineImpl::releaseMemoryRegions(
     const std::vector<MemoryRegion>& regions) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (const auto& region : regions) {
+        clearSkipRegistrationLocked(region.addr);
         registering_memory_regions_.erase(
             reinterpret_cast<uintptr_t>(region.addr));
     }
@@ -1164,6 +1190,15 @@ void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {
 
 void TransferEngineImpl::eraseMemoryRegionLocked(void* addr) {
     local_memory_regions_.erase(reinterpret_cast<uintptr_t>(addr));
+}
+
+void TransferEngineImpl::clearSkipRegistrationLocked(void* addr) {
+#if defined(USE_HYLINK) && defined(ENABLE_MULTI_PROTOCOL)
+    // Clear the skip record before releasing mutex_ and allowing address reuse.
+    auto* rdma =
+        dynamic_cast<RdmaTransport*>(multi_transports_->getTransport("rdma"));
+    if (rdma) rdma->clearSkipRegistration(addr);
+#endif
 }
 
 #ifdef WITH_METRICS

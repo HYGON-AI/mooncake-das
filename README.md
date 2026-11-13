@@ -327,28 +327,58 @@ pip install mooncake-transfer-engine-cuda13
 ```
 
 ### Build wheel variants for Hygon HCU
-For Hygon HCU packaging (standard NIC / HyLink RPC / TianLong SHCA), build wheels with `scripts/variant_build.sh`.
-All variants enable `-DUSE_HYGON=ON`; `standard`/`shca` also set `-DUSE_FAKE_HIP_RPC=ON`, and `shca` sets `-DUSE_SHCA=ON`. Only `rpc` enables `-DUSE_HYLINK=ON`; the other variants explicitly disable it. All variants enable multi-protocol support and disable unit-test builds:
+For Hygon HCU packaging (standard NIC / TianLong SHCA), build wheels with `scripts/variant_build.sh`.
+Without feature flags, the script builds for a normal RDMA NIC with HIP and
+HyLink disabled. Add `--shca` for a TianLong SHCA NIC, `--hip` for HIP support,
+or `--hylink` for HyLink support. HyLink depends on HIP, so `--hylink` also enables
+`USE_HIP`; `--hip --hylink` and `--hylink --hip` produce the same build.
+
+| Feature flags | `USE_SHCA` | `USE_HYLINK` | `USE_HIP` | Package |
+| --- | --- | --- | --- | --- |
+| none | OFF | OFF | OFF | `mooncake-transfer-engine` |
+| `--shca` | ON | OFF | OFF | `mooncake-transfer-engine-shca` |
+| `--hip` | OFF | OFF | ON | `mooncake-transfer-engine` |
+| `--shca --hip` | ON | OFF | ON | `mooncake-transfer-engine-shca` |
+| `--hylink` | OFF | ON | ON | `mooncake-transfer-engine` |
+| `--shca --hylink` | ON | ON | ON | `mooncake-transfer-engine-shca` |
+
+Package names depend only on the NIC: `mooncake-transfer-engine` for standard
+RDMA and `mooncake-transfer-engine-shca` for SHCA. HIP, HyLink and etcd flags do
+not change the package name.
+
+`USE_ETCD` and `STORE_USE_ETCD` default to `OFF`; add `--etcd` to enable both.
 
 ```bash
-# Standard NIC, without HyLink
-bash scripts/variant_build.sh standard
+# Standard RDMA NIC, without HIP or HyLink
+bash scripts/variant_build.sh
 
-# Standard NIC, with HyLink (Hygon HCU RPC)
-bash scripts/variant_build.sh rpc
+# TianLong SHCA NIC, without HIP or HyLink
+bash scripts/variant_build.sh --shca
 
-# TianLong SHCA NIC, without HyLink
-bash scripts/variant_build.sh shca
+# HIP support without HyLink
+bash scripts/variant_build.sh --hip
+bash scripts/variant_build.sh --shca --hip
+
+# HyLink builds (also enable HIP)
+bash scripts/variant_build.sh --hylink
+bash scripts/variant_build.sh --shca --hylink
 ```
 
 Common options:
 
 ```bash
+# Enable both etcd options; HCU PR and release CI pass --etcd explicitly
+bash scripts/variant_build.sh --hylink --etcd
+bash scripts/variant_build.sh --shca --hylink --etcd
+
 # Skip dependency installation
-bash scripts/variant_build.sh --skip-deps standard
+bash scripts/variant_build.sh --skip-deps
 
 # Override parallel build jobs
-bash scripts/variant_build.sh --jobs 32 shca
+bash scripts/variant_build.sh --jobs 32 --shca --hylink
+
+# Inspect the selected flags, build directory and wheel destination
+bash scripts/variant_build.sh --dry-run --skip-deps --hip
 ```
 
 In addition to CUDA, Mooncake also supports other accelerator backends, along with flexible installation and deployment options. See the guides below for details:

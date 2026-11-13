@@ -147,13 +147,14 @@ TEST(MasterServiceDfsScenarioTest, PutEndAllAndMismatchedUpsertAreAtomic) {
 
 TEST(MasterServiceDfsScenarioTest, FailedDfsPutStartDoesNotLeakTenantQuota) {
     const ScopedDfsEnvironment dfs("master_dfs_scenario_quota", "1048576");
-    // The DFS shard holds 1 MB, so a 4 MB dual-replica put fails admission.
+    // A 4 MB DFS-only put cannot fit in the 1 MB shard or fall back to memory.
     // The follow-up memory-only put of the full 4 MB quota succeeds, which it
     // could not if the failed attempt had leaked a quota charge.
     MasterScenario("a DFS put that fails admission releases its quota charge")
         .Given(MemoryNode("memory"))
         .Given(Tenant(TenantId::Default().value()).Quota(4096_KB))
         .When(PutStart("dfs_quota_failure", 4096_KB)
+                  .Replicas(0)
                   .DfsReplicas(1)
                   .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
         .When(PutStart("quota_after_dfs_failure", 4096_KB))
