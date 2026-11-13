@@ -1184,6 +1184,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             registered_addr_to_base_.erase((uint64_t)addr);
         }
         return rc;
+#endif
     }
 }
 
