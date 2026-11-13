@@ -5,6 +5,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - v0.3.14_dev
+      - v0.3.14_dev_l4
 
 permissions:
   contents: read

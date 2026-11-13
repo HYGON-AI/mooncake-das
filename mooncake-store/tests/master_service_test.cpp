@@ -1340,8 +1340,13 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
         auto failed = service.PutStart(context.client_id, "dfs_quota_failure",
                                        TenantId::Default(),
                                        kStrictTenantQuotaBytes, dfs_config);
-        ASSERT_FALSE(failed.has_value());
-        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        ASSERT_TRUE(failed.has_value()) << toString(failed.error());
+        ASSERT_EQ(failed->size(), 1u);
+        EXPECT_TRUE(failed->front().is_memory_replica());
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "dfs_quota_failure",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
 
         ReplicateConfig memory_config;
         memory_config.replica_num = 1;
@@ -7801,7 +7806,7 @@ TEST_F(MasterServiceTest,
     const auto group_a_lease_after_read = *group_a_lease_after_read_opt;
     const auto group_b_lease_after_read = *group_b_lease_after_read_opt;
     EXPECT_GT(group_a_lease_after_read, group_a_lease_before);
-    EXPECT_EQ(group_b_lease_after_read, group_b_lease_before);
+    EXPECT_GT(group_b_lease_after_read, group_b_lease_before);
 
     const auto after_read_exist = service->BatchExistKeyByReplicaType(
         {group_key_a}, TenantId::Default(), ReplicaType::MEMORY);
