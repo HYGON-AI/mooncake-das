@@ -388,6 +388,21 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
     return true;
 }
 
+bool ScopedSegmentAccess::IsSegmentMountedForClientRecord(
+    const UUID& segment_id,
+    const std::shared_ptr<ClientLivenessRecord>& owner_record) const {
+    const auto it = segment_manager_->mounted_segments_.find(segment_id);
+    if (!owner_record || it == segment_manager_->mounted_segments_.end()) {
+        return false;
+    }
+    const auto& mounted = it->second;
+    const auto& registration = mounted.allocator_registration;
+    return mounted.status == SegmentStatus::OK && mounted.buf_allocator &&
+           registration && registration->IsServing() &&
+           std::atomic_load_explicit(&registration->client_liveness_,
+                                     std::memory_order_acquire) == owner_record;
+}
+
 bool ScopedSegmentAccess::ReplaceAllocators(
     const std::vector<AllocatorReplacement>& replacements) {
     std::vector<AllocatorManager::Replacement> manager_replacements;
