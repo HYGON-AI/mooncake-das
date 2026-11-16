@@ -146,6 +146,12 @@ ImmutableBucketAllocator::~ImmutableBucketAllocator() {
     std::vector<int64_t> ready_bucket_ids;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [id, state] : buckets_) {
+            if (state->evicting) {
+                MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
+                    -1, -static_cast<int64_t>(state->append_offset));
+            }
+        }
         ready_bucket_ids = DetachReadyBucketsLocked();
         UpdateBucketPoolMetricsLocked();
     }
@@ -384,6 +390,12 @@ ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
         std::lock_guard<std::mutex> lock(mutex_);
         replacement->next_bucket_id_ = next_bucket_id_;
         replacement->next_generation_ = next_generation_;
+        for (const auto& [id, state] : buckets_) {
+            if (state->evicting) {
+                MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
+                    -1, -static_cast<int64_t>(state->append_offset));
+            }
+        }
         ready_bucket_ids_.clear();
         buckets_.clear();
         key_index_.clear();
@@ -1994,6 +2006,8 @@ ImmutableBucketAllocator::CommitEvictionLogical(PendingEviction&& pending) {
         }
     }
     it->second->evicting = true;
+    MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
+        1, static_cast<int64_t>(it->second->append_offset));
     EvictedBucket bucket;
     bucket.bucket_id_ = pending.bucket_id_;
     bucket.identity_ = std::move(pending.bucket_identity_);
@@ -2014,7 +2028,14 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
             !it->second->evicting) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        it->second->delete_after = std::chrono::system_clock::time_point{};
+        // A token may have waited behind another deletion attempt. Recheck
+        // both clocks after taking the I/O lock so stale candidates cannot
+        // bypass a newly installed backoff or lease deadline.
+        if ((it->second->delete_after &&
+             *it->second->delete_after > std::chrono::system_clock::now()) ||
+            it->second->delete_retry_after > std::chrono::steady_clock::now()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
     // shortcut: interrupted deletion may restore intact cached entries; add a
     // durable eviction intent only if recovery must remember logical evictions.
@@ -2022,6 +2043,23 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
                              BucketDataPath(bucket.bucket_id_)}) {
         auto deleted = fs_adapter_->DeleteFile(path);
         if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto& state = *buckets_.at(bucket.bucket_id_);
+                // Saturate at seven failures: 1, 2, 4, 8, 16, 32, then 60s.
+                state.delete_failures =
+                    std::min<int>(state.delete_failures + 1, 7);
+                auto delay = std::chrono::seconds(1);
+                for (int i = 1; i < state.delete_failures; ++i) {
+                    delay = std::min(delay * 2, std::chrono::seconds(60));
+                }
+                state.delete_retry_after =
+                    std::chrono::steady_clock::now() + delay;
+                if (!state.delete_after)
+                    state.delete_after =
+                        std::chrono::system_clock::time_point{};
+            }
+            MasterMetricManager::instance().inc_dfs_bucket_delete_failures();
             static DfsLogLimiter log_limiter;
             if (auto suppressed = log_limiter.ShouldLog()) {
                 LOG(ERROR)
@@ -2035,6 +2073,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
+            -1, -static_cast<int64_t>(
+                    buckets_.at(bucket.bucket_id_)->append_offset));
         buckets_.erase(bucket.bucket_id_);
         PublishBucketIdSnapshotLocked();
         UpdateBucketPoolMetricsLocked();
@@ -2051,7 +2092,10 @@ void ImmutableBucketAllocator::DeferDeletion(
     if (it == buckets_.end() || it->second.get() != bucket.identity_.get() ||
         !it->second->evicting)
         return;
-    it->second->delete_after = not_before;
+    it->second->delete_after =
+        std::max(it->second->delete_after.value_or(
+                     std::chrono::system_clock::time_point{}),
+                 not_before);
     bucket.identity_.reset();
 }
 
@@ -2062,7 +2106,8 @@ size_t ImmutableBucketAllocator::RetryFailedEvictions() {
         const auto now = std::chrono::system_clock::now();
         for (const auto& [id, state] : buckets_) {
             if (!state->evicting || !state->delete_after ||
-                *state->delete_after > now)
+                *state->delete_after > now ||
+                state->delete_retry_after > std::chrono::steady_clock::now())
                 continue;
             EvictedBucket bucket;
             bucket.bucket_id_ = id;

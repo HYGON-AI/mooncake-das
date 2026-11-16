@@ -7241,6 +7241,7 @@ TEST_F(MasterServiceTest, DfsBucketEvictionStopsOnPhysicalDeleteFailure) {
                       retained);
             std::filesystem::remove_all(failed_file);
             std::filesystem::rename(backup, failed_file);
+            MasterServiceTestPeer::ExpireDfsDeletions(service);
             EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 1u);
             EXPECT_FALSE(std::filesystem::exists(failed_file));
             EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service),
@@ -7727,10 +7728,13 @@ TEST_F(MasterServiceTest, DfsBucketInvalidationRetriesFailedFinalization) {
         EXPECT_TRUE(MasterServiceTestPeer::HasPendingDfsInvalidation(
             service, desc.shard_idx));
         EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 0u);
+        EXPECT_FALSE(
+            MasterServiceTestPeer::RunBucketDfsEviction(service, true));
         EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service), used);
 
         std::filesystem::remove_all(meta);
         if (saved_meta) std::filesystem::rename(backup, meta);
+        MasterServiceTestPeer::ExpireDfsDeletions(service);
         EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 1u);
         EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service), used - 4096);
         // An already-maintained target reports no new commit; HasBucket keeps
@@ -7786,6 +7790,7 @@ TEST_F(MasterServiceTest, DfsBucketInvalidationDoesNotBorrowRetrySuccess) {
                 MasterServiceTestPeer::RunBucketDfsEviction(service, true));
             std::filesystem::remove_all(other.file_path);
             std::filesystem::rename(backup, other.file_path);
+            MasterServiceTestPeer::ExpireDfsDeletions(service);
             ASSERT_TRUE(std::filesystem::remove(target.file_path));
             const auto used = MasterServiceTestPeer::GetDfsUsedBytes(service);
             ASSERT_TRUE(service

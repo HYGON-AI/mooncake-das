@@ -326,6 +326,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
        private:
         friend class ImmutableBucketAllocator;
+        friend class test::ImmutableBucketAllocatorTestPeer;
         int64_t bucket_id_ = -1;
         std::shared_ptr<void> identity_;
     };
@@ -448,6 +449,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // verdict.
         bool evicting = false;
         std::optional<std::chrono::system_clock::time_point> delete_after;
+        std::chrono::steady_clock::time_point delete_retry_after{};
+        uint8_t delete_failures = 0;
         // A ready bucket owns a fully preallocated data file but has never
         // accepted an allocation. Ready buckets are absent from the LRU.
         bool ready = false;
