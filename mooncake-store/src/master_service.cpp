@@ -8184,8 +8184,16 @@ bool MasterService::RunBucketDfsEvictionInternal(
         if (keep_until > std::chrono::system_clock::now()) {
             allocator->DeferDeletion(std::move(evicted_bucket), keep_until);
         } else {
-            deleted = allocator->DeleteEvictedBucket(std::move(evicted_bucket))
-                          .has_value();
+            auto result =
+                allocator->DeleteEvictedBucket(std::move(evicted_bucket));
+            if (!result) {
+                LOG(ERROR)
+                    << "DFS bucket data deletion failed; capacity remains "
+                       "reserved for runtime retry, error="
+                    << result.error();
+                return evicted;
+            }
+            deleted = true;
         }
         evicted = evicted || deleted;
         if (invalidating_missing_bucket) return true;

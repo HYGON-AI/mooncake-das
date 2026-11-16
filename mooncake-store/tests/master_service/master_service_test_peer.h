@@ -125,6 +125,22 @@ class MasterServiceTestPeer {
         return service.bucket_allocator_->RetryFailedEvictions();
     }
 
+    static void StopEviction(MasterService& service) {
+        service.eviction_running_ = false;
+        if (service.eviction_thread_.joinable())
+            service.eviction_thread_.join();
+        if (service.dfs_eviction_thread_.joinable())
+            service.dfs_eviction_thread_.join();
+    }
+
+    static bool RunBucketDfsEviction(MasterService& service, bool force_one) {
+        return service.RunBucketDfsEvictionInternal(force_one);
+    }
+
+    static uint64_t GetDfsUsedBytes(MasterService& service) {
+        return service.bucket_allocator_->GetUsedBytes();
+    }
+
     explicit MasterServiceTestPeer(MasterService& service)
         : service_(service) {}
 

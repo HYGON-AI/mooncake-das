@@ -7174,6 +7174,150 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRemovesWholeBucket) {
     std::filesystem::remove_all(root, ec);
 }
 
+TEST_F(MasterServiceTest, DfsBucketEvictionStopsOnPhysicalDeleteFailure) {
+    // Cover watermark/forced eviction and a watermark pass that has already
+    // released one bucket before encountering the failed deletion.
+    for (const auto [force_one, prior_success] :
+         {std::pair{false, false}, {true, false}, {false, true}}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "force_one=" << force_one
+                     << ", prior_success=" << prior_success);
+        const auto root = MakeDfsTestRoot("evict_delete_failure");
+        ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.1");
+        ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+        {
+            MasterService service;
+            MasterServiceTestPeer::StopEviction(service);
+            const auto context = PrepareSimpleSegment(service);
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.dfs_replica_num = 1;
+            std::vector<std::string> files;
+            const int failed_index = prior_success ? 1 : 0;
+            for (int i = 0; i < failed_index + 3; ++i) {
+                const auto key = "delete_failure_" + std::to_string(i);
+                auto start = service.PutStart(context.client_id, key,
+                                              TenantId::Default(), 100, config);
+                ASSERT_TRUE(start.has_value());
+                const auto* dfs = FindDfsDescriptor(*start);
+                ASSERT_NE(dfs, nullptr);
+                files.push_back(dfs->get_dfs_descriptor().file_path);
+                ASSERT_TRUE(service
+                                .PutEnd(context.client_id, key,
+                                        TenantId::Default(), ReplicaType::ALL)
+                                .has_value());
+            }
+            const auto used = MasterServiceTestPeer::GetDfsUsedBytes(service);
+            ASSERT_EQ(used, files.size() * 4096);
+            const auto& failed_file = files[failed_index];
+            const auto backup = failed_file + ".backup";
+            std::filesystem::rename(failed_file, backup);
+            ASSERT_TRUE(std::filesystem::create_directory(failed_file));
+            std::ofstream(failed_file + "/blocked")
+                << "block physical deletion";
+
+            EXPECT_EQ(
+                MasterServiceTestPeer::RunBucketDfsEviction(service, force_one),
+                prior_success);
+            EXPECT_EQ(
+                MasterServiceTestPeer::HasDfsReplicaInMetadata(
+                    service, "delete_failure_" + std::to_string(failed_index)),
+                std::optional<bool>(false));
+            const auto next_key =
+                "delete_failure_" + std::to_string(failed_index + 1);
+            EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(service,
+                                                                     next_key),
+                      std::optional<bool>(true));
+            EXPECT_TRUE(std::filesystem::exists(files[failed_index + 1]));
+            const auto retained = used - (prior_success ? 4096 : 0);
+            EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service),
+                      retained);
+            if (prior_success) EXPECT_FALSE(std::filesystem::exists(files[0]));
+
+            // The same entry point used by maintenance must retain failed
+            // deletion capacity and release it exactly once after retry.
+            EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 0u);
+            EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service),
+                      retained);
+            std::filesystem::remove_all(failed_file);
+            std::filesystem::rename(backup, failed_file);
+            EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 1u);
+            EXPECT_FALSE(std::filesystem::exists(failed_file));
+            EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service),
+                      retained - 4096);
+            EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 0u);
+            EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(service,
+                                                                     next_key),
+                      std::optional<bool>(true));
+        }
+        std::filesystem::remove_all(root);
+    }
+}
+
+TEST_F(MasterServiceTest, DfsBucketEvictionContinuesAfterLeaseDeferral) {
+    for (const bool force_one : {false, true}) {
+        SCOPED_TRACE(force_one);
+        const auto root = MakeDfsTestRoot("evict_defer_then_delete");
+        ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.1");
+        ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+        {
+            MasterService service(MasterServiceConfig::builder()
+                                      .set_default_kv_lease_ttl(60000)
+                                      .build());
+            MasterServiceTestPeer::StopEviction(service);
+            const auto context = PrepareSimpleSegment(service);
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.dfs_replica_num = 1;
+            std::vector<std::string> files;
+            for (const auto* key : {"deferred", "next", "active"}) {
+                auto start = service.PutStart(context.client_id, key,
+                                              TenantId::Default(), 100, config);
+                ASSERT_TRUE(start.has_value());
+                const auto* dfs = FindDfsDescriptor(*start);
+                ASSERT_NE(dfs, nullptr);
+                files.push_back(dfs->get_dfs_descriptor().file_path);
+                ASSERT_TRUE(service
+                                .PutEnd(context.client_id, key,
+                                        TenantId::Default(), ReplicaType::ALL)
+                                .has_value());
+            }
+            service.RunBatchEvictForTesting(1.0, 1.0);
+            bool physically_freed = false;
+            EXPECT_TRUE(MasterServiceTestPeer::DuringDfsEvictionAfterValidation(
+                service,
+                [&] {
+                    auto reader = std::async(std::launch::async, [&] {
+                        return service.GetReplicaList("deferred",
+                                                      TenantId::Default());
+                    });
+                    EXPECT_TRUE(reader.get().has_value());
+                },
+                force_one ? &physically_freed : nullptr));
+            if (force_one) EXPECT_TRUE(physically_freed);
+            EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(
+                          service, "deferred"),
+                      std::nullopt);
+            EXPECT_EQ(
+                MasterServiceTestPeer::HasDfsReplicaInMetadata(service, "next"),
+                std::nullopt);
+            EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(service,
+                                                                     "active"),
+                      std::optional<bool>(true));
+            EXPECT_TRUE(std::filesystem::exists(files[0]));
+            EXPECT_FALSE(std::filesystem::exists(files[1]));
+            EXPECT_TRUE(std::filesystem::exists(files[2]));
+            EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service), 8192u);
+            EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 0u);
+            MasterServiceTestPeer::ExpireDfsDeletions(service);
+            EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 1u);
+            EXPECT_FALSE(std::filesystem::exists(files[0]));
+            EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service), 4096u);
+        }
+        std::filesystem::remove_all(root);
+    }
+}
+
 TEST_F(MasterServiceTest, DfsBucketEvictionRejectsLeasedBucketWithoutChanges) {
     const auto root = MakeDfsTestRoot("evict_leased");
     ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.25");
