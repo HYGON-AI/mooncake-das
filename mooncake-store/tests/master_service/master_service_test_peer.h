@@ -141,6 +141,17 @@ class MasterServiceTestPeer {
         return service.bucket_allocator_->GetUsedBytes();
     }
 
+    static bool InvalidateDfsBucket(MasterService& service, int64_t bucket_id) {
+        return service.RunBucketDfsEvictionInternal(false, bucket_id);
+    }
+
+    static bool HasPendingDfsInvalidation(MasterService& service,
+                                          int64_t bucket_id) {
+        std::lock_guard<std::mutex> lock(
+            service.invalidated_dfs_buckets_mutex_);
+        return service.invalidated_dfs_buckets_.contains(bucket_id);
+    }
+
     explicit MasterServiceTestPeer(MasterService& service)
         : service_(service) {}
 

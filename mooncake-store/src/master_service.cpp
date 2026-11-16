@@ -8012,7 +8012,8 @@ bool MasterService::RunBucketDfsEvictionInternal(
     // Buckets already inspected in this cycle. Bounds the scan when every
     // remaining bucket keeps getting rejected.
     std::set<int64_t> attempted;
-    bool evicted = allocator->RetryFailedEvictions() > 0;
+    const size_t retried = allocator->RetryFailedEvictions();
+    bool evicted = !invalidating_missing_bucket && retried > 0;
     if (force_one && evicted) return true;
     int low_utilization_evictions = 0;
     int low_utilization_attempts = 0;
@@ -8181,7 +8182,8 @@ bool MasterService::RunBucketDfsEvictionInternal(
                       << evicted_bucket_id << ", committed=true";
         }
         bool deleted = false;
-        if (keep_until > std::chrono::system_clock::now()) {
+        if (!invalidating_missing_bucket &&
+            keep_until > std::chrono::system_clock::now()) {
             allocator->DeferDeletion(std::move(evicted_bucket), keep_until);
         } else {
             auto result =
