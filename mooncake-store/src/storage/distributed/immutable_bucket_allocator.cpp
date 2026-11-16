@@ -1186,7 +1186,8 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     MarkMetaDirtyLocked(bucket);
 
     auto descriptor = MakeBucketDescriptor(BucketDataPath(bucket.bucket_id),
-                                          *layout, bucket.bucket_id);
+                                          *layout, bucket.bucket_id,
+                                          entry.generation);
     return descriptor;
 }
 
@@ -1260,6 +1261,14 @@ ImmutableBucketAllocator::FindMatchingEntryLocked(
     if (entry.reserved_size != desc.aligned_size)
         return fail("aligned_size_mismatch");
     if (entry.key_size != key.size()) return fail("key_size_mismatch");
+    // Generation is the only field that distinguishes two allocations of the
+    // same key at the same size and offset (the layout repeats exactly when a
+    // key is re-reserved into a reclaimed slot). Callers that predate this
+    // field send 0 and keep the field-only comparison.
+    if (desc.AllocationGeneration() != 0 &&
+        entry.generation != desc.AllocationGeneration()) {
+        return fail("generation_mismatch");
+    }
     auto layout = RebuildBucketEntryLayout(entry.entry_offset, entry.value_size,
                                            alignment_);
     if (!layout) return fail("invalid_entry_layout");
@@ -1841,7 +1850,8 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
             candidate.shard_idx = static_cast<int>(bucket_id);
             candidate.offset = layout->offset;
             candidate.descriptor =
-                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout, bucket_id);
+                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
+                                     bucket_id, entry.generation);
             candidates.push_back(std::move(candidate));
         }
 
@@ -1951,7 +1961,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             // match replica metadata field by field.
             candidate.descriptor =
                 MakeBucketDescriptor(BucketDataPath(victim->bucket_id), *layout,
-                                     victim->bucket_id);
+                                     victim->bucket_id, entry.generation);
             candidates.push_back(std::move(candidate));
         }
 
@@ -2387,9 +2397,15 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
             auto layout = RebuildBucketEntryLayout(
                 entry.entry_offset, entry.value_size, alignment_);
             if (!layout) continue;
+            // Carry the recovered generation too. Without it a recovered
+            // descriptor would read back as generation 0, which
+            // FindMatchingEntryLocked treats as "not supplied" and matches on
+            // the layout fields alone, so a later Free or MarkCommitted built
+            // from it could address a different allocation of the same key in
+            // the same slot.
             recovered_replicas_.push_back(RecoveredReplica{
                 key, MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
-                                          bucket_id)});
+                                          bucket_id, entry.generation)});
         }
     }
 

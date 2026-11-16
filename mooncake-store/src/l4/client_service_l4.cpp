@@ -520,25 +520,34 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
         tl::expected<void, ErrorCode> completion =
             tl::make_unexpected(ErrorCode::RPC_FAIL);
         const auto object_checksum = context->object_checksums[i];
+        // Echo the allocation this write owns. If the key was rewritten while
+        // the data was in flight, the master answers INVALID_WRITE and this
+        // task stops instead of committing or revoking its successor. A
+        // generation of 0 means the allocation predates fencing, so the V2
+        // call downgrades itself to the classic form.
+        const auto& dfs_descriptor = context->descriptors[i];
+        const uint64_t dfs_generation = dfs_descriptor.AllocationGeneration();
         for (int attempt = 0; attempt < kMaxCompletionAttempts; ++attempt) {
             if (succeeded) {
                 completion = context->is_upsert
                                  ? master_client_.UpsertEnd(
                                        ObjectMeta{key, object_checksum},
                                        ReplicaType::DFS,
-                                       context->descriptors[i].MasterEpoch())
-                                 : master_client_.PutEnd(
-                                       ObjectMeta{key, object_checksum},
+                                       dfs_descriptor.MasterEpoch())
+                                 : master_client_.PutEndV2(
+                                       ObjectMetaV2{key, object_checksum,
+                                                    dfs_generation},
                                        ReplicaType::DFS,
-                                       context->descriptors[i].MasterEpoch());
+                                       dfs_descriptor.MasterEpoch());
             } else {
-                completion = context->is_upsert
-                                 ? master_client_.UpsertRevoke(
-                                       key, ReplicaType::DFS,
-                                       context->descriptors[i].MasterEpoch())
-                                 : master_client_.PutRevoke(
-                                       key, ReplicaType::DFS,
-                                       context->descriptors[i].MasterEpoch());
+                completion =
+                    context->is_upsert
+                        ? master_client_.UpsertRevoke(
+                              key, ReplicaType::DFS,
+                              dfs_descriptor.MasterEpoch())
+                        : master_client_.PutRevokeV2(
+                              RevokeObjectMetaV2{key, dfs_generation},
+                              ReplicaType::DFS, dfs_descriptor.MasterEpoch());
             }
             if (completion) break;
             // OBJECT_NOT_FOUND / INVALID_WRITE mean the object already moved on
@@ -552,9 +561,21 @@ void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
             }
         }
         if (!completion) {
+            const auto error = completion.error();
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::INVALID_WRITE ||
+                error == ErrorCode::ILLEGAL_CLIENT) {
+                // The key moved on before this completion landed. That is the
+                // outcome generation fencing exists to produce: the successor
+                // keeps its own state and nothing is left to reclaim, because
+                // this write owned no replica any more. Not an error.
+                VLOG(1) << "Async DFS completion for key " << key
+                        << " was superseded, error=" << toString(error);
+                continue;
+            }
             LOG(ERROR) << "Failed to finalize async DFS write for key " << key
                        << " (" << (succeeded ? "PutEnd" : "PutRevoke")
-                       << "), error=" << toString(completion.error())
+                       << "), error=" << toString(error)
                        << "; the master will reclaim the PROCESSING replica via "
                           "its put-start timeout";
         }

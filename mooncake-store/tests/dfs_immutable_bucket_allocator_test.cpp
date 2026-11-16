@@ -1031,6 +1031,12 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
     EXPECT_EQ(replicas[0].descriptor.aligned_size, committed_desc.aligned_size);
     EXPECT_EQ(replicas[0].descriptor.shard_idx, committed_desc.shard_idx);
     EXPECT_EQ(replicas[0].descriptor.file_path, committed_desc.file_path);
+    // The recovered descriptor must keep the allocation identity it was
+    // reserved with. A zero here would let a later completion match on the
+    // layout fields alone and address a re-reservation of the same slot.
+    EXPECT_NE(replicas[0].descriptor.AllocationGeneration(), 0u);
+    EXPECT_EQ(replicas[0].descriptor.AllocationGeneration(),
+              committed_desc.AllocationGeneration());
 
     EXPECT_TRUE(recovered.GetBucketIdForKey("committed").has_value());
     // The uncommitted entry must not come back as readable.

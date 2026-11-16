@@ -76,6 +76,98 @@ struct LegacyMetadataPayload {
     struct_pack::compatible<bool, 1> hard_pinned;
 };
 
+// The checksum-and-affinity-era layout of the payload: object_checksum is v3
+// and residency_affinity_id is v4, exactly as MetadataPayload has them today,
+// but the nested DFS descriptor predates allocation_generation.
+struct ChecksumDfsDescriptor {
+    std::string file_path;
+    uint64_t offset = 0;
+    uint64_t object_size = 0;
+    uint64_t aligned_size = 0;
+    int shard_idx = 0;
+    struct_pack::compatible<UUID, 2> master_epoch;
+};
+struct ChecksumReplicaDescriptor {
+    ReplicaID id;
+    std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
+                 LocalDiskDescriptor, ChecksumDfsDescriptor>
+        descriptor_variant;
+    ReplicaStatus status;
+};
+struct ChecksumMetadataPayload {
+    UUID client_id{0, 0};
+    uint64_t size{0};
+    std::vector<ChecksumReplicaDescriptor> replicas;
+    struct_pack::compatible<std::string, 1> group_id;
+    struct_pack::compatible<ObjectDataType, 1> data_type;
+    struct_pack::compatible<bool, 1> hard_pinned;
+    struct_pack::compatible<std::string, 2> session_id;
+    struct_pack::compatible<uint64_t, 3> object_checksum;
+    struct_pack::compatible<std::string, 4> residency_affinity_id;
+};
+
+// allocation_generation must not share a compatible version with a sibling
+// field of the enclosing payload. struct_pack collects compatible versions
+// recursively and writes one group per version, so a nested field numbered 3
+// would join object_checksum's group and shift what either side reads. This
+// pairs every field that is easy to mis-associate with a distinct value.
+TEST(DfsEpochSerializationTest, ChecksumAndAffinitySurviveBidirectionalReads) {
+    // Old layout (no allocation_generation) read by the current one.
+    ChecksumMetadataPayload old;
+    old.client_id = UUID{11, 12};
+    old.size = 4096;
+    old.group_id = "tenant-group";
+    old.session_id = "session-x";
+    old.object_checksum = 0xABCD;
+    old.residency_affinity_id = "opaque-affinity";
+    ChecksumReplicaDescriptor old_replica;
+    old_replica.id = 3;
+    old_replica.status = ReplicaStatus::COMPLETE;
+    old_replica.descriptor_variant =
+        ChecksumDfsDescriptor{"/dfs/bucket_1.data", 4096, 4096, 4096, 1, {}};
+    old.replicas.push_back(old_replica);
+
+    auto current = struct_pack::deserialize<MetadataPayload>(
+        struct_pack::serialize(old));
+    ASSERT_TRUE(current.has_value());
+    EXPECT_EQ(current->object_checksum.value_or(0), 0xABCDu);
+    EXPECT_EQ(current->residency_affinity_id.value_or(""), "opaque-affinity");
+    EXPECT_EQ(current->session_id.value_or(""), "session-x");
+    ASSERT_EQ(current->replicas.size(), 1u);
+    ASSERT_TRUE(current->replicas[0].is_dfs_replica());
+    // The old allocation never had an identity; it must read back as absent,
+    // not as some unrelated field's value.
+    EXPECT_FALSE(current->replicas[0].get_dfs_descriptor()
+                     .allocation_generation.has_value());
+
+    // Current layout, now with an allocation, read by the old one.
+    current->replicas[0].get_dfs_descriptor().allocation_generation = 77;
+    current->object_checksum = 0xBEEF;
+    current->residency_affinity_id = "affinity-2";
+    auto restored = struct_pack::deserialize<ChecksumMetadataPayload>(
+        struct_pack::serialize(*current));
+    ASSERT_TRUE(restored.has_value());
+    EXPECT_EQ(restored->object_checksum.value_or(0), 0xBEEFu);
+    EXPECT_EQ(restored->residency_affinity_id.value_or(""), "affinity-2");
+    EXPECT_EQ(restored->session_id.value_or(""), "session-x");
+    ASSERT_EQ(restored->replicas.size(), 1u);
+    ASSERT_EQ(restored->replicas[0].descriptor_variant.index(), 4u);
+    const auto& dfs = std::get<ChecksumDfsDescriptor>(
+        restored->replicas[0].descriptor_variant);
+    EXPECT_EQ(dfs.offset, 4096u);
+    EXPECT_EQ(dfs.file_path, "/dfs/bucket_1.data");
+
+    // And the current layout must round-trip the new field on its own.
+    auto roundtrip = struct_pack::deserialize<MetadataPayload>(
+        struct_pack::serialize(*current));
+    ASSERT_TRUE(roundtrip.has_value());
+    ASSERT_EQ(roundtrip->replicas.size(), 1u);
+    EXPECT_EQ(roundtrip->replicas[0].get_dfs_descriptor()
+                  .allocation_generation.value_or(0),
+              77u);
+    EXPECT_EQ(roundtrip->object_checksum.value_or(0), 0xBEEFu);
+}
+
 TEST(DfsEpochSerializationTest, OldAndNewOplogPayloadsRemainReadable) {
     for (const bool dfs : {false, true}) {
         SCOPED_TRACE(dfs);

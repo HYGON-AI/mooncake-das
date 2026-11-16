@@ -139,6 +139,31 @@ class WrappedMasterService {
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
 
+    // Generation-fenced completion RPCs. A client sends these only for a
+    // completion that carries a DFS allocation generation, which only this
+    // master's bucket allocator produces, so an older master never sees them
+    // and an older client never sends them.
+    tl::expected<void, ErrorCode> PutEndV2(
+        const UUID& client_id, const ObjectMetaV2& object_meta,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
+
+    tl::expected<void, ErrorCode> PutRevokeV2(
+        const UUID& client_id, const RevokeObjectMetaV2& object_meta,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEndV2(
+        const UUID& client_id, const std::vector<ObjectMetaV2>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
+
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevokeV2(
+        const UUID& client_id,
+        const std::vector<RevokeObjectMetaV2>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const std::string& tenant_id = "default", const UUID& dfs_epoch = {});
+
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
