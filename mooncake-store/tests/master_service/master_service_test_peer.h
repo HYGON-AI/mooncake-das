@@ -21,6 +21,15 @@ class MasterServiceTestPeer {
         service.dfs_allocator_.store(allocator);
     }
 
+    static ImmutableBucketAllocator& BucketAllocator(MasterService& service) {
+        return *service.bucket_allocator_;
+    }
+
+    static bool RecoverDfsRoot(MasterService& service, const std::string& root,
+                               const std::string& identity) {
+        return service.RecoverDfsRootAfterReplacement(root, identity);
+    }
+
     static std::vector<int64_t> GetTrackedDfsBucketIds(MasterService& service) {
         auto snapshot = service.bucket_allocator_->GetBucketIdSnapshot();
         return snapshot ? snapshot->bucket_ids : std::vector<int64_t>{};
@@ -121,6 +130,11 @@ class MasterServiceTestPeer {
             *service.bucket_allocator_);
     }
 
+    static void PostponeDfsRetry(MasterService& service, int64_t bucket_id) {
+        ImmutableBucketAllocatorTestPeer::PostponeRetry(
+            *service.bucket_allocator_, bucket_id);
+    }
+
     static size_t RetryDfsDeletions(MasterService& service) {
         return service.bucket_allocator_->RetryFailedEvictions();
     }
@@ -135,6 +149,10 @@ class MasterServiceTestPeer {
 
     static bool RunBucketDfsEviction(MasterService& service, bool force_one) {
         return service.RunBucketDfsEvictionInternal(force_one);
+    }
+
+    static bool RunLowUtilizationBucketEviction(MasterService& service) {
+        return service.RunBucketDfsEvictionInternal(false, std::nullopt, 0.75);
     }
 
     static uint64_t GetDfsUsedBytes(MasterService& service) {

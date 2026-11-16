@@ -8193,7 +8193,9 @@ bool MasterService::RunBucketDfsEvictionInternal(
                     << "DFS bucket data deletion failed; capacity remains "
                        "reserved for runtime retry, error="
                     << result.error();
-                return evicted;
+                // Invalidation finished logically; maintenance owns physical
+                // retry.
+                return invalidating_missing_bucket || evicted;
             }
             deleted = true;
         }

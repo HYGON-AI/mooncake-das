@@ -7255,6 +7255,103 @@ TEST_F(MasterServiceTest, DfsBucketEvictionStopsOnPhysicalDeleteFailure) {
     }
 }
 
+TEST_F(MasterServiceTest, DfsBucketDeleteFailureBacklogLimitsNormalEviction) {
+    for (const int mode : {0, 1, 2}) {
+        SCOPED_TRACE(mode);
+        const auto root = MakeDfsTestRoot("delete_failure_backlog");
+        ScopedBucketDfsEnv env(root, "8192", "6", "0", "0.5", "0.1");
+        ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+        {
+            MasterService service;
+            MasterServiceTestPeer::StopEviction(service);
+            const auto context = PrepareSimpleSegment(service);
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.dfs_replica_num = 1;
+            std::vector<DistributedFSDescriptor> descriptors;
+            for (int i = 0; i < 5; ++i) {
+                const auto key = "backlog_" + std::to_string(i);
+                auto start = service.PutStart(context.client_id, key,
+                                              TenantId::Default(), 100, config);
+                ASSERT_TRUE(start);
+                descriptors.push_back(
+                    FindDfsDescriptor(*start)->get_dfs_descriptor());
+                ASSERT_TRUE(service.PutEnd(context.client_id, key,
+                                           TenantId::Default(),
+                                           ReplicaType::ALL));
+                const auto padding = key + "_padding";
+                ASSERT_TRUE(service.PutStart(context.client_id, padding,
+                                             TenantId::Default(), 100, config));
+                ASSERT_TRUE(service.PutEnd(context.client_id, padding,
+                                           TenantId::Default(),
+                                           ReplicaType::ALL));
+                ASSERT_TRUE(service.Remove(padding, TenantId::Default(), true));
+            }
+            const auto run = [&] {
+                return mode == 2 ? MasterServiceTestPeer::
+                                       RunLowUtilizationBucketEviction(service)
+                                 : MasterServiceTestPeer::RunBucketDfsEviction(
+                                       service, mode == 1);
+            };
+            for (int i = 0; i < 2; ++i) {
+                const auto& file = descriptors[i].file_path;
+                std::filesystem::rename(file, file + ".backup");
+                ASSERT_TRUE(std::filesystem::create_directory(file));
+                std::ofstream(file + "/blocked") << "block deletion";
+                EXPECT_FALSE(run());
+                MasterServiceTestPeer::PostponeDfsRetry(
+                    service, descriptors[i].shard_idx);
+                EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(
+                              service, "backlog_" + std::to_string(i)),
+                          std::optional<bool>(false));
+            }
+            for (int i = 0; i < 3; ++i) EXPECT_FALSE(run());
+            EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service),
+                      5 * 8192u);
+            EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(
+                          service, "backlog_2"),
+                      std::optional<bool>(true));
+            // Confirmed missing buckets bypass admission; failed cleanup still
+            // retains quota.
+            const auto& missing = descriptors[3];
+            ASSERT_TRUE(std::filesystem::remove(missing.file_path));
+            const auto meta = std::filesystem::path(missing.file_path)
+                                  .replace_extension(".meta");
+            std::filesystem::rename(meta, meta.string() + ".backup");
+            ASSERT_TRUE(std::filesystem::create_directory(meta));
+            std::ofstream(meta / "blocked") << "block metadata deletion";
+            EXPECT_TRUE(MasterServiceTestPeer::InvalidateDfsBucket(
+                service, missing.shard_idx));
+            EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(
+                          service, "backlog_3"),
+                      std::optional<bool>(false));
+            EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service),
+                      5 * 8192u);
+            MasterServiceTestPeer::PostponeDfsRetry(service, missing.shard_idx);
+            EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 0u);
+            std::filesystem::remove_all(meta);
+            std::filesystem::rename(meta.string() + ".backup", meta);
+            MasterServiceTestPeer::ExpireDfsDeletions(service);
+            EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 1u);
+            EXPECT_FALSE(run());
+            const auto& first = descriptors[0].file_path;
+            std::filesystem::remove_all(first);
+            std::filesystem::rename(first + ".backup", first);
+            MasterServiceTestPeer::ExpireDfsDeletions(service);
+            EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 1u);
+            EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service),
+                      3 * 8192u);
+            EXPECT_TRUE(run());
+            EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(
+                          service, "backlog_2"),
+                      std::optional<bool>(false));
+            EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service),
+                      2 * 8192u);
+        }
+        std::filesystem::remove_all(root);
+    }
+}
+
 TEST_F(MasterServiceTest, DfsBucketEvictionContinuesAfterLeaseDeferral) {
     for (const bool force_one : {false, true}) {
         SCOPED_TRACE(force_one);
@@ -7679,6 +7776,110 @@ TEST_F(MasterServiceTest, DfsBucketMissingFileInvalidationIsNotEviction) {
     std::filesystem::remove_all(root, ec);
 }
 
+class InvalidationIoAdapter : public PosixFsAdapter {
+   public:
+    size_t exists_calls = 0;
+    size_t delete_calls = 0;
+    std::function<void(const std::string&)> before_exists;
+    tl::expected<bool, ErrorCode> FileExists(const std::string& path) override {
+        ++exists_calls;
+        if (before_exists) before_exists(path);
+        return PosixFsAdapter::FileExists(path);
+    }
+    tl::expected<void, ErrorCode> DeleteFile(const std::string& path) override {
+        ++delete_calls;
+        return PosixFsAdapter::DeleteFile(path);
+    }
+};
+
+TEST_F(MasterServiceTest, DfsRootRecoveryIgnoresLogicallyEvictedMissingBucket) {
+    // committed, commit during file check, valid, frozen, identity lost, marker
+    // lost
+    for (const int mode : {0, 1, 2, 3, 4, 5}) {
+        SCOPED_TRACE(mode);
+        const auto root = MakeDfsTestRoot("root_pending_delete");
+        ScopedBucketDfsEnv env(root, "4096", "4");
+        ScopedEnvVar ready_buckets("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+        {
+            MasterService service;
+            MasterServiceTestPeer::StopEviction(service);
+            const auto context = PrepareSimpleSegment(service);
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.dfs_replica_num = 1;
+            std::vector<DistributedFSDescriptor> descriptors;
+            for (const auto* key : {"lost", "healthy"}) {
+                auto start = service.PutStart(context.client_id, key,
+                                              TenantId::Default(), 100, config);
+                ASSERT_TRUE(start);
+                descriptors.push_back(
+                    FindDfsDescriptor(*start)->get_dfs_descriptor());
+                ASSERT_TRUE(service.PutEnd(context.client_id, key,
+                                           TenantId::Default(),
+                                           ReplicaType::ALL));
+            }
+            const auto storage = service.GetStorageConfig();
+            ASSERT_TRUE(storage);
+            const auto& victim = descriptors[0];
+            auto& allocator = MasterServiceTestPeer::BucketAllocator(service);
+            ASSERT_TRUE(std::filesystem::remove(victim.file_path));
+            auto meta = std::filesystem::path(victim.file_path)
+                            .replace_extension(".meta");
+            ASSERT_TRUE(std::filesystem::remove(meta));
+            ASSERT_TRUE(std::filesystem::create_directory(meta));
+            std::ofstream(meta / "blocked") << "block physical finalization";
+            const auto used = allocator.GetUsedBytes();
+            auto adapter = std::make_unique<InvalidationIoAdapter>();
+            ASSERT_TRUE(adapter->Init(root));
+            auto* io = adapter.get();
+            ImmutableBucketAllocatorTestPeer::SetAdapter(allocator,
+                                                         std::move(adapter));
+            if (mode == 0 || mode >= 4) {
+                ASSERT_TRUE(MasterServiceTestPeer::InvalidateDfsBucket(
+                    service, victim.shard_idx));
+                EXPECT_TRUE(allocator.IsBucketEvicting(victim.shard_idx));
+                EXPECT_EQ(allocator.GetUsedBytes(), used);
+            }
+            auto frozen = mode == 1 || mode == 3
+                              ? allocator.PrepareInvalidation(victim.shard_idx)
+                              : ImmutableBucketAllocator::PendingEviction{};
+            bool committed_during_check = false;
+            if (mode == 1) {
+                io->before_exists = [&](const std::string& path) {
+                    if (path != victim.file_path || committed_during_check)
+                        return;
+                    committed_during_check = true;
+                    auto logical =
+                        allocator.CommitEvictionLogical(std::move(frozen));
+                    ASSERT_TRUE(logical);
+                    allocator.DeferDeletion(std::move(*logical),
+                                            std::chrono::system_clock::now() +
+                                                std::chrono::hours(1));
+                };
+            }
+            if (mode == 4)
+                ASSERT_TRUE(std::filesystem::remove(root + "/" +
+                                                    kDfsRootIdentityFileName));
+            if (mode == 5)
+                ASSERT_TRUE(std::filesystem::remove(root + "/" +
+                                                    kDfsRootMarkerFileName));
+            ASSERT_TRUE(MasterServiceTestPeer::RecoverDfsRoot(
+                service, root, storage->dfs_root_identity));
+            if (mode <= 1) io->before_exists = {};
+            if (mode == 1) EXPECT_TRUE(committed_during_check);
+            EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(service,
+                                                                     "healthy"),
+                      std::optional<bool>(mode <= 1));
+            if (mode <= 1) {
+                EXPECT_TRUE(allocator.HasBucket(victim.shard_idx));
+                EXPECT_EQ(allocator.GetUsedBytes(), used);
+                EXPECT_TRUE(std::filesystem::exists(descriptors[1].file_path));
+            }
+        }
+        std::filesystem::remove_all(root);
+    }
+}
+
 TEST_F(MasterServiceTest, DfsBucketInvalidationRetriesFailedFinalization) {
     const auto root = MakeDfsTestRoot("missing_finalize_failure");
     ScopedBucketDfsEnv env(root, "4096", "4");
@@ -7709,8 +7910,19 @@ TEST_F(MasterServiceTest, DfsBucketInvalidationRetriesFailedFinalization) {
         ASSERT_TRUE(std::filesystem::create_directory(meta));
         std::ofstream(meta / "blocked") << "block metadata deletion";
 
-        EXPECT_FALSE(MasterServiceTestPeer::InvalidateDfsBucket(
-            service, desc.shard_idx));
+        auto adapter = std::make_unique<InvalidationIoAdapter>();
+        ASSERT_TRUE(adapter->Init(root));
+        auto* io = adapter.get();
+        ImmutableBucketAllocatorTestPeer::SetAdapter(
+            MasterServiceTestPeer::BucketAllocator(service),
+            std::move(adapter));
+        ASSERT_TRUE(service
+                        .BatchInvalidateDfsBuckets(context.client_id,
+                                                   {{desc.shard_idx}},
+                                                   TenantId::Default())
+                        .front());
+        EXPECT_TRUE(MasterServiceTestPeer::InvalidateDfsBucket(service,
+                                                               desc.shard_idx));
         EXPECT_EQ(MasterServiceTestPeer::GetDfsUsedBytes(service), used);
         EXPECT_EQ(MasterServiceTestPeer::HasDfsReplicaInMetadata(
                       service, "missing_finalize"),
@@ -7719,14 +7931,23 @@ TEST_F(MasterServiceTest, DfsBucketInvalidationRetriesFailedFinalization) {
             MasterServiceTestPeer::GetTrackedDfsBucketIds(service);
         EXPECT_EQ(std::count(tracked.begin(), tracked.end(), desc.shard_idx),
                   1);
-        ASSERT_TRUE(service
-                        .BatchInvalidateDfsBuckets(context.client_id,
-                                                   {{desc.shard_idx}},
-                                                   TenantId::Default())
-                        .front());
-        service.ProcessInvalidatedDfsBucketsForTesting();
-        EXPECT_TRUE(MasterServiceTestPeer::HasPendingDfsInvalidation(
-            service, desc.shard_idx));
+        MasterServiceTestPeer::PostponeDfsRetry(service, desc.shard_idx);
+        const auto checks = io->exists_calls;
+        const auto deletes = io->delete_calls;
+        for (int i = 0; i < 3; ++i) {
+            // Another client can repeat the already handled report
+            // idempotently.
+            ASSERT_TRUE(service
+                            .BatchInvalidateDfsBuckets(UUID{1, 2},
+                                                       {{desc.shard_idx}},
+                                                       TenantId::Default())
+                            .front());
+            service.ProcessInvalidatedDfsBucketsForTesting();
+            EXPECT_FALSE(MasterServiceTestPeer::HasPendingDfsInvalidation(
+                service, desc.shard_idx));
+            EXPECT_EQ(io->exists_calls, checks);
+            EXPECT_EQ(io->delete_calls, deletes);
+        }
         EXPECT_EQ(MasterServiceTestPeer::RetryDfsDeletions(service), 0u);
         EXPECT_FALSE(
             MasterServiceTestPeer::RunBucketDfsEviction(service, true));
@@ -7749,7 +7970,7 @@ TEST_F(MasterServiceTest, DfsBucketInvalidationRetriesFailedFinalization) {
 }
 
 TEST_F(MasterServiceTest, DfsBucketInvalidationDoesNotBorrowRetrySuccess) {
-    for (const int mode : {0, 1, 2}) {
+    for (const int mode : {0, 1, 2, 3}) {
         SCOPED_TRACE(mode);
         const auto root = MakeDfsTestRoot("missing_unrelated_retry");
         ScopedBucketDfsEnv env(root, "4096", "4");
@@ -7770,7 +7991,7 @@ TEST_F(MasterServiceTest, DfsBucketInvalidationDoesNotBorrowRetrySuccess) {
                     FindDfsDescriptor(*start)->get_dfs_descriptor());
                 // Mode 2 checks per-key processing protection; the other modes
                 // leave an allocation in flight so preparation rejects it.
-                if (std::string(key) != "retry_target" || mode == 2) {
+                if (std::string(key) != "retry_target" || mode >= 2) {
                     ASSERT_TRUE(service.PutEnd(context.client_id, key,
                                                TenantId::Default(),
                                                ReplicaType::ALL));
@@ -7798,6 +8019,10 @@ TEST_F(MasterServiceTest, DfsBucketInvalidationDoesNotBorrowRetrySuccess) {
                                                        {{target.shard_idx}},
                                                        TenantId::Default())
                             .front());
+            auto frozen = mode == 3
+                              ? MasterServiceTestPeer::BucketAllocator(service)
+                                    .PrepareInvalidation(target.shard_idx)
+                              : ImmutableBucketAllocator::PendingEviction{};
             if (mode == 0) {
                 EXPECT_FALSE(MasterServiceTestPeer::InvalidateDfsBucket(
                     service, target.shard_idx));
@@ -7814,6 +8039,9 @@ TEST_F(MasterServiceTest, DfsBucketInvalidationDoesNotBorrowRetrySuccess) {
             if (mode == 2) {
                 ASSERT_TRUE(MasterServiceTestPeer::SetProcessingKeyForTest(
                     service, "retry_target", false));
+            } else if (mode == 3) {
+                MasterServiceTestPeer::BucketAllocator(service).AbortEviction(
+                    std::move(frozen));
             } else {
                 ASSERT_TRUE(service.PutEnd(context.client_id, "retry_target",
                                            TenantId::Default(),

@@ -1984,6 +1984,70 @@ TEST(ImmutableBucketAllocatorTest, DeleteBackoffAndPendingMetrics) {
               failures + attempted);
 }
 
+TEST(ImmutableBucketAllocatorTest,
+     PreparedEvictionRechecksDeleteFailureBacklog) {
+    TempDir tmp("bucket_backlog_commit");
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), kAlignment, 6)));
+    std::vector<DistributedFSDescriptor> descriptors;
+    for (const auto* key : {"a", "b", "c", "d", "active"}) {
+        auto desc = alloc.Allocate(key, 100);
+        ASSERT_TRUE(desc);
+        ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
+        descriptors.push_back(*desc);
+    }
+    auto first = alloc.CommitEvictionLogical(
+        alloc.PrepareEvictionForAllocationFailure());
+    auto second = alloc.CommitEvictionLogical(
+        alloc.PrepareEvictionForAllocationFailure());
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    const auto future =
+        std::chrono::system_clock::now() + std::chrono::hours(1);
+    alloc.DeferDeletion(std::move(*first), future);
+    alloc.DeferDeletion(std::move(*second), future);
+    // Lease-only pending deletions do not block another candidate.
+    auto pending = alloc.PrepareEvictionForAllocationFailure();
+    ASSERT_EQ(pending.bucket_id(), descriptors[2].shard_idx);
+    auto moved = std::move(pending);
+    pending = std::move(moved);
+    const auto used = alloc.GetUsedBytes();
+    auto adapter = std::make_unique<DeleteCountingAdapter>();
+    ASSERT_TRUE(adapter->Init(tmp.path()));
+    auto* io = adapter.get();
+    ImmutableBucketAllocatorTestPeer::SetAdapter(alloc, std::move(adapter));
+    for (int i = 0; i < 2; ++i) {
+        io->blocked = BucketMetaFile(tmp, descriptors[i].shard_idx);
+        ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+        auto token = ImmutableBucketAllocatorTestPeer::DeletionToken(
+            alloc, descriptors[i].shard_idx);
+        EXPECT_FALSE(alloc.DeleteEvictedBucket(std::move(token)));
+        ImmutableBucketAllocatorTestPeer::PostponeRetry(
+            alloc, descriptors[i].shard_idx);
+    }
+    EXPECT_FALSE(alloc.CommitEvictionLogical(std::move(pending)));
+    EXPECT_EQ(alloc.GetUsedBytes(), used);
+    // Preparing the exact bucket proves rejection restored its unfrozen state.
+    auto invalidation = alloc.PrepareInvalidation(descriptors[2].shard_idx);
+    ASSERT_EQ(invalidation.bucket_id(), descriptors[2].shard_idx);
+    auto invalidation_moved = std::move(invalidation);
+    invalidation = std::move(invalidation_moved);
+    auto logical = alloc.CommitEvictionLogical(std::move(invalidation));
+    ASSERT_TRUE(logical);
+    io->blocked.clear();
+    EXPECT_TRUE(alloc.DeleteEvictedBucket(std::move(*logical)));
+    auto replacement = alloc.Allocate("c", 100);
+    ASSERT_TRUE(replacement);
+    ASSERT_TRUE(alloc.MarkCommitted("c", *replacement));
+    alloc.Free("c", descriptors[2]);
+    EXPECT_TRUE(alloc.MarkCommitted("c", *replacement));
+    EXPECT_EQ(alloc.PrepareEvictionForAllocationFailure().bucket_id(), -1);
+    ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 2u);
+    auto resumed = alloc.PrepareEvictionForAllocationFailure();
+    EXPECT_EQ(resumed.bucket_id(), descriptors[3].shard_idx);
+}
+
 TEST(ImmutableBucketAllocatorTest, StaleDeletionCandidatesRecheckBackoff) {
     TempDir tmp("bucket_backoff_stale");
     ImmutableBucketAllocator alloc;

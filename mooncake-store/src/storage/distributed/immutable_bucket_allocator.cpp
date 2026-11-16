@@ -106,6 +106,7 @@ ImmutableBucketAllocator::PendingEviction::PendingEviction(
     PendingEviction&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)),
       bucket_id_(std::exchange(other.bucket_id_, -1)),
+      invalidation_(other.invalidation_),
       bucket_identity_(std::move(other.bucket_identity_)),
       candidates_(std::move(other.candidates_)) {
     other.candidates_.clear();
@@ -126,6 +127,7 @@ ImmutableBucketAllocator::PendingEviction::operator=(
         }
         owner_ = std::exchange(other.owner_, nullptr);
         bucket_id_ = std::exchange(other.bucket_id_, -1);
+        invalidation_ = other.invalidation_;
         bucket_identity_ = std::move(other.bucket_identity_);
         candidates_ = std::move(other.candidates_);
         other.candidates_.clear();
@@ -1807,6 +1809,12 @@ bool ImmutableBucketAllocator::HasBucket(int64_t bucket_id) const {
     return buckets_.contains(bucket_id);
 }
 
+bool ImmutableBucketAllocator::IsBucketEvicting(int64_t bucket_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = buckets_.find(bucket_id);
+    return it != buckets_.end() && it->second->evicting;
+}
+
 tl::expected<bool, ErrorCode>
 ImmutableBucketAllocator::IsBucketDataFilePresent(int64_t bucket_id) const {
     if (bucket_id < 0) {
@@ -1868,6 +1876,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
             active_bucket_id_ = -1;
             RequestRefillLocked();
         }
+        pending.invalidation_ = true;
         pending.owner_ = this;
         pending.bucket_id_ = bucket_id;
         pending.bucket_identity_ = victim;
@@ -1890,6 +1899,18 @@ ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
     return PrepareEvictionInternal(/*force_one=*/false, threshold);
 }
 
+bool ImmutableBucketAllocator::DeleteFailureBacklogFullLocked() const {
+    constexpr size_t kMaxFailedDeletions = 2;
+    size_t failures = 0;
+    for (const auto& [id, bucket] : buckets_) {
+        if (bucket->evicting && bucket->delete_failures != 0 &&
+            ++failures >= kMaxFailedDeletions) {
+            return true;
+        }
+    }
+    return false;
+}
+
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionInternal(
     bool force_one, double low_utilization_threshold) {
@@ -1898,6 +1919,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (DeleteFailureBacklogFullLocked()) return pending;
 
         const uint64_t capacity =
             max_bucket_count_ > 0
@@ -1989,13 +2011,20 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
 
 tl::expected<ImmutableBucketAllocator::EvictedBucket, ErrorCode>
 ImmutableBucketAllocator::CommitEvictionLogical(PendingEviction&& pending) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     auto it = buckets_.find(pending.bucket_id_);
     if (!initialized_.load(std::memory_order_acquire) ||
         pending.owner_ != this || it == buckets_.end() ||
         it->second.get() != pending.bucket_identity_.get() ||
         !it->second->frozen || it->second->evicting ||
         it->second->pending_entries != 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Already committed buckets may still fail later; this gates new commits
+    // only.
+    if (!pending.invalidation_ && DeleteFailureBacklogFullLocked()) {
+        lock.unlock();
+        AbortEviction(std::move(pending), /*demote=*/false);
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     for (const auto& candidate : pending.candidates_) {
