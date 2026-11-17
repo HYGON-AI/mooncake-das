@@ -20,6 +20,7 @@
 #include "common/network.h"
 #include "environment_variables.h"
 #include "real_client.h"
+#include "storage/distributed/fs_adapter.h"
 #include "test_server_helpers.h"
 #include "version.h"
 
@@ -227,6 +228,145 @@ TEST_F(ClientMetricsTest, DirectStorageMetricSourceClassification) {
     EXPECT_STREQ(DirectStorageMetricSource(ReplicaType::DFS), "dfs");
     EXPECT_STREQ(DirectStorageMetricSource(ReplicaType::LOCAL_DISK),
                  "local_disk");
+}
+
+TEST_F(ClientMetricsTest, PosixIoMetricsSeparatePathAndResult) {
+    ClientMetric metrics(0);
+    auto& dfs = metrics.dfs_metric;
+
+    // One sample per adapter call, so sum/count is the per-call latency.
+    dfs.ObservePosixIo(/*write=*/false, "direct", 4u << 20, 800, true);
+    dfs.ObservePosixIo(/*write=*/false, "direct", 4u << 20, 1200, true);
+    dfs.ObservePosixIo(/*write=*/false, "staged", 4096, 50, true);
+    // A failed call still counts as an attempt but stays out of the
+    // successful-latency average.
+    dfs.ObservePosixIo(/*write=*/false, "direct", 4u << 20, 30000, false);
+
+    EXPECT_EQ(dfs.dfs_posix_read_ops.value({"direct", "success"}), 2);
+    EXPECT_EQ(dfs.dfs_posix_read_ops.value({"direct", "failure"}), 1);
+    EXPECT_EQ(dfs.dfs_posix_read_ops.value({"staged", "success"}), 1);
+    EXPECT_EQ(dfs.dfs_posix_read_bytes.value({"direct", "success"}),
+              2 * (4u << 20));
+    // Staged and direct are never mixed: the labels keep them apart.
+    EXPECT_EQ(dfs.dfs_posix_read_bytes.value({"staged", "success"}), 4096);
+
+    dfs.ObservePosixIo(/*write=*/true, "buffered", 1u << 20, 400, true);
+    EXPECT_EQ(dfs.dfs_posix_write_ops.value({"buffered", "success"}), 1);
+    EXPECT_EQ(dfs.dfs_posix_write_bytes.value({"buffered", "success"}),
+              1u << 20);
+    EXPECT_EQ(dfs.dfs_posix_read_ops.value({"buffered", "success"}), 0);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    // Assert the exported numbers, not just that the series exist: the whole
+    // point of the result dimension is that the stalled 30 ms sample stays out
+    // of the successful average.
+    const auto find_value = [&serialized](const std::string& name,
+                                          const std::string& labels) {
+        const std::string needle = name + "{" + labels + "} ";
+        const auto pos = serialized.find(needle);
+        if (pos == std::string::npos) return std::string{};
+        const auto start = pos + needle.size();
+        const auto end = serialized.find('\n', start);
+        return serialized.substr(start, end - start);
+    };
+    const std::string direct_ok = "path=\"direct\",result=\"success\"";
+    const std::string direct_fail = "path=\"direct\",result=\"failure\"";
+    EXPECT_EQ(find_value("mooncake_dfs_posix_read_latency_us_sum", direct_ok),
+              "2000");
+    EXPECT_EQ(find_value("mooncake_dfs_posix_read_latency_us_count", direct_ok),
+              "2");
+    EXPECT_EQ(
+        find_value("mooncake_dfs_posix_read_latency_us_sum", direct_fail),
+        "30000");
+    EXPECT_EQ(
+        find_value("mooncake_dfs_posix_read_latency_us_count", direct_fail),
+        "1");
+}
+
+TEST_F(ClientMetricsTest, PosixIoPathLabelsAreStable) {
+    // Scrape queries key off these spellings, so they must not drift.
+    EXPECT_STREQ(FsIoPathName(FsIoPath::kDirect), "direct");
+    EXPECT_STREQ(FsIoPathName(FsIoPath::kStaged), "staged");
+    EXPECT_STREQ(FsIoPathName(FsIoPath::kBuffered), "buffered");
+}
+
+// Regression for the teardown race: a timed-out BatchGet keeps reading on a
+// detached thread, so its IoScope can outlive whoever installed the observer.
+// The observer must therefore own the state it reports to instead of pointing
+// back at its installer, and it must survive the installer being destroyed
+// mid-I/O. Failure here is either std::bad_function_call from an emptied
+// observer (which a noexcept destructor turns into std::terminate) or a
+// use-after-free of the captured state.
+TEST_F(ClientMetricsTest, PosixIoObserverOutlivesItsInstaller) {
+    class BlockingAdapter : public FileSystemAdapter {
+       public:
+        void ReadWhileBlocked(
+            const std::shared_ptr<std::atomic<bool>>& release) {
+            iovec iov{nullptr, 4096};
+            // The scope is entered here, mirroring an adapter call that is
+            // already past IoScope construction when the owner goes away.
+            IoScope scope(this, /*write=*/false, FsIoPath::kDirect,
+                          TotalIovBytes(&iov, 1));
+            while (!release->load()) std::this_thread::yield();
+            scope.MarkSuccess(true);
+        }
+
+        tl::expected<void, ErrorCode> DeleteFile(const std::string&) override {
+            return {};
+        }
+        tl::expected<bool, ErrorCode> FileExists(const std::string&) override {
+            return true;
+        }
+        tl::expected<std::vector<std::string>, ErrorCode> ListFiles(
+            const std::string&) override {
+            return std::vector<std::string>{};
+        }
+        tl::expected<size_t, ErrorCode> GetFileSize(
+            const std::string&) override {
+            return size_t{0};
+        }
+        tl::expected<void, ErrorCode> Init(const std::string&) override {
+            return {};
+        }
+        tl::expected<void, ErrorCode> Shutdown() override { return {}; }
+        const char* GetName() const override { return "blocking-fake"; }
+    };
+
+    BlockingAdapter adapter;
+    auto release = std::make_shared<std::atomic<bool>>(false);
+
+    // Stand-in for Client::metrics_: the owner scope below drops its reference
+    // while the read is still blocked, exactly like ~Client during teardown.
+    auto metric = std::make_shared<ClientMetric>(0);
+    adapter.SetIoObserver([metric](const FsIoObservation& observation) {
+        metric->dfs_metric.ObservePosixIo(
+            observation.write, FsIoPathName(observation.path),
+            observation.bytes, observation.latency_us, observation.success);
+    });
+
+    std::thread reader(
+        [&adapter, release] { adapter.ReadWhileBlocked(release); });
+
+    // Give the reader time to enter IoScope, then drop the owner's reference.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::weak_ptr<ClientMetric> probe = metric;
+    metric.reset();
+
+    // The observer's copy must be what keeps the metric alive now. This is the
+    // property the fix buys: the reporting target outlives its installer.
+    EXPECT_FALSE(probe.expired());
+
+    release->store(true);
+    reader.join();
+
+    // The late observation ran against the captured metric without touching
+    // the destroyed owner. The adapter still holds the observer, so the metric
+    // stays alive until the adapter goes away -- that is expected, and the
+    // point is that nothing here crashed or observed a dangling owner.
+    EXPECT_FALSE(probe.expired());
+    adapter.SetIoObserver(nullptr);
+    EXPECT_TRUE(probe.expired());
 }
 
 TEST_F(ClientMetricsTest, WaitingQueueL4MetricsSeparateReadsFromConsumption) {

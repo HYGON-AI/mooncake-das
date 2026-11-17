@@ -553,6 +553,8 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(int fd, const iovec* iov,
     for (int i = 0; i < iovcnt; ++i) total_length += iov[i].iov_len;
     if (total_length == 0) return size_t{0};
 
+    IoScope scope(this, /*write=*/true, FsIoPath::kStaged, total_length);
+
     auto& threefs_iov = resource->iov_;
     auto& ior_write = resource->ior_write_;
     size_t total_written = 0;
@@ -598,8 +600,10 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::WriteAt(int fd, const iovec* iov,
     }
 
     if (total_written != total_length) {
+        scope.MarkSuccess(false);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+    scope.MarkSuccess(true);
     return total_written;
 }
 
@@ -623,6 +627,8 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadAt(int fd, iovec* iov,
     size_t total_length = 0;
     for (int i = 0; i < iovcnt; ++i) total_length += iov[i].iov_len;
     if (total_length == 0) return size_t{0};
+
+    IoScope scope(this, /*write=*/false, FsIoPath::kStaged, total_length);
 
     auto& threefs_iov = resource->iov_;
     auto& ior_read = resource->ior_read_;
@@ -667,8 +673,10 @@ tl::expected<size_t, ErrorCode> Hf3fsAdapter::ReadAt(int fd, iovec* iov,
     }
 
     if (total_read != total_length) {
+        scope.MarkSuccess(false);
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
+    scope.MarkSuccess(true);
     return total_read;
 }
 

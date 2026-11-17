@@ -113,6 +113,13 @@ class DistributedStorageBackend
         root_identity_provider_ = std::move(provider);
     }
 
+    // Forward per-call positional I/O observations to the adapter. Installed
+    // before I/O starts; without an observer the adapter pays only a null
+    // check per call.
+    void SetIoObserver(FsIoObserver observer) {
+        if (fs_adapter_) fs_adapter_->SetIoObserver(std::move(observer));
+    }
+
     // Minimal adapter-level probes used by SGLang's health state machine.
     // These methods never touch business keys.
     tl::expected<void, ErrorCode> ProbeRead();
