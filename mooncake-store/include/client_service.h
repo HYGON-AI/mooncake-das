@@ -1387,8 +1387,13 @@ class Client {
     const UUID client_id_;
     std::string dfs_root_identity_;
 
-    // Client-side metrics
-    std::unique_ptr<ClientMetric> metrics_;
+    // Client-side metrics. Shared rather than unique because the DFS I/O
+    // observer captures a reference to it: a timed-out BatchGet keeps running
+    // on a detached thread after the foreground call returns, so a late
+    // observation can arrive after ~Client has run. Holding the metric by
+    // value there keeps the object alive until that last I/O finishes and
+    // avoids the callback ever touching this Client.
+    std::shared_ptr<ClientMetric> metrics_;
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;

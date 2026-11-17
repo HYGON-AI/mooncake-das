@@ -205,7 +205,7 @@ build_variant() {
             ;;
     esac
     cmake_args+=(-DUSE_SHCA="${use_shca}" -DUSE_HYLINK="${USE_HYLINK}"
-                 -DUSE_HIP="${USE_HIP}" -DUSE_HYGON="${USE_HIP}" -DUSE_CUDA=OFF)
+                 -DUSE_HIP="${USE_HIP}" -DUSE_HYGON="${USE_HIP}" -DUSE_FAKE_HIP_RPC="${USE_HIP}" -DUSE_CUDA=OFF)
 
     if [ "${DRY_RUN}" -eq 0 ] && \
         { [ "${nic_type}" != standard ] || [ "${GPU_BACKEND}" != hylink ]; }; then

@@ -858,6 +858,14 @@ struct DfsMetric {
     // Failures are dimensioned by ErrorCode name so a scrape can tell
     // DFS_SERVICE_UNAVAILABLE apart from FILE_WRITE_FAIL without log digging.
     std::array<std::string, 1> error_label_names = {"error"};
+    // Positional I/O is dimensioned by adapter path: direct (aligned scatter
+    // into the caller's buffers; usually O_DIRECT but it falls back to a plain
+    // fd when the filesystem refuses it), staged (bounce buffer + copy) and
+    // buffered (page cache). Their latency profiles differ by an order of
+    // magnitude, so they must never be averaged together. The result dimension
+    // separates the adapter's own return status; see ObservePosixIo for why it
+    // does not track BatchGet timeouts.
+    std::array<std::string, 2> io_path_label_names = {"path", "result"};
 
     explicit DfsMetric(std::map<std::string, std::string> labels = {})
         : dfs_read_bytes("mooncake_dfs_read_bytes_total",
@@ -898,6 +906,30 @@ struct DfsMetric {
               "DFS writes skipped without being attempted because a non-DFS "
               "replica transfer failed first (key count)",
               labels),
+          dfs_posix_read_latency_us(
+              "mooncake_dfs_posix_read_latency_us",
+              "Per-call DFS positional read latency (us), one sample per "
+              "adapter call",
+              kSsdLatencyBucket, labels, io_path_label_names),
+          dfs_posix_write_latency_us(
+              "mooncake_dfs_posix_write_latency_us",
+              "Per-call DFS positional write latency (us), one sample per "
+              "adapter call",
+              kSsdLatencyBucket, labels, io_path_label_names),
+          dfs_posix_read_ops("mooncake_dfs_posix_read_ops_total",
+                             "DFS positional read calls by adapter path",
+                             labels, io_path_label_names),
+          dfs_posix_read_bytes(
+              "mooncake_dfs_posix_read_bytes_total",
+              "Bytes requested by DFS positional read calls by adapter path",
+              labels, io_path_label_names),
+          dfs_posix_write_ops("mooncake_dfs_posix_write_ops_total",
+                              "DFS positional write calls by adapter path",
+                              labels, io_path_label_names),
+          dfs_posix_write_bytes(
+              "mooncake_dfs_posix_write_bytes_total",
+              "Bytes requested by DFS positional write calls by adapter path",
+              labels, io_path_label_names),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t dfs_read_bytes;
@@ -912,6 +944,12 @@ struct DfsMetric {
     ylt::metric::hybrid_counter_1t dfs_read_errors;
     ylt::metric::hybrid_counter_1t dfs_write_errors;
     ylt::metric::counter_t dfs_writes_skipped;
+    ylt::metric::hybrid_histogram_2t dfs_posix_read_latency_us;
+    ylt::metric::hybrid_histogram_2t dfs_posix_write_latency_us;
+    ylt::metric::hybrid_counter_2t dfs_posix_read_ops;
+    ylt::metric::hybrid_counter_2t dfs_posix_read_bytes;
+    ylt::metric::hybrid_counter_2t dfs_posix_write_ops;
+    ylt::metric::hybrid_counter_2t dfs_posix_write_bytes;
     std::chrono::steady_clock::time_point start_time_;
 
     // One op is one key, matching the SsdMetric convention. Only successful
@@ -960,6 +998,44 @@ struct DfsMetric {
 
     void RecordSkippedWrites(int64_t count) { dfs_writes_skipped.inc(count); }
 
+    // One observation per adapter-level positional I/O call. `path` keeps the
+    // three adapter paths apart: averaging across them mixes different copy
+    // strategies and cache behaviour, which differ by an order of magnitude.
+    //
+    // `success` is this call's own return status, not the outcome of the
+    // enclosing logical read:
+    //  - short transfers are reported per branch, because the adapters judge
+    //    them differently: posix ReadAt and aligned DirectReadAt count a short
+    //    return as success, while the staged branch and 3FS turn it into
+    //    FILE_READ_FAIL/FILE_WRITE_FAIL.
+    //  - a BatchGet that times out is not reflected here at all. The timeout
+    //    is enforced above the adapter and the read keeps running; if it later
+    //    succeeds it lands in the success tail with the full stall time, and
+    //    if it never returns it produces no sample. So this label cannot be
+    //    used to exclude stalled I/O from the success average.
+    //
+    // Ops/bytes count attempts, including ones that failed: bytes is the
+    // requested length, and a retry after a short transfer counts that
+    // remainder again. Real ErrorCode failures are already reported by the
+    // backend through RecordReadErrors/RecordWriteErrors, so nothing is
+    // recorded there to avoid inventing an error name for that dimension.
+    void ObservePosixIo(bool write, const char* path, uint64_t bytes,
+                        uint64_t latency_us, bool success) {
+        const std::array<std::string, 2> label = {
+            path, success ? "success" : "failure"};
+        if (write) {
+            dfs_posix_write_ops.inc(label);
+            dfs_posix_write_bytes.inc(label, static_cast<int64_t>(bytes));
+            dfs_posix_write_latency_us.observe(
+                label, static_cast<int64_t>(latency_us));
+        } else {
+            dfs_posix_read_ops.inc(label);
+            dfs_posix_read_bytes.inc(label, static_cast<int64_t>(bytes));
+            dfs_posix_read_latency_us.observe(
+                label, static_cast<int64_t>(latency_us));
+        }
+    }
+
     void serialize(std::string& str) {
         dfs_read_bytes.serialize(str);
         dfs_write_bytes.serialize(str);
@@ -973,6 +1049,12 @@ struct DfsMetric {
         dfs_read_errors.serialize(str);
         dfs_write_errors.serialize(str);
         dfs_writes_skipped.serialize(str);
+        dfs_posix_read_latency_us.serialize(str);
+        dfs_posix_write_latency_us.serialize(str);
+        dfs_posix_read_ops.serialize(str);
+        dfs_posix_read_bytes.serialize(str);
+        dfs_posix_write_ops.serialize(str);
+        dfs_posix_write_bytes.serialize(str);
     }
 
     std::string summary_metrics() {

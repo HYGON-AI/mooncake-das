@@ -43,6 +43,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     eviction/evictor.cpp
     eviction/offloading_reclaimer.cpp
     eviction/report_observers.cpp
+    metadata/lease_eviction_index.cpp
     master_service.cpp
     l4/master_service_l4.cpp
     promotion_candidate_tracker.cpp

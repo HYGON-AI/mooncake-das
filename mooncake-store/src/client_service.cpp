@@ -686,6 +686,10 @@ Client::Client(const std::string& local_hostname,
 Client::~Client() {
     StopDfsWritesAndBufferLogging();
 
+    // The I/O observer holds the metric by value, not `this`, so a late
+    // observation from a detached timed-out read is safe after this point and
+    // needs no detach here. Clearing it would instead race with those reads.
+
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -5563,6 +5567,22 @@ void Client::SetDfsStorageBackend(
         backend->SetBatchTimeoutFixedMs(GetDfsBatchTimeoutFixedMs());
         backend->SetMasterEpochProvider(
             master_client_.MakeDfsMasterEpochProvider());
+        // Report per-call positional I/O so a scrape can derive the adapter
+        // level average latency and IO size. The callback captures the metric
+        // by value, never `this`: a timed-out BatchGet keeps reading on a
+        // detached thread after the foreground call returns, so an observation
+        // can outlive this Client. The shared_ptr keeps the metric alive until
+        // that last I/O finishes. It only touches DfsMetric's atomics and must
+        // never take service_metrics_mutex_, which is on the reporting path.
+        if (metrics_) {
+            std::shared_ptr<ClientMetric> metric = metrics_;
+            backend->SetIoObserver(
+                [metric = std::move(metric)](const FsIoObservation& o) {
+                    metric->dfs_metric.ObservePosixIo(
+                        o.write, FsIoPathName(o.path), o.bytes, o.latency_us,
+                        o.success);
+                });
+        }
     }
     dfs_storage_backend_ = std::move(backend);
     EnsureStorageControlPlaneStarted();
