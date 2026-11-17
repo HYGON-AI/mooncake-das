@@ -6,7 +6,10 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -20,6 +23,53 @@ struct FileInfo {
     std::string name;
     size_t size;
 };
+
+/**
+ * @brief Which adapter code path served one positional I/O call.
+ *
+ * The three paths have very different latency profiles, so callers that
+ * aggregate them must keep them apart rather than averaging:
+ *  - kDirect: zero-copy scatter straight into the caller's buffers
+ *    (page-cache bypassing where the adapter supports it).
+ *  - kStaged: an aligned bounce window plus a copy out of it, because the
+ *    request could not satisfy direct-I/O alignment rules. Also covers
+ *    adapters that must stage through their own registered buffer (3FS
+ *    USRBIO).
+ *  - kBuffered: ordinary page-cache-backed read/write.
+ */
+enum class FsIoPath { kDirect, kStaged, kBuffered };
+
+// Stable label spelling for FsIoPath so scrapes are not tied to enum order.
+inline const char* FsIoPathName(FsIoPath path) noexcept {
+    switch (path) {
+        case FsIoPath::kDirect:
+            return "direct";
+        case FsIoPath::kStaged:
+            return "staged";
+        case FsIoPath::kBuffered:
+            return "buffered";
+    }
+    return "unknown";
+}
+
+/**
+ * @brief One observed positional I/O call, reported after it returns.
+ *
+ * `bytes` is the requested length, not the number of bytes the call actually
+ * transferred, so that a short transfer cannot be mistaken for a small read.
+ * `success` is false when the adapter returned an error.
+ */
+struct FsIoObservation {
+    bool write;
+    FsIoPath path;
+    uint64_t bytes;
+    uint64_t latency_us;
+    bool success;
+};
+
+// Opaque sink for FsIoObservation. Storage-layer code only forwards to it, so
+// no metric header has to be dragged into the adapter or backend.
+using FsIoObserver = std::function<void(const FsIoObservation&)>;
 
 // One positional I/O for FileSystemAdapter::BatchWriteAt/BatchReadAt.
 struct FdIoRequest {
@@ -39,6 +89,18 @@ struct FdIoRequest {
 class FileSystemAdapter {
    public:
     virtual ~FileSystemAdapter() = default;
+
+    /**
+     * @brief Install the sink for per-call positional I/O observations.
+     *
+     * Optional and off by default: with no observer installed the hot path
+     * only pays for a null check. Install or clear it only while no I/O is in
+     * flight, which is what Client's teardown drain already guarantees; the
+     * hot path copies the observer into each IoScope rather than locking.
+     */
+    void SetIoObserver(FsIoObserver observer) {
+        io_observer_ = std::move(observer);
+    }
 
     // === File I/O ===
     // Optional path-based I/O for root markers, probes and metadata sidecars.
@@ -315,7 +377,77 @@ class FileSystemAdapter {
     // === Identity ===
 
     virtual const char* GetName() const = 0;
+
+   protected:
+    // Scoped timer for one positional I/O. Reports on scope exit so a normal
+    // or failed syscall return is covered without repeating the bookkeeping at
+    // every return site. Calls rejected before the scope is constructed (bad
+    // arguments, adapter not ready) produce no observation at all.
+    //
+    // The observer is copied at construction rather than re-read at
+    // destruction, so a report never depends on adapter state at completion
+    // time. Install or clear the observer only while no I/O is in flight:
+    // the copy protects this report from a later change, but a copy racing an
+    // assignment to the same std::function is still a data race.
+    class IoScope {
+       public:
+        IoScope(const FileSystemAdapter* adapter, bool write, FsIoPath path,
+                uint64_t bytes)
+            : observer_(adapter->io_observer_),
+              write_(write),
+              path_(path),
+              bytes_(bytes),
+              start_(std::chrono::steady_clock::now()) {}
+
+        ~IoScope() {
+            if (!observer_) return;
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start_)
+                    .count();
+            // Destructors are implicitly noexcept: an exception escaping here
+            // would call std::terminate and take the whole process down for a
+            // metric update. Observation is best-effort by definition.
+            try {
+                observer_(FsIoObservation{
+                    write_, path_, bytes_,
+                    elapsed > 0 ? static_cast<uint64_t>(elapsed) : 0,
+                    success_});
+            } catch (...) {
+            }
+        }
+
+        IoScope(const IoScope&) = delete;
+        IoScope& operator=(const IoScope&) = delete;
+
+        // Defaults to failure so an exception thrown inside the scope (for
+        // example a bad_alloc while staging) is not reported as a success.
+        // Every normal return path sets this explicitly.
+        void MarkSuccess(bool success) { success_ = success; }
+
+       private:
+        FsIoObserver observer_;
+        bool write_;
+        FsIoPath path_;
+        uint64_t bytes_;
+        std::chrono::steady_clock::time_point start_;
+        bool success_ = false;
+    };
+
+    FsIoObserver io_observer_;
 };
+
+// Sum of iovec lengths, saturating instead of overflowing on hostile input.
+inline uint64_t TotalIovBytes(const iovec* iov, int iovcnt) {
+    uint64_t total = 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].iov_len > std::numeric_limits<uint64_t>::max() - total) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        total += iov[i].iov_len;
+    }
+    return total;
+}
 
 // Created when the DFS allocator initializes and maintained by the master as a
 // stable format/version marker. Read health checks use the two dedicated

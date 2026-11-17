@@ -287,11 +287,19 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::WriteAt(int fd,
     if (!valid) return tl::make_unexpected(valid.error());
     if (iovcnt == 0) return size_t{0};
 
+    // pwritev on a cached fd goes to the page cache, so this is the buffered
+    // path. Shard writes always land here; bucket writes use the same call.
+    IoScope scope(this, /*write=*/true, FsIoPath::kBuffered,
+                  TotalIovBytes(iov, iovcnt));
     ssize_t ret;
     do {
         ret = ::pwritev(fd, iov, iovcnt, static_cast<off_t>(offset));
     } while (ret < 0 && errno == EINTR);
-    if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (ret < 0) {
+        scope.MarkSuccess(false);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    scope.MarkSuccess(true);
     return static_cast<size_t>(ret);
 }
 
@@ -305,11 +313,17 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::ReadAt(int fd, iovec* iov,
     if (!valid) return tl::make_unexpected(valid.error());
     if (iovcnt == 0) return size_t{0};
 
+    IoScope scope(this, /*write=*/false, FsIoPath::kBuffered,
+                  TotalIovBytes(iov, iovcnt));
     ssize_t ret;
     do {
         ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
     } while (ret < 0 && errno == EINTR);
-    if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    if (ret < 0) {
+        scope.MarkSuccess(false);
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    scope.MarkSuccess(true);
     return static_cast<size_t>(ret);
 }
 
@@ -433,16 +447,25 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(int fd, iovec* iov,
     }
     if (total_length == 0) return size_t{0};
 
-    if (aligned) {
-        return DirectReadAtAligned(fd, iov, iovcnt, offset);
+    if (!aligned) {
+        static std::once_flag once;
+        std::call_once(once, [] {
+            LOG(WARNING) << "DFS direct read falling back to staged bounce "
+                            "path; buffer address or length is not aligned to "
+                         << kDirectIoAlignment << " bytes";
+        });
     }
-    static std::once_flag once;
-    std::call_once(once, [] {
-        LOG(WARNING) << "DFS direct read falling back to staged bounce path; "
-                      << "buffer address or length is not aligned to "
-                      << kDirectIoAlignment << " bytes";
-    });
-    return DirectReadAtStaged(fd, iov, iovcnt, offset);
+
+    // One observation per DirectReadAt call, not per internal pread: the
+    // staged branch may issue several preads to cover the window, and only
+    // the caller-visible call is what the caller measures.
+    IoScope scope(this, /*write=*/false,
+                  aligned ? FsIoPath::kDirect : FsIoPath::kStaged,
+                  total_length);
+    auto result = aligned ? DirectReadAtAligned(fd, iov, iovcnt, offset)
+                          : DirectReadAtStaged(fd, iov, iovcnt, offset);
+    scope.MarkSuccess(result.has_value());
+    return result;
 }
 
 tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtAligned(
