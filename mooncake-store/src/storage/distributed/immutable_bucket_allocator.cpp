@@ -2111,6 +2111,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
     }
     bucket.identity_.reset();
     bucket_pool_cv_.notify_all();
+    LOG(INFO) << "Evicted DFS bucket " << bucket.bucket_id_;
     return {};
 }
 

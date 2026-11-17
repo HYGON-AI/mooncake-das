@@ -8106,6 +8106,7 @@ bool MasterService::RunBucketDfsEvictionInternal(
         ImmutableBucketAllocator::EvictedBucket evicted_bucket;
         std::chrono::system_clock::time_point keep_until{};
         std::vector<std::shared_ptr<Lease>> validated_leases;
+        size_t lease_waiting_keys = 0;
         {
             // Coordinate allocator replacement without blocking unrelated keys.
             std::shared_lock<std::shared_mutex> state_lock(master_state_mutex_);
@@ -8159,8 +8160,14 @@ bool MasterService::RunBucketDfsEvictionInternal(
                     PublishKvRemovedAfterEvict(candidate.key, erased, "disk", metadata, tenant_id);
                     if (!metadata.IsValid()) accessor.Erase();
                 }
+                const auto lease_check_time = std::chrono::system_clock::now();
                 for (const auto& lease : validated_leases) {
-                    keep_until = std::max(keep_until, lease->ExpiresAt());
+                    const auto deadline = lease->ExpiresAt();
+                    keep_until = std::max(keep_until, deadline);
+                    if (!invalidating_missing_bucket &&
+                        deadline > lease_check_time) {
+                        ++lease_waiting_keys;
+                    }
                 }
             }
         }
@@ -8171,6 +8178,8 @@ bool MasterService::RunBucketDfsEvictionInternal(
             continue;
         }
 
+        LOG(INFO) << "Logically evicted DFS bucket " << evicted_bucket_id
+                  << ", lease_waiting_keys=" << lease_waiting_keys;
         if (committed && !invalidating_missing_bucket) {
             MasterMetricManager::instance().inc_dfs_bucket_evictions();
         }
