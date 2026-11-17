@@ -584,7 +584,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
             Environ::ReadOr(
                 FileStorageEnvironmentVariables::
                     MOONCAKE_OFFLOAD_DFS_HEARTBEAT_INTERVAL_SECONDS,
-                uint32_t{300}),
+                uint32_t{30}),
             1),
         std::memory_order_release);
     dfs_batch_timeout_fixed_ms_.store(
