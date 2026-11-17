@@ -457,7 +457,7 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::atomic<bool> dfs_heartbeat_running_{false};
     std::thread dfs_heartbeat_thread_;
-    std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{300};
+    std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{30};
     uint64_t dfs_snapshot_version_ = 0;
     UUID dfs_snapshot_epoch_{};
     std::future<void> rescan_future_;

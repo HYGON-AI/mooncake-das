@@ -398,7 +398,7 @@ std::string FileStorage::UnifiedBufferDiagnostics() const {
 }
 
 tl::expected<void, ErrorCode> FileStorage::InitDfs() {
-    dfs_heartbeat_interval_seconds_.store(300, std::memory_order_release);
+    dfs_heartbeat_interval_seconds_.store(30, std::memory_order_release);
     LOG(INFO) << "DFS storage mode enabled; starting DFS heartbeat thread";
     dfs_heartbeat_running_.store(true);
     dfs_heartbeat_thread_ =
