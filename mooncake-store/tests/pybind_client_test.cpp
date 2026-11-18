@@ -1296,8 +1296,9 @@ TEST_F(RealClientDfsPrefetchTest, UsesDedicatedArenaAndFailsPerKeyWhenFull) {
 TEST_F(RealClientDfsPrefetchTest, SharedRootRegionIsReleasedAfterLastKey) {
     DfsPrefetchTestEnv dfs_env;
     // Room for exactly the two objects read by one prefetch call. The budget
-    // is what is left after four read chunks and one write chunk of
-    // protection, so the buffer has to be 48 KiB to leave 16 KiB of prefetch.
+    // is what is left after the read and write protections (four read chunks
+    // and one write chunk by default), so the buffer has to be 48 KiB to leave
+    // 16 KiB of prefetch.
     ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
                                 "49152");
     const std::vector<std::string> keys = {
