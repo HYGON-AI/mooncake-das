@@ -102,10 +102,20 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Variables::MC_STORE_DFS_READ_CHUNK_SIZE_BYTES, config.read_chunk_size);
     config.write_chunk_size = Environ::ReadOr(
         Variables::MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES, config.write_chunk_size);
+    config.read_protection_chunks = Environ::ReadOr(
+        Variables::MC_STORE_DFS_READ_PROTECTION_CHUNKS,
+        config.read_protection_chunks);
+    config.write_protection_chunks = Environ::ReadOr(
+        Variables::MC_STORE_DFS_WRITE_PROTECTION_CHUNKS,
+        config.write_protection_chunks);
     constexpr int64_t kDefaultDfsChunkSize = 1LL * 1024 * 1024 * 1024;
     if (config.read_chunk_size <= 0) config.read_chunk_size = kDefaultDfsChunkSize;
     if (config.write_chunk_size <= 0) {
         config.write_chunk_size = kDefaultDfsChunkSize;
+    }
+    if (config.read_protection_chunks <= 0) config.read_protection_chunks = 4;
+    if (config.write_protection_chunks <= 0) {
+        config.write_protection_chunks = 1;
     }
     const auto prefetch_ratio = Environ::ReadOr(
         Variables::MC_STORE_DFS_PREFETCH_CAPACITY_RATIO,
