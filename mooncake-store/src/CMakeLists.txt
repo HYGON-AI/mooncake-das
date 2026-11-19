@@ -776,7 +776,7 @@ endif()
 if(USE_CUDA)
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
 elseif(USE_HIP)
-  target_link_libraries(mooncake_store PRIVATE hip::host)
+  target_link_libraries(mooncake_store PRIVATE hip::host ${CMAKE_DL_LIBS})
 endif()
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT

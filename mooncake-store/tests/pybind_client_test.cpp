@@ -519,11 +519,11 @@ std::string DfsPrefetchSource(size_t seed) {
     return source;
 }
 
-// Whether this machine can provide the pinned (and, on HYGON, mapped) host
+// Whether this machine can provide the pinned (and, on HIP, mapped) host
 // memory the prefetch arena needs. Only this hardware capability may skip
 // the arena success tests; an unavailable arena is otherwise a failure.
 bool PinnedPrefetchMemorySupported(size_t required_bytes) {
-#if defined(USE_HYGON)
+#if defined(USE_HIP)
     constexpr bool kMappedRequired = true;
 #else
     constexpr bool kMappedRequired = false;

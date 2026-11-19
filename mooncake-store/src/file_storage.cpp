@@ -25,7 +25,7 @@ namespace mooncake {
 namespace {
 
 bool UseMappedPinnedRestoreArena() {
-#if defined(USE_HYGON)
+#if defined(USE_HIP)
     return true;
 #else
     return false;
