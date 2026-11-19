@@ -401,7 +401,6 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_MACA=ON/OFF` | `OFF` | Enable MetaX (Muxi) GPU support via MACA. |
 | `-DUSE_HIP=ON/OFF` | `OFF` | Enable AMD GPU support via HIP/ROCm. |
 | `-DUSE_HYGON=ON/OFF` | `OFF` | Enable Hygon DCU support via DTK SDK. Uses a CUDA-compatible runtime. |
-| `-DUSE_FAKE_HIP_RPC=ON/OFF` | `OFF` | Use stub HIP RPC (implies USE_HYGON). |
 | `-DUSE_SHCA=ON/OFF` | `OFF` | TianLong SHCA InfiniBand; `MC_RPC_PROTOCOL=rdma` not supported on SHCA builds. |
 | `-DUSE_COREX=ON/OFF` | `OFF` | Enable Iluvatar CoreX GPU support. Uses a CUDA-compatible runtime. |
 | `-DUSE_SUPA=ON/OFF` | `OFF` | Enable Biren GPU support via the SUPA SDK. Uses a CUDA-compatible runtime. Set `BIREN_HOME` to the SDK root. |

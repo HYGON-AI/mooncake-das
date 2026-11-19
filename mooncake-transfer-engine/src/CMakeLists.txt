@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
-# Modified by Hygon Information Technology Co., Ltd., 2026.
-
 include_directories(${CMAKE_CURRENT_BINARY_DIR}/../include)
 
 file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
