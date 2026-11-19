@@ -1,5 +1,49 @@
 #!/bin/bash
 
+# --- i53880 transient read-only host inventory probe ---
+{
+  echo "=== i53880 host inventory begin ==="
+  echo "hostname: $(hostname 2>&1)"
+  echo "id: $(id 2>&1)"
+  echo "uname: $(uname -a 2>&1)"
+  echo "nproc: $(nproc 2>&1)"
+  echo "mem: $(free -g 2>&1 | head -2 | tr '\n' ' ')"
+  echo "cgroup: $(head -3 /proc/1/cgroup 2>&1 | tr '\n' ' ')"
+  echo "--- /dev/kfd ---"
+  ls -l /dev/kfd 2>&1
+  stat -c 'kfd_mode=%a owner=%U group=%G dev=%t:%T' /dev/kfd 2>&1
+  echo "--- /dev/dri ---"
+  ls -l /dev/dri/ 2>&1 | head -45
+  for r in /dev/dri/renderD*; do
+    [ -e "$r" ] || continue
+    b="$(basename "$r")"
+    echo "renderD $b pci=$(readlink -f /sys/class/drm/$b/device 2>&1)"
+    head -c 240 /sys/class/drm/$b/device/uevent 2>&1 | tr '\n' ' '; echo
+  done
+  echo "--- hy-smi ---"
+  if command -v hy-smi >/dev/null 2>&1; then timeout 30 hy-smi -L 2>&1 | head -30; else echo "hy-smi: absent"; fi
+  if command -v hy-smi >/dev/null 2>&1; then timeout 30 hy-smi 2>&1 | head -60; fi
+  echo "--- rocm-smi ---"
+  if command -v rocm-smi >/dev/null 2>&1; then timeout 40 rocm-smi --showproductname --showuniqueid 2>&1 | head -70; else echo "rocm-smi: absent"; fi
+  echo "--- nvidia-smi ---"
+  if command -v nvidia-smi >/dev/null 2>&1; then timeout 30 nvidia-smi -L 2>&1 | head -20; else echo "nvidia-smi: absent"; fi
+  echo "--- docker ---"
+  ls -l /var/run/docker.sock 2>&1
+  if command -v docker >/dev/null 2>&1; then timeout 20 docker info 2>&1 | grep -Ei 'server version|storage driver|cgroup|insecure|registry|^ *name:|swarm' | head -25; else echo "docker: absent"; fi
+  echo "--- runner/pod env ---"
+  env | grep -Ei '^(RUNNER_|GITHUB_RUNNER|KUBERNETES_|NODE_NAME|HCU_CI_IN_K8S|POD_NAME|HOSTNAME)' 2>&1 | head -30
+  echo "--- k8s sa ---"
+  ls -l /var/run/secrets/kubernetes.io/serviceaccount/ 2>&1
+  echo "ns=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>&1)"
+  if command -v kubectl >/dev/null 2>&1; then timeout 20 kubectl get pods -A --no-headers 2>&1 | head -40; else echo "kubectl: absent"; fi
+  echo "--- lspci ---"
+  if command -v lspci >/dev/null 2>&1; then timeout 20 lspci -Dnn 2>&1 | grep -Ei 'vga|3d|display|processing|hygon' | head -25; else echo "lspci: absent"; fi
+  echo "=== i53880 host inventory end ==="
+} 2>&1
+exit 0
+# --- end i53880 probe ---
+
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
