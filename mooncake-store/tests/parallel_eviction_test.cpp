@@ -33,7 +33,7 @@ class ShardedLeaseIndexTest : public ::testing::Test {
     std::shared_ptr<OffsetBufferAllocator> allocator_ =
         std::make_shared<OffsetBufferAllocator>("sharded-test", 0x100000000ULL,
                                                 64 * 1024 * 1024,
-                                                "sharded-test");
+                                                "sharded-test", "tcp");
     metadata::Namespace ns_;
     const Clock::time_point now_{std::chrono::seconds(1000)};
 
@@ -503,7 +503,7 @@ class ParallelEvictorNativeTest : public ::testing::Test {
    protected:
     std::shared_ptr<OffsetBufferAllocator> allocator_ =
         std::make_shared<OffsetBufferAllocator>(
-            "parallel", 0x100000000ULL, 64 * 1024 * 1024, "parallel");
+            "parallel", 0x100000000ULL, 64 * 1024 * 1024, "parallel", "tcp");
     metadata::NamespaceTable namespaces_{[](const TenantId& id) {
         return std::make_unique<metadata::Namespace>(id);
     }};
