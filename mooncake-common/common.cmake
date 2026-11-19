@@ -93,7 +93,6 @@ option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
 option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
-option(USE_FAKE_HIP_RPC "option for using fake HIP RPC implementation" OFF)
 option(USE_RISCV "Enable RISC-V build compatibility settings" OFF)
 if(USE_RISCV)
   if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
@@ -142,13 +141,6 @@ option(USE_FABRIC
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 option(USE_MEMFABRIC "option for using memfabric transport" OFF)
-
-if(USE_FAKE_HIP_RPC)
-  # Fake HIP RPC stubs live under USE_HYGON paths in hip_transport.
-  set(USE_HYGON ON)
-  add_compile_definitions(USE_FAKE_HIP_RPC)
-  message(STATUS "Using fake HIP RPC implementation")
-endif()
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -510,8 +502,7 @@ if(USE_MUSA)
 endif()
 
 if(USE_HYGON)
-  # Enable shared HIP IPC/stream paths,
-  # Hygon fabric/RPC remains gated by USE_HYGON in hip_transport.
+  # Use the shared HIP transport and enable the Store H2D scatter kernel.
   set(USE_HIP ON)
 
   if(NOT DEFINED DTK_ROOT OR DTK_ROOT STREQUAL "")
