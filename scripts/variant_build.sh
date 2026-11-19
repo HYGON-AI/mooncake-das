@@ -219,9 +219,7 @@ build_variant() {
     echo "==> Wheel output: ${FINAL_DIST_DIR}"
     run_cmd mkdir -p "${REPO_ROOT}/${BUILD_DIR}" "${FINAL_DIST_DIR}"
     unset VERBOSE || true
-    # Clear legacy backend flags when reusing an older build directory.
     run_cmd cmake -S "${REPO_ROOT}" -B "${REPO_ROOT}/${BUILD_DIR}" "${cmake_args[@]}" \
-        -UUSE_HYGON -UUSE_FAKE_HIP_RPC \
         -DSTORE_USE_JEMALLOC=ON \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_SHARED_LIBS=ON \
         -DCMAKE_VERBOSE_MAKEFILE=OFF -DCMAKE_CXX_FLAGS="" \
