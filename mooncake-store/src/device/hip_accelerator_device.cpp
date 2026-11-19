@@ -15,6 +15,9 @@
 
 #if defined(USE_HIP)
 
+#include <dlfcn.h>
+#include <filesystem>
+
 namespace mooncake {
 namespace device {
 namespace {
@@ -104,7 +107,6 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
                               static_cast<hipStream_t>(stream)) == hipSuccess;
     }
 
-#if defined(USE_HYGON)
     bool CopyFromHostBatchAsync(std::span<const HostCopyRange> ranges,
                                 void* stream,
                                 bool* used_batch_kernel = nullptr) const
@@ -188,7 +190,6 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         if (used_batch_kernel) *used_batch_kernel = true;
         return true;
     }
-#endif
 
     bool CreateStream(void** stream) const override {
         hipStream_t hip_stream = nullptr;
@@ -207,7 +208,6 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
             std::shared_lock<std::shared_mutex> lock(HipRuntimeStateMutex());
             success = hipStreamSynchronize(hip_stream) == hipSuccess;
         }
-#if defined(USE_HYGON)
         // Synchronization establishes that the kernel no longer dereferences
         // the mapped descriptor array. Free it even when the stream reports a
         // device-side error; the stream has completed in either case.
@@ -223,7 +223,6 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         for (void *descriptor : descriptors) {
             FreeHipPinnedHost(descriptor);
         }
-#endif
         return success;
     }
 
@@ -240,7 +239,6 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         return PinnedHostBuffer(addr, size, FreeHipPinnedHostBuffer);
     }
 
-#if defined(USE_HYGON)
     PinnedHostBuffer AllocateMappedPinnedHost(size_t size) const override {
         void *addr = nullptr;
         if (AllocateHipPinnedHost(&addr, size, hipHostMallocMapped) !=
@@ -258,10 +256,8 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         return PinnedHostBuffer(addr, size, FreeHipPinnedHostBuffer,
                                 device_addr);
     }
-#endif
 
     ~HipAcceleratorDevice() override {
-#if defined(USE_HYGON)
         std::vector<void *> descriptors;
         {
             std::lock_guard<std::mutex> descriptor_lock(descriptor_mutex_);
@@ -279,15 +275,27 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
         for (const auto &[_, module] : copy_modules_) {
             hipModuleUnload(module);
         }
-#endif
     }
 
    private:
-#if defined(USE_HYGON)
     static std::string CopyKernelPath() {
         const char *directory = std::getenv("MC_COPY_KERNEL_PATH");
         if (directory && directory[0] != '\0') {
             return std::string(directory) + "/mc_copy_kernel.co";
+        }
+
+        // Wheels and native installs keep the kernel beside the Store library.
+        // auditwheel may move that library into a sibling .libs directory.
+        static int library_anchor;
+        Dl_info library_info{};
+        if (dladdr(&library_anchor, &library_info) && library_info.dli_fname) {
+            const auto library_dir =
+                std::filesystem::path(library_info.dli_fname).parent_path();
+            for (const auto &path : {library_dir / "mc_copy_kernel.co",
+                                     library_dir.parent_path() / "mooncake" /
+                                         "mc_copy_kernel.co"}) {
+                if (std::ifstream(path).good()) return path.string();
+            }
         }
         return "/usr/local/lib/python3.10/dist-packages/mooncake/mc_copy_kernel.co";
     }
@@ -329,7 +337,6 @@ class HipAcceleratorDevice final : public ProbeCachedAcceleratorDevice {
     mutable std::unordered_map<int, hipFunction_t> copy_functions_;
     mutable std::unordered_map<void *, std::vector<void *>>
         pending_descriptors_;
-#endif
 };
 
 const AcceleratorDevice& HipDeviceInstance() {

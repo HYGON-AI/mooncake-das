@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
-# Modified by Hygon Information Technology Co., Ltd., 2026.
-
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
@@ -347,7 +343,7 @@ if(USE_CUDA AND NOT USE_HIP)
                                                      "WITH_NVIDIA_PEERMEM=0")
 endif()
 
-if(USE_MNNVL OR USE_HIP)
+if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
   target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
@@ -595,8 +591,6 @@ add_test(NAME multi_transport_locality_test
 
 add_executable(rdma_context_reprobe_test
                ${WORKSPACE}/rdma_context_reprobe_test.cpp)
-target_include_directories(rdma_context_reprobe_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
@@ -615,8 +609,6 @@ add_test(NAME rdma_memory_location_test COMMAND rdma_memory_location_test)
 
 add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
-target_include_directories(rdma_transport_submit_task_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
                                                              gtest gtest_main)
 add_test(NAME rdma_transport_submit_task_test

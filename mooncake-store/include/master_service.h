@@ -2255,7 +2255,7 @@ class MasterService {
     // the bucket-specific lifecycle calls (MarkCommitted, two-phase eviction,
     // recovery, deferred metadata flush) that are not part of the common
     // interface.
-    std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{300};
+    std::atomic<uint32_t> dfs_heartbeat_interval_seconds_{30};
     std::atomic<uint64_t> dfs_batch_timeout_fixed_ms_{
         kDefaultDfsBatchTimeoutFixedMs};
     mutable std::mutex dfs_epoch_mutex_;

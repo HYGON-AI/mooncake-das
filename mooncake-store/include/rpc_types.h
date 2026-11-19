@@ -33,7 +33,7 @@ struct DfsBucketSnapshotResponse {
     UUID epoch{};
     uint64_t version = 0;
     bool unchanged = false;
-    uint32_t heartbeat_interval_seconds = 300;
+    uint32_t heartbeat_interval_seconds = 30;
     uint64_t batch_timeout_fixed_ms = kDefaultDfsBatchTimeoutFixedMs;
     std::vector<int64_t> bucket_ids;
 };

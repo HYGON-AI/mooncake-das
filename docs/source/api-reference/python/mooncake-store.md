@@ -3202,11 +3202,12 @@ LOCAL_DISK, or DISK replica (for example, only NOF replicas) returns
 `INVALID_REPLICA` at session start. Put sessions reserve object space through
 Master `BatchPutStart` and finalize through `BatchPutEnd`.
 
-For `create_read_plan(..., page_wise=True)`, set
-`MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE=1` to read layer by layer when every key in
-the plan selects a memory replica. If any key selects DFS, or its source is
-unknown, the plan keeps the single page-wise range call. The setting is off by
-default and does not change plans created with `page_wise=False`. With
+For `create_read_plan(..., page_wise=True)`, the plan reads layer by layer by
+default when every key in the plan selects a memory replica. If any key selects
+DFS, or its source is
+unknown, the plan keeps the single page-wise range call. Set
+`MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE=0` to disable this behavior. The setting does
+not change plans created with `page_wise=False`. With
 `borrowed_sessions=True`, the plan inspects the caller's active sessions without
 re-querying Master or releasing prefetched DFS data.
 

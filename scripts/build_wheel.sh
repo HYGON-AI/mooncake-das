@@ -28,7 +28,7 @@ echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
-# Hygon HCU copy kernel artifact (only present when built with -DUSE_HYGON=ON)
+# Store H2D scatter kernel artifact (built with -DUSE_HIP=ON).
 rm -f mooncake-wheel/mooncake/*.co
 
 if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
@@ -62,10 +62,9 @@ fi
 # Copy the shared segment wrapper, which builds on engine.so
 cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment.py
 
-# Copy Hygon HCU mc_copy_kernel.co when present (built with USE_HYGON and
-# without USE_FAKE_HIP_RPC; standard/shca variants skip compiling it).
+# Copy the Store H2D scatter kernel when built with USE_HIP.
 if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co" ]; then
-    echo "Copying mc_copy_kernel (USE_HYGON)..."
+    echo "Copying mc_copy_kernel (USE_HIP)..."
     cp "${BUILD_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co" mooncake-wheel/mooncake/mc_copy_kernel.co
 fi
 

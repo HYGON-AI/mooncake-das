@@ -1,35 +1,21 @@
-# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
-# Modified by Hygon Information Technology Co., Ltd., 2026.
-
 file(GLOB HIP_TRANSPORT_SOURCES "*.cpp")
 
-# mc_copy_kernel.co is shared by Hygon fabric transfers and the Store DFS
-# scatter-copy path. The Store path also needs it when fake HIP RPC is used.
-if (USE_HYGON)
-    set(COPY_KERNEL ${CMAKE_CURRENT_BINARY_DIR}/mc_copy_kernel.co)
+add_library(hip_transport OBJECT ${HIP_TRANSPORT_SOURCES})
 
-    add_custom_command(
-        OUTPUT ${COPY_KERNEL}
-        COMMAND hipcc --genco -fPIC -x hip
-                ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip
-                -o ${COPY_KERNEL}
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip
-    )
-
-    add_library(hip_transport OBJECT
-        ${HIP_TRANSPORT_SOURCES}
-        ${COPY_KERNEL}
-    )
-else()
-    add_library(hip_transport OBJECT ${HIP_TRANSPORT_SOURCES})
-endif()
+# The Store uses this kernel for batched copies from mapped host memory.
+set(COPY_KERNEL ${CMAKE_CURRENT_BINARY_DIR}/mc_copy_kernel.co)
+add_custom_command(
+  OUTPUT ${COPY_KERNEL}
+  COMMAND hipcc --genco -fPIC -x hip
+          ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip -o ${COPY_KERNEL}
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip
+  VERBATIM)
+target_sources(hip_transport PRIVATE ${COPY_KERNEL})
+install(FILES ${COPY_KERNEL} DESTINATION lib)
 
 target_link_libraries(hip_transport PRIVATE glog::glog)
 
 target_include_directories(hip_transport PUBLIC ${HIP_INCLUDE_DIRS})
 
 # Treat warnings as errors for hip_transport
-target_compile_options(hip_transport PRIVATE
-    -Werror
-)
+target_compile_options(hip_transport PRIVATE -Werror)

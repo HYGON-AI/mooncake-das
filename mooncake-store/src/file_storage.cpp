@@ -25,7 +25,7 @@ namespace mooncake {
 namespace {
 
 bool UseMappedPinnedRestoreArena() {
-#if defined(USE_HYGON)
+#if defined(USE_HIP)
     return true;
 #else
     return false;
@@ -136,17 +136,19 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                     static_cast<size_t>(std::max<int64_t>(
                         config_.write_chunk_size, 0)),
                     dfs_alignment);
-            // Reserve room for four concurrent reads. A single chunk only
-            // protects one read; further concurrent reads then compete with
-            // prefetch and write staging for the shared headroom and fail
-            // whenever that headroom is fragmented or already taken.
-            constexpr size_t kReadProtectionChunks = 4;
+            // Reserve room for several concurrent reads
+            // (MC_STORE_DFS_READ_PROTECTION_CHUNKS, default 4). A single
+            // chunk only protects one read; further concurrent reads then
+            // compete with prefetch and write staging for the shared headroom
+            // and fail whenever that headroom is fragmented or already taken.
+            const auto read_protection_chunks = static_cast<size_t>(
+                std::max<int64_t>(config_.read_protection_chunks, 1));
             const auto desired_read_protection =
                 read_chunk_allocation_bytes >
                         std::numeric_limits<size_t>::max() /
-                            kReadProtectionChunks
+                            read_protection_chunks
                     ? std::numeric_limits<size_t>::max()
-                    : read_chunk_allocation_bytes * kReadProtectionChunks;
+                    : read_chunk_allocation_bytes * read_protection_chunks;
             const auto read_min_protection_bytes = std::min(
                 desired_read_protection,
                 pinned_restore_arena_->capacity / 2);
@@ -157,27 +159,42 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                     << desired_read_protection
                     << ", effective_read_protection_bytes="
                     << read_min_protection_bytes
+                    << ", read_protection_chunks=" << read_protection_chunks
                     << ", unified_capacity_bytes="
                     << pinned_restore_arena_->capacity;
             }
-            // Carve room for one write chunk out of the prefetch budget so
+            // Carve room for write chunks out of the prefetch budget so
             // prefetch can never fill the whole non-read region and leave DFS
-            // write staging without space. This is a configuration-time
-            // reservation only: writes wait for space (bounded by
-            // MC_STORE_DFS_WRITE_ARENA_WAIT_MS, default 10s) instead of failing
-            // immediately, so once reads release memory the write proceeds. No
-            // per-request write protection is therefore needed in the
-            // admission path.
-            constexpr size_t kWriteProtectionChunks = 1;
+            // write staging without space
+            // (MC_STORE_DFS_WRITE_PROTECTION_CHUNKS, default 1). This is a
+            // configuration-time reservation only: writes wait for space
+            // (bounded by MC_STORE_DFS_WRITE_ARENA_WAIT_MS, default 10s)
+            // instead of failing immediately, so once reads release memory the
+            // write proceeds. No per-request write protection is therefore
+            // needed in the admission path.
+            const auto write_protection_chunks = static_cast<size_t>(
+                std::max<int64_t>(config_.write_protection_chunks, 1));
             const auto desired_write_protection =
                 write_chunk_allocation_bytes >
                         std::numeric_limits<size_t>::max() /
-                            kWriteProtectionChunks
+                            write_protection_chunks
                     ? std::numeric_limits<size_t>::max()
-                    : write_chunk_allocation_bytes * kWriteProtectionChunks;
+                    : write_chunk_allocation_bytes * write_protection_chunks;
             const auto write_min_protection_bytes = std::min(
                 desired_write_protection,
                 pinned_restore_arena_->capacity - read_min_protection_bytes);
+            if (desired_write_protection > write_min_protection_bytes) {
+                LOG(WARNING)
+                    << "DFS write protection was clamped to the space left "
+                       "after the read protection: "
+                       "requested_write_protection_bytes="
+                    << desired_write_protection
+                    << ", effective_write_protection_bytes="
+                    << write_min_protection_bytes
+                    << ", write_protection_chunks=" << write_protection_chunks
+                    << ", unified_capacity_bytes="
+                    << pinned_restore_arena_->capacity;
+            }
             const auto prefetch_limit_bytes = static_cast<uint64_t>(
                 static_cast<double>(pinned_restore_arena_->capacity) *
                 config_.prefetch_capacity_ratio);
@@ -188,7 +205,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                 admission_limits.prefetch_limit_bytes) {
                 LOG(WARNING)
                     << "DFS prefetch capacity was truncated to leave room for "
-                       "one read chunk and one write chunk: "
+                       "the read and write protections: "
                        "requested_prefetch_limit_bytes="
                     << prefetch_limit_bytes
                     << ", effective_prefetch_limit_bytes="
@@ -398,7 +415,7 @@ std::string FileStorage::UnifiedBufferDiagnostics() const {
 }
 
 tl::expected<void, ErrorCode> FileStorage::InitDfs() {
-    dfs_heartbeat_interval_seconds_.store(300, std::memory_order_release);
+    dfs_heartbeat_interval_seconds_.store(30, std::memory_order_release);
     LOG(INFO) << "DFS storage mode enabled; starting DFS heartbeat thread";
     dfs_heartbeat_running_.store(true);
     dfs_heartbeat_thread_ =

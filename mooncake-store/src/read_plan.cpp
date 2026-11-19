@@ -428,8 +428,9 @@ struct ReadPlan::Impl {
             reservation = std::make_unique<ActiveKeys>(client.get(), session);
             const char *adaptive_source =
                 std::getenv("MOONCAKE_READ_PLAN_ADAPTIVE_SOURCE");
-            const bool adaptive = page_wise && adaptive_source &&
-                                  std::string(adaptive_source) == "1";
+            const bool adaptive = page_wise &&
+                                  (!adaptive_source ||
+                                   std::string(adaptive_source) == "1");
             bool effective_page_wise = page_wise;
             if (!borrowed_sessions) {
                 started = true;
