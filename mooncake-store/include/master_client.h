@@ -350,6 +350,28 @@ class MasterClient {
         ReplicaType replica_type = ReplicaType::ALL,
         const UUID& dfs_epoch = {});
 
+    // Generation-fenced completion. These carry the DFS allocation a write
+    // owns, so a completion that arrives after the key was rewritten cannot
+    // act on the allocation that replaced it. A completion with no generation
+    // is downgraded to the classic form, because such an allocation came from
+    // a master that predates fencing; a completion that carries one always
+    // uses the V2 form, because only a master which understands it can have
+    // produced the generation in the first place.
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEndV2(
+        const ObjectMetaV2& object_meta, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
+    [[nodiscard]] tl::expected<void, ErrorCode> PutRevokeV2(
+        const RevokeObjectMetaV2& object_meta, ReplicaType replica_type,
+        const UUID& dfs_epoch = {});
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEndV2(
+        const std::vector<ObjectMetaV2>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevokeV2(
+        const std::vector<RevokeObjectMetaV2>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL,
+        const UUID& dfs_epoch = {});
+
     /**
      * @brief Starts an upsert operation (insert or update)
      * @param key Object key

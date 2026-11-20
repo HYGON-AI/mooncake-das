@@ -156,6 +156,7 @@ class MasterMetricManager {
     void inc_dfs_replica_skipped_total(const std::string& reason);
     void add_dfs_bucket_pending_deletion(int64_t count, int64_t bytes);
     void inc_dfs_bucket_delete_failures();
+    void inc_memory_replica_skipped_total(const std::string& reason);
     void set_dfs_bucket_pool_state(uint64_t ready_count,
                                    uint64_t create_inflight,
                                    uint64_t ready_reserved_bytes);
@@ -679,6 +680,7 @@ class MasterMetricManager {
     ylt::metric::gauge_t dfs_bucket_pending_delete_count_;
     ylt::metric::gauge_t dfs_bucket_pending_delete_bytes_;
     ylt::metric::counter_t dfs_bucket_delete_failures_;
+    ylt::metric::dynamic_counter_1t memory_replica_skipped_total_;
     ylt::metric::gauge_t dfs_bucket_ready_count_;
     ylt::metric::gauge_t dfs_bucket_create_inflight_;
     ylt::metric::histogram_t dfs_bucket_create_latency_us_;

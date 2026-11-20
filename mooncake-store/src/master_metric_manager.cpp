@@ -78,6 +78,11 @@ MasterMetricManager::MasterMetricManager()
           "Append-offset capacity retained by pending deletions"),
       dfs_bucket_delete_failures_("dfs_bucket_delete_failures_total",
                                   "Failed physical bucket deletion attempts"),
+      memory_replica_skipped_total_(
+          "master_memory_replica_skipped_total",
+          "Memory replicas skipped after allocation failure with DFS-only "
+          "fallback",
+          {"reason"}),
       dfs_bucket_ready_count_("dfs_bucket_ready_count",
                               "Current number of ready DFS buckets"),
       dfs_bucket_create_inflight_(
@@ -908,6 +913,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     dfs_bucket_pending_delete_count_.update(0);
     dfs_bucket_pending_delete_bytes_.update(0);
     dfs_bucket_delete_failures_.inc(0);
+    memory_replica_skipped_total_.inc({"NO_AVAILABLE_HANDLE"}, 0);
     dfs_bucket_ready_count_.update(0);
     dfs_bucket_create_inflight_.update(0);
     dfs_bucket_create_total_.inc({"success"}, 0);
@@ -1330,6 +1336,11 @@ void MasterMetricManager::add_dfs_bucket_pending_deletion(int64_t count,
 
 void MasterMetricManager::inc_dfs_bucket_delete_failures() {
     dfs_bucket_delete_failures_.inc();
+}
+
+void MasterMetricManager::inc_memory_replica_skipped_total(
+    const std::string& reason) {
+    memory_replica_skipped_total_.inc({reason});
 }
 
 void MasterMetricManager::set_dfs_bucket_pool_state(
@@ -2621,6 +2632,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(dfs_bucket_pending_delete_count_);
     serialize_metric(dfs_bucket_pending_delete_bytes_);
     serialize_metric(dfs_bucket_delete_failures_);
+    serialize_metric(memory_replica_skipped_total_);
     serialize_metric(dfs_bucket_ready_count_);
     serialize_metric(dfs_bucket_create_inflight_);
     serialize_metric(dfs_bucket_create_latency_us_);

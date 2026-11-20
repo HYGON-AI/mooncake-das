@@ -95,6 +95,12 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
 // The "reliable" guarantee of RELIABLE_MULTI_REPLICA is enforced at the
 // transfer stage (all allocated replicas must complete or the put is
 // revoked), not at the allocation stage for memory-only configs.
+//
+// MEMORY-segment exhaustion is the one case that may bypass all of the
+// above: when the caller allows it, AllocateReplicas keeps going with the
+// DFS replica alone rather than failing the write. That decision is made
+// in AllocateReplicas, which sees the allocator error; this function only
+// describes the non-degraded policy.
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
                                   size_t allocated_nof_replicas) {
@@ -4894,6 +4900,67 @@ bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
         [this](const Replica& replica) { return IsReplicaReadable(replica); });
 }
 
+std::optional<ErrorCode> MasterService::RejectStaleDfsCompletion(
+    const ObjectMetadata& metadata, std::string_view key,
+    std::optional<uint64_t> dfs_generation, ReplicaType replica_type,
+    bool missing_dfs_replica_is_noop, std::string_view action) const {
+    // This guard is fenced by the DFS allocation, so it only runs when the
+    // caller supplies a generation; the classic RPCs supply none and are out of
+    // scope. A MEMORY or NoF completion can still be stale under the same key:
+    // End/Revoke look the object up by key, so a late End(MEMORY) from an old
+    // write reaches a successor too. That predates this change and this guard
+    // does not cover it; all this does is stop a completion from touching DFS
+    // replicas of another generation.
+    if (!dfs_generation.has_value()) return std::nullopt;
+    if (replica_type != ReplicaType::ALL && replica_type != ReplicaType::DFS) {
+        return std::nullopt;
+    }
+
+    // Compare against every DFS replica still held by the object. An object is
+    // replaced as a whole, so a matching DFS replica proves the object is still
+    // the one this writer started; its absence means the writer was superseded
+    // or its own replica is already gone.
+    const uint64_t expected = *dfs_generation;
+    bool saw_dfs_replica = false;
+    bool generation_matches = false;
+    metadata.VisitReplicas(
+        [](const Replica& replica) { return replica.is_dfs_replica(); },
+        [&saw_dfs_replica, &generation_matches,
+         expected](const Replica& replica) {
+            saw_dfs_replica = true;
+            if (replica.get_dfs_descriptor().AllocationGeneration() ==
+                expected) {
+                generation_matches = true;
+            }
+        });
+    if (generation_matches) return std::nullopt;
+
+    // Another allocation's DFS replica is published under this key: the write
+    // was superseded while its data was in flight. Acting on it would commit a
+    // successor that has not been written, or revoke it outright.
+    if (saw_dfs_replica) {
+        LOG(WARNING) << "key=" << key << ", action=" << action
+                     << ", error=stale_dfs_allocation"
+                     << ", expected_generation=" << expected;
+        return ErrorCode::INVALID_WRITE;
+    }
+
+    // No DFS replica at all. A revoke then matches nothing, so it is left as a
+    // no-op and a retried revoke does not turn into an error. An end is not a
+    // no-op even with no replica to complete: it still rewrites the successor's
+    // checksum, grants it a read lease and publishes a stored event, all on
+    // behalf of a write that no longer owns the key. It is rejected, both for a
+    // DFS-only completion and for an ALL one, which would additionally reach
+    // whatever the successor published -- a memory-only object, for instance.
+    if (!missing_dfs_replica_is_noop) {
+        LOG(WARNING) << "key=" << key << ", action=" << action
+                     << ", error=stale_dfs_allocation_no_dfs_replica"
+                     << ", expected_generation=" << expected;
+        return ErrorCode::INVALID_WRITE;
+    }
+    return std::nullopt;
+}
+
 bool MasterService::IsEvictableMemoryReplica(const Replica& replica) const {
     return replica.is_memory_replica() && IsReplicaReadable(replica) &&
            replica.get_refcnt() == 0;
@@ -5150,7 +5217,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
                                      const std::string& writer_host_id,
                                      bool* dfs_allocation_failed,
     const std::optional<DfsBatchReservation>& preallocated_dfs,
-    bool skip_dfs_replica)
+    bool skip_dfs_replica, bool allow_dfs_only_fallback)
     -> tl::expected<std::vector<Replica>, ErrorCode> {
     if (dfs_allocation_failed != nullptr) {
         *dfs_allocation_failed = false;
@@ -5160,6 +5227,10 @@ auto MasterService::AllocateReplicas(const std::string& key,
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     bool has_enough_memory_segments = false;
+    // Set when the MEMORY allocation itself failed (segment exhaustion), as
+    // opposed to being denied by the config or by the namespace policy. Only
+    // this failure may degrade to a DFS-only object.
+    bool memory_allocation_exhausted = false;
 
     if (config.replica_num > 0) {
         std::vector<std::string> preferred_segments;
@@ -5222,7 +5293,19 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 if (has_enough_memory_segments) {
                     need_mem_eviction_ = true;
                 }
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                // Memory-segment exhaustion is the one failure that may keep
+                // going: the DFS replica is still reachable and far better
+                // than dropping the write. Every other failure (quota, the
+                // namespace policy, a config the allocator rejects) stays a
+                // hard error, and so does a request that asked for nothing but
+                // memory.
+                const bool degradable =
+                    allow_dfs_only_fallback && config.dfs_replica_num > 0 &&
+                    config.nof_replica_num == 0 && !skip_dfs_replica;
+                if (!degradable) {
+                    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+                }
+                memory_allocation_exhausted = true;
             }
         } else {
             allocated_memory_replicas = allocation_result->size();
@@ -5264,10 +5347,16 @@ auto MasterService::AllocateReplicas(const std::string& key,
     }
 #endif
 
-    if (!(skip_dfs_replica && config.nof_replica_num == 0
-              ? allocated_memory_replicas > 0
-              : HasExpectedReplicaAllocation(config, allocated_memory_replicas,
-                                             allocated_nof_replicas))) {
+    // A degraded object has no MEMORY replica at all, so the memory side of
+    // the requirement is deliberately not checked; the DFS replica below is
+    // still required and still allocated on the normal path.
+    const bool allocation_satisfied =
+        memory_allocation_exhausted ||
+        (skip_dfs_replica && config.nof_replica_num == 0
+             ? allocated_memory_replicas > 0
+             : HasExpectedReplicaAllocation(config, allocated_memory_replicas,
+                                            allocated_nof_replicas));
+    if (!allocation_satisfied) {
         if ((config.replica_num > 0 &&
              allocated_memory_replicas != config.replica_num) ||
             (config.nof_replica_num > 0 &&
@@ -5298,12 +5387,19 @@ auto MasterService::AllocateReplicas(const std::string& key,
     if (allocated_memory_replicas < config.replica_num ||
         allocated_nof_replicas < config.nof_replica_num) {
         MasterMetricManager::instance().inc_put_start_partial_allocations();
-        LOG(WARNING) << "key=" << key << ", action=put_start_partial_allocation"
-                     << ", requested_memory_replicas=" << config.replica_num
-                     << ", allocated_memory_replicas="
-                     << allocated_memory_replicas
-                     << ", requested_nof_replicas=" << config.nof_replica_num
-                     << ", allocated_nof_replicas=" << allocated_nof_replicas;
+        static DfsLogLimiter partial_log_limiter;
+        if (auto suppressed = partial_log_limiter.ShouldLog()) {
+            LOG(WARNING) << "key=" << key
+                         << ", action=put_start_partial_allocation"
+                         << ", requested_memory_replicas=" << config.replica_num
+                         << ", allocated_memory_replicas="
+                         << allocated_memory_replicas
+                         << ", requested_nof_replicas="
+                         << config.nof_replica_num
+                         << ", allocated_nof_replicas="
+                         << allocated_nof_replicas
+                         << ", suppressed=" << *suppressed;
+        }
     }
 
     if (use_disk_replica_) {
@@ -5326,7 +5422,9 @@ auto MasterService::AllocateReplicas(const std::string& key,
         } else if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
             LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                        << ", error=dfs_allocator_not_initialized";
-            if (dfs_allocation_failed != nullptr) *dfs_allocation_failed = true;
+            if (dfs_allocation_failed != nullptr) {
+                *dfs_allocation_failed = !memory_allocation_exhausted;
+            }
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         } else {
             auto alloc = dfs_allocator_->Allocate(key, value_length);
@@ -5343,12 +5441,38 @@ auto MasterService::AllocateReplicas(const std::string& key,
                         << ", error=" << alloc.error();
                 }
                 if (dfs_allocation_failed != nullptr) {
+                    // Not reported when the write already lost its memory
+                    // replicas: this request is a degraded one, and
+                    // AdmitWithDfsRecovery would answer the DFS shortfall by
+                    // force-evicting a whole bucket, which it must not do on
+                    // behalf of a write that memory exhaustion already
+                    // marginalised. DFS space is reclaimed by the background
+                    // evictor on its watermark instead.
                     *dfs_allocation_failed =
+                        !memory_allocation_exhausted &&
                         IsDfsReplicaFallbackError(alloc.error());
                 }
                 return tl::make_unexpected(alloc.error());
             }
             replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
+        }
+    }
+
+    // Count and log the degradation only now that the DFS replica this write
+    // depends on actually exists. Doing it earlier would report a write as
+    // "degraded" when the DFS allocation then failed and nothing was
+    // published, which would make the metric lean optimistic exactly when
+    // memory and DFS are both short.
+    if (memory_allocation_exhausted) {
+        MasterMetricManager::instance().inc_memory_replica_skipped_total(
+            toString(ErrorCode::NO_AVAILABLE_HANDLE));
+        static DfsLogLimiter degraded_log_limiter;
+        if (auto suppressed = degraded_log_limiter.ShouldLog()) {
+            LOG(WARNING)
+                << "key=" << key << ", action=put_start_degraded_to_dfs_only"
+                << ", requested_memory_replicas=" << config.replica_num
+                << ", dfs_replica_num=" << config.dfs_replica_num
+                << ", suppressed=" << *suppressed;
         }
     }
 
@@ -5429,7 +5553,7 @@ auto MasterService::AllocateAndInsertMetadata(
         committed_soft_pin_timeout,
     bool* dfs_allocation_failed,
     const std::optional<DfsBatchReservation>& preallocated_dfs,
-    bool skip_dfs_replica)
+    bool skip_dfs_replica, bool allow_dfs_only_fallback)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     assert(!accessor.IsPublished());
     const std::string& key = accessor.GetKey();
@@ -5442,7 +5566,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
     auto allocation_result = AllocateReplicas(
         key, value_length, config, writer_host_id, dfs_allocation_failed,
-        preallocated_dfs, skip_dfs_replica);
+        preallocated_dfs, skip_dfs_replica, allow_dfs_only_fallback);
     if (!allocation_result) {
         return tl::make_unexpected(allocation_result.error());
     }
@@ -5611,6 +5735,15 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    // The classic entry point carries no DFS generation.
+    return PutEndWithGeneration(client_id, object_meta, std::nullopt,
+                                tenant_id, replica_type);
+}
+
+auto MasterService::PutEndWithGeneration(
+    const UUID& client_id, const ObjectMeta& object_meta,
+    std::optional<uint64_t> dfs_generation, const TenantId& tenant_id,
+    ReplicaType replica_type) -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -5625,6 +5758,19 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
                    << ", was PutStart-ed by " << metadata.client_id;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    // A DFS completion carries the allocation it belongs to. If the published
+    // DFS replica is a different allocation, this write was superseded while
+    // its data was still in flight: committing now would publish the newer,
+    // possibly unwritten allocation. Report it as a stale write so the caller
+    // stops retrying without touching the current generation. An end on an
+    // object that no longer holds any DFS replica is rejected for the same
+    // reason: with nothing to complete it would still rewrite the successor.
+    if (auto stale = RejectStaleDfsCompletion(
+            metadata, key, dfs_generation, replica_type,
+            /*missing_dfs_replica_is_noop=*/false, "PutEnd")) {
+        return tl::make_unexpected(*stale);
     }
 
     auto is_target_replica = [replica_type](const Replica& replica) {
@@ -5926,6 +6072,15 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    // The classic entry point carries no DFS generation.
+    return PutRevokeWithGeneration(client_id, key, std::nullopt, tenant_id,
+                                   replica_type);
+}
+
+auto MasterService::PutRevokeWithGeneration(
+    const UUID& client_id, const std::string& key,
+    std::optional<uint64_t> dfs_generation, const TenantId& tenant_id,
+    ReplicaType replica_type) -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -5940,6 +6095,18 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
                    << key << ", was PutStart-ed by " << metadata.client_id;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    // A superseded writer must not revoke the allocation that replaced it.
+    // Only a DFS-only revoke that finds no DFS replica matches nothing and can
+    // stay a no-op. An ALL revoke would also match the successor's MEMORY/NoF
+    // replicas, so it must be rejected instead.
+    const bool missing_dfs_replica_is_noop =
+        replica_type == ReplicaType::DFS;
+    if (auto stale = RejectStaleDfsCompletion(
+            metadata, key, dfs_generation, replica_type,
+            missing_dfs_replica_is_noop, "PutRevoke")) {
+        return tl::make_unexpected(*stale);
     }
 
     if (!accessor.InProcessing()) {
@@ -12418,6 +12585,29 @@ auto MasterService::PutStartInternal(const UUID& client_id, const std::string& k
         }
     }
 
+    // A degraded write publishes a DFS replica and no memory replica. Several
+    // conditions must hold for that to be acceptable:
+    //  - the request must come from a client that can consume such a topology;
+    //  - the bucket allocator must exist, because it is what stamps the
+    //    allocation generation the completion is fenced by, and it may have
+    //    been retired during DFS root recovery;
+    //  - hard-pinned objects are promised to stay resident and unevictable;
+    //  - a managed weight group accounts for its members as memory-resident,
+    //    so a member that lands only on DFS would not match what the group
+    //    reserves. The group lock taken above is what makes this check
+    //    authoritative for the rest of the request.
+    //
+    // These are all master-local checks evaluated per request. Nothing about
+    // them is cached on the client, so a connection made while DFS was down
+    // still gets the fallback the moment the master can serve it again.
+    const bool hard_pin_blocks_fallback = config.with_hard_pin;
+    const bool weight_group_blocks_fallback =
+        weight_group_operation_lock.has_value();
+    const bool allow_dfs_only_fallback =
+        !use_kvcs_ && bucket_allocator_ != nullptr &&
+        config.supports_dfs_only_fallback.value_or(false) &&
+        !hard_pin_blocks_fallback && !weight_group_blocks_fallback;
+
     if (config.dfs_replica_num > 0 && !use_kvcs_) {
         if (!enable_dfs_ || !dfs_allocator_ || !dfs_allocator_->IsInitialized() ||
             (preallocated_dfs && preallocated_dfs->source_allocator != dfs_allocator_.get())) {
@@ -12490,7 +12680,7 @@ auto MasterService::PutStartInternal(const UUID& client_id, const std::string& k
             accessor, client_id, slice_length, config, plan->writer_host_id,
             plan->group_id, plan->residency_affinity_id, now,
             plan->soft_pin_request, std::nullopt, dfs_allocation_failed,
-            preallocated_dfs, skip);
+            preallocated_dfs, skip, allow_dfs_only_fallback);
         if (!allocated && *dfs_allocation_failed) allocation_error = allocated.error();
         return allocated;
     };

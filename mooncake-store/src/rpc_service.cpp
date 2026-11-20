@@ -871,6 +871,218 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     return results;
 }
 
+// === generation-fenced completion (V2) ===
+//
+// These carry the DFS allocation generation a write owns, so a completion that
+// arrives after its key was rewritten cannot commit or revoke the allocation
+// that replaced it. The generation is turned into the optional form the master
+// compares against; 0 keeps the previous behaviour.
+
+namespace {
+
+std::optional<uint64_t> DfsGenerationFromV2(uint64_t generation) {
+    if (generation == 0) return std::nullopt;
+    return generation;
+}
+
+}  // namespace
+
+tl::expected<void, ErrorCode> WrappedMasterService::PutEndV2(
+    const UUID& client_id, const ObjectMetaV2& object_meta,
+    ReplicaType replica_type, const std::string& tenant_id,
+    const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_put_end_requests();
+        MasterMetricManager::instance().inc_put_end_failures();
+        LOG(WARNING) << "Rejecting stale DFS allocation in PutEndV2";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+    return execute_rpc(
+        "PutEndV2",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.PutEndWithGeneration(
+                        client_id,
+                        ObjectMeta{object_meta.key,
+                                   object_meta.object_checksum},
+                        DfsGenerationFromV2(object_meta.dfs_generation),
+                        resolved_tenant_id, replica_type);
+                });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", key=", object_meta.key,
+                             ", dfs_generation=", object_meta.dfs_generation);
+        },
+        [] { MasterMetricManager::instance().inc_put_end_requests(); },
+        [] { MasterMetricManager::instance().inc_put_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::PutRevokeV2(
+    const UUID& client_id, const RevokeObjectMetaV2& object_meta,
+    ReplicaType replica_type, const std::string& tenant_id,
+    const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_put_revoke_requests();
+        MasterMetricManager::instance().inc_put_revoke_failures();
+        LOG(WARNING) << "Rejecting stale DFS allocation in PutRevokeV2";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+    return execute_rpc(
+        "PutRevokeV2",
+        [&] {
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    return master_service_.PutRevokeWithGeneration(
+                        client_id, object_meta.key,
+                        DfsGenerationFromV2(object_meta.dfs_generation),
+                        resolved_tenant_id, replica_type);
+                });
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", key=", object_meta.key,
+                             ", dfs_generation=", object_meta.dfs_generation);
+        },
+        [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchPutEndV2(
+    const UUID& client_id, const std::vector<ObjectMetaV2>& object_metas,
+    ReplicaType replica_type, const std::string& tenant_id,
+    const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_batch_put_end_requests(
+            object_metas.size());
+        if (!object_metas.empty()) {
+            MasterMetricManager::instance().inc_batch_put_end_failures(
+                object_metas.size());
+        }
+        LOG(WARNING) << "Rejecting stale DFS allocation in BatchPutEndV2";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_metas.size(),
+            tl::make_unexpected(ErrorCode::INVALID_WRITE));
+    }
+
+    ScopedVLogTimer timer(1, "BatchPutEndV2");
+    const size_t total_keys = object_metas.size();
+    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
+    MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
+
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        object_metas.size(), [&](const TenantId& resolved_tenant_id) {
+            std::vector<tl::expected<void, ErrorCode>> batch_results;
+            batch_results.reserve(object_metas.size());
+            for (const auto& object_meta : object_metas) {
+                batch_results.emplace_back(
+                    master_service_.PutEndWithGeneration(
+                        client_id,
+                        ObjectMeta{object_meta.key,
+                                   object_meta.object_checksum},
+                        DfsGenerationFromV2(object_meta.dfs_generation),
+                        resolved_tenant_id, replica_type));
+            }
+            return batch_results;
+        });
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            LOG(ERROR) << "BatchPutEndV2 failed for key[" << i << "] '"
+                       << object_metas[i].key
+                       << "': " << toString(results[i].error());
+        }
+    }
+    if (failure_count != 0 && failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_put_end_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_end_partial_success(
+            failure_count);
+    }
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchPutRevokeV2(
+    const UUID& client_id, const std::vector<RevokeObjectMetaV2>& object_metas,
+    ReplicaType replica_type, const std::string& tenant_id,
+    const UUID& dfs_epoch) {
+    if (dfs_epoch != UUID{} &&
+        dfs_epoch != master_service_.GetDfsMasterEpoch()) {
+        MasterMetricManager::instance().inc_batch_put_revoke_requests(
+            object_metas.size());
+        if (!object_metas.empty()) {
+            MasterMetricManager::instance().inc_batch_put_revoke_failures(
+                object_metas.size());
+        }
+        LOG(WARNING) << "Rejecting stale DFS allocation in BatchPutRevokeV2";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_metas.size(),
+            tl::make_unexpected(ErrorCode::INVALID_WRITE));
+    }
+
+    ScopedVLogTimer timer(1, "BatchPutRevokeV2");
+    const size_t total_keys = object_metas.size();
+    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
+    MasterMetricManager::instance().inc_batch_put_revoke_requests(total_keys);
+
+    auto results = WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        object_metas.size(), [&](const TenantId& resolved_tenant_id) {
+            std::vector<tl::expected<void, ErrorCode>> batch_results;
+            batch_results.reserve(object_metas.size());
+            for (const auto& object_meta : object_metas) {
+                batch_results.emplace_back(
+                    master_service_.PutRevokeWithGeneration(
+                        client_id, object_meta.key,
+                        DfsGenerationFromV2(object_meta.dfs_generation),
+                        resolved_tenant_id, replica_type));
+            }
+            return batch_results;
+        });
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            LOG(ERROR) << "BatchPutRevokeV2 failed for key[" << i << "] '"
+                       << object_metas[i].key
+                       << "': " << toString(results[i].error());
+        }
+    }
+    if (failure_count != 0 && failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_put_revoke_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_put_revoke_partial_success(
+            failure_count);
+    }
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const uint64_t slice_length,
@@ -2342,6 +2554,10 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::PutRevoke, &WrappedMasterService::BatchPutStart,
         &WrappedMasterService::BatchPutEnd,
         &WrappedMasterService::BatchPutRevoke,
+        &WrappedMasterService::PutEndV2,
+        &WrappedMasterService::PutRevokeV2,
+        &WrappedMasterService::BatchPutEndV2,
+        &WrappedMasterService::BatchPutRevokeV2,
         &WrappedMasterService::UpsertStart, &WrappedMasterService::UpsertEnd,
         &WrappedMasterService::UpsertRevoke,
         &WrappedMasterService::BatchUpsertStart,

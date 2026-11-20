@@ -93,6 +93,40 @@ class MasterServiceTestPeer {
         SpinLocker lock(&hold->metadata().lock);
         return hold->metadata().EvictionDeadline();
     }
+    struct ObjectWriteState {
+        bool is_processing = false;
+        std::optional<uint64_t> checksum;
+        bool has_memory_replica = false;
+        bool has_dfs_replica = false;
+        uint64_t dfs_generation = 0;
+    };
+
+    static std::optional<ObjectWriteState> GetObjectWriteStateForTest(
+        const MasterService& service, const std::string& key,
+        const TenantId& tenant = TenantId::Default()) {
+        auto hold = ReadObject(
+            service,
+            ObjectIdentity{service.ResolveRequestTenantId(tenant), key});
+        if (!hold) return std::nullopt;
+        const auto& metadata = hold->metadata();
+        SpinLocker lock(&metadata.lock);
+        ObjectWriteState state;
+        state.is_processing = hold->state().is_processing;
+        state.checksum = metadata.GetPart(0).checksum();
+        metadata.VisitReplicas(
+            [](const Replica&) { return true; },
+            [&state](const Replica& replica) {
+                state.has_memory_replica =
+                    state.has_memory_replica || replica.is_memory_replica();
+                if (replica.is_dfs_replica()) {
+                    state.has_dfs_replica = true;
+                    state.dfs_generation = replica.get_dfs_descriptor()
+                                               .AllocationGeneration();
+                }
+            });
+        return state;
+    }
+
     static bool DuringDfsEvictionAfterValidation(MasterService& service, const std::function<void()>& action,
         bool* physically_freed = nullptr) {
         bool reached = false;

@@ -1533,6 +1533,9 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
         ReplicateConfig config;
         config.replica_num = 1;
         config.dfs_replica_num = 1;
+        // A real client sets this in AttachConfig; the master only degrades a
+        // write that declared it can consume a DFS-only topology.
+        config.supports_dfs_only_fallback = true;
 
         for (const char* key : {"memory_full_a", "memory_full_b"}) {
             auto start = service.PutStart(context.client_id, key,
@@ -1548,17 +1551,269 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
             service.UnmountSegment(context.segment_id, context.client_id)
                 .has_value());
 
-        auto failed = service.PutStart(context.client_id, "memory_full_c",
-                                       TenantId::Default(), 4096, config);
-        ASSERT_FALSE(failed.has_value());
-        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+        // Memory is exhausted, so the write degrades to its DFS replica
+        // instead of failing outright.
+        auto degraded = service.PutStart(context.client_id, "memory_full_c",
+                                         TenantId::Default(), 4096, config);
+        ASSERT_TRUE(degraded.has_value())
+            << "expected DFS-only fallback, got " << degraded.error();
+        EXPECT_EQ(degraded->size(), 1u);
+        EXPECT_TRUE(degraded->front().is_dfs_replica());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "memory_full_c",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
 
-        for (const char* key : {"memory_full_a", "memory_full_b"}) {
+        for (const char* key : {"memory_full_a", "memory_full_b",
+                                "memory_full_c"}) {
             auto query = service.GetReplicaList(key, TenantId::Default());
             ASSERT_TRUE(query.has_value()) << key;
-            ASSERT_EQ(query->replicas.size(), 1u);
-            EXPECT_TRUE(query->replicas.front().is_dfs_replica());
+            ASSERT_EQ(query->replicas.size(), 1u) << key;
+            EXPECT_TRUE(query->replicas.front().is_dfs_replica()) << key;
         }
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+// A client that does not declare the capability must keep the strict
+// behaviour even when the master could degrade, so upgrading the master alone
+// never hands an old client a topology it would judge invalid and revoke.
+TEST_F(MasterServiceTest, DfsBucketFallbackRequiresClientCapability) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_fallback_capability_" +
+          std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "1.0");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.9");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service, "small_memory",
+                                                  kDefaultSegmentBase, 8192);
+        // Everything else matches the degrading case; only the capability bit
+        // is left unset, which is exactly what a client predating the feature
+        // sends.
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        ASSERT_FALSE(config.supports_dfs_only_fallback);
+
+        for (const char* key : {"strict_a", "strict_b"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
+                            .has_value());
+        }
+
+        ASSERT_TRUE(
+            service.UnmountSegment(context.segment_id, context.client_id)
+                .has_value());
+
+        auto rejected = service.PutStart(context.client_id, "strict_c",
+                                         TenantId::Default(), 4096, config);
+        ASSERT_FALSE(rejected.has_value());
+        EXPECT_EQ(rejected.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+// A late DFS completion that finds no DFS replica under the key must not touch
+// the successor. An end would otherwise rewrite its checksum, grant it a lease
+// and publish a stored event on behalf of a write that no longer owns the key;
+// a revoke matches nothing and stays a no-op so a retried revoke does not
+// become an error.
+TEST_F(MasterServiceTest,
+       LateDfsCompletionDoesNotTouchSuccessorWithoutDfsReplica) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_late_completion_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedBucketDfsEnv env(dfs_root, "1048576", "16");
+
+    MasterServiceConfig master_config;
+    master_config.put_start_discard_timeout_sec = 1;
+    master_config.put_start_release_timeout_sec = 60;
+    {
+        MasterService service(master_config);
+        const auto context = PrepareSimpleSegment(service);
+        const UUID client_id = context.client_id;
+
+        // First generation: DFS-only, so its background completion is the only
+        // thing that can publish it. It is deliberately never completed here.
+        auto first = service.PutStart(
+            client_id, "late_key", TenantId::Default(), 4096, DfsOnlyConfig());
+        ASSERT_TRUE(first.has_value()) << toString(first.error());
+        ASSERT_EQ(first->size(), 1u);
+        ASSERT_TRUE(first->front().is_dfs_replica());
+        const uint64_t first_generation =
+            first->front().get_dfs_descriptor().AllocationGeneration();
+        ASSERT_NE(first_generation, 0u);
+
+        // Let the discard window pass so the next PutStart replaces the object
+        // instead of answering OBJECT_ALREADY_EXISTS.
+        std::this_thread::sleep_for(std::chrono::seconds(
+            master_config.put_start_discard_timeout_sec + 1));
+
+        // Second generation: memory only, so the key holds no DFS replica at
+        // all. Leave it PROCESSING while all three stale completions arrive;
+        // that is the window in which the old End changed checksum/lease/event
+        // state and an ALL revoke could delete the successor outright.
+        ReplicateConfig memory_only;
+        memory_only.replica_num = 1;
+        auto second = service.PutStart(client_id, "late_key",
+                                       TenantId::Default(), 4096, memory_only);
+        ASSERT_TRUE(second.has_value()) << toString(second.error());
+        ASSERT_EQ(second->size(), 1u);
+        ASSERT_TRUE(second->front().is_memory_replica());
+
+        // The stale end belongs to the first generation and finds no DFS
+        // replica. It must be rejected before it can write the successor's
+        // checksum.
+        auto stale_end = service.PutEndWithGeneration(
+            client_id, ObjectMeta{"late_key", uint64_t{0xC0FFEE}},
+            first_generation, TenantId::Default(), ReplicaType::DFS);
+        ASSERT_FALSE(stale_end.has_value());
+        EXPECT_EQ(stale_end.error(), ErrorCode::INVALID_WRITE);
+
+        // A DFS-only revoke finds no target and is the one completion that
+        // remains a harmless no-op. The successor must still be present and
+        // PROCESSING.
+        auto stale_dfs_revoke = service.PutRevokeWithGeneration(
+            client_id, "late_key", first_generation, TenantId::Default(),
+            ReplicaType::DFS);
+        ASSERT_TRUE(stale_dfs_revoke.has_value())
+            << toString(stale_dfs_revoke.error());
+
+        // An ALL revoke is not a no-op: without generation fencing it would
+        // match and remove the successor's PROCESSING MEMORY replica. It must
+        // be rejected.
+        auto stale_all_revoke = service.PutRevokeWithGeneration(
+            client_id, "late_key", first_generation, TenantId::Default(),
+            ReplicaType::ALL);
+        ASSERT_FALSE(stale_all_revoke.has_value());
+        EXPECT_EQ(stale_all_revoke.error(), ErrorCode::INVALID_WRITE);
+
+        // The successor must still be PROCESSING, retain its MEMORY replica,
+        // have no DFS replica, and keep its original checksum before its
+        // legitimate End.
+        const auto successor_state =
+            MasterServiceTestPeer::GetObjectWriteStateForTest(service,
+                                                              "late_key");
+        ASSERT_TRUE(successor_state.has_value());
+        EXPECT_TRUE(successor_state->is_processing);
+        EXPECT_FALSE(successor_state->checksum.has_value());
+        EXPECT_TRUE(successor_state->has_memory_replica);
+        EXPECT_FALSE(successor_state->has_dfs_replica);
+
+        // If any stale completion changed or removed the successor, this
+        // legitimate End either fails or publishes the stale checksum. It must
+        // still complete the original MEMORY allocation with no checksum.
+        ASSERT_TRUE(service
+                        .PutEnd(client_id, "late_key", TenantId::Default(),
+                                ReplicaType::MEMORY)
+                        .has_value());
+
+        const auto final_state =
+            service.GetReplicaList("late_key", TenantId::Default());
+        ASSERT_TRUE(final_state.has_value()) << toString(final_state.error());
+        EXPECT_FALSE(final_state->object_checksum.has_value())
+            << "stale DFS completion must not write the successor's checksum";
+        ASSERT_EQ(final_state->replicas.size(), 1u);
+        EXPECT_TRUE(final_state->replicas.front().is_memory_replica());
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, LateDfsCompletionRejectsDifferentGeneration) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_cross_generation_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedBucketDfsEnv env(dfs_root, "1048576", "16");
+
+    MasterServiceConfig master_config;
+    master_config.put_start_discard_timeout_sec = 1;
+    master_config.put_start_release_timeout_sec = 60;
+    {
+        MasterService service(master_config);
+        const auto context = PrepareSimpleSegment(service);
+        const UUID client_id = context.client_id;
+        const auto dfs_config = DfsOnlyConfig();
+
+        auto first = service.PutStart(client_id, "cross_generation",
+                                      TenantId::Default(), 4096, dfs_config);
+        ASSERT_TRUE(first.has_value()) << toString(first.error());
+        ASSERT_EQ(first->size(), 1u);
+        const uint64_t first_generation =
+            first->front().get_dfs_descriptor().AllocationGeneration();
+        ASSERT_NE(first_generation, 0u);
+
+        std::this_thread::sleep_for(std::chrono::seconds(
+            master_config.put_start_discard_timeout_sec + 1));
+
+        auto second = service.PutStart(client_id, "cross_generation",
+                                       TenantId::Default(), 4096, dfs_config);
+        ASSERT_TRUE(second.has_value()) << toString(second.error());
+        ASSERT_EQ(second->size(), 1u);
+        const uint64_t second_generation =
+            second->front().get_dfs_descriptor().AllocationGeneration();
+        ASSERT_NE(second_generation, 0u);
+        EXPECT_NE(first_generation, second_generation);
+
+        auto stale_end = service.PutEndWithGeneration(
+            client_id, ObjectMeta{"cross_generation", std::nullopt},
+            first_generation, TenantId::Default(), ReplicaType::DFS);
+        ASSERT_FALSE(stale_end.has_value());
+        EXPECT_EQ(stale_end.error(), ErrorCode::INVALID_WRITE);
+
+        auto stale_revoke = service.PutRevokeWithGeneration(
+            client_id, "cross_generation", first_generation,
+            TenantId::Default(), ReplicaType::DFS);
+        ASSERT_FALSE(stale_revoke.has_value());
+        EXPECT_EQ(stale_revoke.error(), ErrorCode::INVALID_WRITE);
+
+        const auto successor_state =
+            MasterServiceTestPeer::GetObjectWriteStateForTest(
+                service, "cross_generation");
+        ASSERT_TRUE(successor_state.has_value());
+        EXPECT_TRUE(successor_state->is_processing);
+        EXPECT_TRUE(successor_state->has_dfs_replica);
+        EXPECT_EQ(successor_state->dfs_generation, second_generation);
+
+        ASSERT_TRUE(
+            service
+                .PutEndWithGeneration(
+                    client_id, ObjectMeta{"cross_generation", std::nullopt},
+                    second_generation, TenantId::Default(), ReplicaType::DFS)
+                .has_value());
+        auto readable =
+            service.GetReplicaList("cross_generation", TenantId::Default());
+        ASSERT_TRUE(readable.has_value()) << toString(readable.error());
+        ASSERT_EQ(readable->replicas.size(), 1u);
+        EXPECT_TRUE(readable->replicas.front().is_dfs_replica());
     }
 
     std::error_code ec;

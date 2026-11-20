@@ -519,6 +519,18 @@ class MasterService {
                 const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
+    // Internal completion entry point. Carries the DFS allocation generation
+    // the writer owns (nullopt when the caller cannot supply one), which the
+    // public ObjectMeta does not: its wire schema stays unchanged so an older
+    // client keeps working against this master. Only the generation-fenced
+    // RPCs fill the optional in.
+    auto PutEndWithGeneration(const UUID& client_id,
+                              const ObjectMeta& object_meta,
+                              std::optional<uint64_t> dfs_generation,
+                              const TenantId& tenant_id,
+                              ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
     auto PutEnd(const UUID& client_id, const std::string& key,
                 const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
@@ -538,6 +550,15 @@ class MasterService {
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
                    const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
+    // Generation-carrying counterpart of the above, for the V2 completion
+    // RPCs. See PutEndWithGeneration.
+    auto PutRevokeWithGeneration(const UUID& client_id,
+                                 const std::string& key,
+                                 std::optional<uint64_t> dfs_generation,
+                                 const TenantId& tenant_id,
+                                 ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -1558,12 +1579,17 @@ class MasterService {
     // Allocate the physical replicas without changing object metadata.  This
     // is used by leased upserts to prove that replacement storage is available
     // before the old metadata is removed.
+    // `allow_dfs_only_fallback` lets a memory-segment exhaustion degrade to a
+    // DFS-only object instead of failing the write. It only applies when no
+    // MEMORY replica could be allocated at all; a partially satisfied memory
+    // request still fails as before. PutStart enables it, UpsertStart keeps the
+    // strict behaviour.
     auto AllocateReplicas(const std::string& key, uint64_t value_length,
                           const ReplicateConfig& config,
                           const std::string& writer_host_id,
                           bool* dfs_allocation_failed = nullptr,
         const std::optional<DfsBatchReservation>& preallocated_dfs = std::nullopt,
-        bool skip_dfs_replica = false)
+        bool skip_dfs_replica = false, bool allow_dfs_only_fallback = false)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
     class MetadataAccessorRW;
@@ -1594,7 +1620,7 @@ class MasterService {
             committed_soft_pin_timeout = std::nullopt,
         bool* dfs_allocation_failed = nullptr,
         const std::optional<DfsBatchReservation>& preallocated_dfs = std::nullopt,
-        bool skip_dfs_replica = false)
+        bool skip_dfs_replica = false, bool allow_dfs_only_fallback = false)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     // What PutStart and UpsertStart settle before they take the key.
@@ -2595,6 +2621,22 @@ class MasterService {
     bool IsReplicaReadable(const Replica& replica) const;
     bool IsReplicaReadableForGet(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
+
+    // Rejects a DFS PutEnd/PutRevoke whose allocation generation no longer
+    // matches the one published under the key. Returns the error to report, or
+    // nullopt when the completion may proceed.
+    //
+    // The object is replaced as a whole, so a matching DFS replica means the
+    // key is still the one this writer started. When another allocation's DFS
+    // replica is published instead, the write was superseded and is rejected.
+    // With no DFS replica at all the two completions differ: a revoke matches
+    // nothing and is a no-op, which keeps a retried revoke from turning into an
+    // error; an end still rewrites the successor's checksum, grants it a lease
+    // and publishes a stored event, so it is rejected.
+    std::optional<ErrorCode> RejectStaleDfsCompletion(
+        const ObjectMetadata& metadata, std::string_view key,
+        std::optional<uint64_t> dfs_generation, ReplicaType replica_type,
+        bool missing_dfs_replica_is_noop, std::string_view action) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
