@@ -468,7 +468,6 @@ class Replica {
         : id_(src.id_),
           data_(std::move(src.data_)),
           status_(src.status_),
-          eviction_pending_(src.eviction_pending_),
           refcnt_(src.refcnt_.exchange(0)) {
         // Mark the source as moved-from so its destructor doesn't
         // double-decrement metrics.
@@ -501,7 +500,6 @@ class Replica {
         id_ = src.id_;
         data_ = std::move(src.data_);
         status_ = src.status_;
-        eviction_pending_ = src.eviction_pending_;
         refcnt_.store(src.refcnt_.exchange(0));
         // Mark src as moved-from.
         src.status_ = ReplicaStatus::UNDEFINED;
@@ -545,10 +543,6 @@ class Replica {
     [[nodiscard]] ReplicaID id() const { return id_; }
 
     [[nodiscard]] ReplicaStatus status() const { return status_; }
-
-    [[nodiscard]] bool is_eviction_pending() const { return eviction_pending_; }
-
-    void set_eviction_pending(bool pending) { eviction_pending_ = pending; }
 
     [[nodiscard]] bool is_completed() const {
         return status_ == ReplicaStatus::COMPLETE;
@@ -1013,8 +1007,6 @@ class Replica {
                  LocalDiskReplicaData, DfsReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
-    // Transient read barrier, protected by the owning metadata shard mutex.
-    bool eviction_pending_{false};
 
     friend class MasterService;  // Standby restore advances next_id_
     std::atomic<uint32_t> refcnt_{0};

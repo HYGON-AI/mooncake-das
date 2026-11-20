@@ -1,8 +1,11 @@
 #pragma once
 
 #include <utility>
+#include <future>
+#include <thread>
 
 #include "master_service.h"
+#include "immutable_bucket_allocator_test_peer.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 
 namespace mooncake::test {
@@ -16,6 +19,15 @@ class MasterServiceTestPeer {
     static void SetDfsAllocator(MasterService& service,
                          DfsAllocatorInterface* allocator) {
         service.dfs_allocator_.store(allocator);
+    }
+
+    static ImmutableBucketAllocator& BucketAllocator(MasterService& service) {
+        return *service.bucket_allocator_;
+    }
+
+    static bool RecoverDfsRoot(MasterService& service, const std::string& root,
+                               const std::string& identity) {
+        return service.RecoverDfsRootAfterReplacement(root, identity);
     }
 
     static std::vector<int64_t> GetTrackedDfsBucketIds(MasterService& service) {
@@ -81,24 +93,81 @@ class MasterServiceTestPeer {
         SpinLocker lock(&hold->metadata().lock);
         return hold->metadata().EvictionDeadline();
     }
-    static bool DuringDfsEvictionAfterValidation(MasterService& service, const std::string& key,
-        const std::function<void()>& read_requests) {
+    static bool DuringDfsEvictionAfterValidation(MasterService& service, const std::function<void()>& action,
+        bool* physically_freed = nullptr) {
         bool reached = false;
-        bool all_frozen = true;
-        service.dfs_bucket_after_freeze_hook_ = [&] {
-            auto frozen = [&] {
-                auto hold = ReadObject(service, {TenantId::Default(), key});
-                return hold && hold->metadata().HasReplica([](const Replica& replica) {
-                    return replica.is_dfs_replica() && replica.is_eviction_pending();
-                });
-            }();
-            all_frozen = all_frozen && frozen;
+        service.dfs_bucket_after_validation_hook_ = [&] {
+            if (reached) return;
             reached = true;
-            read_requests();
+            action();
         };
-        service.RunDfsEvictionForTesting();
-        service.dfs_bucket_after_freeze_hook_ = {};
-        return reached && all_frozen;
+        // Hold another shared owner across the entire transaction, including
+        // metadata removal. Any exclusive master commit would deadlock this
+        // deterministic test (bounded by the native test runner's timeout).
+        std::promise<void> held;
+        std::promise<void> release;
+        auto released = release.get_future();
+        std::thread holder([&] {
+            std::shared_lock<std::shared_mutex> lock(
+                service.master_state_mutex_);
+            held.set_value();
+            released.wait();
+        });
+        held.get_future().wait();
+        if (physically_freed) {
+            *physically_freed = service.RunBucketDfsEvictionInternal(true);
+        } else {
+            service.RunDfsEvictionForTesting();
+        }
+        release.set_value();
+        holder.join();
+        service.dfs_bucket_after_validation_hook_ = {};
+        return reached;
+    }
+
+    static void ExpireDfsDeletions(MasterService& service) {
+        ImmutableBucketAllocatorTestPeer::ExpireDeletions(
+            *service.bucket_allocator_);
+    }
+
+    static void PostponeDfsRetry(MasterService& service, int64_t bucket_id) {
+        ImmutableBucketAllocatorTestPeer::PostponeRetry(
+            *service.bucket_allocator_, bucket_id);
+    }
+
+    static size_t RetryDfsDeletions(MasterService& service) {
+        return service.bucket_allocator_->RetryFailedEvictions();
+    }
+
+    static void StopEviction(MasterService& service) {
+        service.eviction_running_ = false;
+        if (service.eviction_thread_.joinable())
+            service.eviction_thread_.join();
+        if (service.dfs_eviction_thread_.joinable())
+            service.dfs_eviction_thread_.join();
+    }
+
+    static bool RunBucketDfsEviction(MasterService& service, bool force_one) {
+        return service.RunBucketDfsEvictionInternal(force_one);
+    }
+
+    static bool RunLowUtilizationBucketEviction(MasterService& service) {
+        return service.RunBucketDfsEvictionInternal(false, std::nullopt, 0.75);
+    }
+
+    static uint64_t GetDfsUsedBytes(MasterService& service) {
+        return service.bucket_allocator_->GetUsedBytes();
+    }
+
+    static bool InvalidateDfsBucket(MasterService& service, int64_t bucket_id) {
+        return service.RunBucketDfsEvictionInternal(false, bucket_id);
+    }
+
+    static bool HasPendingDfsInvalidation(MasterService& service,
+                                          int64_t bucket_id) {
+        std::lock_guard<std::mutex> lock(
+            service.invalidated_dfs_buckets_mutex_);
+        return service.invalidated_dfs_buckets_.contains(bucket_id);
     }
 
     explicit MasterServiceTestPeer(MasterService& service)
