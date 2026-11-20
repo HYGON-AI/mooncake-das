@@ -162,6 +162,14 @@ struct ReplicateConfig {
         per_key_preferred_hca_names;
     // Per-key opaque residency affinity metadata.
     struct_pack::compatible<std::vector<std::string>, 4> residency_affinity_ids;
+    // Capability bit. A client that can consume a DFS-only topology sets this
+    // so the master may degrade a memory-starved write to its DFS replica
+    // instead of failing it. Clients that predate the field leave it unset and
+    // keep the strict behaviour: they would judge such an object invalid and
+    // revoke it (and, for DFS-only writes, could report success while
+    // publishing nothing). Set by the client when it builds the request, never
+    // by the caller.
+    struct_pack::compatible<bool, 5> supports_dfs_only_fallback;
 
     bool HasValidKeyHints(size_t key_count) const {
         return (!group_ids || group_ids->size() == key_count) &&
@@ -380,9 +388,26 @@ struct DistributedFSDescriptor {
     // Master incarnation that issued this location. Filled on RPC responses,
     // including recovered locations; it is not the persistent bucket identity.
     struct_pack::compatible<UUID, 2> master_epoch;
+    // Allocation identity within that incarnation. The bucket allocator bumps
+    // it on every reservation, so a descriptor carried back by the client
+    // names one exact allocation. PutEnd/PutRevoke compare it against the
+    // allocation currently published under the key: a write that has been
+    // superseded (its key was replaced after the put-start discard window)
+    // then cannot commit or revoke the allocation that replaced it.
+    //
+    // The version is 5, not the next free slot in this struct (3), because a
+    // nested struct's compatible versions share the enclosing struct's version
+    // space: struct_pack collects them recursively and writes one group per
+    // version. MetadataPayload and StandbyObjectMetadata already use 3 for
+    // object_checksum and 4 for residency_affinity_id, so a field of theirs
+    // here would join those groups and shift what an older reader consumes.
+    struct_pack::compatible<uint64_t, 5> allocation_generation;
     UUID MasterEpoch() const { return master_epoch.value_or(UUID{}); }
+    uint64_t AllocationGeneration() const {
+        return allocation_generation.value_or(0);
+    }
     YLT_REFL(DistributedFSDescriptor, file_path, offset, object_size,
-             aligned_size, shard_idx, master_epoch);
+             aligned_size, shard_idx, master_epoch, allocation_generation);
 };
 
 struct DfsReplicaData {
@@ -468,7 +493,6 @@ class Replica {
         : id_(src.id_),
           data_(std::move(src.data_)),
           status_(src.status_),
-          eviction_pending_(src.eviction_pending_),
           refcnt_(src.refcnt_.exchange(0)) {
         // Mark the source as moved-from so its destructor doesn't
         // double-decrement metrics.
@@ -501,7 +525,6 @@ class Replica {
         id_ = src.id_;
         data_ = std::move(src.data_);
         status_ = src.status_;
-        eviction_pending_ = src.eviction_pending_;
         refcnt_.store(src.refcnt_.exchange(0));
         // Mark src as moved-from.
         src.status_ = ReplicaStatus::UNDEFINED;
@@ -545,10 +568,6 @@ class Replica {
     [[nodiscard]] ReplicaID id() const { return id_; }
 
     [[nodiscard]] ReplicaStatus status() const { return status_; }
-
-    [[nodiscard]] bool is_eviction_pending() const { return eviction_pending_; }
-
-    void set_eviction_pending(bool pending) { eviction_pending_ = pending; }
 
     [[nodiscard]] bool is_completed() const {
         return status_ == ReplicaStatus::COMPLETE;
@@ -1013,8 +1032,6 @@ class Replica {
                  LocalDiskReplicaData, DfsReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
-    // Transient read barrier, protected by the owning metadata shard mutex.
-    bool eviction_pending_{false};
 
     friend class MasterService;  // Standby restore advances next_id_
     std::atomic<uint32_t> refcnt_{0};

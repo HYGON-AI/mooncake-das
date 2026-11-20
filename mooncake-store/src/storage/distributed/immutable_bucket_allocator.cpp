@@ -106,6 +106,7 @@ ImmutableBucketAllocator::PendingEviction::PendingEviction(
     PendingEviction&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)),
       bucket_id_(std::exchange(other.bucket_id_, -1)),
+      invalidation_(other.invalidation_),
       bucket_identity_(std::move(other.bucket_identity_)),
       candidates_(std::move(other.candidates_)) {
     other.candidates_.clear();
@@ -126,6 +127,7 @@ ImmutableBucketAllocator::PendingEviction::operator=(
         }
         owner_ = std::exchange(other.owner_, nullptr);
         bucket_id_ = std::exchange(other.bucket_id_, -1);
+        invalidation_ = other.invalidation_;
         bucket_identity_ = std::move(other.bucket_identity_);
         candidates_ = std::move(other.candidates_);
         other.candidates_.clear();
@@ -146,6 +148,12 @@ ImmutableBucketAllocator::~ImmutableBucketAllocator() {
     std::vector<int64_t> ready_bucket_ids;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [id, state] : buckets_) {
+            if (state->evicting) {
+                MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
+                    -1, -static_cast<int64_t>(state->append_offset));
+            }
+        }
         ready_bucket_ids = DetachReadyBucketsLocked();
         UpdateBucketPoolMetricsLocked();
     }
@@ -384,6 +392,12 @@ ImmutableBucketAllocator::RetireAndCreateReplacementAllocator() {
         std::lock_guard<std::mutex> lock(mutex_);
         replacement->next_bucket_id_ = next_bucket_id_;
         replacement->next_generation_ = next_generation_;
+        for (const auto& [id, state] : buckets_) {
+            if (state->evicting) {
+                MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
+                    -1, -static_cast<int64_t>(state->append_offset));
+            }
+        }
         ready_bucket_ids_.clear();
         buckets_.clear();
         key_index_.clear();
@@ -1186,7 +1200,8 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     MarkMetaDirtyLocked(bucket);
 
     auto descriptor = MakeBucketDescriptor(BucketDataPath(bucket.bucket_id),
-                                          *layout, bucket.bucket_id);
+                                          *layout, bucket.bucket_id,
+                                          entry.generation);
     return descriptor;
 }
 
@@ -1260,6 +1275,14 @@ ImmutableBucketAllocator::FindMatchingEntryLocked(
     if (entry.reserved_size != desc.aligned_size)
         return fail("aligned_size_mismatch");
     if (entry.key_size != key.size()) return fail("key_size_mismatch");
+    // Generation is the only field that distinguishes two allocations of the
+    // same key at the same size and offset (the layout repeats exactly when a
+    // key is re-reserved into a reclaimed slot). Callers that predate this
+    // field send 0 and keep the field-only comparison.
+    if (desc.AllocationGeneration() != 0 &&
+        entry.generation != desc.AllocationGeneration()) {
+        return fail("generation_mismatch");
+    }
     auto layout = RebuildBucketEntryLayout(entry.entry_offset, entry.value_size,
                                            alignment_);
     if (!layout) return fail("invalid_entry_layout");
@@ -1577,7 +1600,7 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
         for (const auto& [bucket_id, bucket] : buckets_) {
             // An unsealed bucket is deliberately never written: it is still
             // being appended to, and its data is discarded on the next start.
-            if (!bucket->sealed || !bucket->meta_dirty) continue;
+            if (!bucket->sealed || !bucket->meta_dirty || bucket->evicting) continue;
             pending.push_back({bucket_id, bucket, SnapshotLocked(*bucket)});
             // Clear the flag together with taking the snapshot. A change that
             // lands while we are unlocked sets it again and is picked up by the
@@ -1602,7 +1625,8 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = buckets_.find(item.bucket_id);
             if (it == buckets_.end() ||
-                it->second.get() != item.bucket_identity.get()) {
+                it->second.get() != item.bucket_identity.get() ||
+                it->second->evicting) {
                 continue;
             }
         }
@@ -1725,7 +1749,7 @@ bool ImmutableBucketAllocator::DiscardMissingBucketIfEmpty(int64_t bucket_id) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(bucket_id);
         if (it == buckets_.end()) return true;
-        if (it->second->live_bytes != 0) return false;
+        if (it->second->live_bytes != 0 || it->second->frozen) return false;
 
         auto ready_it = std::find(ready_bucket_ids_.begin(),
                                   ready_bucket_ids_.end(), bucket_id);
@@ -1794,6 +1818,12 @@ bool ImmutableBucketAllocator::HasBucket(int64_t bucket_id) const {
     return buckets_.contains(bucket_id);
 }
 
+bool ImmutableBucketAllocator::IsBucketEvicting(int64_t bucket_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = buckets_.find(bucket_id);
+    return it != buckets_.end() && it->second->evicting;
+}
+
 tl::expected<bool, ErrorCode>
 ImmutableBucketAllocator::IsBucketDataFilePresent(int64_t bucket_id) const {
     if (bucket_id < 0) {
@@ -1841,7 +1871,8 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
             candidate.shard_idx = static_cast<int>(bucket_id);
             candidate.offset = layout->offset;
             candidate.descriptor =
-                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout, bucket_id);
+                MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
+                                     bucket_id, entry.generation);
             candidates.push_back(std::move(candidate));
         }
 
@@ -1855,6 +1886,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
             active_bucket_id_ = -1;
             RequestRefillLocked();
         }
+        pending.invalidation_ = true;
         pending.owner_ = this;
         pending.bucket_id_ = bucket_id;
         pending.bucket_identity_ = victim;
@@ -1877,6 +1909,18 @@ ImmutableBucketAllocator::PrepareEvictionForLowUtilization(double threshold) {
     return PrepareEvictionInternal(/*force_one=*/false, threshold);
 }
 
+bool ImmutableBucketAllocator::DeleteFailureBacklogFullLocked() const {
+    constexpr size_t kMaxFailedDeletions = 2;
+    size_t failures = 0;
+    for (const auto& [id, bucket] : buckets_) {
+        if (bucket->evicting && bucket->delete_failures != 0 &&
+            ++failures >= kMaxFailedDeletions) {
+            return true;
+        }
+    }
+    return false;
+}
+
 ImmutableBucketAllocator::PendingEviction
 ImmutableBucketAllocator::PrepareEvictionInternal(
     bool force_one, double low_utilization_threshold) {
@@ -1885,6 +1929,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (DeleteFailureBacklogFullLocked()) return pending;
 
         const uint64_t capacity =
             max_bucket_count_ > 0
@@ -1951,7 +1996,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
             // match replica metadata field by field.
             candidate.descriptor =
                 MakeBucketDescriptor(BucketDataPath(victim->bucket_id), *layout,
-                                     victim->bucket_id);
+                                     victim->bucket_id, entry.generation);
             candidates.push_back(std::move(candidate));
         }
 
@@ -1974,58 +2019,152 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
     return pending;
 }
 
-bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
-    // Detach first so the destructor of `pending` cannot abort what we commit.
-    auto* owner = std::exchange(pending.owner_, nullptr);
-    if (owner != this) return false;
+tl::expected<ImmutableBucketAllocator::EvictedBucket, ErrorCode>
+ImmutableBucketAllocator::CommitEvictionLogical(PendingEviction&& pending) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto it = buckets_.find(pending.bucket_id_);
+    if (!initialized_.load(std::memory_order_acquire) ||
+        pending.owner_ != this || it == buckets_.end() ||
+        it->second.get() != pending.bucket_identity_.get() ||
+        !it->second->frozen || it->second->evicting ||
+        it->second->pending_entries != 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Already committed buckets may still fail later; this gates new commits
+    // only.
+    if (!pending.invalidation_ && DeleteFailureBacklogFullLocked()) {
+        lock.unlock();
+        AbortEviction(std::move(pending), /*demote=*/false);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    for (const auto& candidate : pending.candidates_) {
+        auto indexed = key_index_.find(candidate.key);
+        if (indexed != key_index_.end() &&
+            indexed->second == pending.bucket_id_) {
+            key_index_.erase(indexed);
+        }
+    }
+    it->second->evicting = true;
+    MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
+        1, static_cast<int64_t>(it->second->append_offset));
+    EvictedBucket bucket;
+    bucket.bucket_id_ = pending.bucket_id_;
+    bucket.identity_ = std::move(pending.bucket_identity_);
+    pending.owner_ = nullptr;
+    return bucket;
+}
 
-    const int64_t bucket_id = pending.bucket_id_;
-    auto bucket_identity = std::move(pending.bucket_identity_);
-    auto candidates = std::move(pending.candidates_);
-    if (bucket_id < 0 || !bucket_identity) return false;
-
+tl::expected<void, ErrorCode> ImmutableBucketAllocator::DeleteEvictedBucket(
+    EvictedBucket&& bucket) {
+    // Serialize with metadata flush and root retirement. A retired token must
+    // never touch paths that may now belong to a replacement filesystem root.
     std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = buckets_.find(bucket_id);
-        if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
-            return false;
+        auto it = buckets_.find(bucket.bucket_id_);
+        if (!initialized_.load(std::memory_order_acquire) ||
+            it == buckets_.end() || it->second.get() != bucket.identity_.get() ||
+            !it->second->evicting) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        if (it->second->pending_entries != 0) {
-            it->second->frozen = false;
-            // Restore cold LRU position so the next round can reconsider it
-            // after the pending write completes or times out.
-            if (lru_index_.find(bucket_id) == lru_index_.end()) {
-                lru_list_.push_back(bucket_id);
-                lru_index_[bucket_id] = std::prev(lru_list_.end());
-            }
-            LOG(WARNING) << "Aborted DFS bucket eviction at commit: bucket "
-                        << bucket_id << " has a PENDING entry";
-            return false;
+        // A token may have waited behind another deletion attempt. Recheck
+        // both clocks after taking the I/O lock so stale candidates cannot
+        // bypass a newly installed backoff or lease deadline.
+        if ((it->second->delete_after &&
+             *it->second->delete_after > std::chrono::system_clock::now()) ||
+            it->second->delete_retry_after > std::chrono::steady_clock::now()) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        // Prepare already enumerated the frozen bucket's live keys. Reuse
-        // that list without reading or rewriting metadata at commit time.
-        for (const auto& candidate : candidates) {
-            auto index_it = key_index_.find(candidate.key);
-            if (index_it != key_index_.end() && index_it->second == bucket_id) {
-                key_index_.erase(index_it);
-            }
-        }
-        buckets_.erase(it);
-        PublishBucketIdSnapshotLocked();
-        RemoveFromLruLocked(bucket_id);
-        if (active_bucket_id_ == bucket_id) active_bucket_id_ = -1;
     }
-
-    // shortcut: interrupted deletion may restore cached entries, add a durable
-    // eviction intent if recovery must remember logical evictions.
-    // The master has already dropped all replicas before file deletion.
-    DeleteBucketFiles(bucket_id);
-    // The deleted bucket's quota slot is reusable only after its files are no
-    // longer present. Wake both refill workers and allocation waiters now.
+    // shortcut: interrupted deletion may restore intact cached entries; add a
+    // durable eviction intent only if recovery must remember logical evictions.
+    for (const auto& path : {BucketMetaPath(bucket.bucket_id_),
+                             BucketDataPath(bucket.bucket_id_)}) {
+        auto deleted = fs_adapter_->DeleteFile(path);
+        if (!deleted && deleted.error() != ErrorCode::FILE_NOT_FOUND) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto& state = *buckets_.at(bucket.bucket_id_);
+                // Saturate at seven failures: 1, 2, 4, 8, 16, 32, then 60s.
+                state.delete_failures =
+                    std::min<int>(state.delete_failures + 1, 7);
+                auto delay = std::chrono::seconds(1);
+                for (int i = 1; i < state.delete_failures; ++i) {
+                    delay = std::min(delay * 2, std::chrono::seconds(60));
+                }
+                state.delete_retry_after =
+                    std::chrono::steady_clock::now() + delay;
+                if (!state.delete_after)
+                    state.delete_after =
+                        std::chrono::system_clock::time_point{};
+            }
+            MasterMetricManager::instance().inc_dfs_bucket_delete_failures();
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(ERROR)
+                    << "DFS bucket deletion failed; capacity reserved for retry"
+                    << ", bucket_id=" << bucket.bucket_id_ << ", path=" << path
+                    << ", error=" << deleted.error()
+                    << ", suppressed=" << *suppressed;
+            }
+            return tl::make_unexpected(deleted.error());
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        MasterMetricManager::instance().add_dfs_bucket_pending_deletion(
+            -1, -static_cast<int64_t>(
+                    buckets_.at(bucket.bucket_id_)->append_offset));
+        buckets_.erase(bucket.bucket_id_);
+        PublishBucketIdSnapshotLocked();
+        UpdateBucketPoolMetricsLocked();
+    }
+    bucket.identity_.reset();
     bucket_pool_cv_.notify_all();
-    LOG(INFO) << "Evicted DFS bucket " << bucket_id;
-    return true;
+    LOG(INFO) << "Evicted DFS bucket " << bucket.bucket_id_;
+    return {};
+}
+
+void ImmutableBucketAllocator::DeferDeletion(
+    EvictedBucket&& bucket, std::chrono::system_clock::time_point not_before) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = buckets_.find(bucket.bucket_id_);
+    if (it == buckets_.end() || it->second.get() != bucket.identity_.get() ||
+        !it->second->evicting)
+        return;
+    it->second->delete_after =
+        std::max(it->second->delete_after.value_or(
+                     std::chrono::system_clock::time_point{}),
+                 not_before);
+    bucket.identity_.reset();
+}
+
+size_t ImmutableBucketAllocator::RetryFailedEvictions() {
+    std::vector<EvictedBucket> retries;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto now = std::chrono::system_clock::now();
+        for (const auto& [id, state] : buckets_) {
+            if (!state->evicting || !state->delete_after ||
+                *state->delete_after > now ||
+                state->delete_retry_after > std::chrono::steady_clock::now())
+                continue;
+            EvictedBucket bucket;
+            bucket.bucket_id_ = id;
+            bucket.identity_ = state;
+            retries.push_back(std::move(bucket));
+        }
+    }
+    size_t completed = 0;
+    for (auto& bucket : retries) {
+        if (DeleteEvictedBucket(std::move(bucket))) ++completed;
+    }
+    return completed;
+}
+
+bool ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
+    auto logical = CommitEvictionLogical(std::move(pending));
+    return logical && DeleteEvictedBucket(std::move(*logical)).has_value();
 }
 
 void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending) {
@@ -2387,9 +2526,15 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk(
             auto layout = RebuildBucketEntryLayout(
                 entry.entry_offset, entry.value_size, alignment_);
             if (!layout) continue;
+            // Carry the recovered generation too. Without it a recovered
+            // descriptor would read back as generation 0, which
+            // FindMatchingEntryLocked treats as "not supplied" and matches on
+            // the layout fields alone, so a later Free or MarkCommitted built
+            // from it could address a different allocation of the same key in
+            // the same slot.
             recovered_replicas_.push_back(RecoveredReplica{
                 key, MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
-                                          bucket_id)});
+                                          bucket_id, entry.generation)});
         }
     }
 

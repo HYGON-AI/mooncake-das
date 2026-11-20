@@ -4,6 +4,7 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
+#include <algorithm>
 #include <csignal>
 #include <string>
 #include <vector>
@@ -115,6 +116,26 @@ struct RpcNameTraits<&WrappedMasterService::PutRevoke> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
     static constexpr const char* value = "BatchPutRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutEndV2> {
+    static constexpr const char* value = "PutEndV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PutRevokeV2> {
+    static constexpr const char* value = "PutRevokeV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutEndV2> {
+    static constexpr const char* value = "BatchPutEndV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchPutRevokeV2> {
+    static constexpr const char* value = "BatchPutRevokeV2";
 };
 
 template <>
@@ -899,6 +920,109 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
         keys.size(), client_id_, keys, replica_type, tenant_id_.value(),
         dfs_epoch);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+// === generation-fenced completion (V2) ===
+//
+// The generation decides which protocol a completion uses, and it is the only
+// thing that decides. A master stamps a generation only with the bucket
+// allocator that also registers these RPCs, so a non-zero value proves the V2
+// form is understood; a zero value means the allocation came from a master (or
+// an allocator) that predates generation fencing and keeps the classic form.
+// Nothing about the master's current DFS state is cached on the client: DFS can
+// be disabled when the connection is made and enabled later, and that must not
+// change how an already-established connection finalizes its writes.
+
+tl::expected<void, ErrorCode> MasterClient::PutEndV2(
+    const ObjectMetaV2& object_meta, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
+    if (object_meta.dfs_generation == 0) {
+        return PutEnd(ObjectMeta{object_meta.key, object_meta.object_checksum},
+                      replica_type, dfs_epoch);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::PutEndV2");
+    timer.LogRequest("key=", object_meta.key,
+                     ", dfs_generation=", object_meta.dfs_generation);
+
+    auto result = invoke_rpc<&WrappedMasterService::PutEndV2, void>(
+        client_id_, object_meta, replica_type, tenant_id_.value(), dfs_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::PutRevokeV2(
+    const RevokeObjectMetaV2& object_meta, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
+    if (object_meta.dfs_generation == 0) {
+        return PutRevoke(object_meta.key, replica_type, dfs_epoch);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::PutRevokeV2");
+    timer.LogRequest("key=", object_meta.key,
+                     ", dfs_generation=", object_meta.dfs_generation);
+
+    auto result = invoke_rpc<&WrappedMasterService::PutRevokeV2, void>(
+        client_id_, object_meta, replica_type, tenant_id_.value(), dfs_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEndV2(
+    const std::vector<ObjectMetaV2>& object_metas, ReplicaType replica_type,
+    const UUID& dfs_epoch) {
+    // One fenced item forces the whole batch onto the V2 form: a classic RPC
+    // cannot carry that item's generation, and dropping it would silently
+    // reopen the stale-completion window this protocol exists to close.
+    // Items without a generation travel along with dfs_generation == 0 and the
+    // master falls back to its field-only comparison for them.
+    const bool has_generation =
+        std::any_of(object_metas.begin(), object_metas.end(),
+                    [](const ObjectMetaV2& object_meta) {
+                        return object_meta.dfs_generation != 0;
+                    });
+    if (!has_generation) {
+        std::vector<ObjectMeta> classic;
+        classic.reserve(object_metas.size());
+        for (const auto& object_meta : object_metas) {
+            classic.emplace_back(
+                ObjectMeta{object_meta.key, object_meta.object_checksum});
+        }
+        return BatchPutEnd(classic, replica_type, dfs_epoch);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutEndV2");
+    timer.LogRequest("keys_count=", object_metas.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEndV2, void>(
+        object_metas.size(), client_id_, object_metas, replica_type,
+        tenant_id_.value(), dfs_epoch);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevokeV2(
+    const std::vector<RevokeObjectMetaV2>& object_metas,
+    ReplicaType replica_type, const UUID& dfs_epoch) {
+    const bool has_generation =
+        std::any_of(object_metas.begin(), object_metas.end(),
+                    [](const RevokeObjectMetaV2& object_meta) {
+                        return object_meta.dfs_generation != 0;
+                    });
+    if (!has_generation) {
+        std::vector<std::string> keys;
+        keys.reserve(object_metas.size());
+        for (const auto& object_meta : object_metas) {
+            keys.push_back(object_meta.key);
+        }
+        return BatchPutRevoke(keys, replica_type, dfs_epoch);
+    }
+    ScopedVLogTimer timer(1, "MasterClient::BatchPutRevokeV2");
+    timer.LogRequest("keys_count=", object_metas.size());
+
+    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevokeV2,
+                                   void>(
+        object_metas.size(), client_id_, object_metas, replica_type,
+        tenant_id_.value(), dfs_epoch);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

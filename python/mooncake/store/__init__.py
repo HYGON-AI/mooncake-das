@@ -9,6 +9,10 @@ from types import ModuleType
 _CPP_EXPORTS = frozenset(
     {
         "RangedReadSnapshot",
+        "ReadKeyMapping",
+        "ReadComponent",
+        "ReadLayout",
+        "ReadPlan",
         "ObjectDataType",
         "SoftPinAction",
         "ReplicateConfig",

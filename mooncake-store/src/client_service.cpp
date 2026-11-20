@@ -94,6 +94,19 @@ UUID DfsWriteEpoch(const std::vector<Replica::Descriptor>& replicas) {
     return {};
 }
 
+// The DFS allocation this write owns. Returned by the master in the PutStart
+// descriptor and echoed back on PutEnd/PutRevoke, so a completion that arrives
+// after the key was rewritten is rejected instead of acting on the successor.
+std::optional<uint64_t> DfsAllocationGeneration(
+    const std::vector<Replica::Descriptor>& replicas) {
+    for (const auto& replica : replicas) {
+        if (replica.is_dfs_replica()) {
+            return replica.get_dfs_descriptor().AllocationGeneration();
+        }
+    }
+    return std::nullopt;
+}
+
 template <typename Item, typename Rpc>
 std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
     const std::vector<Item>& items, const std::vector<UUID>& epochs,
@@ -415,9 +428,14 @@ bool AllAllocatedTransfersSucceeded(const ReplicaTransferSummary& summary) {
            summary.failed_dfs_transfers == 0;
 }
 
+// `allow_missing_memory` accepts a DFS-only object, which the master produces
+// when the memory segments are exhausted and the write degrades to its DFS
+// replica. It requires every requested DFS replica to be present, so a
+// degraded object is only accepted when the fallback actually landed.
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   const ReplicaTransferSummary& summary,
-                                  bool allow_missing_dfs = false) {
+                                  bool allow_missing_dfs = false,
+                                  bool allow_missing_memory = false) {
     if (config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
         return summary.allocated_memory_replicas > 0;
     }
@@ -431,6 +449,11 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
         summary.allocated_dfs_replicas == 0) {
         return summary.allocated_memory_replicas == config.replica_num &&
                summary.allocated_nof_replicas == config.nof_replica_num;
+    }
+    if (allow_missing_memory && config.dfs_replica_num == 1 &&
+        summary.allocated_memory_replicas == 0) {
+        return summary.allocated_nof_replicas == config.nof_replica_num &&
+               summary.allocated_dfs_replicas == config.dfs_replica_num;
     }
     return summary.allocated_memory_replicas == config.replica_num &&
            summary.allocated_nof_replicas == config.nof_replica_num &&
@@ -466,10 +489,11 @@ struct FinalizeDecision {
 
 FinalizeDecision DetermineFinalizeDecision(
     const ReplicateConfig& config, const ReplicaTransferSummary& summary,
-    bool allow_missing_dfs = false, bool allow_memory_only_fallback = false) {
+    bool allow_missing_dfs = false, bool allow_memory_only_fallback = false,
+    bool allow_missing_memory = false) {
     const auto write_mode = DetermineReplicaWriteMode(config);
-    const bool allocation_satisfied =
-        HasExpectedReplicaAllocation(config, summary, allow_missing_dfs);
+    const bool allocation_satisfied = HasExpectedReplicaAllocation(
+        config, summary, allow_missing_dfs, allow_missing_memory);
 
     const bool dfs_deferred = summary.dfs_completion_deferred;
     if (dfs_deferred && summary.allocated_memory_replicas > 0 &&
@@ -479,10 +503,15 @@ FinalizeDecision DetermineFinalizeDecision(
     }
     // Preserve a completed local tier when an allocated DFS write fails on any
     // backend. Missing DFS allocation is degradable only for callers that
-    // explicitly enable the bucket-mode memory-only fallback.
+    // explicitly enable the bucket-mode memory-only fallback. A local tier
+    // must actually exist for this to mean anything: on a DFS-only object
+    // there is nothing to preserve, and reporting success would publish
+    // nothing at all.
+    const bool has_local_tier = summary.allocated_memory_replicas > 0 ||
+                                summary.allocated_nof_replicas > 0;
     const bool best_effort_dfs_failure =
         allow_missing_dfs && config.dfs_replica_num == 1 && !dfs_deferred &&
-        NonDfsTransfersSucceeded(summary) &&
+        has_local_tier && NonDfsTransfersSucceeded(summary) &&
         ((allow_memory_only_fallback &&
           summary.allocated_dfs_replicas == 0) ||
          (summary.allocated_dfs_replicas == 1 &&
@@ -794,6 +823,14 @@ ReplicateConfig Client::AttachConfig(const ReplicateConfig& config) const {
     } else if (DistributedStorageConfig::IsReplicaEnabledFromEnvironment()) {
         client_cfg.dfs_replica_num = 1;
     }
+    // Declare that this client can consume a DFS-only topology. The bit
+    // describes the client, not the master: it says the client understands a
+    // result with no MEMORY replica and can finalize such a write with the
+    // generation-fenced completion. Whether a write may actually degrade is
+    // decided by the master from its own live state, so a connection made
+    // while DFS was disabled does not freeze this client into the strict
+    // behaviour after DFS comes back.
+    client_cfg.supports_dfs_only_fallback = true;
     return client_cfg;
 }
 
@@ -2830,7 +2867,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                   /*allow_memory_only_fallback=*/
                                       dfs_storage_backend_ &&
                                       dfs_storage_backend_->GetAllocatorType() ==
-                                          DfsAllocatorType::BUCKET);
+                                          DfsAllocatorType::BUCKET,
+                                  /*allow_missing_memory=*/true);
 
     if (finalize_decision.success && finalize_decision.revoke_type ==
                                       ReplicaType::DFS) {
@@ -2842,10 +2880,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     std::optional<ErrorCode> finalize_error;
+    const uint64_t dfs_generation =
+        DfsAllocationGeneration(*start_result).value_or(0);
     if (finalize_decision.end_type.has_value()) {
-        auto end_result = master_client_.PutEnd(
-            ObjectMeta{key, object_checksum}, *finalize_decision.end_type,
-            DfsWriteEpoch(*start_result));
+        auto end_result = master_client_.PutEndV2(
+            ObjectMetaV2{key, object_checksum, dfs_generation},
+            *finalize_decision.end_type, DfsWriteEpoch(*start_result));
         if (!end_result) {
             finalize_error = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << *finalize_error;
@@ -2853,8 +2893,9 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result = master_client_.PutRevoke(
-            key, *finalize_decision.revoke_type, DfsWriteEpoch(*start_result));
+        auto revoke_result = master_client_.PutRevokeV2(
+            RevokeObjectMetaV2{key, dfs_generation},
+            *finalize_decision.revoke_type, DfsWriteEpoch(*start_result));
         if (!revoke_result) {
             if (!finalize_error.has_value()) {
                 finalize_error = revoke_result.error();
@@ -3425,7 +3466,9 @@ void Client::healDanglingLocalDiskBatchStarts(
         }
         op.replicas = std::move(retry_responses[r].value());
         op.RecordAllocatedReplicas();
-        if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+        if (!HasExpectedReplicaAllocation(config, op.transfer_summary,
+                                          /*allow_missing_dfs=*/false,
+                                          /*allow_missing_memory=*/true)) {
             op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
                                 PutOperationState::MASTER_FAILED,
                                 "Allocated replicas do not satisfy "
@@ -3522,7 +3565,8 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
             op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary,
-                                              /*allow_missing_dfs=*/true)) {
+                                              /*allow_missing_dfs=*/true,
+                                              /*allow_missing_memory=*/true)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
                                     PutOperationState::MASTER_FAILED,
                                     "Allocated replicas do not satisfy "
@@ -4197,6 +4241,10 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
     struct BatchFinalizeGroup {
         std::vector<std::string> keys;
         std::vector<size_t> indices;
+        // Per-key DFS allocation identity, echoed back so the master can drop
+        // a completion whose allocation the key has already replaced. 0 means
+        // the op had no DFS replica.
+        std::vector<uint64_t> dfs_generations;
     };
 
     BatchFinalizeGroup end_all_group;
@@ -4213,10 +4261,12 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
     std::vector<ErrorCode> terminal_errors(ops.size(), ErrorCode::OK);
     std::vector<std::optional<ErrorCode>> finalize_rpc_errors(ops.size());
 
-    auto add_group_entry = [](BatchFinalizeGroup& group, const std::string& key,
-                              size_t index) {
+    auto add_group_entry = [&ops](BatchFinalizeGroup& group,
+                                  const std::string& key, size_t index) {
         group.keys.emplace_back(key);
         group.indices.emplace_back(index);
+        group.dfs_generations.emplace_back(
+            DfsAllocationGeneration(ops[index].replicas).value_or(0));
     };
 
     auto add_finalize_action =
@@ -4281,7 +4331,8 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
 
         const auto finalize_decision = DetermineFinalizeDecision(
             op.ToReplicateConfig(), op.transfer_summary,
-            /*allow_missing_dfs=*/true, allow_memory_only_fallback);
+            /*allow_missing_dfs=*/true, allow_memory_only_fallback,
+            /*allow_missing_memory=*/true);
         should_succeed[i] = finalize_decision.success;
         terminal_errors[i] = finalize_decision.error;
         add_finalize_action(finalize_decision.end_type, true, op.key, i);
@@ -4293,14 +4344,15 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
         if (group.keys.empty()) {
             return;
         }
-        std::vector<ObjectMeta> object_metas;
+        std::vector<ObjectMetaV2> object_metas;
         object_metas.reserve(group.indices.size());
         for (size_t i = 0; i < group.indices.size(); ++i) {
-            object_metas.emplace_back(ObjectMeta{
-                group.keys[i], ops[group.indices[i]].object_checksum});
+            object_metas.emplace_back(ObjectMetaV2{
+                group.keys[i], ops[group.indices[i]].object_checksum,
+                group.dfs_generations[i]});
         }
-        auto responses =
-            master_client_.BatchPutEnd(object_metas, replica_type, dfs_epoch);
+        auto responses = master_client_.BatchPutEndV2(object_metas,
+                                                      replica_type, dfs_epoch);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -4327,8 +4379,14 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
         if (group.keys.empty()) {
             return;
         }
-        auto responses =
-            master_client_.BatchPutRevoke(group.keys, replica_type, dfs_epoch);
+        std::vector<RevokeObjectMetaV2> object_metas;
+        object_metas.reserve(group.keys.size());
+        for (size_t i = 0; i < group.keys.size(); ++i) {
+            object_metas.emplace_back(RevokeObjectMetaV2{
+                group.keys[i], group.dfs_generations[i]});
+        }
+        auto responses = master_client_.BatchPutRevokeV2(
+            object_metas, replica_type, dfs_epoch);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 if (!best_effort) {
@@ -7236,10 +7294,14 @@ void Client::SubmitDfsWriteChunk(
         }
         // In BUCKET mode, an incomplete requested topology will be revoked.
         // Skipping the DFS write keeps that revoke unambiguous instead of
-        // racing a background completion.
+        // racing a background completion. A memory-exhausted object is the
+        // exception: its DFS replica is the whole object, so it must still be
+        // written.
         if (bucket_mode &&
             !HasExpectedReplicaAllocation(op.ToReplicateConfig(),
-                                          op.transfer_summary)) {
+                                          op.transfer_summary,
+                                          /*allow_missing_dfs=*/false,
+                                          /*allow_missing_memory=*/true)) {
             continue;
         }
 

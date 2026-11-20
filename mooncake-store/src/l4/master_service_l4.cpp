@@ -500,6 +500,7 @@ bool MasterService::RecoverDfsRootAfterReplacement(
             return false;
         }
         for (const int64_t bucket_id : snapshot->bucket_ids) {
+            if (bucket_allocator_->IsBucketEvicting(bucket_id)) continue;
             const auto present =
                 bucket_allocator_->IsBucketDataFilePresent(bucket_id);
             if (!present) {
@@ -522,6 +523,8 @@ bool MasterService::RecoverDfsRootAfterReplacement(
                         << root;
                     continue;
                 }
+                // Logical eviction may have committed after the snapshot/check.
+                if (bucket_allocator_->IsBucketEvicting(bucket_id)) continue;
                 root_lost_data = true;
                 LOG(WARNING) << "Replacement DFS root is missing bucket "
                              << bucket_id
@@ -818,7 +821,7 @@ tl::expected<uint8_t, ErrorCode> MasterService::SetDfsFilterMode(
 
 bool MasterService::IsReplicaReadableForGet(const Replica& replica) const {
     if (!replica.is_completed() || !replica.is_available() ||
-        replica.is_eviction_pending() || IsAwaitingRemount(replica)) return false;
+        IsAwaitingRemount(replica)) return false;
     return !replica.is_dfs_replica() ||
            (enable_dfs_.load(std::memory_order_acquire) &&
             !dfs_root_recovery_in_progress_.load(std::memory_order_acquire));
@@ -907,6 +910,10 @@ MasterService::BatchInvalidateDfsBuckets(
             results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
+        if (bucket_allocator_->IsBucketEvicting(report.bucket_id)) {
+            results.emplace_back();
+            continue;
+        }
         const auto file_present = IsDfsBucketDataFilePresent(report.bucket_id);
         if (!file_present) {
             LOG(WARNING) << "Cannot verify DFS bucket " << report.bucket_id
@@ -921,7 +928,9 @@ MasterService::BatchInvalidateDfsBuckets(
             results.emplace_back();
             continue;
         }
-        bucket_ids.insert(report.bucket_id);
+        if (!bucket_allocator_->IsBucketEvicting(report.bucket_id)) {
+            bucket_ids.insert(report.bucket_id);
+        }
         results.emplace_back();
     }
 
@@ -939,10 +948,16 @@ void MasterService::ProcessInvalidatedDfsBuckets() {
         pending.swap(invalidated_dfs_buckets_);
     }
     for (const int64_t bucket_id : pending) {
+        if (bucket_allocator_ != nullptr &&
+            bucket_allocator_->IsBucketEvicting(bucket_id))
+            continue;
         const auto file_present = IsDfsBucketDataFilePresent(bucket_id);
         if (!file_present) {
             LOG(WARNING) << "Deferring DFS bucket invalidation for bucket "
                          << bucket_id << ": " << file_present.error();
+            if (bucket_allocator_ != nullptr &&
+                bucket_allocator_->IsBucketEvicting(bucket_id))
+                continue;
             std::lock_guard<std::mutex> lock(invalidated_dfs_buckets_mutex_);
             invalidated_dfs_buckets_.insert(bucket_id);
             continue;
@@ -954,7 +969,8 @@ void MasterService::ProcessInvalidatedDfsBuckets() {
         }
         if (!RunBucketDfsEvictionInternal(/*force_one=*/false, bucket_id)) {
             if (bucket_allocator_ != nullptr &&
-                bucket_allocator_->HasBucket(bucket_id)) {
+                bucket_allocator_->HasBucket(bucket_id) &&
+                !bucket_allocator_->IsBucketEvicting(bucket_id)) {
                 std::lock_guard<std::mutex> lock(
                     invalidated_dfs_buckets_mutex_);
                 invalidated_dfs_buckets_.insert(bucket_id);

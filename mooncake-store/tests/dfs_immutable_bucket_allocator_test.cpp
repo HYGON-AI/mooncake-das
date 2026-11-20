@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -30,6 +31,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "crc32c.h"
+#include "immutable_bucket_allocator_test_peer.h"
 #include "master_metric_manager.h"
 #include "replica.h"
 #include "storage/distributed/bucket_entry_layout.h"
@@ -1031,6 +1033,12 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
     EXPECT_EQ(replicas[0].descriptor.aligned_size, committed_desc.aligned_size);
     EXPECT_EQ(replicas[0].descriptor.shard_idx, committed_desc.shard_idx);
     EXPECT_EQ(replicas[0].descriptor.file_path, committed_desc.file_path);
+    // The recovered descriptor must keep the allocation identity it was
+    // reserved with. A zero here would let a later completion match on the
+    // layout fields alone and address a re-reservation of the same slot.
+    EXPECT_NE(replicas[0].descriptor.AllocationGeneration(), 0u);
+    EXPECT_EQ(replicas[0].descriptor.AllocationGeneration(),
+              committed_desc.AllocationGeneration());
 
     EXPECT_TRUE(recovered.GetBucketIdForKey("committed").has_value());
     // The uncommitted entry must not come back as readable.
@@ -1829,6 +1837,313 @@ TEST(ImmutableBucketAllocatorTest, EvictionDisabledYieldsNoCandidates) {
     ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(config));
     EXPECT_FALSE(alloc.IsEvictionEnabled());
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     LogicalEvictionRetainsQuotaAndRetriesDeletion) {
+    for (const bool fail_meta : {false, true}) {
+        SCOPED_TRACE(fail_meta);
+        TempDir tmp("bucket_deferred_retry");
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), kAlignment, 2)));
+        auto old = alloc.Allocate("victim", 100);
+        ASSERT_TRUE(old);
+        ASSERT_TRUE(alloc.MarkCommitted("victim", *old));
+        ASSERT_TRUE(alloc.Allocate("active", 100));
+        alloc.FlushDirtyMetadata();
+        auto pending = alloc.PrepareEvictionForAllocationFailure();
+        ASSERT_EQ(pending.bucket_id(), 0);
+        auto logical = alloc.CommitEvictionLogical(std::move(pending));
+        ASSERT_TRUE(logical);
+        EXPECT_EQ(alloc.GetBucketCount(), 2u);
+        const auto used = alloc.GetUsedBytes();
+        EXPECT_FALSE(alloc.GetBucketIdForKey("victim"));
+        EXPECT_FALSE(alloc.MarkCommitted("victim", *old));
+        alloc.Free("victim", *old);
+        EXPECT_TRUE(alloc.PrepareInvalidation(0).Empty());
+        EXPECT_TRUE(alloc.PrepareEvictionForAllocationFailure().Empty());
+        EXPECT_FALSE(alloc.Allocate("no_space", 100));
+        alloc.DeferDeletion(
+            std::move(*logical),
+            std::chrono::system_clock::now() + std::chrono::hours(1));
+        EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+        EXPECT_TRUE(std::filesystem::exists(old->file_path));
+        EXPECT_EQ(alloc.GetUsedBytes(), used);
+
+        // A nonempty directory at a file path makes real POSIX deletion fail.
+        const auto blocked =
+            fail_meta ? BucketMetaFile(tmp, 0) : old->file_path;
+        std::filesystem::rename(blocked, blocked + ".backup");
+        std::filesystem::create_directory(blocked);
+        std::ofstream(blocked + "/child") << "block deletion";
+        ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+        EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+        EXPECT_EQ(alloc.GetBucketCount(), 2u);
+        EXPECT_EQ(alloc.GetUsedBytes(), used);
+        EXPECT_FALSE(alloc.Allocate("still_full", 100));
+        std::filesystem::remove_all(blocked);
+        std::filesystem::rename(blocked + ".backup", blocked);
+        ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+        EXPECT_EQ(alloc.RetryFailedEvictions(), 1u);
+        EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+        EXPECT_EQ(alloc.GetBucketCount(), 1u);
+        EXPECT_LT(alloc.GetUsedBytes(), used);
+        EXPECT_FALSE(std::filesystem::exists(old->file_path));
+        auto replacement = alloc.Allocate("victim", 100);
+        ASSERT_TRUE(replacement);
+        EXPECT_NE(replacement->file_path, old->file_path);
+        alloc.Free("victim", *old);
+        EXPECT_TRUE(alloc.MarkCommitted("victim", *replacement));
+    }
+}
+
+class DeleteCountingAdapter : public PosixFsAdapter {
+   public:
+    std::string blocked;
+    std::atomic<size_t> calls{0};
+    tl::expected<void, ErrorCode> DeleteFile(const std::string& path) override {
+        ++calls;
+        if (path == blocked)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return PosixFsAdapter::DeleteFile(path);
+    }
+};
+
+int64_t DeleteMetric(const std::string& name) {
+    const auto text = MasterMetricManager::instance().serialize_metrics();
+    const auto prefix = "\n" + name + " ";
+    const auto pos = text.find(prefix);
+    EXPECT_NE(pos, std::string::npos) << name;
+    return pos == std::string::npos
+               ? -1
+               : std::stoll(text.substr(pos + prefix.size()));
+}
+
+TEST(ImmutableBucketAllocatorTest, DeleteBackoffAndPendingMetrics) {
+    TempDir tmp("bucket_backoff");
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), kAlignment, 2)));
+    auto adapter = std::make_unique<DeleteCountingAdapter>();
+    ASSERT_TRUE(adapter->Init(tmp.path()));
+    auto* io = adapter.get();
+    ImmutableBucketAllocatorTestPeer::SetAdapter(alloc, std::move(adapter));
+    const auto count = DeleteMetric("dfs_bucket_pending_delete_count");
+    const auto bytes = DeleteMetric("dfs_bucket_pending_delete_bytes");
+    const auto failures = DeleteMetric("dfs_bucket_delete_failures_total");
+    for (const auto* key : {"a", "b"}) {
+        auto desc = alloc.Allocate(key, 100);
+        ASSERT_TRUE(desc);
+        ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
+    }
+    const auto used = alloc.GetUsedBytes();
+    auto first = alloc.CommitEvictionLogical(alloc.PrepareInvalidation(0));
+    auto second = alloc.CommitEvictionLogical(alloc.PrepareInvalidation(1));
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(DeleteMetric("dfs_bucket_pending_delete_count"), count + 2);
+    EXPECT_EQ(DeleteMetric("dfs_bucket_pending_delete_bytes"), bytes + used);
+    io->blocked = BucketMetaFile(tmp, 0);
+    const auto before = std::chrono::steady_clock::now();
+    EXPECT_FALSE(alloc.DeleteEvictedBucket(std::move(*first)));
+    EXPECT_GE(ImmutableBucketAllocatorTestPeer::RetryState(alloc, 0).second,
+              before + std::chrono::seconds(1));
+    const auto calls = io->calls.load();
+    // A far-future deadline makes the skip assertion independent of scheduling.
+    ImmutableBucketAllocatorTestPeer::PostponeRetry(alloc, 0);
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+    EXPECT_EQ(io->calls.load(), calls);
+    EXPECT_EQ(DeleteMetric("dfs_bucket_delete_failures_total"), failures + 1);
+    alloc.DeferDeletion(std::move(*second),
+                        std::chrono::system_clock::time_point{});
+    EXPECT_EQ(alloc.RetryFailedEvictions(),
+              1u);  // b proceeds while a backs off.
+    EXPECT_EQ(alloc.GetUsedBytes(), used - kAlignment);
+    int attempted = 1;
+    for (const int delay : {2, 4, 8, 16, 32, 60, 60, 60}) {
+        ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+        const auto start = std::chrono::steady_clock::now();
+        EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+        const auto end = std::chrono::steady_clock::now();
+        const auto state =
+            ImmutableBucketAllocatorTestPeer::RetryState(alloc, 0);
+        EXPECT_GE(state.second, start + std::chrono::seconds(delay));
+        EXPECT_LE(state.second, end + std::chrono::seconds(delay));
+        EXPECT_LE(state.first, 7);
+        EXPECT_EQ(DeleteMetric("dfs_bucket_delete_failures_total"),
+                  failures + ++attempted);
+        EXPECT_EQ(alloc.GetUsedBytes(), kAlignment);
+        EXPECT_EQ(DeleteMetric("dfs_bucket_pending_delete_bytes"),
+                  bytes + kAlignment);
+    }
+    io->blocked.clear();
+    // Both files already absent still count as successful finalization, not
+    // failures.
+    std::filesystem::remove(tmp.file("bucket_000000.data"));
+    std::filesystem::remove(BucketMetaFile(tmp, 0));
+    ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 1u);
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+    EXPECT_EQ(alloc.GetUsedBytes(), 0u);
+    EXPECT_EQ(DeleteMetric("dfs_bucket_pending_delete_count"), count);
+    EXPECT_EQ(DeleteMetric("dfs_bucket_pending_delete_bytes"), bytes);
+    EXPECT_EQ(DeleteMetric("dfs_bucket_delete_failures_total"),
+              failures + attempted);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     PreparedEvictionRechecksDeleteFailureBacklog) {
+    TempDir tmp("bucket_backlog_commit");
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), kAlignment, 6)));
+    std::vector<DistributedFSDescriptor> descriptors;
+    for (const auto* key : {"a", "b", "c", "d", "active"}) {
+        auto desc = alloc.Allocate(key, 100);
+        ASSERT_TRUE(desc);
+        ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
+        descriptors.push_back(*desc);
+    }
+    auto first = alloc.CommitEvictionLogical(
+        alloc.PrepareEvictionForAllocationFailure());
+    auto second = alloc.CommitEvictionLogical(
+        alloc.PrepareEvictionForAllocationFailure());
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    const auto future =
+        std::chrono::system_clock::now() + std::chrono::hours(1);
+    alloc.DeferDeletion(std::move(*first), future);
+    alloc.DeferDeletion(std::move(*second), future);
+    // Lease-only pending deletions do not block another candidate.
+    auto pending = alloc.PrepareEvictionForAllocationFailure();
+    ASSERT_EQ(pending.bucket_id(), descriptors[2].shard_idx);
+    auto moved = std::move(pending);
+    pending = std::move(moved);
+    const auto used = alloc.GetUsedBytes();
+    auto adapter = std::make_unique<DeleteCountingAdapter>();
+    ASSERT_TRUE(adapter->Init(tmp.path()));
+    auto* io = adapter.get();
+    ImmutableBucketAllocatorTestPeer::SetAdapter(alloc, std::move(adapter));
+    for (int i = 0; i < 2; ++i) {
+        io->blocked = BucketMetaFile(tmp, descriptors[i].shard_idx);
+        ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+        auto token = ImmutableBucketAllocatorTestPeer::DeletionToken(
+            alloc, descriptors[i].shard_idx);
+        EXPECT_FALSE(alloc.DeleteEvictedBucket(std::move(token)));
+        ImmutableBucketAllocatorTestPeer::PostponeRetry(
+            alloc, descriptors[i].shard_idx);
+    }
+    EXPECT_FALSE(alloc.CommitEvictionLogical(std::move(pending)));
+    EXPECT_EQ(alloc.GetUsedBytes(), used);
+    // Preparing the exact bucket proves rejection restored its unfrozen state.
+    auto invalidation = alloc.PrepareInvalidation(descriptors[2].shard_idx);
+    ASSERT_EQ(invalidation.bucket_id(), descriptors[2].shard_idx);
+    auto invalidation_moved = std::move(invalidation);
+    invalidation = std::move(invalidation_moved);
+    auto logical = alloc.CommitEvictionLogical(std::move(invalidation));
+    ASSERT_TRUE(logical);
+    io->blocked.clear();
+    EXPECT_TRUE(alloc.DeleteEvictedBucket(std::move(*logical)));
+    auto replacement = alloc.Allocate("c", 100);
+    ASSERT_TRUE(replacement);
+    ASSERT_TRUE(alloc.MarkCommitted("c", *replacement));
+    alloc.Free("c", descriptors[2]);
+    EXPECT_TRUE(alloc.MarkCommitted("c", *replacement));
+    EXPECT_EQ(alloc.PrepareEvictionForAllocationFailure().bucket_id(), -1);
+    ImmutableBucketAllocatorTestPeer::ExpireDeletions(alloc);
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 2u);
+    auto resumed = alloc.PrepareEvictionForAllocationFailure();
+    EXPECT_EQ(resumed.bucket_id(), descriptors[3].shard_idx);
+}
+
+TEST(ImmutableBucketAllocatorTest, StaleDeletionCandidatesRecheckBackoff) {
+    TempDir tmp("bucket_backoff_stale");
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), kAlignment, 2)));
+    auto desc = alloc.Allocate("victim", 100);
+    ASSERT_TRUE(desc);
+    ASSERT_TRUE(alloc.MarkCommitted("victim", *desc));
+    auto adapter = std::make_unique<DeleteCountingAdapter>();
+    ASSERT_TRUE(adapter->Init(tmp.path()));
+    auto* io = adapter.get();
+    io->blocked = BucketMetaFile(tmp, 0);
+    ImmutableBucketAllocatorTestPeer::SetAdapter(alloc, std::move(adapter));
+    auto logical = alloc.CommitEvictionLogical(alloc.PrepareInvalidation(0));
+    ASSERT_TRUE(logical);
+    // These tokens were collected before the failing attempt installs backoff.
+    auto stale = ImmutableBucketAllocatorTestPeer::DeletionToken(alloc, 0);
+    auto stale2 = ImmutableBucketAllocatorTestPeer::DeletionToken(alloc, 0);
+    EXPECT_FALSE(alloc.DeleteEvictedBucket(std::move(*logical)));
+    ImmutableBucketAllocatorTestPeer::PostponeRetry(alloc, 0);
+    const auto failures = DeleteMetric("dfs_bucket_delete_failures_total");
+    const auto calls = io->calls.load();
+    std::unique_lock gate(
+        ImmutableBucketAllocatorTestPeer::DeletionMutex(alloc));
+    std::promise<void> queued;
+    auto worker = std::async(std::launch::async, [&] {
+        queued.set_value();
+        return alloc.DeleteEvictedBucket(std::move(stale));
+    });
+    queued.get_future().wait();
+    gate.unlock();
+    EXPECT_FALSE(worker.get());
+    EXPECT_EQ(io->calls.load(), calls);
+    EXPECT_EQ(DeleteMetric("dfs_bucket_delete_failures_total"), failures);
+    const auto pending = DeleteMetric("dfs_bucket_pending_delete_count");
+    auto replacement = alloc.RetireAndCreateReplacementAllocator();
+    EXPECT_EQ(DeleteMetric("dfs_bucket_pending_delete_count"), pending - 1);
+    ASSERT_TRUE(
+        replacement->Init(MakeEvictionConfig(tmp.path(), kAlignment, 2)));
+    EXPECT_FALSE(alloc.DeleteEvictedBucket(std::move(stale2)));
+    EXPECT_EQ(io->calls.load(), calls);
+    EXPECT_EQ(DeleteMetric("dfs_bucket_pending_delete_count"), pending - 1);
+}
+
+TEST(ImmutableBucketAllocatorTest,
+     LogicalCommitFailureCanAbortAndRetirementCancelsDeletion) {
+    TempDir tmp("bucket_logical_abort");
+    ImmutableBucketAllocator alloc;
+    ImmutableBucketAllocator other;
+    ASSERT_TRUE(alloc.Init(MakeEvictionConfig(tmp.path(), kAlignment, 2)));
+    auto desc = alloc.Allocate("victim", 100);
+    ASSERT_TRUE(desc);
+    ASSERT_TRUE(alloc.MarkCommitted("victim", *desc));
+    ASSERT_TRUE(alloc.Allocate("active", 100));
+    auto pending = alloc.PrepareEvictionForAllocationFailure();
+    EXPECT_FALSE(other.CommitEvictionLogical(std::move(pending)));
+    alloc.AbortEviction(std::move(pending));
+    auto retry = alloc.PrepareEvictionForAllocationFailure();
+    ASSERT_EQ(retry.bucket_id(), 0);
+    auto logical = alloc.CommitEvictionLogical(std::move(retry));
+    ASSERT_TRUE(logical);
+    auto replacement = alloc.RetireAndCreateReplacementAllocator();
+    EXPECT_FALSE(alloc.DeleteEvictedBucket(std::move(*logical)));
+    EXPECT_EQ(alloc.RetryFailedEvictions(), 0u);
+    EXPECT_TRUE(std::filesystem::exists(desc->file_path));
+}
+
+TEST(ImmutableBucketAllocatorTest, DeferredEvictionCanRecoverIntactMetadata) {
+    TempDir tmp("bucket_deferred_restart");
+    auto config = MakeEvictionConfig(tmp.path(), kAlignment, 4);
+    config.bucket_recovery_enabled = true;
+    {
+        ImmutableBucketAllocator alloc;
+        ASSERT_TRUE(alloc.Init(config));
+        auto desc = alloc.Allocate("victim", 100);
+        ASSERT_TRUE(desc);
+        ASSERT_TRUE(alloc.MarkCommitted("victim", *desc));
+        ASSERT_TRUE(alloc.Allocate("active", 100));
+        alloc.FlushDirtyMetadata();
+        auto pending = alloc.PrepareEvictionForAllocationFailure();
+        auto logical = alloc.CommitEvictionLogical(std::move(pending));
+        ASSERT_TRUE(logical);
+        alloc.DeferDeletion(
+            std::move(*logical),
+            std::chrono::system_clock::now() + std::chrono::hours(1));
+    }
+    ImmutableBucketAllocator restarted;
+    ASSERT_TRUE(restarted.Init(config));
+    auto replicas = restarted.TakeRecoveredReplicas();
+    ASSERT_EQ(replicas.size(), 1u);
+    EXPECT_EQ(replicas[0].key, "victim");
 }
 
 TEST(ImmutableBucketAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction) {

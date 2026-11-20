@@ -55,10 +55,15 @@ inline std::optional<BucketEntryLayout> RebuildBucketEntryLayout(
 }
 
 inline DistributedFSDescriptor MakeBucketDescriptor(
-    std::string data_path, const BucketEntryLayout& layout, int64_t bucket_id) {
-    return DistributedFSDescriptor{std::move(data_path), layout.offset,
-                                   layout.object_size, layout.aligned_size,
-                                   static_cast<int>(bucket_id), {}};
+    std::string data_path, const BucketEntryLayout& layout, int64_t bucket_id,
+    uint64_t allocation_generation = 0) {
+    DistributedFSDescriptor descriptor{std::move(data_path), layout.offset,
+                                       layout.object_size, layout.aligned_size,
+                                       static_cast<int>(bucket_id), {}};
+    if (allocation_generation != 0) {
+        descriptor.allocation_generation = allocation_generation;
+    }
+    return descriptor;
 }
 
 inline constexpr int64_t kMaxBucketId =
