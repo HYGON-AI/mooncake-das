@@ -30,8 +30,13 @@ jobs:
       matrix:
         build_variant: [standard, shca]
         dtk:
+          # DTK 27.04 toolchain
+          - version: ${{ vars.HCU_DTK_2704_VERSION }}
+            py: ${{ vars.HCU_DTK_2704_PYTHON_VERSION }}
+          # Current toolchain
           - version: ${{ vars.HCU_DTK_VERSION }}
             py: ${{ vars.PYTHON_VERSION }}
+          # Previous toolchain
           - version: ${{ vars.HCU_DTK_OLD_VERSION }}
             py: ${{ vars.PYTHON_OLD_VERSION }}
     env:
