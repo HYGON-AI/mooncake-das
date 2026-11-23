@@ -48,11 +48,9 @@ class PosixFsAdapter : public FileSystemAdapter {
     tl::expected<void, ErrorCode> SetBucketWriteContext(
         int fd, uint64_t max_write_bytes) override;
 
-    tl::expected<void, ErrorCode> TouchFileAtime(
-        const std::string& path) override;
-
-    tl::expected<void, ErrorCode> UpdateFileSize(
-        const std::string& path, uint64_t size) override;
+    tl::expected<FileMetadataUpdateResult, ErrorCode> UpdateFileMetadata(
+        const std::string& path, uint64_t size, bool update_size,
+        bool update_mtime) override;
 
     tl::expected<void, ErrorCode> PreallocateFile(const std::string& path,
                                                   uint64_t size) override;

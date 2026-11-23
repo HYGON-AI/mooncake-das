@@ -76,9 +76,9 @@ struct DistributedStorageConfig {
 
     std::string object_storage_config_path;
 
-    // POSIX adapter only: when enabled, bucket write handles skip size/atime
+    // POSIX adapter only: when enabled, bucket write handles skip size/mtime
     // updates while retaining range locks, and the master refreshes bucket
-    // size and atime at seal time. Requires a filesystem that implements the
+    // size and mtime at seal time. Requires a filesystem that implements the
     // write-context ioctl; otherwise the adapter reports NOT_SUPPORTED and
     // writes keep the previous behavior. Enabled by default for POSIX buckets.
     bool posix_write_context_enabled = true;

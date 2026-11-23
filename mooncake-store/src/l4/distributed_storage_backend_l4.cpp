@@ -278,31 +278,51 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
         }
         return tl::make_unexpected(fd_result.error());
     }
+    int fd = *fd_result;
 
+    // Write-context ioctl is a pure optimization. If the filesystem does not
+    // implement it, or rejects it for any other reason, fall back to the plain
+    // locked write path instead of failing the write. Once it fails the process
+    // stops probing it, so an unsupported filesystem never induces an
+    // open+ioctl+close storm for every cold bucket.
     if (distributed_config_.posix_write_context_enabled &&
-        distributed_config_.fs_adapter_type == "posix") {
+        distributed_config_.fs_adapter_type == "posix" &&
+        !posix_write_context_unavailable_.load(std::memory_order_relaxed)) {
         auto context = fs_adapter_->SetBucketWriteContext(
-            *fd_result, distributed_config_.bucket_capacity);
+            fd, distributed_config_.bucket_capacity);
         if (context) {
             // One INFO per process; the ioctl is otherwise silent.
             LOG_FIRST_N(INFO, 1)
                 << "DFS bucket write context enabled: client skips per-write "
-                   "size/atime updates (range locks retained)";
-        } else if (context.error() != ErrorCode::NOT_SUPPORTED) {
-            (void)fs_adapter_->CloseFile(*fd_result);
-            return tl::make_unexpected(context.error());
+                   "size/mtime updates (range locks retained)";
         } else {
-            LOG(WARNING)
-                << "DFS bucket write-context ioctl is not supported for "
-                << path
-                << "; falling back to the legacy locked write path "
-                   "(size/atime updates and range locks remain enabled)";
+            posix_write_context_unavailable_.store(true,
+                                                   std::memory_order_relaxed);
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(WARNING)
+                    << "DFS bucket write-context ioctl failed for " << path
+                    << " (error=" << context.error()
+                    << "); disabling it for this process and falling back to "
+                       "the legacy write path from now on, suppressed="
+                    << *suppressed;
+            }
+            if (context.error() != ErrorCode::NOT_SUPPORTED) {
+                // A hard error may have left the fd in an unknown state.
+                // Replace it with a clean handle before writing through it.
+                (void)fs_adapter_->CloseFile(fd);
+                auto reopened = fs_adapter_->OpenFileReadWriteExisting(path);
+                if (!reopened) {
+                    return tl::make_unexpected(reopened.error());
+                }
+                fd = *reopened;
+            }
         }
     }
 
     auto handle = std::make_shared<OpenFileHandle>();
     handle->path = path;
-    handle->fd = *fd_result;
+    handle->fd = fd;
     handle->adapter = fs_adapter_.get();
 
     // A queued operation may still carry the old epoch before this client has
@@ -338,7 +358,7 @@ DistributedStorageBackend::GetOrOpenBucketForRead(int64_t bucket_id,
                              ImmutableBucketAllocator::FormatBucketId(bucket_id) +
                              kBucketDataSuffix;
     // A plain read handle: no write-context ioctl, so reads keep the default
-    // size/atime/range-lock behavior even while writes opt out of it.
+    // size/mtime/range-lock behavior even while writes opt out of it.
     auto fd_result = fs_adapter_->OpenFileReadOnly(path);
     if (!fd_result) {
         static DfsLogLimiter log_limiter;

@@ -285,17 +285,13 @@ tl::expected<void, ErrorCode> PosixFsAdapter::SetBucketWriteContext(
 
     if (::ioctl(fd, STORAGE_MPIO_SET_WRCONTEXT, &context) == 0) return {};
 
+    // Return only the error code: the caller owns the process-wide "give up"
+    // state and the rate-limited logging; a per-open probe must not log here.
     const int saved_errno = errno;
     if (saved_errno == ENOTTY || saved_errno == EINVAL ||
         saved_errno == EOPNOTSUPP) {
-        // The filesystem has no such extension. Report it so the caller can
-        // decide whether falling back to locked writes is acceptable.
-        LOG(WARNING) << "DFS bucket write-context ioctl is unsupported on "
-                        "this filesystem, errno=" << saved_errno;
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    LOG(ERROR) << "DFS bucket write-context ioctl failed, errno="
-               << saved_errno;
     return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 #else
     (void)fd;
@@ -304,75 +300,59 @@ tl::expected<void, ErrorCode> PosixFsAdapter::SetBucketWriteContext(
 #endif
 }
 
-tl::expected<void, ErrorCode> PosixFsAdapter::TouchFileAtime(
-    const std::string& path) {
+tl::expected<FileSystemAdapter::FileMetadataUpdateResult, ErrorCode>
+PosixFsAdapter::UpdateFileMetadata(const std::string& path, uint64_t size,
+                                   bool update_size, bool update_mtime) {
 #if defined(__linux__)
-    // A write handle that skips metadata updates cannot refresh atime, so the
-    // master issues the storage-side update itself. The command takes an
-    // unsigned int payload; the value is unused.
+    if (!update_size && !update_mtime) return FileMetadataUpdateResult{};
+    // A write handle that skips metadata updates cannot refresh them, so the
+    // master issues the storage-side updates itself. Both ioctls share one fd
+    // to avoid a second open per sealed bucket.
     const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        if (errno == ENOENT) return {};
-        LOG(WARNING) << "Failed to open " << path << " for atime refresh, errno="
-                     << errno;
+        if (errno == ENOENT) return FileMetadataUpdateResult{};
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    // The reference ABI uses an unsigned-int ioctl payload. The value is not
-    // interpreted by the current implementation, but passing storage is
-    // required for kernels that validate the _IOW argument.
-    unsigned int arg = 0;
-    const int rc = ::ioctl(fd, STORAGE_UPDATE_TIME, &arg);
-    const int saved_errno = errno;
-    ::close(fd);
-    if (rc == 0) return {};
-    if (saved_errno == ENOENT) return {};
-    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
-        saved_errno == EOPNOTSUPP) {
-        LOG(WARNING) << "DFS atime-refresh ioctl is unsupported on this "
-                        "filesystem, path=" << path
-                     << ", errno=" << saved_errno;
-        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-    }
-    LOG(WARNING) << "Failed to refresh atime for " << path
-                 << ", errno=" << saved_errno;
-    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-#else
-    (void)path;
-    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-#endif
-}
 
-tl::expected<void, ErrorCode> PosixFsAdapter::UpdateFileSize(
-    const std::string& path, uint64_t size) {
-#if defined(__linux__)
-    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-        if (errno == ENOENT) return {};
-        LOG(WARNING) << "Failed to open " << path << " for size update, errno="
-                     << errno;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    FileMetadataUpdateResult result;
+    if (update_size) {
+        storage_ioctl::StorageFileSize file_size{};
+        file_size.size = static_cast<unsigned long long>(size);
+        file_size.rank = 1;
+        if (::ioctl(fd, STORAGE_UPDATE_SIZE, &file_size) == 0) {
+            result.size_ok = true;
+        } else if (errno == ENOTTY || errno == EINVAL ||
+                   errno == EOPNOTSUPP) {
+            result.size_ok = false;
+            result.size_unsupported = true;
+        } else {
+            result.size_ok = false;
+            result.size_failed = true;
+        }
     }
-    storage_ioctl::StorageFileSize file_size{};
-    file_size.size = static_cast<unsigned long long>(size);
-    file_size.rank = 1;
-    const int rc = ::ioctl(fd, STORAGE_UPDATE_SIZE, &file_size);
-    const int saved_errno = errno;
+    if (update_mtime) {
+        // The ABI encodes an unsigned-int payload. The value is not
+        // interpreted, but passing valid storage is required for kernels that
+        // validate the _IOW argument (ad_ofs.c passes NULL).
+        unsigned int arg = 0;
+        if (::ioctl(fd, STORAGE_UPDATE_TIME, &arg) == 0) {
+            result.mtime_ok = true;
+        } else if (errno == ENOTTY || errno == EINVAL ||
+                   errno == EOPNOTSUPP) {
+            result.mtime_ok = false;
+            result.mtime_unsupported = true;
+        } else {
+            result.mtime_ok = false;
+            result.mtime_failed = true;
+        }
+    }
     ::close(fd);
-    if (rc == 0) return {};
-    if (saved_errno == ENOENT) return {};
-    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
-        saved_errno == EOPNOTSUPP) {
-        LOG(WARNING) << "DFS size-update ioctl is unsupported on this "
-                        "filesystem, path=" << path
-                     << ", errno=" << saved_errno;
-        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
-    }
-    LOG(WARNING) << "Failed to update size for " << path
-                 << ", errno=" << saved_errno;
-    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    return result;
 #else
     (void)path;
     (void)size;
+    (void)update_size;
+    (void)update_mtime;
     return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
 }

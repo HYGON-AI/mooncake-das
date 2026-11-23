@@ -24,7 +24,8 @@
 namespace mooncake {
 namespace storage_ioctl {
 
-// Skip the atime update that a write would otherwise trigger.
+// Skip the write-triggered modification-time update (mtime). The flag is named
+// "time" by the vendor ABI; a write updates mtime, not atime.
 inline constexpr uint32_t kWriteStageSkipTime = 0x01;
 // Skip the write-side file-size refresh.
 inline constexpr uint32_t kWriteStageSkipSize = 0x02;

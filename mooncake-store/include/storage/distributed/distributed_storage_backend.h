@@ -292,7 +292,7 @@ class DistributedStorageBackend
      *
      * Only distinct from `GetOrOpenBucket` when the POSIX write context is on:
      * that mode marks the write handle with an ioctl that skips per-write
-     * size/atime updates while retaining range locks, and the mark is a per-fd
+     * size/mtime updates while retaining range locks, and the mark is a per-fd
      * property. Serving reads from that same fd would drag the write-only
      * metadata behavior into the read path, so reads get their own plain
      * handle. When the mode is off this returns the regular handle and the two
@@ -400,6 +400,10 @@ class DistributedStorageBackend
     // feature is off, where reads keep sharing bucket_id_cache_.
     std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
         bucket_id_read_cache_;
+    // Set once the write-context ioctl fails or reports NOT_SUPPORTED. After
+    // that no further open probes the ioctl, so an unsupported or misbehaving
+    // filesystem cannot turn into an open+ioctl storm on every cold bucket.
+    std::atomic<bool> posix_write_context_unavailable_{false};
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
     tl::expected<void, ErrorCode> InitBucketModeLocked();
