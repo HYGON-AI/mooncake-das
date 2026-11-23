@@ -51,6 +51,9 @@ class PosixFsAdapter : public FileSystemAdapter {
     tl::expected<void, ErrorCode> TouchFileAtime(
         const std::string& path) override;
 
+    tl::expected<void, ErrorCode> UpdateFileSize(
+        const std::string& path, uint64_t size) override;
+
     tl::expected<void, ErrorCode> PreallocateFile(const std::string& path,
                                                   uint64_t size) override;
 

@@ -465,8 +465,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // a sealed bucket: an unsealed one is deliberately not persisted at
         // all.
         bool meta_dirty = false;
-        // Set when a sealed bucket still needs its master-owned atime refreshed.
+        // Set when a sealed bucket still needs its master-owned data size and
+        // atime refreshed.
         bool atime_dirty = false;
+        bool data_size_dirty = false;
         // Tombstoned entries, kept for eviction bookkeeping.
         uint64_t tombstones = 0;
         std::unordered_map<std::string, BucketEntry> entries;

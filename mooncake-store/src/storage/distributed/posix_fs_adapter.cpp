@@ -238,7 +238,10 @@ tl::expected<int, ErrorCode> PosixFsAdapter::OpenFile(const std::string& path) {
 
 tl::expected<int, ErrorCode> PosixFsAdapter::OpenFileReadOnly(
     const std::string& path) {
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    int fd;
+    do {
+        fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0) return tl::make_unexpected(ReadOpenError());
     return fd;
 }
@@ -272,13 +275,12 @@ tl::expected<void, ErrorCode> PosixFsAdapter::SetBucketWriteContext(
     if (fd < 0) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
     storage_ioctl::WriteContext context{};
-    // The client is never the file's size/time owner: the master sets both at
-    // bucket creation, and every write handle for this bucket says so here.
+    // The client does not own file size/time updates: the master updates both
+    // when the bucket is sealed, and every write handle says so here.
     context.is_iorank = 0;
     context.size = max_write_bytes;
     context.stage_flags = storage_ioctl::kWriteStageSkipSize |
                           storage_ioctl::kWriteStageSkipTime |
-                          storage_ioctl::kWriteStageSkipLock |
                           storage_ioctl::kWriteStageNoExtendLock;
 
     if (::ioctl(fd, STORAGE_MPIO_SET_WRCONTEXT, &context) == 0) return {};
@@ -316,9 +318,11 @@ tl::expected<void, ErrorCode> PosixFsAdapter::TouchFileAtime(
                      << errno;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    // The reference ABI passes no payload for STORAGE_UPDATE_TIME even though
-    // the command encoding carries an unsigned-int type.
-    const int rc = ::ioctl(fd, STORAGE_UPDATE_TIME, nullptr);
+    // The reference ABI uses an unsigned-int ioctl payload. The value is not
+    // interpreted by the current implementation, but passing storage is
+    // required for kernels that validate the _IOW argument.
+    unsigned int arg = 0;
+    const int rc = ::ioctl(fd, STORAGE_UPDATE_TIME, &arg);
     const int saved_errno = errno;
     ::close(fd);
     if (rc == 0) return {};
@@ -335,6 +339,42 @@ tl::expected<void, ErrorCode> PosixFsAdapter::TouchFileAtime(
     return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
 #else
     (void)path;
+    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+}
+
+tl::expected<void, ErrorCode> PosixFsAdapter::UpdateFileSize(
+    const std::string& path, uint64_t size) {
+#if defined(__linux__)
+    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return {};
+        LOG(WARNING) << "Failed to open " << path << " for size update, errno="
+                     << errno;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    storage_ioctl::StorageFileSize file_size{};
+    file_size.size = static_cast<unsigned long long>(size);
+    file_size.rank = 1;
+    const int rc = ::ioctl(fd, STORAGE_UPDATE_SIZE, &file_size);
+    const int saved_errno = errno;
+    ::close(fd);
+    if (rc == 0) return {};
+    if (saved_errno == ENOENT) return {};
+    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
+        saved_errno == EOPNOTSUPP) {
+        LOG_FIRST_N(WARNING, 1)
+            << "DFS size-update ioctl is unsupported on this filesystem, "
+               "errno="
+            << saved_errno;
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    LOG(WARNING) << "Failed to update size for " << path
+                 << ", errno=" << saved_errno;
+    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+#else
+    (void)path;
+    (void)size;
     return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
 }

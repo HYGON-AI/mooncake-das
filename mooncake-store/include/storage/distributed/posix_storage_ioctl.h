@@ -18,6 +18,7 @@
 #include <linux/types.h>
 #include <sys/ioctl.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace mooncake {
@@ -48,6 +49,19 @@ struct WriteContext {
     uint64_t size;
 };
 
+struct StorageFileSize {
+    unsigned long long size;
+    int rank;
+};
+
+static_assert(sizeof(WriteContext) == 40);
+static_assert(offsetof(WriteContext, chksize) == 16);
+static_assert(offsetof(WriteContext, stripe_width) == 20);
+static_assert(offsetof(WriteContext, is_iorank) == 24);
+static_assert(offsetof(WriteContext, stage_flags) == 28);
+static_assert(offsetof(WriteContext, size) == 32);
+static_assert(sizeof(StorageFileSize) == 16);
+
 }  // namespace storage_ioctl
 }  // namespace mooncake
 
@@ -61,5 +75,9 @@ struct WriteContext {
 #define STORAGE_IOCTL_NR 0xa0
 #define STORAGE_UPDATE_TIME \
     _IOW(STORAGE_IOC_MAGIC_P, STORAGE_IOCTL_NR + 41, unsigned int)
+
+#define STORAGE_UPDATE_SIZE \
+    _IOW(STORAGE_IOC_MAGIC_P, STORAGE_IOCTL_NR + 42, \
+         struct mooncake::storage_ioctl::StorageFileSize)
 
 #endif  // __linux__

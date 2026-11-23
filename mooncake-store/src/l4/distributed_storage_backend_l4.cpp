@@ -279,35 +279,26 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
         return tl::make_unexpected(fd_result.error());
     }
 
-    // When the opt-in write context is active, this is the bucket's lock-free
-    // write handle: the filesystem skips the per-write size refresh, the atime
-    // update and the range-lock extension. Contiguous entries are merged into
-    // one pwritev, so the advertised bound is the whole bucket.
-    bool lock_free_write = false;
-    if (distributed_config_.posix_write_context_enabled) {
+    if (distributed_config_.posix_write_context_enabled &&
+        distributed_config_.fs_adapter_type == "posix") {
         auto context = fs_adapter_->SetBucketWriteContext(
             *fd_result, distributed_config_.bucket_capacity);
-        if (context) {
-            lock_free_write = true;
-        } else if (context.error() != ErrorCode::NOT_SUPPORTED) {
+        if (!context && context.error() != ErrorCode::NOT_SUPPORTED) {
             (void)fs_adapter_->CloseFile(*fd_result);
             return tl::make_unexpected(context.error());
-        } else {
+        } else if (!context) {
             LOG_FIRST_N(WARNING, 1)
                 << "DFS bucket write-context ioctl is not supported for "
                 << path
                 << "; falling back to the legacy locked write path "
                    "(size/atime updates and range locks remain enabled)";
         }
-        // No extension on this filesystem: keep the handle, and with it the
-        // default locked write behavior.
     }
 
     auto handle = std::make_shared<OpenFileHandle>();
     handle->path = path;
     handle->fd = *fd_result;
     handle->adapter = fs_adapter_.get();
-    handle->lock_free_write = lock_free_write;
 
     // A queued operation may still carry the old epoch before this client has
     // observed a restart. Confirm AFTER opening: an old location must never
@@ -712,19 +703,6 @@ DistributedStorageBackend::BatchWriteBucket(
                     break;
                 }
                 if (*result == 0) {
-                    error = ErrorCode::FILE_WRITE_FAIL;
-                    break;
-                }
-                if (prepared[pos].target.keepalive->lock_free_write &&
-                    static_cast<uint64_t>(*result) < total_size - written) {
-                    // Once range locking is disabled, a byte-granular retry
-                    // would restart at an unaligned offset with an unaligned
-                    // length. Treat a short transfer as terminal instead.
-                    LOG(WARNING)
-                        << "Short DFS bucket write cannot be retried with "
-                           "lock-free I/O, key="
-                        << prepared[pos].index << ", expected_remaining="
-                        << (total_size - written) << ", actual=" << *result;
                     error = ErrorCode::FILE_WRITE_FAIL;
                     break;
                 }

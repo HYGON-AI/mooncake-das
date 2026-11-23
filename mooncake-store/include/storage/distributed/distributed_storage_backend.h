@@ -234,9 +234,6 @@ class DistributedStorageBackend
         std::string path;
         int fd = -1;
         FileSystemAdapter* adapter = nullptr;
-        // True only after the storage-side write-context ioctl succeeded.
-        // Short writes cannot be resumed at byte granularity on such a handle.
-        bool lock_free_write = false;
 
         ~OpenFileHandle() {
             if (fd >= 0 && adapter != nullptr) {

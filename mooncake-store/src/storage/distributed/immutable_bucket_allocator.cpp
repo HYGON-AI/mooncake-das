@@ -482,7 +482,10 @@ void ImmutableBucketAllocator::SealActiveBucketLocked() {
     // metadata becomes worth persisting and its master-owned atime must be
     // refreshed. Both I/O operations happen later, outside mutex_.
     bucket.meta_dirty = true;
-    if (atime_refresh_on_seal_) bucket.atime_dirty = true;
+    if (atime_refresh_on_seal_) {
+        bucket.atime_dirty = true;
+        bucket.data_size_dirty = true;
+    }
 }
 
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
@@ -1595,7 +1598,9 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
         int64_t bucket_id = -1;
         BucketPtr bucket_identity;
         PersistedBucketMetadata snapshot;
+        uint64_t data_size = 0;
         bool write_metadata = false;
+        bool update_data_size = false;
         bool touch_atime = false;
     };
     std::vector<PendingWrite> pending;
@@ -1604,17 +1609,21 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
         for (const auto& [bucket_id, bucket] : buckets_) {
             // An unsealed bucket is deliberately never written: it is still
             // being appended to, and its data is discarded on the next start.
-            if (!bucket->sealed || (!bucket->meta_dirty && !bucket->atime_dirty) ||
+            if (!bucket->sealed ||
+                (!bucket->meta_dirty && !bucket->atime_dirty &&
+                 !bucket->data_size_dirty) ||
                 bucket->evicting) {
                 continue;
             }
             pending.push_back({bucket_id, bucket,
                                bucket->meta_dirty ? SnapshotLocked(*bucket)
                                                   : PersistedBucketMetadata{},
-                               bucket->meta_dirty, bucket->atime_dirty});
+                               bucket->append_offset, bucket->meta_dirty,
+                               bucket->data_size_dirty, bucket->atime_dirty});
             // Clear both flags together with taking the snapshot. A change that
             // lands while we are unlocked sets the relevant flag again.
             bucket->meta_dirty = false;
+            bucket->data_size_dirty = false;
             bucket->atime_dirty = false;
         }
     }
@@ -1639,27 +1648,62 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
                 continue;
             }
         }
+        bool retry_metadata = false;
+        bool retry_data_size = false;
+        bool retry_atime = false;
         auto persisted = item.write_metadata
                              ? PersistMetadata(item.snapshot)
                              : tl::expected<void, ErrorCode>{};
+        if (!persisted) {
+            retry_metadata = item.write_metadata;
+            retry_data_size = item.update_data_size;
+            retry_atime = item.touch_atime;
+        }
+        if (persisted && item.update_data_size) {
+            auto updated = fs_adapter_->UpdateFileSize(
+                BucketDataPath(item.bucket_id), item.data_size);
+            if (!updated) {
+                if (updated.error() == ErrorCode::NOT_SUPPORTED) {
+                    LOG_FIRST_N(WARNING, 1)
+                        << "DFS bucket size-update ioctl is unsupported; "
+                           "bucket_id="
+                        << item.bucket_id;
+                } else {
+                    retry_data_size = true;
+                    LOG(WARNING) << "Failed to update DFS bucket size, "
+                                 << "bucket_id=" << item.bucket_id
+                                 << ", error=" << updated.error();
+                }
+            }
+        }
         if (persisted && item.touch_atime) {
             auto touched =
                 fs_adapter_->TouchFileAtime(BucketDataPath(item.bucket_id));
-            // atime is best-effort: filesystems without the extension still get
-            // durable metadata, so a missing feature is not a failure.
-            if (!touched && touched.error() != ErrorCode::NOT_SUPPORTED) {
-                persisted = tl::make_unexpected(touched.error());
+            if (!touched) {
+                if (touched.error() == ErrorCode::NOT_SUPPORTED) {
+                    LOG_FIRST_N(WARNING, 1)
+                        << "DFS bucket atime-update ioctl is unsupported; "
+                           "bucket_id="
+                        << item.bucket_id;
+                } else {
+                    retry_atime = true;
+                    LOG(WARNING) << "Failed to update DFS bucket atime, "
+                                 << "bucket_id=" << item.bucket_id
+                                 << ", error=" << touched.error();
+                }
             }
         }
-        if (persisted) {
+        if (persisted && !retry_data_size && !retry_atime) {
             ++flushed;
             continue;
         }
-        static DfsLogLimiter log_limiter;
-        if (auto suppressed = log_limiter.ShouldLog()) {
-            LOG(WARNING) << "Failed to write DFS bucket metadata, bucket_id="
-                         << item.bucket_id << ", error=" << persisted.error()
-                         << ", suppressed=" << *suppressed;
+        if (!persisted) {
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(WARNING) << "Failed to write DFS bucket metadata, bucket_id="
+                             << item.bucket_id << ", error=" << persisted.error()
+                             << ", suppressed=" << *suppressed;
+            }
         }
         // Put the flags back so the next maintenance tick retries, unless the
         // bucket changed identity meanwhile - then it is not ours to mark.
@@ -1667,8 +1711,9 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
         auto it = buckets_.find(item.bucket_id);
         if (it != buckets_.end() &&
             it->second.get() == item.bucket_identity.get()) {
-            it->second->meta_dirty |= item.write_metadata;
-            it->second->atime_dirty |= item.touch_atime;
+            it->second->meta_dirty |= retry_metadata;
+            it->second->data_size_dirty |= retry_data_size;
+            it->second->atime_dirty |= retry_atime;
         }
     }
     return flushed;
@@ -1902,7 +1947,10 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
-            if (atime_refresh_on_seal_) victim->atime_dirty = true;
+            if (atime_refresh_on_seal_) {
+                victim->atime_dirty = true;
+                victim->data_size_dirty = true;
+            }
         }
         if (was_active) {
             active_bucket_id_ = -1;
@@ -2030,7 +2078,10 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
-            if (atime_refresh_on_seal_) victim->atime_dirty = true;
+            if (atime_refresh_on_seal_) {
+                victim->atime_dirty = true;
+                victim->data_size_dirty = true;
+            }
         }
 
         pending.owner_ = this;

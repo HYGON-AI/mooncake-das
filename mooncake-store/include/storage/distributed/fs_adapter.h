@@ -221,7 +221,7 @@ class FileSystemAdapter {
      *
      * `max_write_bytes` is the largest single write this handle will issue.
      * Implementations issue the storage-side write-context ioctl once per open
-     * so per-write size, atime and range-lock work disappears. Adapters without
+     * so per-write size and atime work disappears. Adapters without
      * the extension report NOT_SUPPORTED and the caller keeps the previous
      * behavior.
      */
@@ -238,6 +238,11 @@ class FileSystemAdapter {
      */
     virtual tl::expected<void, ErrorCode> TouchFileAtime(
         const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    virtual tl::expected<void, ErrorCode> UpdateFileSize(
+        const std::string& /*path*/, uint64_t /*size*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
