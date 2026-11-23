@@ -290,13 +290,12 @@ tl::expected<void, ErrorCode> PosixFsAdapter::SetBucketWriteContext(
         saved_errno == EOPNOTSUPP) {
         // The filesystem has no such extension. Report it so the caller can
         // decide whether falling back to locked writes is acceptable.
-        LOG_FIRST_N(WARNING, 1)
-            << "DFS bucket write-context ioctl is unsupported on this "
-               "filesystem, errno=" << saved_errno;
+        LOG(WARNING) << "DFS bucket write-context ioctl is unsupported on "
+                        "this filesystem, errno=" << saved_errno;
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
-    LOG_FIRST_N(ERROR, 1) << "DFS bucket write-context ioctl failed, errno="
-                          << saved_errno;
+    LOG(ERROR) << "DFS bucket write-context ioctl failed, errno="
+               << saved_errno;
     return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 #else
     (void)fd;
@@ -329,9 +328,9 @@ tl::expected<void, ErrorCode> PosixFsAdapter::TouchFileAtime(
     if (saved_errno == ENOENT) return {};
     if (saved_errno == ENOTTY || saved_errno == EINVAL ||
         saved_errno == EOPNOTSUPP) {
-        LOG_FIRST_N(WARNING, 1)
-            << "DFS atime-refresh ioctl is unsupported on this filesystem, "
-               "errno=" << saved_errno;
+        LOG(WARNING) << "DFS atime-refresh ioctl is unsupported on this "
+                        "filesystem, path=" << path
+                     << ", errno=" << saved_errno;
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     LOG(WARNING) << "Failed to refresh atime for " << path
@@ -363,10 +362,9 @@ tl::expected<void, ErrorCode> PosixFsAdapter::UpdateFileSize(
     if (saved_errno == ENOENT) return {};
     if (saved_errno == ENOTTY || saved_errno == EINVAL ||
         saved_errno == EOPNOTSUPP) {
-        LOG_FIRST_N(WARNING, 1)
-            << "DFS size-update ioctl is unsupported on this filesystem, "
-               "errno="
-            << saved_errno;
+        LOG(WARNING) << "DFS size-update ioctl is unsupported on this "
+                        "filesystem, path=" << path
+                     << ", errno=" << saved_errno;
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     LOG(WARNING) << "Failed to update size for " << path

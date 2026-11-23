@@ -283,11 +283,16 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
         distributed_config_.fs_adapter_type == "posix") {
         auto context = fs_adapter_->SetBucketWriteContext(
             *fd_result, distributed_config_.bucket_capacity);
-        if (!context && context.error() != ErrorCode::NOT_SUPPORTED) {
+        if (context) {
+            // One INFO per process; the ioctl is otherwise silent.
+            LOG_FIRST_N(INFO, 1)
+                << "DFS bucket write context enabled: client skips per-write "
+                   "size/atime updates (range locks retained)";
+        } else if (context.error() != ErrorCode::NOT_SUPPORTED) {
             (void)fs_adapter_->CloseFile(*fd_result);
             return tl::make_unexpected(context.error());
-        } else if (!context) {
-            LOG_FIRST_N(WARNING, 1)
+        } else {
+            LOG(WARNING)
                 << "DFS bucket write-context ioctl is not supported for "
                 << path
                 << "; falling back to the legacy locked write path "

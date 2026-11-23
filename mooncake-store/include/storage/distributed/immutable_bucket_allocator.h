@@ -469,6 +469,12 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // atime refreshed.
         bool atime_dirty = false;
         bool data_size_dirty = false;
+        // Consecutive failed attempts for the size/atime ioctls. Once a bucket
+        // exhausts the retry budget its corresponding dirty flag is dropped:
+        // the ioctl is best-effort metadata, and retrying a persistently
+        // failing file forever would add lock-protected I/O on every flush.
+        uint8_t data_size_failures = 0;
+        uint8_t atime_failures = 0;
         // Tombstoned entries, kept for eviction bookkeeping.
         uint64_t tombstones = 0;
         std::unordered_map<std::string, BucketEntry> entries;
