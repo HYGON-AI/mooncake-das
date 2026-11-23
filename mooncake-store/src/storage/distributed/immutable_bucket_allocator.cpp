@@ -213,6 +213,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     // update these timestamps themselves and the master must not touch them.
     atime_refresh_on_seal_ = config.posix_write_context_enabled &&
                              config.fs_adapter_type == "posix";
+    posix_metadata_ioctls_supported_ = atime_refresh_on_seal_;
 
     std::error_code ec;
     if (!std::filesystem::is_directory(fsdir_, ec) || ec) {
@@ -1682,12 +1683,15 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
                          it->second.get() == item.bucket_identity.get() &&
                          !it->second->evicting;
         }
-        if (still_ours && metadata_written) {
+        if (still_ours && metadata_written &&
+            posix_metadata_ioctls_supported_) {
             if (item.update_data_size) {
                 auto updated = fs_adapter_->UpdateFileSize(
                     BucketDataPath(item.bucket_id), item.data_size);
                 if (!updated) {
-                    if (updated.error() != ErrorCode::NOT_SUPPORTED) {
+                    if (updated.error() == ErrorCode::NOT_SUPPORTED) {
+                        posix_metadata_ioctls_supported_ = false;
+                    } else {
                         retry_data_size = true;
                         LOG(WARNING) << "Failed to update DFS bucket size, "
                                      << "bucket_id=" << item.bucket_id
@@ -1695,14 +1699,18 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
                     }
                 }
             }
-            if (item.touch_atime) {
+            if (item.touch_atime && posix_metadata_ioctls_supported_) {
                 auto touched =
                     fs_adapter_->TouchFileAtime(BucketDataPath(item.bucket_id));
-                if (!touched && touched.error() != ErrorCode::NOT_SUPPORTED) {
-                    retry_atime = true;
-                    LOG(WARNING) << "Failed to update DFS bucket atime, "
-                                 << "bucket_id=" << item.bucket_id
-                                 << ", error=" << touched.error();
+                if (!touched) {
+                    if (touched.error() == ErrorCode::NOT_SUPPORTED) {
+                        posix_metadata_ioctls_supported_ = false;
+                    } else {
+                        retry_atime = true;
+                        LOG(WARNING) << "Failed to update DFS bucket atime, "
+                                     << "bucket_id=" << item.bucket_id
+                                     << ", error=" << touched.error();
+                    }
                 }
             }
         }

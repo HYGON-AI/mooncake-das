@@ -291,11 +291,12 @@ class DistributedStorageBackend
      * @brief Open/cache the buffered read handle for a bucket data file.
      *
      * Only distinct from `GetOrOpenBucket` when the POSIX write context is on:
-     * that mode marks the write handle with an ioctl that skips size/atime/
-     * range-lock work, and the mark is a per-fd property. Serving reads from
-     * that same fd would drag the write-only behavior into the read path, so
-     * reads get their own plain handle. When the mode is off this returns the
-     * regular handle and the two caches stay shared.
+     * that mode marks the write handle with an ioctl that skips per-write
+     * size/atime updates while retaining range locks, and the mark is a per-fd
+     * property. Serving reads from that same fd would drag the write-only
+     * metadata behavior into the read path, so reads get their own plain
+     * handle. When the mode is off this returns the regular handle and the two
+     * caches stay shared.
      */
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode>
     GetOrOpenBucketForRead(int64_t bucket_id, const UUID& epoch);

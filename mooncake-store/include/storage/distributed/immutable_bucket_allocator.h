@@ -579,9 +579,13 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     double eviction_high_watermark_ = 0.9;
     double eviction_low_watermark_ = 0.7;
     std::chrono::seconds eviction_check_interval_{5};
-    // With the opt-in write context, client write handles stop updating atime,
-    // so the master refreshes it when a bucket is sealed.
+    // With the POSIX write context enabled, client write handles stop updating
+    // atime, so the master refreshes it when a bucket is sealed.
     bool atime_refresh_on_seal_ = false;
+    // Cleared after the POSIX metadata ioctl reports NOT_SUPPORTED. This
+    // prevents every later sealed bucket from probing the same unsupported
+    // extension again.
+    std::atomic<bool> posix_metadata_ioctls_supported_{false};
 
     mutable std::mutex mutex_;
     // Serializes `.meta` writes and eviction deletion. Flush and eviction both
