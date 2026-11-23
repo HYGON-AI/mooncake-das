@@ -1105,13 +1105,34 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_dfs_prefetch, bool enable_embedded_master) {
-    return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
-                          global_segment_size, local_buffer_size, protocol,
-                          rdma_devices, master_server_addr, transfer_engine,
-                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
+    return setup_internal(local_hostname, metadata_server, global_segment_size,
+                          local_buffer_size, protocol, rdma_devices,
+                          master_server_addr, transfer_engine, ipc_socket_path,
+                          local_rpc_port, enable_ssd_offload,
                           start_offload_rpc_server, ssd_offload_path, tenant_id,
                           enable_client_http_server, client_http_port,
-                          enable_dfs_prefetch, enable_embedded_master);
+                          enable_dfs_prefetch, enable_embedded_master, "");
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    bool enable_dfs_prefetch, bool enable_embedded_master,
+    const std::string &metadata_cluster_id) {
+    return setup_internal(
+        EgmStorePoolConfig{}, local_hostname, metadata_server,
+        global_segment_size, local_buffer_size, protocol, rdma_devices,
+        master_server_addr, transfer_engine, ipc_socket_path, local_rpc_port,
+        enable_ssd_offload, start_offload_rpc_server, ssd_offload_path,
+        tenant_id, enable_client_http_server, client_http_port,
+        enable_dfs_prefetch, enable_embedded_master, metadata_cluster_id);
 }
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
@@ -1125,6 +1146,27 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_dfs_prefetch, bool enable_embedded_master) {
+    return setup_internal(egm_config, local_hostname, metadata_server,
+                          global_segment_size, local_buffer_size, protocol,
+                          rdma_devices, master_server_addr, transfer_engine,
+                          ipc_socket_path, local_rpc_port, enable_ssd_offload,
+                          start_offload_rpc_server, ssd_offload_path, tenant_id,
+                          enable_client_http_server, client_http_port,
+                          enable_dfs_prefetch, enable_embedded_master, "");
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
+    const std::string &metadata_server, size_t global_segment_size,
+    size_t local_buffer_size, const std::string &protocol,
+    const std::string &rdma_devices, const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    bool enable_dfs_prefetch, bool enable_embedded_master,
+    const std::string &metadata_cluster_id) {
     // Re-entry guard (mirrors initAll_internal): a second setup would
     // overwrite client_ and skip the first instance's ordered cleanup.
     if (client_) {
@@ -1237,7 +1279,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, resolved_metadata_server, protocol,
             device_name, resolved_master_server_addr, transfer_engine,
-            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
+            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator,
+            metadata_cluster_id);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1268,7 +1311,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, resolved_metadata_server, protocol,
                 device_name, resolved_master_server_addr, transfer_engine,
-                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
+                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator,
+                metadata_cluster_id);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1929,6 +1973,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string protocol =
         get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
+    std::string metadata_cluster_id =
+        get_config(config, CONFIG_KEY_METADATA_CLUSTER_ID);
     std::string master_server_addr = get_config(
         config, CONFIG_KEY_MASTER_SERVER_ADDR,
         enable_embedded_master ? std::string() : DEFAULT_MASTER_SERVER_ADDR);
@@ -2006,7 +2052,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             local_buffer_size, protocol, rdma_devices, master_server_addr,
             nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
             ssd_offload_path, tenant_id, enable_client_http_server,
-            client_http_port, enable_dfs_prefetch, enable_embedded_master);
+            client_http_port, enable_dfs_prefetch, enable_embedded_master,
+            metadata_cluster_id);
         if (!result && egm_config->enabled) {
             (void)tearDownAll_internal();
         }

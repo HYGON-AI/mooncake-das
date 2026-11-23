@@ -2553,7 +2553,7 @@ PYBIND11_MODULE(_store, m) {
                     "master_server_addr", "engine", "enable_ssd_offload",
                     "ssd_offload_path", "tenant_id", "enable_client_http_server",
                     "client_http_port", "enable_dfs_prefetch",
-                    "enable_embedded_master"};
+                    "enable_embedded_master", "metadata_cluster_id"};
                 return result;
             },
             "Describe optional local APIs and setup parameters without an RPC. "
@@ -2593,7 +2593,8 @@ PYBIND11_MODULE(_store, m) {
                bool enable_client_http_server = false,
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
                bool enable_dfs_prefetch = true,
-               bool enable_embedded_master = false) {
+               bool enable_embedded_master = false,
+               const std::string &metadata_cluster_id = "") {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2610,7 +2611,7 @@ PYBIND11_MODULE(_store, m) {
                         master_server_addr, transfer_engine, "", 50052,
                         enable_ssd_offload, true, ssd_offload_path, tenant_id,
                         enable_client_http_server, client_http_port,
-                        enable_dfs_prefetch, enable_embedded_master);
+                        enable_dfs_prefetch, enable_embedded_master, metadata_cluster_id);
                     ret = result.has_value() ? 0
                                              : static_cast<int>(result.error());
                 }
@@ -2625,7 +2626,8 @@ PYBIND11_MODULE(_store, m) {
             py::arg("enable_client_http_server") = false,
             py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
             py::arg("enable_dfs_prefetch") = true, py::kw_only(),
-            py::arg("enable_embedded_master") = false)
+            py::arg("enable_embedded_master") = false,
+            py::arg("metadata_cluster_id") = "")
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {

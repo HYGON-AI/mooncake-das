@@ -824,8 +824,20 @@ class RealClient : public PyClient {
         const std::string &tenant_id = "default",
         bool enable_client_http_server = false,
         int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
-        bool enable_dfs_prefetch = true,
-        bool enable_embedded_master = false);
+        bool enable_dfs_prefetch = true, bool enable_embedded_master = false);
+
+    tl::expected<void, ErrorCode> setup_internal(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size, size_t local_buffer_size,
+        const std::string &protocol, const std::string &rdma_devices,
+        const std::string &master_server_addr,
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path, int local_rpc_port,
+        bool enable_ssd_offload, bool start_offload_rpc_server,
+        const std::string &ssd_offload_path, const std::string &tenant_id,
+        bool enable_client_http_server, int client_http_port,
+        bool enable_dfs_prefetch, bool enable_embedded_master,
+        const std::string &metadata_cluster_id);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -1567,6 +1579,19 @@ class RealClient : public PyClient {
         const std::string &ssd_offload_path, const std::string &tenant_id,
         bool enable_client_http_server, int client_http_port,
         bool enable_dfs_prefetch, bool enable_embedded_master);
+
+    tl::expected<void, ErrorCode> setup_internal(
+        const EgmStorePoolConfig &egm_config, const std::string &local_hostname,
+        const std::string &metadata_server, size_t global_segment_size,
+        size_t local_buffer_size, const std::string &protocol,
+        const std::string &rdma_devices, const std::string &master_server_addr,
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path, int local_rpc_port,
+        bool enable_ssd_offload, bool start_offload_rpc_server,
+        const std::string &ssd_offload_path, const std::string &tenant_id,
+        bool enable_client_http_server, int client_http_port,
+        bool enable_dfs_prefetch, bool enable_embedded_master,
+        const std::string &metadata_cluster_id);
 
     friend class DirectGpuReadTest;
     friend class test::PrefetchTeardownTest;

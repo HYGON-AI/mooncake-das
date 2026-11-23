@@ -153,6 +153,16 @@ class Client {
         const std::string& tenant_id = "default",
         std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr);
 
+    static std::optional<std::shared_ptr<Client>> Create(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names,
+        const std::string& master_server_entry,
+        const std::shared_ptr<TransferEngine>& transfer_engine,
+        std::map<std::string, std::string> labels, const std::string& tenant_id,
+        std::shared_ptr<NVMeoFInitiator> nof_initiator,
+        const std::string& metadata_cluster_id);
+
     // Test-only seam: when set, Client::Create builds the default NoF
     // initiator from this factory instead of CreateNofRuntime() whenever the
     // caller passes no initiator (nullptr). Not thread-safe; set before
@@ -1149,6 +1159,12 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
+
+    ErrorCode InitTransferEngine(const std::string& local_hostname,
+                                 const std::string& metadata_connstring,
+                                 const std::string& protocol,
+                                 const std::optional<std::string>& device_names,
+                                 const std::string& metadata_cluster_id);
     void InitTransferSubmitter();
     ErrorCode TransferData(
         const Replica::Descriptor& replica_descriptor,
