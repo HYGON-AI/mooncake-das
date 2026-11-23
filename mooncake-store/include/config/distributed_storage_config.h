@@ -76,6 +76,13 @@ struct DistributedStorageConfig {
 
     std::string object_storage_config_path;
 
+    // POSIX adapter only: when enabled, bucket write handles skip size/atime
+    // updates and extend no range locks, and the master refreshes bucket atime
+    // at seal time. Requires a filesystem that implements the write-context
+    // ioctl; otherwise the adapter reports NOT_SUPPORTED and writes keep the
+    // previous behavior. Off by default so existing deployments are unchanged.
+    bool posix_write_context_enabled = false;
+
     bool UsesObjectStorage() const {
         return fs_adapter_type == "oss" || fs_adapter_type == "s3" ||
                fs_adapter_type == "kvcs-lowlevel";

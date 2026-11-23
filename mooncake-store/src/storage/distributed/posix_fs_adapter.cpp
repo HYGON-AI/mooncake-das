@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -17,6 +18,8 @@
 #include <mutex>
 
 #include <glog/logging.h>
+
+#include "storage/distributed/posix_storage_ioctl.h"
 
 namespace mooncake {
 
@@ -263,8 +266,84 @@ tl::expected<void, ErrorCode> PosixFsAdapter::CloseFile(int fd) {
     return {};
 }
 
+tl::expected<void, ErrorCode> PosixFsAdapter::SetBucketWriteContext(
+    int fd, uint64_t max_write_bytes) {
+#if defined(__linux__)
+    if (fd < 0) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+
+    storage_ioctl::WriteContext context{};
+    // The client is never the file's size/time owner: the master sets both at
+    // bucket creation, and every write handle for this bucket says so here.
+    context.is_iorank = 0;
+    context.size = max_write_bytes;
+    context.stage_flags = storage_ioctl::kWriteStageSkipSize |
+                          storage_ioctl::kWriteStageSkipTime |
+                          storage_ioctl::kWriteStageSkipLock |
+                          storage_ioctl::kWriteStageNoExtendLock;
+
+    if (::ioctl(fd, STORAGE_MPIO_SET_WRCONTEXT, &context) == 0) return {};
+
+    const int saved_errno = errno;
+    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
+        saved_errno == EOPNOTSUPP) {
+        // The filesystem has no such extension. Report it so the caller can
+        // decide whether falling back to locked writes is acceptable.
+        LOG_FIRST_N(WARNING, 1)
+            << "DFS bucket write-context ioctl is unsupported on this "
+               "filesystem, errno=" << saved_errno;
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    LOG_FIRST_N(ERROR, 1) << "DFS bucket write-context ioctl failed, errno="
+                          << saved_errno;
+    return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+#else
+    (void)fd;
+    (void)max_write_bytes;
+    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+}
+
+tl::expected<void, ErrorCode> PosixFsAdapter::TouchFileAtime(
+    const std::string& path) {
+#if defined(__linux__)
+    // A write handle that skips metadata updates cannot refresh atime, so the
+    // master issues the storage-side update itself. The command takes an
+    // unsigned int payload; the value is unused.
+    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return {};
+        LOG(WARNING) << "Failed to open " << path << " for atime refresh, errno="
+                     << errno;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    // The reference ABI passes no payload for STORAGE_UPDATE_TIME even though
+    // the command encoding carries an unsigned-int type.
+    const int rc = ::ioctl(fd, STORAGE_UPDATE_TIME, nullptr);
+    const int saved_errno = errno;
+    ::close(fd);
+    if (rc == 0) return {};
+    if (saved_errno == ENOENT) return {};
+    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
+        saved_errno == EOPNOTSUPP) {
+        LOG_FIRST_N(WARNING, 1)
+            << "DFS atime-refresh ioctl is unsupported on this filesystem, "
+               "errno=" << saved_errno;
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    LOG(WARNING) << "Failed to refresh atime for " << path
+                 << ", errno=" << saved_errno;
+    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+#else
+    (void)path;
+    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+}
+
 tl::expected<void, ErrorCode> PosixFsAdapter::PreallocateFile(
     const std::string& path, uint64_t size) {
+    if (size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 

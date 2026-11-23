@@ -216,6 +216,31 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    /**
+     * @brief Tell a bucket write handle which metadata updates to skip.
+     *
+     * `max_write_bytes` is the largest single write this handle will issue.
+     * Implementations issue the storage-side write-context ioctl once per open
+     * so per-write size, atime and range-lock work disappears. Adapters without
+     * the extension report NOT_SUPPORTED and the caller keeps the previous
+     * behavior.
+     */
+    virtual tl::expected<void, ErrorCode> SetBucketWriteContext(
+        int /*fd*/, uint64_t /*max_write_bytes*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    /**
+     * @brief Refresh a seal-time timestamp for `path`.
+     *
+     * Write handles stop updating it, so the master owns it for sealed buckets.
+     * Adapters without a metadata path report NOT_SUPPORTED.
+     */
+    virtual tl::expected<void, ErrorCode> TouchFileAtime(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     virtual tl::expected<void, ErrorCode> PreallocateFile(
         const std::string& /*path*/, uint64_t /*size*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);

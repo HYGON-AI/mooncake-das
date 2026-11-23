@@ -465,6 +465,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // a sealed bucket: an unsealed one is deliberately not persisted at
         // all.
         bool meta_dirty = false;
+        // Set when a sealed bucket still needs its master-owned atime refreshed.
+        bool atime_dirty = false;
         // Tombstoned entries, kept for eviction bookkeeping.
         uint64_t tombstones = 0;
         std::unordered_map<std::string, BucketEntry> entries;
@@ -569,6 +571,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     double eviction_high_watermark_ = 0.9;
     double eviction_low_watermark_ = 0.7;
     std::chrono::seconds eviction_check_interval_{5};
+    // With the opt-in write context, client write handles stop updating atime,
+    // so the master refreshes it when a bucket is sealed.
+    bool atime_refresh_on_seal_ = false;
 
     mutable std::mutex mutex_;
     // Serializes `.meta` writes and eviction deletion. Flush and eviction both

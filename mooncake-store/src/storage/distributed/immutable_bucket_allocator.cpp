@@ -204,6 +204,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
     eviction_check_interval_ = config.eviction_check_interval;
+    atime_refresh_on_seal_ = config.posix_write_context_enabled;
 
     std::error_code ec;
     if (!std::filesystem::is_directory(fsdir_, ec) || ec) {
@@ -478,9 +479,10 @@ void ImmutableBucketAllocator::SealActiveBucketLocked() {
     if (bucket.sealed) return;
     bucket.sealed = true;
     // The bucket accepts no further allocations, so this is the moment its
-    // metadata becomes worth persisting. The write itself happens outside the
-    // lock, in FlushDirtyMetadata().
+    // metadata becomes worth persisting and its master-owned atime must be
+    // refreshed. Both I/O operations happen later, outside mutex_.
     bucket.meta_dirty = true;
+    if (atime_refresh_on_seal_) bucket.atime_dirty = true;
 }
 
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
@@ -1593,6 +1595,8 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
         int64_t bucket_id = -1;
         BucketPtr bucket_identity;
         PersistedBucketMetadata snapshot;
+        bool write_metadata = false;
+        bool touch_atime = false;
     };
     std::vector<PendingWrite> pending;
     {
@@ -1600,13 +1604,18 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
         for (const auto& [bucket_id, bucket] : buckets_) {
             // An unsealed bucket is deliberately never written: it is still
             // being appended to, and its data is discarded on the next start.
-            if (!bucket->sealed || !bucket->meta_dirty || bucket->evicting) continue;
-            pending.push_back({bucket_id, bucket, SnapshotLocked(*bucket)});
-            // Clear the flag together with taking the snapshot. A change that
-            // lands while we are unlocked sets it again and is picked up by the
-            // next flush, instead of being swallowed by a late clear. It also
-            // keeps a concurrent flush from writing the same file.
+            if (!bucket->sealed || (!bucket->meta_dirty && !bucket->atime_dirty) ||
+                bucket->evicting) {
+                continue;
+            }
+            pending.push_back({bucket_id, bucket,
+                               bucket->meta_dirty ? SnapshotLocked(*bucket)
+                                                  : PersistedBucketMetadata{},
+                               bucket->meta_dirty, bucket->atime_dirty});
+            // Clear both flags together with taking the snapshot. A change that
+            // lands while we are unlocked sets the relevant flag again.
             bucket->meta_dirty = false;
+            bucket->atime_dirty = false;
         }
     }
     if (pending.empty()) return 0;
@@ -1630,7 +1639,18 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
                 continue;
             }
         }
-        auto persisted = PersistMetadata(item.snapshot);
+        auto persisted = item.write_metadata
+                             ? PersistMetadata(item.snapshot)
+                             : tl::expected<void, ErrorCode>{};
+        if (persisted && item.touch_atime) {
+            auto touched =
+                fs_adapter_->TouchFileAtime(BucketDataPath(item.bucket_id));
+            // atime is best-effort: filesystems without the extension still get
+            // durable metadata, so a missing feature is not a failure.
+            if (!touched && touched.error() != ErrorCode::NOT_SUPPORTED) {
+                persisted = tl::make_unexpected(touched.error());
+            }
+        }
         if (persisted) {
             ++flushed;
             continue;
@@ -1641,13 +1661,14 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
                          << item.bucket_id << ", error=" << persisted.error()
                          << ", suppressed=" << *suppressed;
         }
-        // Put the flag back so the next maintenance tick retries, unless the
+        // Put the flags back so the next maintenance tick retries, unless the
         // bucket changed identity meanwhile - then it is not ours to mark.
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(item.bucket_id);
         if (it != buckets_.end() &&
             it->second.get() == item.bucket_identity.get()) {
-            it->second->meta_dirty = true;
+            it->second->meta_dirty |= item.write_metadata;
+            it->second->atime_dirty |= item.touch_atime;
         }
     }
     return flushed;
@@ -1881,6 +1902,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
+            if (atime_refresh_on_seal_) victim->atime_dirty = true;
         }
         if (was_active) {
             active_bucket_id_ = -1;
@@ -2008,6 +2030,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
+            if (atime_refresh_on_seal_) victim->atime_dirty = true;
         }
 
         pending.owner_ = this;
