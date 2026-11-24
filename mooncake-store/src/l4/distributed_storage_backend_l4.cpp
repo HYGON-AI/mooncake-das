@@ -121,6 +121,7 @@ void DistributedStorageBackend::ResetFailedInitializationLocked() {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
         bucket_id_cache_.clear();
         bucket_id_direct_cache_.clear();
+        bucket_id_read_cache_.clear();
     }
     batch_read_pool_.reset();
     canonical_root_dir_.clear();
@@ -277,10 +278,51 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
         }
         return tl::make_unexpected(fd_result.error());
     }
+    int fd = *fd_result;
+
+    // Write-context ioctl is a pure optimization. If the filesystem does not
+    // implement it, or rejects it for any other reason, fall back to the plain
+    // locked write path instead of failing the write. Once it fails the process
+    // stops probing it, so an unsupported filesystem never induces an
+    // open+ioctl+close storm for every cold bucket.
+    if (distributed_config_.posix_write_context_enabled &&
+        distributed_config_.fs_adapter_type == "posix" &&
+        !posix_write_context_unavailable_.load(std::memory_order_relaxed)) {
+        auto context = fs_adapter_->SetBucketWriteContext(
+            fd, distributed_config_.bucket_capacity);
+        if (context) {
+            // One INFO per process; the ioctl is otherwise silent.
+            LOG_FIRST_N(INFO, 1)
+                << "DFS bucket write context enabled: client skips per-write "
+                   "mtime updates (range locks retained)";
+        } else {
+            posix_write_context_unavailable_.store(true,
+                                                   std::memory_order_relaxed);
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(WARNING)
+                    << "DFS bucket write-context ioctl failed for " << path
+                    << " (error=" << context.error()
+                    << "); disabling it for this process and falling back to "
+                       "the legacy write path from now on, suppressed="
+                    << *suppressed;
+            }
+            if (context.error() != ErrorCode::NOT_SUPPORTED) {
+                // A hard error may have left the fd in an unknown state.
+                // Replace it with a clean handle before writing through it.
+                (void)fs_adapter_->CloseFile(fd);
+                auto reopened = fs_adapter_->OpenFileReadWriteExisting(path);
+                if (!reopened) {
+                    return tl::make_unexpected(reopened.error());
+                }
+                fd = *reopened;
+            }
+        }
+    }
 
     auto handle = std::make_shared<OpenFileHandle>();
     handle->path = path;
-    handle->fd = *fd_result;
+    handle->fd = fd;
     handle->adapter = fs_adapter_.get();
 
     // A queued operation may still carry the old epoch before this client has
@@ -302,22 +344,78 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
     return it->second;
 }
 
+tl::expected<std::shared_ptr<DistributedStorageBackend::OpenFileHandle>,
+             ErrorCode>
+DistributedStorageBackend::GetOrOpenBucketForRead(int64_t bucket_id,
+                                                  const UUID& epoch) {
+    {
+        std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
+        auto it = bucket_id_read_cache_.find(bucket_id);
+        if (it != bucket_id_read_cache_.end()) return it->second;
+    }
+
+    const std::string path = canonical_root_dir_ + "/" + kBucketFilePrefix +
+                             ImmutableBucketAllocator::FormatBucketId(bucket_id) +
+                             kBucketDataSuffix;
+    // A plain read handle: no write-context ioctl, so reads keep the default
+    // metadata and range-lock behavior even while writes opt out of per-write
+    // mtime updates.
+    auto fd_result = fs_adapter_->OpenFileReadOnly(path);
+    if (!fd_result) {
+        static DfsLogLimiter log_limiter;
+        if (auto suppressed = log_limiter.ShouldLog()) {
+            LOG(ERROR) << "Failed to open DFS bucket file for read " << path
+                       << ": " << fd_result.error()
+                       << ", suppressed=" << *suppressed;
+        }
+        return tl::make_unexpected(fd_result.error());
+    }
+
+    auto handle = std::make_shared<OpenFileHandle>();
+    handle->path = path;
+    handle->fd = *fd_result;
+    handle->adapter = fs_adapter_.get();
+
+    // A queued operation may still carry the old epoch before this client has
+    // observed a restart. Confirm AFTER opening: an old location must never
+    // acquire a newly recreated bucket file. Cached handles need no RPC.
+    if (master_epoch_provider_) {
+        auto current_epoch = master_epoch_provider_();
+        if (!current_epoch) return tl::make_unexpected(current_epoch.error());
+        if (*current_epoch != epoch) {
+            return tl::make_unexpected(ErrorCode::DFS_STALE_HANDLE);
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
+    // Another thread may have populated the cache while we were opening; keep
+    // the winner and let our handle close its own fd on destruction.
+    auto [it, inserted] = bucket_id_read_cache_.emplace(bucket_id, handle);
+    (void)inserted;
+    return it->second;
+}
+
 tl::expected<bool, ErrorCode>
 DistributedStorageBackend::CleanupBucketFd(int64_t bucket_id) {
     if (!IsBucketMode() || bucket_id < 0) return false;
 
     std::shared_ptr<OpenFileHandle> regular_handle;
     std::shared_ptr<OpenFileHandle> direct_handle;
+    std::shared_ptr<OpenFileHandle> read_handle;
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
         auto regular_it = bucket_id_cache_.find(bucket_id);
         if (regular_it != bucket_id_cache_.end()) regular_handle = regular_it->second;
         auto direct_it = bucket_id_direct_cache_.find(bucket_id);
         if (direct_it != bucket_id_direct_cache_.end()) direct_handle = direct_it->second;
+        auto read_it = bucket_id_read_cache_.find(bucket_id);
+        if (read_it != bucket_id_read_cache_.end()) read_handle = read_it->second;
     }
-    if (!regular_handle && !direct_handle) return false;
+    if (!regular_handle && !direct_handle && !read_handle) return false;
 
-    const auto& handle = regular_handle ? regular_handle : direct_handle;
+    const auto& handle = regular_handle ? regular_handle
+                          : direct_handle ? direct_handle
+                                          : read_handle;
     struct stat path_stat {};
     if (::stat(handle->path.c_str(), &path_stat) == 0) return false;
     if (errno != ENOENT && errno != ESTALE) {
@@ -336,6 +434,12 @@ DistributedStorageBackend::CleanupBucketFd(int64_t bucket_id) {
     if (direct_it != bucket_id_direct_cache_.end() &&
         direct_it->second == direct_handle) {
         bucket_id_direct_cache_.erase(direct_it);
+        erased = true;
+    }
+    auto read_it = bucket_id_read_cache_.find(bucket_id);
+    if (read_it != bucket_id_read_cache_.end() &&
+        read_it->second == read_handle) {
+        bucket_id_read_cache_.erase(read_it);
         erased = true;
     }
     return erased;
@@ -411,15 +515,20 @@ DistributedStorageBackend::InvalidateAllBucketFds() {
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
         handles.reserve(bucket_id_cache_.size() +
-                        bucket_id_direct_cache_.size());
+                        bucket_id_direct_cache_.size() +
+                        bucket_id_read_cache_.size());
         for (auto& [bucket_id, handle] : bucket_id_cache_) {
             handles.push_back(std::move(handle));
         }
         for (auto& [bucket_id, handle] : bucket_id_direct_cache_) {
             handles.push_back(std::move(handle));
         }
+        for (auto& [bucket_id, handle] : bucket_id_read_cache_) {
+            handles.push_back(std::move(handle));
+        }
         bucket_id_cache_.clear();
         bucket_id_direct_cache_.clear();
+        bucket_id_read_cache_.clear();
     }
     return handles.size();
 }
@@ -434,11 +543,16 @@ DistributedStorageBackend::CleanupStaleBucketFds(
     std::vector<int64_t> bucket_ids;
     {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
-        bucket_ids.reserve(bucket_id_cache_.size() + bucket_id_direct_cache_.size());
+        bucket_ids.reserve(bucket_id_cache_.size() +
+                           bucket_id_direct_cache_.size() +
+                           bucket_id_read_cache_.size());
         for (const auto& [bucket_id, handle] : bucket_id_cache_) {
             if (!active_ids.contains(bucket_id)) bucket_ids.push_back(bucket_id);
         }
         for (const auto& [bucket_id, handle] : bucket_id_direct_cache_) {
+            if (!active_ids.contains(bucket_id)) bucket_ids.push_back(bucket_id);
+        }
+        for (const auto& [bucket_id, handle] : bucket_id_read_cache_) {
             if (!active_ids.contains(bucket_id)) bucket_ids.push_back(bucket_id);
         }
     }
@@ -673,8 +787,9 @@ DistributedStorageBackend::PrepareReadTasks(
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
         auto target = ResolveTarget(
-            request.descriptor, request.key,
-            !IsBucketMode() || distributed_config_.direct_read_enabled);
+            request.descriptor, request.key, /*for_read=*/true,
+            /*prefer_direct=*/!IsBucketMode() ||
+                distributed_config_.direct_read_enabled);
         if (!target) {
             results[i] = tl::make_unexpected(target.error());
             continue;
@@ -792,8 +907,6 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
     // is never scattered to the caller.
     const uint64_t read_size = task.total_size;
 
-    const uint64_t alignment = distributed_config_.alignment;
-    std::vector<char> sink(alignment == 0 ? 1 : alignment);
     std::vector<iovec> iovs;
     iovs.reserve(request.slices.size() + 1);
     uint64_t collected = 0;
@@ -805,11 +918,14 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
             collected += size;
         }
     }
-    // If slices don't cover the full aligned range (e.g. a non-session caller
-    // that allocated object_size bytes), absorb the trailing padding with the
-    // sink so the iovec total matches the on-disk reserved size.
+    // Slices may cover only object_size while the read covers the whole reserved
+    // range, so the shortfall is absorbed by a sink. Size it from the actual gap
+    // rather than one alignment unit, so a reservation larger than the
+    // configured alignment cannot overflow the sink.
+    std::vector<char> sink;
     if (collected < read_size) {
-        iovs.push_back({sink.data(), static_cast<size_t>(read_size - collected)});
+        sink.resize(static_cast<size_t>(read_size - collected));
+        iovs.push_back({sink.data(), sink.size()});
     }
 
     constexpr size_t kMaxIovChunk = 1024;

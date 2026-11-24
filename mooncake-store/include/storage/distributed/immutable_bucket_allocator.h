@@ -465,6 +465,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // a sealed bucket: an unsealed one is deliberately not persisted at
         // all.
         bool meta_dirty = false;
+        // Set when a sealed bucket still needs its master-owned mtime
+        // refreshed. This is a one-shot best-effort update: on failure the flag
+        // is cleared and the master logs once instead of retrying.
+        bool mtime_dirty = false;
         // Tombstoned entries, kept for eviction bookkeeping.
         uint64_t tombstones = 0;
         std::unordered_map<std::string, BucketEntry> entries;
@@ -511,7 +515,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     size_t EffectiveReadyTargetLocked() const;
     BucketPtr PromoteReadyBucketLocked();
     bool ActiveBucketHasSpaceLocked(uint64_t required,
-                                    BucketPtr* bucket = nullptr) const;
+                                    BucketPtr* bucket = nullptr,
+                                    uint64_t allocation_alignment = 0) const;
     void RequestRefillLocked();
     void RecordBucketCreationFailureLocked(ErrorCode error);
     void BucketCreateWorker();
@@ -528,7 +533,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // Ensures an active bucket exists with at least `required` bytes free.
     // May temporarily release `lock` to create a bucket.
     tl::expected<BucketPtr, ErrorCode> EnsureActiveBucket(
-        std::unique_lock<std::mutex>& lock, uint64_t required);
+        std::unique_lock<std::mutex>& lock, uint64_t required,
+        uint64_t allocation_alignment = 0);
 
     void TouchLruLocked(int64_t bucket_id, int64_t now_ns);
     void RemoveFromLruLocked(int64_t bucket_id);
@@ -561,6 +567,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     uint64_t bucket_capacity_ = 0;
     uint64_t alignment_ = 4096;
+    uint64_t bucket_batch_alignment_ = 0;
     int64_t max_bucket_count_ = 0;
     size_t ready_bucket_target_ = 4;
     size_t bucket_create_concurrency_ = 2;
@@ -569,7 +576,9 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     double eviction_high_watermark_ = 0.9;
     double eviction_low_watermark_ = 0.7;
     std::chrono::seconds eviction_check_interval_{5};
-
+    // With the POSIX write context enabled, client write handles stop updating
+    // mtime, so the master refreshes it once when a bucket is sealed.
+    bool mtime_refresh_on_seal_ = false;
     mutable std::mutex mutex_;
     // Serializes `.meta` writes and eviction deletion. Flush and eviction both
     // revalidate BucketState pointer identity after taking this mutex so a

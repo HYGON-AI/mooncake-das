@@ -378,6 +378,9 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir) {
     config.bucket_capacity = kBucketCapacity;
     config.max_bucket_count = 16;
     config.alignment = kAlignment;
+    // Keep the legacy contiguous layout: these tests assert per-object offsets
+    // and merged-read task counts, which a nonzero batch boundary would change.
+    config.bucket_batch_alignment = 0;
     config.single_tenant = true;
     config.eviction_enabled = false;
     config.deferred_free_duration = std::chrono::seconds(0);

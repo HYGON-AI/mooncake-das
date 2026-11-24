@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -17,6 +18,8 @@
 #include <mutex>
 
 #include <glog/logging.h>
+
+#include "storage/distributed/posix_storage_ioctl.h"
 
 namespace mooncake {
 
@@ -235,7 +238,10 @@ tl::expected<int, ErrorCode> PosixFsAdapter::OpenFile(const std::string& path) {
 
 tl::expected<int, ErrorCode> PosixFsAdapter::OpenFileReadOnly(
     const std::string& path) {
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    int fd;
+    do {
+        fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    } while (fd < 0 && errno == EINTR);
     if (fd < 0) return tl::make_unexpected(ReadOpenError());
     return fd;
 }
@@ -263,8 +269,73 @@ tl::expected<void, ErrorCode> PosixFsAdapter::CloseFile(int fd) {
     return {};
 }
 
+tl::expected<void, ErrorCode> PosixFsAdapter::SetBucketWriteContext(
+    int fd, uint64_t max_write_bytes) {
+#if defined(__linux__)
+    if (fd < 0) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+
+    storage_ioctl::WriteContext context{};
+    // The client does not own the file's time update: the master refreshes the
+    // mtime when the bucket is sealed. File size is still maintained by the
+    // storage stack, so kWriteStageSkipSize is not set.
+    context.is_iorank = 0;
+    context.size = max_write_bytes;
+    context.stage_flags = storage_ioctl::kWriteStageSkipTime |
+                          storage_ioctl::kWriteStageNoExtendLock;
+
+    if (::ioctl(fd, STORAGE_MPIO_SET_WRCONTEXT, &context) == 0) return {};
+
+    // Return only the error code: the caller owns the process-wide "give up"
+    // state and the rate-limited logging; a per-open probe must not log here.
+    const int saved_errno = errno;
+    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
+        saved_errno == EOPNOTSUPP) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+#else
+    (void)fd;
+    (void)max_write_bytes;
+    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+}
+
+tl::expected<void, ErrorCode> PosixFsAdapter::UpdateFileMtime(
+    const std::string& path) {
+#if defined(__linux__)
+    // A write handle that skips the mtime update cannot refresh it, so the
+    // master does it once when the bucket is sealed. This is best-effort: the
+    // caller logs and does not retry on failure.
+    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return {};
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    // The ABI encodes an unsigned-int payload. The value is not interpreted,
+    // but passing valid storage is required for kernels that validate the _IOW
+    // argument (ad_ofs.c passes NULL).
+    unsigned int arg = 0;
+    const int rc = ::ioctl(fd, STORAGE_UPDATE_TIME, &arg);
+    const int saved_errno = errno;
+    ::close(fd);
+    if (rc >= 0) return {};
+    if (saved_errno == ENOENT) return {};
+    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
+        saved_errno == EOPNOTSUPP) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+#else
+    (void)path;
+    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
+}
+
 tl::expected<void, ErrorCode> PosixFsAdapter::PreallocateFile(
     const std::string& path, uint64_t size) {
+    if (size > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
 
@@ -320,8 +391,11 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::ReadAt(int fd, iovec* iov,
         ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
     } while (ret < 0 && errno == EINTR);
     if (ret < 0) {
+        const int saved_errno = errno;
         scope.MarkSuccess(false);
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        return tl::make_unexpected(saved_errno == ENOENT
+                                       ? ErrorCode::FILE_NOT_FOUND
+                                       : ErrorCode::FILE_READ_FAIL);
     }
     scope.MarkSuccess(true);
     return static_cast<size_t>(ret);
@@ -473,7 +547,12 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtAligned(
     // Every direct-I/O constraint has already been checked, so preadv can
     // scatter straight into the caller's buffers without a bounce or memcpy.
     const ssize_t ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
-    if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    if (ret < 0) {
+        const int saved_errno = errno;
+        return tl::make_unexpected(saved_errno == ENOENT
+                                       ? ErrorCode::FILE_NOT_FOUND
+                                       : ErrorCode::FILE_READ_FAIL);
+    }
     return static_cast<size_t>(ret);
 }
 
@@ -546,7 +625,9 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtStaged(
             ::pread(fd, window + done, static_cast<size_t>(left),
                     static_cast<off_t>(window_start + done));
         if (ret < 0) {
-            error = ErrorCode::FILE_READ_FAIL;
+            const int saved_errno = errno;
+            error = saved_errno == ENOENT ? ErrorCode::FILE_NOT_FOUND
+                                         : ErrorCode::FILE_READ_FAIL;
             break;
         }
         if (ret == 0) break;  // EOF before the requested range was covered

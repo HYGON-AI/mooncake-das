@@ -267,7 +267,7 @@ class DistributedStorageBackend
 
     tl::expected<ResolvedTarget, ErrorCode> ResolveTarget(
         const DistributedFSDescriptor& descriptor, const std::string& key,
-        bool read_only = false);
+        bool for_read = false, bool prefer_direct = false);
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteShard(
         const std::vector<DfsWriteRequest>& requests);
@@ -286,6 +286,20 @@ class DistributedStorageBackend
 
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> GetOrOpenBucket(
         int64_t bucket_id, const UUID& epoch);
+
+    /**
+     * @brief Open/cache the buffered read handle for a bucket data file.
+     *
+     * Only distinct from `GetOrOpenBucket` when the POSIX write context is on:
+     * that mode marks the write handle with an ioctl that skips per-write
+     * mtime updates while retaining range locks, and the mark is a per-fd
+     * property. Serving reads from that same fd would drag the write-only
+     * metadata behavior into the read path, so reads get their own plain
+     * handle. When the mode is off this returns the regular handle and the two
+     * caches stay shared.
+     */
+    tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode>
+    GetOrOpenBucketForRead(int64_t bucket_id, const UUID& epoch);
 
     /**
      * @brief Open/cache the direct (page-cache-bypassing) read handle for a
@@ -381,6 +395,15 @@ class DistributedStorageBackend
         bucket_id_cache_;
     std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
         bucket_id_direct_cache_;
+    // Buffered read handles, used only when the POSIX write context is on so a
+    // read never inherits the write handle's ioctl. Empty (and unused) when the
+    // feature is off, where reads keep sharing bucket_id_cache_.
+    std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
+        bucket_id_read_cache_;
+    // Set once the write-context ioctl fails or reports NOT_SUPPORTED. After
+    // that no further open probes the ioctl, so an unsupported or misbehaving
+    // filesystem cannot turn into an open+ioctl storm on every cold bucket.
+    std::atomic<bool> posix_write_context_unavailable_{false};
     std::unique_ptr<ThreadPool> batch_read_pool_;
 
     tl::expected<void, ErrorCode> InitBucketModeLocked();

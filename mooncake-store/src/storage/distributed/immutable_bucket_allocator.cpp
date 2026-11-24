@@ -196,6 +196,28 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     fs_adapter_type_ = config.fs_adapter_type;
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
+    bucket_batch_alignment_ = config.bucket_batch_alignment;
+    // The batch boundary exists to keep each client write inside one 512 KiB
+    // filesystem range-lock unit, which only the POSIX write context relies on.
+    // Other adapters gain nothing from it and would only pay the padding cost.
+    if (fs_adapter_type_ != "posix") {
+        bucket_batch_alignment_ = 0;
+    } else if (bucket_batch_alignment_ != 0 &&
+               (!IsValidBucketAlignment(bucket_batch_alignment_) ||
+                bucket_batch_alignment_ < alignment_ ||
+                bucket_batch_alignment_ % alignment_ != 0 ||
+                bucket_batch_alignment_ > bucket_capacity_ ||
+                bucket_capacity_ % bucket_batch_alignment_ != 0)) {
+        // The batch boundary is a master-side placement hint only. A value that
+        // the current bucket geometry cannot honor must not stop the master, so
+        // fall back to the legacy per-key allocation instead of failing Init().
+        LOG(WARNING) << "DFS bucket batch alignment is incompatible with the "
+                        "bucket geometry; disabling batch alignment, "
+                     << "batch_alignment=" << bucket_batch_alignment_
+                     << ", alignment=" << alignment_
+                     << ", bucket_capacity=" << bucket_capacity_;
+        bucket_batch_alignment_ = 0;
+    }
     max_bucket_count_ = config.max_bucket_count;
     ready_bucket_target_ = static_cast<size_t>(config.ready_bucket_target);
     bucket_create_concurrency_ =
@@ -204,6 +226,11 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
     eviction_check_interval_ = config.eviction_check_interval;
+    // The mtime refresh ioctl exists only on the POSIX adapter. Other adapters
+    // never receive a write context from the client, so they still update it
+    // themselves and the master must not touch it.
+    mtime_refresh_on_seal_ = config.posix_write_context_enabled &&
+                             config.fs_adapter_type == "posix";
 
     std::error_code ec;
     if (!std::filesystem::is_directory(fsdir_, ec) || ec) {
@@ -366,6 +393,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     LOG(INFO) << "DFS bucket allocator initialized, fsdir=" << fsdir_
               << ", bucket_capacity=" << bucket_capacity_
               << ", alignment=" << alignment_
+              << ", bucket_batch_alignment=" << bucket_batch_alignment_
               << ", max_bucket_count=" << max_bucket_count_
               << ", ready_bucket_target=" << ready_bucket_target_
               << ", bucket_create_concurrency=" << bucket_create_concurrency_
@@ -478,9 +506,10 @@ void ImmutableBucketAllocator::SealActiveBucketLocked() {
     if (bucket.sealed) return;
     bucket.sealed = true;
     // The bucket accepts no further allocations, so this is the moment its
-    // metadata becomes worth persisting. The write itself happens outside the
-    // lock, in FlushDirtyMetadata().
+    // metadata becomes worth persisting and its master-owned mtime must be
+    // refreshed. Both I/O operations happen later, outside mutex_.
     bucket.meta_dirty = true;
+    if (mtime_refresh_on_seal_) bucket.mtime_dirty = true;
 }
 
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
@@ -640,14 +669,18 @@ void ImmutableBucketAllocator::RollbackBucketPublicationLocked(
 }
 
 bool ImmutableBucketAllocator::ActiveBucketHasSpaceLocked(
-    uint64_t required, BucketPtr* bucket) const {
+    uint64_t required, BucketPtr* bucket,
+    uint64_t allocation_alignment) const {
     if (active_bucket_id_ < 0) return false;
     auto it = buckets_.find(active_bucket_id_);
     if (it == buckets_.end() || it->second->ready || it->second->sealed ||
         it->second->frozen) {
         return false;
     }
-    auto entry_start = CheckedAlignUp(it->second->append_offset, alignment_);
+    const uint64_t alignment = allocation_alignment == 0
+                                   ? alignment_
+                                   : allocation_alignment;
+    auto entry_start = CheckedAlignUp(it->second->append_offset, alignment);
     if (!entry_start || *entry_start > it->second->capacity ||
         required > it->second->capacity - *entry_start) {
         return false;
@@ -991,8 +1024,9 @@ ImmutableBucketAllocator::CreateBucketUnlocked(
 }
 
 tl::expected<ImmutableBucketAllocator::BucketPtr, ErrorCode>
-ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
-                                          uint64_t required) {
+ImmutableBucketAllocator::EnsureActiveBucket(
+    std::unique_lock<std::mutex>& lock, uint64_t required,
+    uint64_t allocation_alignment) {
     if (required > bucket_capacity_) {
         // Refuse rather than spill across buckets: the caller asked for one
         // contiguous region and no bucket can ever satisfy it.
@@ -1016,7 +1050,7 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
 
     while (true) {
         BucketPtr active;
-        if (ActiveBucketHasSpaceLocked(required, &active)) {
+        if (ActiveBucketHasSpaceLocked(required, &active, allocation_alignment)) {
             observe_rollover();
             return active;
         }
@@ -1088,9 +1122,11 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
         RequestRefillLocked();
         ++waiting_allocators_;
         const auto wait_started = std::chrono::steady_clock::now();
-        bucket_pool_cv_.wait(lock, [this, required, failure_sequence] {
+        bucket_pool_cv_.wait(lock, [this, required, allocation_alignment,
+                                      failure_sequence] {
             return stop_bucket_workers_ ||
-                   ActiveBucketHasSpaceLocked(required) ||
+                   ActiveBucketHasSpaceLocked(required, nullptr,
+                                               allocation_alignment) ||
                    !ready_bucket_ids_.empty() ||
                    (bucket_creation_failure_sequence_ != failure_sequence &&
                     bucket_creations_in_flight_ == 0) ||
@@ -1110,7 +1146,7 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
         if (ready_bucket_ids_.empty() &&
-            !ActiveBucketHasSpaceLocked(required) &&
+            !ActiveBucketHasSpaceLocked(required, nullptr, allocation_alignment) &&
             bucket_creations_in_flight_ == 0 &&
             bucket_creation_failure_sequence_ != failure_sequence) {
             const ErrorCode error = last_bucket_creation_error_ == ErrorCode::OK
@@ -1376,6 +1412,9 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
     std::vector<Reservation> reserved;
     reserved.reserve(requests.size());
     size_t already_exists_count = 0;
+    // Track the bucket in which this batch last reserved an entry. A batch
+    // re-aligns only when it enters a different bucket.
+    int64_t aligned_bucket_id = -1;
 
     // Mark every not-yet-resolved request as a generic failure so a later break
     // leaves no slot at its default OK.
@@ -1389,10 +1428,10 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
         }
     };
 
-    // Append-pack in request order. EnsureActiveBucket receives only the
-    // current object's reserved size, so a partially filled active bucket is
-    // used before a new bucket is created. A bucket boundary can therefore
-    // occur only between two objects, never inside one object.
+    // Append-pack in request order. The first actual reservation in this batch
+    // starts at bucket_batch_alignment_ when configured; keys inside the batch
+    // keep the normal per-key alignment. If a later key rolls to a new bucket,
+    // offset zero naturally starts the continuation on the same boundary.
     for (size_t index = 0; index < requests.size(); ++index) {
         const auto& request = requests[index];
         // Dedup right before the reserve, under the same lock hold. A key can
@@ -1440,6 +1479,54 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
             break;
         }
         auto bucket = bucket_result.value();
+        if (bucket_batch_alignment_ != 0 &&
+            bucket->bucket_id != aligned_bucket_id) {
+            // Entering a new bucket for this batch: re-align its start to the
+            // configured batch boundary. This also covers a bucket that another
+            // batch packed into while this batch was rolling over. Applying the
+            // padding per bucket instead of once per batch is what allows the
+            // whole-batch mutex to be dropped.
+            auto aligned_start =
+                CheckedAlignUp(bucket->append_offset, bucket_batch_alignment_);
+            if (!aligned_start || *aligned_start > bucket->capacity ||
+                object_layout->aligned_size >
+                    bucket->capacity - *aligned_start) {
+                // Ask EnsureActiveBucket for a bucket that also has room after
+                // the batch boundary. It publishes the replacement before
+                // sealing the old active bucket, so a failed creation leaves
+                // the old bucket available for smaller allocations.
+                bucket_result = EnsureActiveBucket(
+                    lock, object_layout->aligned_size, bucket_batch_alignment_);
+                if (!bucket_result) {
+                    results[index].success = false;
+                    results[index].descriptor = DistributedFSDescriptor{};
+                    results[index].error = bucket_result.error();
+                    fail_remaining(index + 1);
+                    break;
+                }
+                bucket = bucket_result.value();
+                aligned_start = CheckedAlignUp(bucket->append_offset,
+                                               bucket_batch_alignment_);
+            }
+            if (!aligned_start || *aligned_start > bucket->capacity ||
+                object_layout->aligned_size >
+                    bucket->capacity - *aligned_start) {
+                results[index].success = false;
+                results[index].descriptor = DistributedFSDescriptor{};
+                results[index].error = ErrorCode::NO_AVAILABLE_HANDLE;
+                fail_remaining(index + 1);
+                break;
+            }
+            if (*aligned_start != bucket->append_offset) {
+                // Keep this padding if the batch later fails. EnsureActiveBucket
+                // may release mutex_ while creating the next bucket, allowing
+                // another batch to append and commit entries in this bucket;
+                // the padding cannot then be safely distinguished from that
+                // batch's state during rollback.
+                bucket->append_offset = *aligned_start;
+            }
+            aligned_bucket_id = bucket->bucket_id;
+        }
         auto descriptor =
             ReserveInBucketLocked(*bucket, request.key, request.size);
         if (!descriptor) {
@@ -1587,12 +1674,12 @@ void ImmutableBucketAllocator::Free(const std::string& key,
 size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
     if (!fs_adapter_) return 0;
 
-    // Snapshot every dirty bucket under the lock, then do the writes without
-    // it.
     struct PendingWrite {
         int64_t bucket_id = -1;
         BucketPtr bucket_identity;
         PersistedBucketMetadata snapshot;
+        bool write_metadata = false;
+        bool touch_mtime = false;
     };
     std::vector<PendingWrite> pending;
     {
@@ -1600,13 +1687,19 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
         for (const auto& [bucket_id, bucket] : buckets_) {
             // An unsealed bucket is deliberately never written: it is still
             // being appended to, and its data is discarded on the next start.
-            if (!bucket->sealed || !bucket->meta_dirty || bucket->evicting) continue;
-            pending.push_back({bucket_id, bucket, SnapshotLocked(*bucket)});
-            // Clear the flag together with taking the snapshot. A change that
-            // lands while we are unlocked sets it again and is picked up by the
-            // next flush, instead of being swallowed by a late clear. It also
-            // keeps a concurrent flush from writing the same file.
+            if (!bucket->sealed ||
+                (!bucket->meta_dirty && !bucket->mtime_dirty) ||
+                bucket->evicting) {
+                continue;
+            }
+            pending.push_back({bucket_id, bucket,
+                               bucket->meta_dirty ? SnapshotLocked(*bucket)
+                                                  : PersistedBucketMetadata{},
+                               bucket->meta_dirty, bucket->mtime_dirty});
+            // Clear both flags together with taking the snapshot. A change that
+            // lands while we are unlocked sets the relevant flag again.
             bucket->meta_dirty = false;
+            bucket->mtime_dirty = false;
         }
     }
     if (pending.empty()) return 0;
@@ -1618,36 +1711,71 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
                   return lhs.bucket_id < rhs.bucket_id;
               });
 
+    // Phase 1: persist every dirty `.meta` first. Only this phase takes
+    // metadata_io_mutex_ and does fsync work. The mtime refresh is deferred to
+    // phase 2 so it never holds other buckets' `.meta` writes.
+    std::vector<PendingWrite> mtime_items;
+    mtime_items.reserve(pending.size());
     size_t flushed = 0;
     for (const auto& item : pending) {
-        std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
+        if (item.write_metadata) {
+            std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto it = buckets_.find(item.bucket_id);
+                if (it == buckets_.end() ||
+                    it->second.get() != item.bucket_identity.get() ||
+                    it->second->evicting) {
+                    continue;
+                }
+            }
+            // PersistMetadata logs its own failure with the path and error, so
+            // no second log line here.
+            auto persisted = PersistMetadata(item.snapshot);
+            if (!persisted) {
+                // Put the flag back so a later tick retries the `.meta` write;
+                // the mtime refresh rides along with it.
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto it = buckets_.find(item.bucket_id);
+                if (it != buckets_.end() &&
+                    it->second.get() == item.bucket_identity.get()) {
+                    it->second->meta_dirty = true;
+                    it->second->mtime_dirty |= item.touch_mtime;
+                }
+                continue;
+            }
+            ++flushed;
+        }
+        if (item.touch_mtime) mtime_items.push_back(item);
+    }
+
+    // Phase 2: refresh mtime on the sealed data files, one open per bucket.
+    // This runs outside metadata_io_mutex_ and never blocks `.meta` writes. The
+    // mtime ioctl is best-effort: on failure log once and drop the request
+    // instead of retrying.
+    for (const auto& item : mtime_items) {
+        bool still_ours = true;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = buckets_.find(item.bucket_id);
-            if (it == buckets_.end() ||
-                it->second.get() != item.bucket_identity.get() ||
-                it->second->evicting) {
-                continue;
+            still_ours = it != buckets_.end() &&
+                         it->second.get() == item.bucket_identity.get() &&
+                         !it->second->evicting && !it->second->frozen;
+        }
+        // If the bucket became frozen/evicting after phase 1 the ioctl was not
+        // attempted; leave the flag cleared so it is not retried.
+        if (!still_ours) continue;
+
+        auto updated = fs_adapter_->UpdateFileMtime(
+            BucketDataPath(item.bucket_id));
+        if (!updated) {
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(WARNING) << "Failed to refresh DFS bucket mtime, bucket_id="
+                             << item.bucket_id
+                             << ", error=" << updated.error()
+                             << ", not retrying, suppressed=" << *suppressed;
             }
-        }
-        auto persisted = PersistMetadata(item.snapshot);
-        if (persisted) {
-            ++flushed;
-            continue;
-        }
-        static DfsLogLimiter log_limiter;
-        if (auto suppressed = log_limiter.ShouldLog()) {
-            LOG(WARNING) << "Failed to write DFS bucket metadata, bucket_id="
-                         << item.bucket_id << ", error=" << persisted.error()
-                         << ", suppressed=" << *suppressed;
-        }
-        // Put the flag back so the next maintenance tick retries, unless the
-        // bucket changed identity meanwhile - then it is not ours to mark.
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = buckets_.find(item.bucket_id);
-        if (it != buckets_.end() &&
-            it->second.get() == item.bucket_identity.get()) {
-            it->second->meta_dirty = true;
         }
     }
     return flushed;
@@ -1881,6 +2009,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
+            if (mtime_refresh_on_seal_) victim->mtime_dirty = true;
         }
         if (was_active) {
             active_bucket_id_ = -1;
@@ -2008,6 +2137,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
+            if (mtime_refresh_on_seal_) victim->mtime_dirty = true;
         }
 
         pending.owner_ = this;
