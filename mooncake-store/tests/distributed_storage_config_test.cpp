@@ -99,7 +99,7 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_EQ(config.shard_count, 64);
     EXPECT_EQ(config.shard_capacity, 4ULL * 1024 * 1024 * 1024);
     EXPECT_EQ(config.alignment, 4096);
-    EXPECT_EQ(config.bucket_batch_alignment, 0);
+    EXPECT_EQ(config.bucket_batch_alignment, 512 * 1024);
     EXPECT_TRUE(config.posix_write_context_enabled);
     EXPECT_TRUE(config.single_tenant);
     EXPECT_TRUE(config.eviction_enabled);

@@ -648,14 +648,18 @@ void ImmutableBucketAllocator::RollbackBucketPublicationLocked(
 }
 
 bool ImmutableBucketAllocator::ActiveBucketHasSpaceLocked(
-    uint64_t required, BucketPtr* bucket) const {
+    uint64_t required, BucketPtr* bucket,
+    uint64_t allocation_alignment) const {
     if (active_bucket_id_ < 0) return false;
     auto it = buckets_.find(active_bucket_id_);
     if (it == buckets_.end() || it->second->ready || it->second->sealed ||
         it->second->frozen) {
         return false;
     }
-    auto entry_start = CheckedAlignUp(it->second->append_offset, alignment_);
+    const uint64_t alignment = allocation_alignment == 0
+                                   ? alignment_
+                                   : allocation_alignment;
+    auto entry_start = CheckedAlignUp(it->second->append_offset, alignment);
     if (!entry_start || *entry_start > it->second->capacity ||
         required > it->second->capacity - *entry_start) {
         return false;
@@ -999,8 +1003,9 @@ ImmutableBucketAllocator::CreateBucketUnlocked(
 }
 
 tl::expected<ImmutableBucketAllocator::BucketPtr, ErrorCode>
-ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
-                                          uint64_t required) {
+ImmutableBucketAllocator::EnsureActiveBucket(
+    std::unique_lock<std::mutex>& lock, uint64_t required,
+    uint64_t allocation_alignment) {
     if (required > bucket_capacity_) {
         // Refuse rather than spill across buckets: the caller asked for one
         // contiguous region and no bucket can ever satisfy it.
@@ -1024,7 +1029,7 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
 
     while (true) {
         BucketPtr active;
-        if (ActiveBucketHasSpaceLocked(required, &active)) {
+        if (ActiveBucketHasSpaceLocked(required, &active, allocation_alignment)) {
             observe_rollover();
             return active;
         }
@@ -1096,9 +1101,11 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
         RequestRefillLocked();
         ++waiting_allocators_;
         const auto wait_started = std::chrono::steady_clock::now();
-        bucket_pool_cv_.wait(lock, [this, required, failure_sequence] {
+        bucket_pool_cv_.wait(lock, [this, required, allocation_alignment,
+                                      failure_sequence] {
             return stop_bucket_workers_ ||
-                   ActiveBucketHasSpaceLocked(required) ||
+                   ActiveBucketHasSpaceLocked(required, nullptr,
+                                               allocation_alignment) ||
                    !ready_bucket_ids_.empty() ||
                    (bucket_creation_failure_sequence_ != failure_sequence &&
                     bucket_creations_in_flight_ == 0) ||
@@ -1118,7 +1125,7 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
         if (ready_bucket_ids_.empty() &&
-            !ActiveBucketHasSpaceLocked(required) &&
+            !ActiveBucketHasSpaceLocked(required, nullptr, allocation_alignment) &&
             bucket_creations_in_flight_ == 0 &&
             bucket_creation_failure_sequence_ != failure_sequence) {
             const ErrorCode error = last_bucket_creation_error_ == ErrorCode::OK
@@ -1384,15 +1391,8 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
     std::vector<Reservation> reserved;
     reserved.reserve(requests.size());
     size_t already_exists_count = 0;
-    // Per-bucket padding records: each batch re-aligns the 512 KiB start when
-    // it enters a bucket (including one reused after a concurrent batch packed
-    // into it). Records let a failed batch drop any padding it inserted.
-    struct AlignRecord {
-        BucketPtr bucket;
-        uint64_t restore_offset = 0;
-        uint64_t restore_pending = 0;
-    };
-    std::vector<AlignRecord> align_records;
+    // Track the bucket in which this batch last reserved an entry. A batch
+    // re-aligns only when it enters a different bucket.
     int64_t aligned_bucket_id = -1;
 
     // Mark every not-yet-resolved request as a generic failure so a later break
@@ -1467,15 +1467,15 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
             // whole-batch mutex to be dropped.
             auto aligned_start =
                 CheckedAlignUp(bucket->append_offset, bucket_batch_alignment_);
-            if (!aligned_start ||
-                *aligned_start > bucket->capacity ||
+            if (!aligned_start || *aligned_start > bucket->capacity ||
                 object_layout->aligned_size >
                     bucket->capacity - *aligned_start) {
-                // Not enough room after alignment: keep this bucket's final
-                // partial region and continue in a fresh bucket at offset zero.
-                SealActiveBucketLocked();
-                bucket_result = EnsureActiveBucket(lock,
-                                                   object_layout->aligned_size);
+                // Ask EnsureActiveBucket for a bucket that also has room after
+                // the batch boundary. It publishes the replacement before
+                // sealing the old active bucket, so a failed creation leaves
+                // the old bucket available for smaller allocations.
+                bucket_result = EnsureActiveBucket(
+                    lock, object_layout->aligned_size, bucket_batch_alignment_);
                 if (!bucket_result) {
                     results[index].success = false;
                     results[index].descriptor = DistributedFSDescriptor{};
@@ -1487,7 +1487,7 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
                 aligned_start = CheckedAlignUp(bucket->append_offset,
                                                bucket_batch_alignment_);
             }
-            if (!aligned_start ||
+            if (!aligned_start || *aligned_start > bucket->capacity ||
                 object_layout->aligned_size >
                     bucket->capacity - *aligned_start) {
                 results[index].success = false;
@@ -1497,9 +1497,11 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
                 break;
             }
             if (*aligned_start != bucket->append_offset) {
-                align_records.push_back(AlignRecord{bucket,
-                                                    bucket->append_offset,
-                                                    bucket->pending_entries});
+                // Keep this padding if the batch later fails. EnsureActiveBucket
+                // may release mutex_ while creating the next bucket, allowing
+                // another batch to append and commit entries in this bucket;
+                // the padding cannot then be safely distinguished from that
+                // batch's state during rollback.
                 bucket->append_offset = *aligned_start;
             }
             aligned_bucket_id = bucket->bucket_id;
@@ -1557,19 +1559,6 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
             if (results[it->request_index].error == ErrorCode::OK) {
                 results[it->request_index].error =
                     ErrorCode::NO_AVAILABLE_HANDLE;
-            }
-        }
-        // Drop any 512 KiB alignment padding this batch inserted. Reverse
-        // order restores the outermost pad first; the guard ensures we only
-        // rewrite a bucket whose state still matches what we recorded.
-        for (auto it = align_records.rbegin(); it != align_records.rend();
-             ++it) {
-            auto bucket_it = buckets_.find(it->bucket->bucket_id);
-            if (bucket_it != buckets_.end() &&
-                bucket_it->second.get() == it->bucket.get() &&
-                bucket_it->second->pending_entries == it->restore_pending &&
-                bucket_it->second->append_offset >= it->restore_offset) {
-                bucket_it->second->append_offset = it->restore_offset;
             }
         }
         lock.unlock();

@@ -292,7 +292,7 @@ class DistributedStorageBackend
      *
      * Only distinct from `GetOrOpenBucket` when the POSIX write context is on:
      * that mode marks the write handle with an ioctl that skips per-write
-     * size/mtime updates while retaining range locks, and the mark is a per-fd
+     * mtime updates while retaining range locks, and the mark is a per-fd
      * property. Serving reads from that same fd would drag the write-only
      * metadata behavior into the read path, so reads get their own plain
      * handle. When the mode is off this returns the regular handle and the two

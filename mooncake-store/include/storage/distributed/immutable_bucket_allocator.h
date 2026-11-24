@@ -515,7 +515,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     size_t EffectiveReadyTargetLocked() const;
     BucketPtr PromoteReadyBucketLocked();
     bool ActiveBucketHasSpaceLocked(uint64_t required,
-                                    BucketPtr* bucket = nullptr) const;
+                                    BucketPtr* bucket = nullptr,
+                                    uint64_t allocation_alignment = 0) const;
     void RequestRefillLocked();
     void RecordBucketCreationFailureLocked(ErrorCode error);
     void BucketCreateWorker();
@@ -532,7 +533,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     // Ensures an active bucket exists with at least `required` bytes free.
     // May temporarily release `lock` to create a bucket.
     tl::expected<BucketPtr, ErrorCode> EnsureActiveBucket(
-        std::unique_lock<std::mutex>& lock, uint64_t required);
+        std::unique_lock<std::mutex>& lock, uint64_t required,
+        uint64_t allocation_alignment = 0);
 
     void TouchLruLocked(int64_t bucket_id, int64_t now_ns);
     void RemoveFromLruLocked(int64_t bucket_id);
@@ -565,7 +567,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     uint64_t bucket_capacity_ = 0;
     uint64_t alignment_ = 4096;
-    uint64_t bucket_batch_alignment_ = 0;
+    uint64_t bucket_batch_alignment_ = 512 * 1024;
     int64_t max_bucket_count_ = 0;
     size_t ready_bucket_target_ = 4;
     size_t bucket_create_concurrency_ = 2;

@@ -171,8 +171,8 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
     config.allocator_type = DfsAllocatorType::BUCKET;
     config.bucket_capacity = bucket_capacity;
     config.max_bucket_count = max_bucket_count;
-    config.ready_bucket_target = 0;
     config.alignment = kAlignment;
+    config.bucket_batch_alignment = 0;
     config.single_tenant = true;
     config.eviction_enabled = false;
     config.eviction_high_watermark = 0.9;

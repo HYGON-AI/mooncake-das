@@ -294,7 +294,7 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
             // One INFO per process; the ioctl is otherwise silent.
             LOG_FIRST_N(INFO, 1)
                 << "DFS bucket write context enabled: client skips per-write "
-                   "size/mtime updates (range locks retained)";
+                   "mtime updates (range locks retained)";
         } else {
             posix_write_context_unavailable_.store(true,
                                                    std::memory_order_relaxed);
@@ -358,7 +358,8 @@ DistributedStorageBackend::GetOrOpenBucketForRead(int64_t bucket_id,
                              ImmutableBucketAllocator::FormatBucketId(bucket_id) +
                              kBucketDataSuffix;
     // A plain read handle: no write-context ioctl, so reads keep the default
-    // size/mtime/range-lock behavior even while writes opt out of it.
+    // metadata and range-lock behavior even while writes opt out of per-write
+    // mtime updates.
     auto fd_result = fs_adapter_->OpenFileReadOnly(path);
     if (!fd_result) {
         static DfsLogLimiter log_limiter;

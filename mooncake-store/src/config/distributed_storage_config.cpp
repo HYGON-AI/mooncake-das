@@ -349,11 +349,14 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
         (!IsValidBucketAlignment(bucket_batch_alignment) ||
          bucket_batch_alignment < alignment ||
          bucket_batch_alignment % alignment != 0 ||
-         bucket_batch_alignment > bucket_capacity)) {
+         bucket_batch_alignment > bucket_capacity ||
+         bucket_capacity % bucket_batch_alignment != 0)) {
         LOG(ERROR) << "DistributedStorageConfig: bucket_batch_alignment must "
-                      "be 0 or a power-of-two multiple of alignment, "
+                      "be 0 or a power-of-two multiple of alignment, no greater "
+                      "than bucket_capacity, and divide bucket_capacity, "
                       "batch_alignment="
-                   << bucket_batch_alignment << ", alignment=" << alignment;
+                   << bucket_batch_alignment << ", alignment=" << alignment
+                   << ", bucket_capacity=" << bucket_capacity;
         return false;
     }
     if (bucket_capacity % alignment != 0) {
