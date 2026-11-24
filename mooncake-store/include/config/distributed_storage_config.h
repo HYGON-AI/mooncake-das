@@ -16,6 +16,9 @@ struct DistributedStorageConfig {
     int shard_count = 64;
     uint64_t shard_capacity = 4ULL * 1024 * 1024 * 1024;
     uint64_t alignment = 4096;
+    // BUCKET mode only: alignment of the first key in each BatchPutStart
+    // reservation. Zero keeps the existing per-key allocation behavior.
+    uint64_t bucket_batch_alignment = 0;
     bool single_tenant = true;
     bool eviction_enabled = true;
     double eviction_high_watermark = 0.9;

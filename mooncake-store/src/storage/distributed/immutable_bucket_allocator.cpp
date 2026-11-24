@@ -200,6 +200,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     fs_adapter_type_ = config.fs_adapter_type;
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
+    bucket_batch_alignment_ = config.bucket_batch_alignment;
     max_bucket_count_ = config.max_bucket_count;
     ready_bucket_target_ = static_cast<size_t>(config.ready_bucket_target);
     bucket_create_concurrency_ =
@@ -376,6 +377,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     LOG(INFO) << "DFS bucket allocator initialized, fsdir=" << fsdir_
               << ", bucket_capacity=" << bucket_capacity_
               << ", alignment=" << alignment_
+              << ", bucket_batch_alignment=" << bucket_batch_alignment_
               << ", max_bucket_count=" << max_bucket_count_
               << ", ready_bucket_target=" << ready_bucket_target_
               << ", bucket_create_concurrency=" << bucket_create_concurrency_
@@ -1390,6 +1392,16 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
     std::vector<Reservation> reserved;
     reserved.reserve(requests.size());
     size_t already_exists_count = 0;
+    // Per-bucket padding records: each batch re-aligns the 512 KiB start when
+    // it enters a bucket (including one reused after a concurrent batch packed
+    // into it). Records let a failed batch drop any padding it inserted.
+    struct AlignRecord {
+        BucketPtr bucket;
+        uint64_t restore_offset = 0;
+        uint64_t restore_pending = 0;
+    };
+    std::vector<AlignRecord> align_records;
+    int64_t aligned_bucket_id = -1;
 
     // Mark every not-yet-resolved request as a generic failure so a later break
     // leaves no slot at its default OK.
@@ -1403,10 +1415,10 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
         }
     };
 
-    // Append-pack in request order. EnsureActiveBucket receives only the
-    // current object's reserved size, so a partially filled active bucket is
-    // used before a new bucket is created. A bucket boundary can therefore
-    // occur only between two objects, never inside one object.
+    // Append-pack in request order. The first actual reservation in this batch
+    // starts at bucket_batch_alignment_ when configured; keys inside the batch
+    // keep the normal per-key alignment. If a later key rolls to a new bucket,
+    // offset zero naturally starts the continuation on the same boundary.
     for (size_t index = 0; index < requests.size(); ++index) {
         const auto& request = requests[index];
         // Dedup right before the reserve, under the same lock hold. A key can
@@ -1454,6 +1466,52 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
             break;
         }
         auto bucket = bucket_result.value();
+        if (bucket_batch_alignment_ != 0 &&
+            bucket->bucket_id != aligned_bucket_id) {
+            // Entering a new bucket for this batch: re-align its start to the
+            // configured batch boundary. This also covers a bucket that another
+            // batch packed into while this batch was rolling over. Applying the
+            // padding per bucket instead of once per batch is what allows the
+            // whole-batch mutex to be dropped.
+            auto aligned_start =
+                CheckedAlignUp(bucket->append_offset, bucket_batch_alignment_);
+            if (!aligned_start ||
+                *aligned_start > bucket->capacity ||
+                object_layout->aligned_size >
+                    bucket->capacity - *aligned_start) {
+                // Not enough room after alignment: keep this bucket's final
+                // partial region and continue in a fresh bucket at offset zero.
+                SealActiveBucketLocked();
+                bucket_result = EnsureActiveBucket(lock,
+                                                   object_layout->aligned_size);
+                if (!bucket_result) {
+                    results[index].success = false;
+                    results[index].descriptor = DistributedFSDescriptor{};
+                    results[index].error = bucket_result.error();
+                    fail_remaining(index + 1);
+                    break;
+                }
+                bucket = bucket_result.value();
+                aligned_start = CheckedAlignUp(bucket->append_offset,
+                                               bucket_batch_alignment_);
+            }
+            if (!aligned_start ||
+                object_layout->aligned_size >
+                    bucket->capacity - *aligned_start) {
+                results[index].success = false;
+                results[index].descriptor = DistributedFSDescriptor{};
+                results[index].error = ErrorCode::NO_AVAILABLE_HANDLE;
+                fail_remaining(index + 1);
+                break;
+            }
+            if (*aligned_start != bucket->append_offset) {
+                align_records.push_back(AlignRecord{bucket,
+                                                    bucket->append_offset,
+                                                    bucket->pending_entries});
+                bucket->append_offset = *aligned_start;
+            }
+            aligned_bucket_id = bucket->bucket_id;
+        }
         auto descriptor =
             ReserveInBucketLocked(*bucket, request.key, request.size);
         if (!descriptor) {
@@ -1507,6 +1565,19 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
             if (results[it->request_index].error == ErrorCode::OK) {
                 results[it->request_index].error =
                     ErrorCode::NO_AVAILABLE_HANDLE;
+            }
+        }
+        // Drop any 512 KiB alignment padding this batch inserted. Reverse
+        // order restores the outermost pad first; the guard ensures we only
+        // rewrite a bucket whose state still matches what we recorded.
+        for (auto it = align_records.rbegin(); it != align_records.rend();
+             ++it) {
+            auto bucket_it = buckets_.find(it->bucket->bucket_id);
+            if (bucket_it != buckets_.end() &&
+                bucket_it->second.get() == it->bucket.get() &&
+                bucket_it->second->pending_entries == it->restore_pending &&
+                bucket_it->second->append_offset >= it->restore_offset) {
+                bucket_it->second->append_offset = it->restore_offset;
             }
         }
         lock.unlock();

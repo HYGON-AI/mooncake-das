@@ -54,6 +54,8 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar shard_count{"MOONCAKE_DFS_SHARD_COUNT"};
     ScopedEnvVar shard_capacity{"MOONCAKE_DFS_SHARD_CAPACITY"};
     ScopedEnvVar alignment{"MOONCAKE_DFS_ALIGNMENT"};
+    ScopedEnvVar bucket_batch_alignment{
+        "MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT"};
     ScopedEnvVar posix_write_context{
         "MOONCAKE_DFS_POSIX_WRITE_CONTEXT_ENABLED"};
     ScopedEnvVar single_tenant{"MOONCAKE_DFS_SINGLE_TENANT"};
@@ -97,6 +99,7 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_EQ(config.shard_count, 64);
     EXPECT_EQ(config.shard_capacity, 4ULL * 1024 * 1024 * 1024);
     EXPECT_EQ(config.alignment, 4096);
+    EXPECT_EQ(config.bucket_batch_alignment, 0);
     EXPECT_TRUE(config.posix_write_context_enabled);
     EXPECT_TRUE(config.single_tenant);
     EXPECT_TRUE(config.eviction_enabled);

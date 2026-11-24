@@ -571,6 +571,7 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     uint64_t bucket_capacity_ = 0;
     uint64_t alignment_ = 4096;
+    uint64_t bucket_batch_alignment_ = 0;
     int64_t max_bucket_count_ = 0;
     size_t ready_bucket_target_ = 4;
     size_t bucket_create_concurrency_ = 2;

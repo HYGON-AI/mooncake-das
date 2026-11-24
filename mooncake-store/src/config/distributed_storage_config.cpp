@@ -180,6 +180,9 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT, config.max_bucket_count);
     config.alignment =
         Environ::ReadOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
+    config.bucket_batch_alignment = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT,
+        config.bucket_batch_alignment);
     config.posix_write_context_enabled =
         Environ::ReadOr(Variables::MOONCAKE_DFS_POSIX_WRITE_CONTEXT_ENABLED,
                         config.posix_write_context_enabled);
@@ -284,6 +287,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", enable_health_check=" << enable_health_check
         << ", shard_count=" << shard_count
         << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment
+        << ", bucket_batch_alignment=" << bucket_batch_alignment
         << ", single_tenant=" << single_tenant
         << ", eviction_enabled=" << eviction_enabled
         << ", eviction_high_watermark=" << eviction_high_watermark
@@ -339,6 +343,17 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
         LOG(ERROR) << "DistributedStorageConfig: alignment must be a power of "
                       "2, alignment="
                    << alignment;
+        return false;
+    }
+    if (bucket_batch_alignment != 0 &&
+        (!IsValidBucketAlignment(bucket_batch_alignment) ||
+         bucket_batch_alignment < alignment ||
+         bucket_batch_alignment % alignment != 0 ||
+         bucket_batch_alignment > bucket_capacity)) {
+        LOG(ERROR) << "DistributedStorageConfig: bucket_batch_alignment must "
+                      "be 0 or a power-of-two multiple of alignment, "
+                      "batch_alignment="
+                   << bucket_batch_alignment << ", alignment=" << alignment;
         return false;
     }
     if (bucket_capacity % alignment != 0) {

@@ -902,6 +902,7 @@ When the space needs to be released, this interface is used to remove the previo
 metadata-management
 ssd-offload
 immutable-dfs-bucket-allocator
+posix-dfs-bucket-concurrent-write
 ssd-free-ratio-first-allocation
 nvme-kv-backend
 oss-backend
