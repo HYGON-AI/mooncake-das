@@ -197,6 +197,13 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
     bucket_batch_alignment_ = config.bucket_batch_alignment;
+    if (bucket_batch_alignment_ > bucket_capacity_) {
+        LOG(WARNING) << "DFS bucket batch alignment exceeds bucket capacity; "
+                        "disabling batch alignment for compatibility, "
+                     << "batch_alignment=" << bucket_batch_alignment_
+                     << ", bucket_capacity=" << bucket_capacity_;
+        bucket_batch_alignment_ = 0;
+    }
     max_bucket_count_ = config.max_bucket_count;
     ready_bucket_target_ = static_cast<size_t>(config.ready_bucket_target);
     bucket_create_concurrency_ =
