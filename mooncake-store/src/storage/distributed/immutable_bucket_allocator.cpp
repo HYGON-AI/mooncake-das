@@ -197,12 +197,17 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
     bucket_batch_alignment_ = config.bucket_batch_alignment;
-    if (bucket_batch_alignment_ != 0 &&
-        (!IsValidBucketAlignment(bucket_batch_alignment_) ||
-         bucket_batch_alignment_ < alignment_ ||
-         bucket_batch_alignment_ % alignment_ != 0 ||
-         bucket_batch_alignment_ > bucket_capacity_ ||
-         bucket_capacity_ % bucket_batch_alignment_ != 0)) {
+    // The batch boundary exists to keep each client write inside one 512 KiB
+    // filesystem range-lock unit, which only the POSIX write context relies on.
+    // Other adapters gain nothing from it and would only pay the padding cost.
+    if (fs_adapter_type_ != "posix") {
+        bucket_batch_alignment_ = 0;
+    } else if (bucket_batch_alignment_ != 0 &&
+               (!IsValidBucketAlignment(bucket_batch_alignment_) ||
+                bucket_batch_alignment_ < alignment_ ||
+                bucket_batch_alignment_ % alignment_ != 0 ||
+                bucket_batch_alignment_ > bucket_capacity_ ||
+                bucket_capacity_ % bucket_batch_alignment_ != 0)) {
         // The batch boundary is a master-side placement hint only. A value that
         // the current bucket geometry cannot honor must not stop the master, so
         // fall back to the legacy per-key allocation instead of failing Init().
