@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "mooncake-keyscale",
+  "description": "Test Mooncake key-capacity limits and eviction stability with any multi-node, multi-segment layout: one conf file defines the roles, every holder row is one segment with its own size, and the driver pushes resident keys to the per-segment object cap before watching N eviction rounds. The bundled 6-segment conf is only a reference sized to one environment's memory limit.",
+  "author": {
+    "name": "Mooncake Team"
+  },
+  "homepage": "https://kvcache-ai.github.io/Mooncake/skills/mooncake-keyscale.html",
+  "repository": "https://github.com/kvcache-ai/Mooncake",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mooncake",
+    "key-scale",
+    "capacity",
+    "eviction",
+    "stability",
+    "multi-segment",
+    "master"
+  ]
+}
