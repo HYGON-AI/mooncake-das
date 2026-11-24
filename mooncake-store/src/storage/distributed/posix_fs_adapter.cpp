@@ -320,8 +320,11 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::ReadAt(int fd, iovec* iov,
         ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
     } while (ret < 0 && errno == EINTR);
     if (ret < 0) {
+        const int saved_errno = errno;
         scope.MarkSuccess(false);
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        return tl::make_unexpected(saved_errno == ENOENT
+                                       ? ErrorCode::FILE_NOT_FOUND
+                                       : ErrorCode::FILE_READ_FAIL);
     }
     scope.MarkSuccess(true);
     return static_cast<size_t>(ret);
