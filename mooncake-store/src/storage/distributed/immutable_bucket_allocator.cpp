@@ -197,10 +197,19 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
     bucket_batch_alignment_ = config.bucket_batch_alignment;
-    if (bucket_batch_alignment_ > bucket_capacity_) {
-        LOG(WARNING) << "DFS bucket batch alignment exceeds bucket capacity; "
-                        "disabling batch alignment for compatibility, "
+    if (bucket_batch_alignment_ != 0 &&
+        (!IsValidBucketAlignment(bucket_batch_alignment_) ||
+         bucket_batch_alignment_ < alignment_ ||
+         bucket_batch_alignment_ % alignment_ != 0 ||
+         bucket_batch_alignment_ > bucket_capacity_ ||
+         bucket_capacity_ % bucket_batch_alignment_ != 0)) {
+        // The batch boundary is a master-side placement hint only. A value that
+        // the current bucket geometry cannot honor must not stop the master, so
+        // fall back to the legacy per-key allocation instead of failing Init().
+        LOG(WARNING) << "DFS bucket batch alignment is incompatible with the "
+                        "bucket geometry; disabling batch alignment, "
                      << "batch_alignment=" << bucket_batch_alignment_
+                     << ", alignment=" << alignment_
                      << ", bucket_capacity=" << bucket_capacity_;
         bucket_batch_alignment_ = 0;
     }

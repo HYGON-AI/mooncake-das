@@ -345,20 +345,9 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                    << alignment;
         return false;
     }
-    if (bucket_batch_alignment != 0 &&
-        (!IsValidBucketAlignment(bucket_batch_alignment) ||
-         bucket_batch_alignment < alignment ||
-         bucket_batch_alignment % alignment != 0 ||
-         (bucket_batch_alignment <= bucket_capacity &&
-          bucket_capacity % bucket_batch_alignment != 0))) {
-        LOG(ERROR) << "DistributedStorageConfig: bucket_batch_alignment must "
-                      "be 0 or a power-of-two multiple of alignment; when it "
-                      "fits in bucket_capacity, it must divide bucket_capacity, "
-                      "batch_alignment="
-                   << bucket_batch_alignment << ", alignment=" << alignment
-                   << ", bucket_capacity=" << bucket_capacity;
-        return false;
-    }
+    // bucket_batch_alignment is a master-side placement hint. It is validated
+    // and normalized by the bucket allocator so that a client sharing the same
+    // environment never fails to start because of it.
     if (bucket_capacity % alignment != 0) {
         LOG(ERROR) << "DistributedStorageConfig: bucket_capacity ("
                    << bucket_capacity << ") must be a multiple of alignment ("

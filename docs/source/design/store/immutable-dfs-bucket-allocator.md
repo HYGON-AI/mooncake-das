@@ -65,7 +65,7 @@ are consumed only by the master allocator.
 | `MOONCAKE_DFS_ROOT_DIR` | `/mnt/3fs/mooncake` | Shared directory containing bucket files. |
 | `MOONCAKE_DFS_FS_ADAPTER` | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. |
 | `MOONCAKE_DFS_ALIGNMENT` | `4096` | Power-of-two entry alignment; must divide bucket capacity. |
-| `MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT` | `524288` (512 KiB) | Bucket batch boundary. Set to `0` for old behavior. It must be a power-of-two multiple of the entry alignment. If it exceeds bucket capacity, the master disables batch alignment for compatibility and logs a warning; otherwise bucket capacity must be divisible by it. |
+| `MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT` | `524288` (512 KiB) | Bucket batch boundary, consumed by the master allocator only. Set to `0` for the legacy per-key layout. Any value the bucket geometry cannot honor (not a power-of-two multiple of the entry alignment, larger than bucket capacity, or not dividing it) is disabled with a warning instead of failing startup; clients ignore this variable. |
 | `MOONCAKE_DFS_EVICTION_ENABLED` | `true` | Enable bucket-level eviction. |
 | `MOONCAKE_DFS_EVICTION_HIGH_WATERMARK` | `0.9` | Usage ratio that starts normal eviction. |
 | `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | `0.7` | Usage ratio at which normal eviction stops. |
