@@ -476,7 +476,12 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtAligned(
     // Every direct-I/O constraint has already been checked, so preadv can
     // scatter straight into the caller's buffers without a bounce or memcpy.
     const ssize_t ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
-    if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    if (ret < 0) {
+        const int saved_errno = errno;
+        return tl::make_unexpected(saved_errno == ENOENT
+                                       ? ErrorCode::FILE_NOT_FOUND
+                                       : ErrorCode::FILE_READ_FAIL);
+    }
     return static_cast<size_t>(ret);
 }
 
@@ -549,7 +554,9 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtStaged(
             ::pread(fd, window + done, static_cast<size_t>(left),
                     static_cast<off_t>(window_start + done));
         if (ret < 0) {
-            error = ErrorCode::FILE_READ_FAIL;
+            const int saved_errno = errno;
+            error = saved_errno == ENOENT ? ErrorCode::FILE_NOT_FOUND
+                                         : ErrorCode::FILE_READ_FAIL;
             break;
         }
         if (ret == 0) break;  // EOF before the requested range was covered
