@@ -180,6 +180,12 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT, config.max_bucket_count);
     config.alignment =
         Environ::ReadOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
+    config.bucket_batch_alignment = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT,
+        config.bucket_batch_alignment);
+    config.posix_write_context_enabled =
+        Environ::ReadOr(Variables::MOONCAKE_DFS_POSIX_WRITE_CONTEXT_ENABLED,
+                        config.posix_write_context_enabled);
     config.single_tenant = Environ::ReadOr(
         Variables::MOONCAKE_DFS_SINGLE_TENANT, config.single_tenant);
     config.eviction_enabled = Environ::ReadOr(
@@ -281,6 +287,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", enable_health_check=" << enable_health_check
         << ", shard_count=" << shard_count
         << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment
+        << ", bucket_batch_alignment=" << bucket_batch_alignment
         << ", single_tenant=" << single_tenant
         << ", eviction_enabled=" << eviction_enabled
         << ", eviction_high_watermark=" << eviction_high_watermark
@@ -296,6 +303,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", allocator_type=" << ToString(allocator_type)
         << ", bucket_capacity=" << bucket_capacity
         << ", bucket_recovery_enabled=" << bucket_recovery_enabled
+        << ", posix_write_context_enabled=" << posix_write_context_enabled
         << ", max_bucket_count=" << max_bucket_count
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
@@ -337,6 +345,9 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                    << alignment;
         return false;
     }
+    // bucket_batch_alignment is a master-side placement hint. It is validated
+    // and normalized by the bucket allocator so that a client sharing the same
+    // environment never fails to start because of it.
     if (bucket_capacity % alignment != 0) {
         LOG(ERROR) << "DistributedStorageConfig: bucket_capacity ("
                    << bucket_capacity << ") must be a multiple of alignment ("

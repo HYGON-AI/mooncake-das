@@ -216,6 +216,33 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    /**
+     * @brief Tell a bucket write handle which metadata updates to skip.
+     *
+     * `max_write_bytes` is the largest single write this handle will issue.
+     * Implementations issue the storage-side write-context ioctl once per open
+     * so the per-write mtime update disappears. File size is still maintained
+     * by the storage stack. Adapters without the extension report
+     * NOT_SUPPORTED and the caller keeps the previous behavior.
+     */
+    virtual tl::expected<void, ErrorCode> SetBucketWriteContext(
+        int /*fd*/, uint64_t /*max_write_bytes*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    /**
+     * @brief Refresh a sealed bucket file's modification time (mtime).
+     *
+     * Write handles skip the per-write mtime update, so the master refreshes it
+     * once when a bucket is sealed. Success is best-effort: the caller logs one
+     * line on failure and does not retry. Adapters without the extension report
+     * NOT_SUPPORTED.
+     */
+    virtual tl::expected<void, ErrorCode> UpdateFileMtime(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
     virtual tl::expected<void, ErrorCode> PreallocateFile(
         const std::string& /*path*/, uint64_t /*size*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);

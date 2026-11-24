@@ -183,6 +183,7 @@ DistributedStorageBackend::~DistributedStorageBackend() {
         std::lock_guard<std::mutex> lock(bucket_cache_mutex_);
         bucket_id_cache_.clear();
         bucket_id_direct_cache_.clear();
+        bucket_id_read_cache_.clear();
     }
     batch_read_pool_.reset();
     if (fs_adapter_) fs_adapter_->Shutdown();
@@ -254,7 +255,7 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::InitLocked() {
 tl::expected<DistributedStorageBackend::ResolvedTarget, ErrorCode>
 DistributedStorageBackend::ResolveTarget(
     const DistributedFSDescriptor& descriptor, const std::string& key,
-    bool read_only) {
+    bool for_read, bool prefer_direct) {
     // BUCKET mode: the descriptor carries an allocator-chosen path, so it must
     // be validated before it is used to open anything.
     if (descriptor.shard_idx < 0) {
@@ -284,24 +285,39 @@ DistributedStorageBackend::ResolveTarget(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto handle = read_only ? GetOrOpenBucketDirect(descriptor.shard_idx,
-                                                    descriptor.MasterEpoch())
-                            : GetOrOpenBucket(descriptor.shard_idx,
-                                              descriptor.MasterEpoch());
-    if (!handle && read_only) {
-        if (handle.error() != ErrorCode::NOT_SUPPORTED) {
+    // Read and write each have a dedicated handle type. Direct (O_DIRECT) reads
+    // are always their own fd. Buffered reads share the write handle unless the
+    // POSIX write context is on, because that mode stamps the write fd with an
+    // ioctl whose per-fd effects must not leak into reads.
+    const UUID epoch = descriptor.MasterEpoch();
+    bool direct_read = false;
+    tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> handle =
+        tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    if (for_read && prefer_direct) {
+        handle = GetOrOpenBucketDirect(descriptor.shard_idx, epoch);
+        if (handle) {
+            direct_read = true;
+        } else if (handle.error() != ErrorCode::NOT_SUPPORTED) {
             return tl::make_unexpected(handle.error());
         }
-        handle =
-            GetOrOpenBucket(descriptor.shard_idx, descriptor.MasterEpoch());
-        read_only = false;
+    }
+    if (!handle) {
+        // Only the POSIX adapter implements the write context, so only there
+        // must a read avoid the write fd. Other adapters keep sharing one fd
+        // even if the flag is set by mistake.
+        const bool separate_read =
+            for_read && distributed_config_.posix_write_context_enabled &&
+            distributed_config_.fs_adapter_type == "posix";
+        handle = separate_read
+                     ? GetOrOpenBucketForRead(descriptor.shard_idx, epoch)
+                     : GetOrOpenBucket(descriptor.shard_idx, epoch);
     }
     if (!handle) return tl::make_unexpected(handle.error());
     auto& shared = handle.value();
     // BUCKET mode needs no per-fd lock: the allocator hands each object a
     // unique, non-overlapping on-disk range, so concurrent writers and readers
     // never touch the same bytes.
-    return ResolvedTarget{shared->fd, nullptr, read_only, shared};
+    return ResolvedTarget{shared->fd, nullptr, direct_read, shared};
 }
 
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(

@@ -16,6 +16,13 @@ struct DistributedStorageConfig {
     int shard_count = 64;
     uint64_t shard_capacity = 4ULL * 1024 * 1024 * 1024;
     uint64_t alignment = 4096;
+    // BUCKET mode only: align the first allocation of each BatchPutStart
+    // segment to this boundary. The same rule also applies to single-key
+    // PutStart allocations because they use BatchAllocate internally. Zero
+    // preserves the existing per-key allocation behavior. Padding before the
+    // boundary is reserved space, so nonzero values can reduce usable capacity
+    // by up to one boundary per bucket segment.
+    uint64_t bucket_batch_alignment = 512 * 1024;
     bool single_tenant = true;
     bool eviction_enabled = true;
     double eviction_high_watermark = 0.9;
@@ -75,6 +82,13 @@ struct DistributedStorageConfig {
     bool allocator_type_valid = true;
 
     std::string object_storage_config_path;
+
+    // POSIX adapter only: when enabled, bucket write handles skip per-write
+    // mtime updates while retaining range locks. File size remains maintained
+    // by the storage stack, and the master refreshes bucket mtime at seal time.
+    // Requires a filesystem that implements the write-context ioctl; otherwise
+    // writes keep the previous behavior. Enabled by default for POSIX buckets.
+    bool posix_write_context_enabled = true;
 
     bool UsesObjectStorage() const {
         return fs_adapter_type == "oss" || fs_adapter_type == "s3" ||

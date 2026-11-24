@@ -45,6 +45,12 @@ class PosixFsAdapter : public FileSystemAdapter {
 
     tl::expected<void, ErrorCode> CloseFile(int fd) override;
 
+    tl::expected<void, ErrorCode> SetBucketWriteContext(
+        int fd, uint64_t max_write_bytes) override;
+
+    tl::expected<void, ErrorCode> UpdateFileMtime(
+        const std::string& path) override;
+
     tl::expected<void, ErrorCode> PreallocateFile(const std::string& path,
                                                   uint64_t size) override;
 
