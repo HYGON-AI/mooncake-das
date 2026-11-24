@@ -221,9 +221,9 @@ class FileSystemAdapter {
      *
      * `max_write_bytes` is the largest single write this handle will issue.
      * Implementations issue the storage-side write-context ioctl once per open
-     * so per-write size and mtime work disappears. Adapters without the
-     * extension report NOT_SUPPORTED and the caller keeps the previous
-     * behavior.
+     * so the per-write mtime update disappears. File size is still maintained
+     * by the storage stack. Adapters without the extension report
+     * NOT_SUPPORTED and the caller keeps the previous behavior.
      */
     virtual tl::expected<void, ErrorCode> SetBucketWriteContext(
         int /*fd*/, uint64_t /*max_write_bytes*/) {
@@ -231,33 +231,15 @@ class FileSystemAdapter {
     }
 
     /**
-     * @brief Outcome of the seal-time size/mtime ioctl pair on one open file.
+     * @brief Refresh a sealed bucket file's modification time (mtime).
      *
-     * Each command is attempted independently on the same fd. A requested
-     * command is reported by exactly one of `*_ok` / `*_unsupported` /
-     * `*_failed`.
+     * Write handles skip the per-write mtime update, so the master refreshes it
+     * once when a bucket is sealed. Success is best-effort: the caller logs one
+     * line on failure and does not retry. Adapters without the extension report
+     * NOT_SUPPORTED.
      */
-    struct FileMetadataUpdateResult {
-        bool size_ok = true;
-        bool size_unsupported = false;
-        bool size_failed = false;
-        bool mtime_ok = true;
-        bool mtime_unsupported = false;
-        bool mtime_failed = false;
-    };
-
-    /**
-     * @brief Refresh a sealed bucket file's size and mtime on one open fd.
-     *
-     * Write handles stop updating both, so the master owns them for sealed
-     * buckets. `size` and the mtime refresh run on a single fd to avoid a
-     * second open. `update_size`/`update_mtime` select which command to issue;
-     * at least one must be true. Adapters without the extension are reported
-     * through `*_unsupported`; the caller decides how to react.
-     */
-    virtual tl::expected<FileMetadataUpdateResult, ErrorCode>
-    UpdateFileMetadata(const std::string& /*path*/, uint64_t /*size*/,
-                       bool /*update_size*/, bool /*update_mtime*/) {
+    virtual tl::expected<void, ErrorCode> UpdateFileMtime(
+        const std::string& /*path*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 

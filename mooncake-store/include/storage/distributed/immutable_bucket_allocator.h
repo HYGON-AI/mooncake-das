@@ -465,16 +465,10 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         // a sealed bucket: an unsealed one is deliberately not persisted at
         // all.
         bool meta_dirty = false;
-        // Set when a sealed bucket still needs its master-owned data size and
-        // mtime refreshed.
+        // Set when a sealed bucket still needs its master-owned mtime
+        // refreshed. This is a one-shot best-effort update: on failure the flag
+        // is cleared and the master logs once instead of retrying.
         bool mtime_dirty = false;
-        bool data_size_dirty = false;
-        // Consecutive failed attempts for the size/mtime ioctls. Once a bucket
-        // exhausts the retry budget its corresponding dirty flag is dropped:
-        // the ioctl is best-effort metadata, and retrying a persistently
-        // failing file forever would add lock-protected I/O on every flush.
-        uint8_t data_size_failures = 0;
-        uint8_t mtime_failures = 0;
         // Tombstoned entries, kept for eviction bookkeeping.
         uint64_t tombstones = 0;
         std::unordered_map<std::string, BucketEntry> entries;
@@ -581,14 +575,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     double eviction_low_watermark_ = 0.7;
     std::chrono::seconds eviction_check_interval_{5};
     // With the POSIX write context enabled, client write handles stop updating
-    // mtime, so the master refreshes it when a bucket is sealed.
+    // mtime, so the master refreshes it once when a bucket is sealed.
     bool mtime_refresh_on_seal_ = false;
-    // Size and mtime use one process-wide capability flag intentionally: the
-    // vendor exposes them as one POSIX metadata extension, so either command
-    // being unsupported disables the pair consistently. Cleared once the ioctl
-    // reports NOT_SUPPORTED so later sealed buckets stop probing it.
-    std::atomic<bool> posix_metadata_ioctls_supported_{false};
-
     mutable std::mutex mutex_;
     // Serializes `.meta` writes and eviction deletion. Flush and eviction both
     // revalidate BucketState pointer identity after taking this mutex so a

@@ -34,10 +34,6 @@ constexpr const char* kBucketFilePrefix = "bucket_";
 constexpr const char* kBucketDataSuffix = ".data";
 constexpr const char* kBucketMetaSuffix = ".meta";
 constexpr auto kBucketCreationRetryDelay = std::chrono::seconds(1);
-// How many times a sealed bucket retries the master-owned size/mtime ioctls
-// before giving up. These are best-effort metadata updates; a persistently
-// failing file must not keep adding lock-protected I/O on every flush.
-constexpr uint8_t kBucketMetadataUpdateMaxAttempts = 3;
 
 int64_t CurrentTimeNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -209,12 +205,11 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
     eviction_check_interval_ = config.eviction_check_interval;
-    // The size/mtime refresh ioctls exist only on the POSIX adapter. Other
-    // adapters never receive a write context from the client, so they still
-    // update these timestamps themselves and the master must not touch them.
+    // The mtime refresh ioctl exists only on the POSIX adapter. Other adapters
+    // never receive a write context from the client, so they still update it
+    // themselves and the master must not touch it.
     mtime_refresh_on_seal_ = config.posix_write_context_enabled &&
                              config.fs_adapter_type == "posix";
-    posix_metadata_ioctls_supported_ = mtime_refresh_on_seal_;
 
     std::error_code ec;
     if (!std::filesystem::is_directory(fsdir_, ec) || ec) {
@@ -493,10 +488,7 @@ void ImmutableBucketAllocator::SealActiveBucketLocked() {
     // metadata becomes worth persisting and its master-owned mtime must be
     // refreshed. Both I/O operations happen later, outside mutex_.
     bucket.meta_dirty = true;
-    if (mtime_refresh_on_seal_) {
-        bucket.mtime_dirty = true;
-        bucket.data_size_dirty = true;
-    }
+    if (mtime_refresh_on_seal_) bucket.mtime_dirty = true;
 }
 
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
@@ -1676,9 +1668,7 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
         int64_t bucket_id = -1;
         BucketPtr bucket_identity;
         PersistedBucketMetadata snapshot;
-        uint64_t data_size = 0;
         bool write_metadata = false;
-        bool update_data_size = false;
         bool touch_mtime = false;
     };
     std::vector<PendingWrite> pending;
@@ -1688,20 +1678,17 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
             // An unsealed bucket is deliberately never written: it is still
             // being appended to, and its data is discarded on the next start.
             if (!bucket->sealed ||
-                (!bucket->meta_dirty && !bucket->mtime_dirty &&
-                 !bucket->data_size_dirty) ||
+                (!bucket->meta_dirty && !bucket->mtime_dirty) ||
                 bucket->evicting) {
                 continue;
             }
             pending.push_back({bucket_id, bucket,
                                bucket->meta_dirty ? SnapshotLocked(*bucket)
                                                   : PersistedBucketMetadata{},
-                               bucket->append_offset, bucket->meta_dirty,
-                               bucket->data_size_dirty, bucket->mtime_dirty});
+                               bucket->meta_dirty, bucket->mtime_dirty});
             // Clear both flags together with taking the snapshot. A change that
             // lands while we are unlocked sets the relevant flag again.
             bucket->meta_dirty = false;
-            bucket->data_size_dirty = false;
             bucket->mtime_dirty = false;
         }
     }
@@ -1715,14 +1702,12 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
               });
 
     // Phase 1: persist every dirty `.meta` first. Only this phase takes
-    // metadata_io_mutex_ and does fsync work. The size/mtime ioctls are
-    // deferred to phase 2 so they never hold other buckets' `.meta` writes.
-    std::vector<PendingWrite> ioctl_items;
-    ioctl_items.reserve(pending.size());
+    // metadata_io_mutex_ and does fsync work. The mtime refresh is deferred to
+    // phase 2 so it never holds other buckets' `.meta` writes.
+    std::vector<PendingWrite> mtime_items;
+    mtime_items.reserve(pending.size());
     size_t flushed = 0;
     for (const auto& item : pending) {
-        bool retry_metadata = false;
-        bool metadata_written = !item.write_metadata;
         if (item.write_metadata) {
             std::lock_guard<std::mutex> metadata_lock(metadata_io_mutex_);
             {
@@ -1737,55 +1722,28 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
             // PersistMetadata logs its own failure with the path and error, so
             // no second log line here.
             auto persisted = PersistMetadata(item.snapshot);
-            metadata_written = static_cast<bool>(persisted);
-            retry_metadata = !persisted;
-            if (persisted) ++flushed;
-        }
-        if (retry_metadata) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = buckets_.find(item.bucket_id);
-            if (it != buckets_.end() &&
-                it->second.get() == item.bucket_identity.get()) {
-                it->second->meta_dirty = true;
-                // `.meta` is still pending, so keep the ioctl flags for the
-                // next round without counting an ioctl failure.
-                it->second->data_size_dirty |= item.update_data_size;
-                it->second->mtime_dirty |= item.touch_mtime;
-            }
-            continue;
-        }
-        // `.meta` is durable for this snapshot; the size/mtime refresh is
-        // handled after all `.meta` writes in phase 2.
-        if (metadata_written && (item.update_data_size || item.touch_mtime)) {
-            ioctl_items.push_back(item);
-        }
-    }
-
-    if (ioctl_items.empty() || !posix_metadata_ioctls_supported_) {
-        // With no extension available there is nothing to refresh. The flags
-        // were already cleared above, so these buckets are done.
-        if (!posix_metadata_ioctls_supported_) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (const auto& item : ioctl_items) {
+            if (!persisted) {
+                // Put the flag back so a later tick retries the `.meta` write;
+                // the mtime refresh rides along with it.
+                std::lock_guard<std::mutex> lock(mutex_);
                 auto it = buckets_.find(item.bucket_id);
                 if (it != buckets_.end() &&
                     it->second.get() == item.bucket_identity.get()) {
-                    it->second->data_size_failures = 0;
-                    it->second->mtime_failures = 0;
+                    it->second->meta_dirty = true;
+                    it->second->mtime_dirty |= item.touch_mtime;
                 }
+                continue;
             }
+            ++flushed;
         }
-        // Every `.meta` write already succeeded, so the buckets counted in
-        // phase 1 are the returned total.
-        return flushed;
+        if (item.touch_mtime) mtime_items.push_back(item);
     }
 
-    // Phase 2: refresh size/mtime on the sealed data files, one open per
-    // bucket. This runs outside metadata_io_mutex_ and never blocks `.meta`
-    // writes. Identity is revalidated immediately before the ioctl.
-    for (const auto& item : ioctl_items) {
-        if (!posix_metadata_ioctls_supported_) break;
-
+    // Phase 2: refresh mtime on the sealed data files, one open per bucket.
+    // This runs outside metadata_io_mutex_ and never blocks `.meta` writes. The
+    // mtime ioctl is best-effort: on failure log once and drop the request
+    // instead of retrying.
+    for (const auto& item : mtime_items) {
         bool still_ours = true;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1794,123 +1752,21 @@ size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
                          it->second.get() == item.bucket_identity.get() &&
                          !it->second->evicting && !it->second->frozen;
         }
-        if (!still_ours) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = buckets_.find(item.bucket_id);
-            if (it != buckets_.end() &&
-                it->second.get() == item.bucket_identity.get()) {
-                // The bucket became frozen/evicting after phase 1. The ioctl
-                // was not attempted, so preserve both pending updates for a
-                // later maintenance pass instead of losing them.
-                it->second->data_size_dirty |= item.update_data_size;
-                it->second->mtime_dirty |= item.touch_mtime;
-            }
-            continue;
-        }
+        // If the bucket became frozen/evicting after phase 1 the ioctl was not
+        // attempted; leave the flag cleared so it is not retried.
+        if (!still_ours) continue;
 
-        auto updated = fs_adapter_->UpdateFileMetadata(
-            BucketDataPath(item.bucket_id), item.data_size,
-            item.update_data_size, item.touch_mtime);
-        bool size_success = false;
-        bool mtime_success = false;
-        bool size_retry = false;
-        bool mtime_retry = false;
-        bool metadata_unsupported = false;
+        auto updated = fs_adapter_->UpdateFileMtime(
+            BucketDataPath(item.bucket_id));
         if (!updated) {
-            if (updated.error() == ErrorCode::NOT_SUPPORTED) {
-                // The whole extension is unavailable (e.g. a non-Linux build or
-                // an adapter that cannot even open the file). Disable it for
-                // the process so later rounds stop probing, and drop these
-                // pending refreshes instead of losing them silently each tick.
-                posix_metadata_ioctls_supported_ = false;
-                metadata_unsupported = true;
-            } else {
-                // A transient failure (open error): retry within the bound.
-                size_retry = item.update_data_size;
-                mtime_retry = item.touch_mtime;
-                static DfsLogLimiter log_limiter;
-                if (auto suppressed = log_limiter.ShouldLog()) {
-                    LOG(WARNING) << "Failed to open DFS bucket data for "
-                                    "metadata update, bucket_id="
-                                 << item.bucket_id
-                                 << ", error=" << updated.error()
-                                 << ", suppressed=" << *suppressed;
-                }
-            }
-        } else {
-            if (!updated->size_ok && updated->size_unsupported) {
-                posix_metadata_ioctls_supported_ = false;
-                metadata_unsupported = true;
-            }
-            if (!updated->mtime_ok && updated->mtime_unsupported) {
-                posix_metadata_ioctls_supported_ = false;
-                metadata_unsupported = true;
-            }
-            size_success = updated->size_ok;
-            mtime_success = updated->mtime_ok;
-            size_retry = updated->size_failed;
-            mtime_retry = updated->mtime_failed;
-            if (size_retry || mtime_retry) {
-                static DfsLogLimiter log_limiter;
-                if (auto suppressed = log_limiter.ShouldLog()) {
-                    LOG(WARNING) << "DFS bucket metadata ioctl failed, "
-                                    "bucket_id="
-                                 << item.bucket_id
-                                 << ", size_failed=" << size_retry
-                                 << ", mtime_failed=" << mtime_retry
-                                 << ", suppressed=" << *suppressed;
-                }
+            static DfsLogLimiter log_limiter;
+            if (auto suppressed = log_limiter.ShouldLog()) {
+                LOG(WARNING) << "Failed to refresh DFS bucket mtime, bucket_id="
+                             << item.bucket_id
+                             << ", error=" << updated.error()
+                             << ", not retrying, suppressed=" << *suppressed;
             }
         }
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = buckets_.find(item.bucket_id);
-        if (it == buckets_.end() ||
-            it->second.get() != item.bucket_identity.get()) {
-            continue;
-        }
-        // Size refresh.
-        if (item.update_data_size) {
-            if (size_retry) {
-                if (++it->second->data_size_failures >=
-                    kBucketMetadataUpdateMaxAttempts) {
-                    LOG(WARNING) << "Giving up DFS bucket size update after "
-                                 << static_cast<int>(
-                                        kBucketMetadataUpdateMaxAttempts)
-                                 << " attempts, bucket_id=" << item.bucket_id;
-                    it->second->data_size_dirty = false;
-                    it->second->data_size_failures = 0;
-                } else {
-                    it->second->data_size_dirty = true;
-                }
-            } else if (size_success) {
-                it->second->data_size_failures = 0;
-            } else if (!posix_metadata_ioctls_supported_) {
-                // Unsupported: drop the pending refresh instead of retrying.
-                it->second->data_size_failures = 0;
-            }
-        }
-        // Mtime refresh.
-        if (item.touch_mtime) {
-            if (mtime_retry) {
-                if (++it->second->mtime_failures >=
-                    kBucketMetadataUpdateMaxAttempts) {
-                    LOG(WARNING) << "Giving up DFS bucket mtime update after "
-                                 << static_cast<int>(
-                                        kBucketMetadataUpdateMaxAttempts)
-                                 << " attempts, bucket_id=" << item.bucket_id;
-                    it->second->mtime_dirty = false;
-                    it->second->mtime_failures = 0;
-                } else {
-                    it->second->mtime_dirty = true;
-                }
-            } else if (mtime_success) {
-                it->second->mtime_failures = 0;
-            } else if (!posix_metadata_ioctls_supported_) {
-                it->second->mtime_failures = 0;
-            }
-        }
-        if (metadata_unsupported) break;
     }
     return flushed;
 }
@@ -2143,10 +1999,7 @@ ImmutableBucketAllocator::PrepareInvalidationInternal(int64_t bucket_id) {
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
-            if (mtime_refresh_on_seal_) {
-                victim->mtime_dirty = true;
-                victim->data_size_dirty = true;
-            }
+            if (mtime_refresh_on_seal_) victim->mtime_dirty = true;
         }
         if (was_active) {
             active_bucket_id_ = -1;
@@ -2274,10 +2127,7 @@ ImmutableBucketAllocator::PrepareEvictionInternal(
         if (!victim->sealed) {
             victim->sealed = true;
             victim->meta_dirty = true;
-            if (mtime_refresh_on_seal_) {
-                victim->mtime_dirty = true;
-                victim->data_size_dirty = true;
-            }
+            if (mtime_refresh_on_seal_) victim->mtime_dirty = true;
         }
 
         pending.owner_ = this;

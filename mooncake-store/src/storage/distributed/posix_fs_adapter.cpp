@@ -275,12 +275,12 @@ tl::expected<void, ErrorCode> PosixFsAdapter::SetBucketWriteContext(
     if (fd < 0) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
     storage_ioctl::WriteContext context{};
-    // The client does not own file size/time updates: the master updates both
-    // when the bucket is sealed, and every write handle says so here.
+    // The client does not own the file's time update: the master refreshes the
+    // mtime when the bucket is sealed. File size is still maintained by the
+    // storage stack, so kWriteStageSkipSize is not set.
     context.is_iorank = 0;
     context.size = max_write_bytes;
-    context.stage_flags = storage_ioctl::kWriteStageSkipSize |
-                          storage_ioctl::kWriteStageSkipTime |
+    context.stage_flags = storage_ioctl::kWriteStageSkipTime |
                           storage_ioctl::kWriteStageNoExtendLock;
 
     if (::ioctl(fd, STORAGE_MPIO_SET_WRCONTEXT, &context) == 0) return {};
@@ -300,59 +300,33 @@ tl::expected<void, ErrorCode> PosixFsAdapter::SetBucketWriteContext(
 #endif
 }
 
-tl::expected<FileSystemAdapter::FileMetadataUpdateResult, ErrorCode>
-PosixFsAdapter::UpdateFileMetadata(const std::string& path, uint64_t size,
-                                   bool update_size, bool update_mtime) {
+tl::expected<void, ErrorCode> PosixFsAdapter::UpdateFileMtime(
+    const std::string& path) {
 #if defined(__linux__)
-    if (!update_size && !update_mtime) return FileMetadataUpdateResult{};
-    // A write handle that skips metadata updates cannot refresh them, so the
-    // master issues the storage-side updates itself. Both ioctls share one fd
-    // to avoid a second open per sealed bucket.
+    // A write handle that skips the mtime update cannot refresh it, so the
+    // master does it once when the bucket is sealed. This is best-effort: the
+    // caller logs and does not retry on failure.
     const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        if (errno == ENOENT) return FileMetadataUpdateResult{};
+        if (errno == ENOENT) return {};
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-
-    FileMetadataUpdateResult result;
-    if (update_size) {
-        storage_ioctl::StorageFileSize file_size{};
-        file_size.size = static_cast<unsigned long long>(size);
-        file_size.rank = 1;
-        if (::ioctl(fd, STORAGE_UPDATE_SIZE, &file_size) == 0) {
-            result.size_ok = true;
-        } else if (errno == ENOTTY || errno == EINVAL ||
-                   errno == EOPNOTSUPP) {
-            result.size_ok = false;
-            result.size_unsupported = true;
-        } else {
-            result.size_ok = false;
-            result.size_failed = true;
-        }
-    }
-    if (update_mtime) {
-        // The ABI encodes an unsigned-int payload. The value is not
-        // interpreted, but passing valid storage is required for kernels that
-        // validate the _IOW argument (ad_ofs.c passes NULL).
-        unsigned int arg = 0;
-        if (::ioctl(fd, STORAGE_UPDATE_TIME, &arg) == 0) {
-            result.mtime_ok = true;
-        } else if (errno == ENOTTY || errno == EINVAL ||
-                   errno == EOPNOTSUPP) {
-            result.mtime_ok = false;
-            result.mtime_unsupported = true;
-        } else {
-            result.mtime_ok = false;
-            result.mtime_failed = true;
-        }
-    }
+    // The ABI encodes an unsigned-int payload. The value is not interpreted,
+    // but passing valid storage is required for kernels that validate the _IOW
+    // argument (ad_ofs.c passes NULL).
+    unsigned int arg = 0;
+    const int rc = ::ioctl(fd, STORAGE_UPDATE_TIME, &arg);
+    const int saved_errno = errno;
     ::close(fd);
-    return result;
+    if (rc >= 0) return {};
+    if (saved_errno == ENOENT) return {};
+    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
+        saved_errno == EOPNOTSUPP) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
 #else
     (void)path;
-    (void)size;
-    (void)update_size;
-    (void)update_mtime;
     return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
 }
