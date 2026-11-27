@@ -490,7 +490,6 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
 // set so cached reads use the unified DFS buffer.
 struct DfsPrefetchTestEnv {
     ScopedEnvVar local_memcpy{"MC_STORE_MEMCPY", "1"};
-    ScopedEnvVar prefetch_ratio{"MC_STORE_DFS_PREFETCH_CAPACITY_RATIO", "1.0"};
     ScopedEnvVar read_chunk{"MC_STORE_DFS_READ_CHUNK_SIZE_BYTES", "4096"};
     ScopedEnvVar write_chunk{"MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096"};
     ScopedEnvVar use_uring{"MOONCAKE_OFFLOAD_USE_URING", "0"};
@@ -1222,13 +1221,12 @@ TEST_F(RealClientTest, DfsPrefetchArenaUnavailableWithoutFileStorage) {
 
 TEST_F(RealClientDfsPrefetchTest, UsesDedicatedArenaAndFailsPerKeyWhenFull) {
     DfsPrefetchTestEnv dfs_env;
-    // 64 KiB buffer, 4 KiB chunks. Read protection is four aligned chunks
-    // (4 x 8 KiB = 32 KiB, exactly C/2 so it is not clamped) and write
-    // protection is one (8 KiB), leaving 24 KiB. A 0.125 ratio caps prefetch
-    // at 8 KiB, which holds one staged object but not two.
+    // 32 KiB buffer, 4 KiB chunks. With the baseline admission policy two
+    // aligned read chunks are held back (2 x 8 KiB = 16 KiB) and one write
+    // chunk is carved out (8 KiB), leaving an 8 KiB prefetch budget. That holds
+    // one staged object but not two.
     ScopedEnvVar prefetch_arena("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
-                                "65536");
-    ScopedEnvVar prefetch_ratio("MC_STORE_DFS_PREFETCH_CAPACITY_RATIO", "0.125");
+                                "32768");
     const std::vector<std::string> keys = {"dfs_prefetch_cached",
                                            "dfs_prefetch_overflow"};
     ASSERT_NO_FATAL_FAILURE(StartDfsClientWithObjects("localhost:17827", keys));

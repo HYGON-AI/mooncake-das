@@ -112,13 +112,9 @@ class FileStorage {
         return pinned_restore_arena_allocator_;
     }
 
-    [[nodiscard]] double PrefetchCapacityRatio() const {
-        return config_.prefetch_capacity_ratio;
-    }
-
     // Effective prefetch bytes after the read and write protections have been
-    // carved out of the ratio-derived budget. Zero means prefetch cannot
-    // succeed regardless of the configured ratio.
+    // carved out of the policy budget. Zero means prefetch cannot succeed
+    // regardless of the policy in use.
     [[nodiscard]] size_t UnifiedPrefetchLimitBytes() const {
         return usage_tracker_ ? static_cast<size_t>(
                                     usage_tracker_->PrefetchLimitBytes())

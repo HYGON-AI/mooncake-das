@@ -2,17 +2,6 @@ file(GLOB HIP_TRANSPORT_SOURCES "*.cpp")
 
 add_library(hip_transport OBJECT ${HIP_TRANSPORT_SOURCES})
 
-# The Store uses this kernel for batched copies from mapped host memory.
-set(COPY_KERNEL ${CMAKE_CURRENT_BINARY_DIR}/mc_copy_kernel.co)
-add_custom_command(
-  OUTPUT ${COPY_KERNEL}
-  COMMAND hipcc --genco -fPIC -x hip
-          ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip -o ${COPY_KERNEL}
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/mc_copy_kernel.hip
-  VERBATIM)
-target_sources(hip_transport PRIVATE ${COPY_KERNEL})
-install(FILES ${COPY_KERNEL} DESTINATION lib)
-
 target_link_libraries(hip_transport PRIVATE glog::glog)
 
 target_include_directories(hip_transport PUBLIC ${HIP_INCLUDE_DIRS})

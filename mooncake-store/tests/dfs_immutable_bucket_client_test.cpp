@@ -29,6 +29,7 @@
 #include "master_metric_manager.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
+#include "ext/dfe_loader.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "test_server_helpers.h"
 #include "utils.h"
@@ -36,6 +37,17 @@
 namespace mooncake::test {
 
 namespace {
+
+// The data-plane provider writes through its own descriptors, so the adapter
+// hooks below (block/delay/fail the next write) only reach the public
+// fallback path. Tests that rely on them are meaningless once a provider is
+// loaded; the no-provider run covers them.
+bool WriteInjectionBypassed() {
+    return ext::DfeProvider::Instance().available();
+}
+
+constexpr char kWriteInjectionSkip[] =
+    "data-plane provider bypasses adapter write injection";
 
 // CPU-backed device bytes let these tests count/fail only foreground D2H,
 // independently of any memory-replica transfer on a worker thread.
@@ -367,6 +379,7 @@ class DfsImmutableBucketLruClientTest : public DfsImmutableBucketClientTest {
 };
 
 TEST_F(DfsImmutableBucketClientTest, UpsertReturnsAfterWriteAndFailureRevokes) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     std::string value(4096, 'A');
     auto slices = Slices(value);
     ASSERT_TRUE(writer_->Upsert("ok", slices, DfsConfig()));
@@ -454,6 +467,7 @@ TEST_F(DfsImmutableBucketClientTest, ExhaustionEvictsWholeBucketAndRetries) {
 }
 
 TEST_F(DfsImmutableBucketClientTest, DfsOnlyObjectsLiveAndDieWithTheirBucket) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     ReplicateConfig dfs_only;
     dfs_only.replica_num = 0;
     dfs_only.dfs_replica_num = 1;
@@ -1418,6 +1432,7 @@ class DfsBucketClientSlotTimeoutTest : public DfsBucketClientTest {
 
 TEST_F(DfsBucketClientSlotTimeoutTest,
        SlotTimeoutKeepsMemoryReplicasForUnsubmittedChunks) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     adapter_->BlockWrites();
     std::vector<std::string> keys{"slot_timeout_0", "slot_timeout_1"};
     std::vector<std::string> values(2, std::string(3072, 'T'));
@@ -1509,6 +1524,7 @@ TEST_F(DfsBucketClientTest, BatchPutWritesEveryKeyAndKeepsBatchContiguous) {
 }
 
 TEST_F(DfsBucketClientTest, ChecksumReusesDfsD2hBeforeMemoryPublication) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     const std::vector<std::string> keys{"checksum_staged_a",
                                         "checksum_staged_b"};
     const std::vector<std::string> expected{"123456789", "abcdef"};
@@ -1683,6 +1699,7 @@ TEST_F(DfsBucketClientTest, AsyncWriteSucceedsAfterCallerBufferIsOverwritten) {
 
 TEST_F(DfsBucketClientTest,
        BatchPutDeadlineKeepsMemoryAndLateDfsWriteIsRevoked) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     writer_.reset();
     SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "50");
     writer_ = CreateClient("127.0.0.1:18203");
@@ -1746,6 +1763,7 @@ TEST_F(DfsBucketClientTest, TimelyBoundedBatchPutPublishesAsynchronously) {
 }
 
 TEST_F(DfsBucketClientTest, FailedBoundedAsyncWriteKeepsMemoryReplica) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     writer_.reset();
     SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "10000");
     writer_ = CreateClient("127.0.0.1:18205");
@@ -1800,6 +1818,7 @@ TEST_F(DfsBucketClientTest, FailedBoundedAsyncWriteKeepsMemoryReplica) {
 
 TEST_F(DfsBucketClientTest,
        ServiceMetricsSynchronousDualWriteReportsPhysicalPartialOutcome) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     const auto endpoint = NextServiceEndpoint();
     ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
     adapter_->FailAllWrites(true);
@@ -1821,6 +1840,7 @@ TEST_F(DfsBucketClientTest,
 
 TEST_F(DfsBucketClientTest,
        ServiceMetricsAsyncWriteMovesFromPendingToPhysicalOutcome) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     const auto endpoint = NextServiceEndpoint();
     ASSERT_EQ(writer_->SetServiceEndpoint(endpoint), 0);
     adapter_->FailAllWrites(true);
@@ -1862,6 +1882,7 @@ TEST_F(DfsBucketClientTest,
 
 TEST_F(DfsBucketClientTest,
        ServiceMetricsDeadlineSettlesBlockedWriteAndIgnoresLateResult) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     writer_.reset();
     SetEnv("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "50");
     writer_ = CreateClient("127.0.0.1:18203");
@@ -2092,16 +2113,20 @@ TEST_F(DfsBucketClientTest, OpenFailuresAreRateLimitedAndRevokeEveryDfsReplica) 
     EXPECT_LE(capture.writes.load(), 1);
 }
 
-TEST_F(DfsBucketClientTest, BatchIoFailureRevokesAllKeysInMergedRun) {
+TEST_F(DfsBucketClientTest, BatchIoFailureRevokesAllKeysInBatch) {
+    // The merged run only exists inside the private provider, which writes
+    // through its own descriptors and therefore bypasses the adapter-level
+    // fault injection. The no-provider run exercises the per-object baseline
+    // contract instead.
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     std::vector<std::string> keys{"bucket_mixed_ok", "bucket_mixed_fail"};
     std::vector<std::string> values{std::string(4096, 'G'),
                                     std::string(4096, 'H')};
     auto slices = MakeSlices(values);
 
-    // A merged contiguous run is one filesystem operation. If that operation
-    // fails, none of its entries is known durable, so every DFS replica in the
-    // run must be revoked.
-    adapter_->FailWriteCall(adapter_->WriteCalls() + 1);
+    // Every write in the batch fails. BatchPut reports enqueue success, but no
+    // entry is known durable, so every DFS replica must be revoked.
+    adapter_->FailAllWrites(true);
     auto results = writer_->BatchPut(keys, slices, DfsConfig());
     ASSERT_EQ(results.size(), keys.size());
     ASSERT_TRUE(results[0].has_value());
@@ -2334,6 +2359,7 @@ TEST_F(DfsBucketClientTest, ReadTimeoutDoesNotChangeClientAccessPolicy) {
 }
 
 TEST_F(DfsBucketClientTest, DuplicateKeyTimeoutKeepsEveryBufferAlive) {
+    if (WriteInjectionBypassed()) GTEST_SKIP() << kWriteInjectionSkip;
     const std::string key = "bucket_duplicate_key_timeout";
     const std::string value(4096, 'R');
     std::vector<std::string> values{value};

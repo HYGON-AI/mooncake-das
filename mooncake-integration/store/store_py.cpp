@@ -3604,8 +3604,8 @@ PYBIND11_MODULE(_store, m) {
                 return self.store_->dfs_prefetch_arena_available();
             },
             "Whether batch_get_session_prefetch has a DFS staging arena "
-            "(MC_STORE_DFS_PREFETCH_CAPACITY_RATIO). When false every DFS "
-            "prefetch read fails, so callers should not submit prefetches.")
+            "budget. When false every DFS prefetch read fails, so callers "
+            "should not submit prefetches.")
         .def(
             "disable_dfs_prefetch",
             [](MooncakeStorePyWrapper &self) {

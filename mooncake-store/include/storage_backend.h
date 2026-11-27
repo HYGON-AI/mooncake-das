@@ -215,17 +215,10 @@ struct FileStorageConfig {
 
     // Unified pinned+mapped backing shared by DFS read, prefetch and write.
     int64_t unified_buffer_size = 12LL * 1024 * 1024 * 1024;
-    double prefetch_capacity_ratio = 0.5;
 
     // Read/write request chunk sizes; these are not backing capacities.
     int64_t read_chunk_size = 1LL * 1024 * 1024 * 1024;
     int64_t write_chunk_size = 1LL * 1024 * 1024 * 1024;
-
-    // How many aligned chunks the admission budgets hold back: read protection
-    // reserves this many read chunks for concurrent reads, write protection
-    // carves this many write chunks out of the prefetch budget.
-    int64_t read_protection_chunks = 4;
-    int64_t write_protection_chunks = 1;
 
     // Limits for scanning and iteration operations
     int64_t scanmeta_iterator_keys_limit =

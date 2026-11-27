@@ -19,7 +19,7 @@
 
 #include <glog/logging.h>
 
-#include "storage/distributed/posix_storage_ioctl.h"
+#include "ext/dfe_loader.h"
 
 namespace mooncake {
 
@@ -274,22 +274,16 @@ tl::expected<void, ErrorCode> PosixFsAdapter::SetBucketWriteContext(
 #if defined(__linux__)
     if (fd < 0) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
-    storage_ioctl::WriteContext context{};
-    // The client does not own the file's time update: the master refreshes the
-    // mtime when the bucket is sealed. File size is still maintained by the
-    // storage stack, so kWriteStageSkipSize is not set.
-    context.is_iorank = 0;
-    context.size = max_write_bytes;
-    context.stage_flags = storage_ioctl::kWriteStageSkipTime |
-                          storage_ioctl::kWriteStageNoExtendLock;
-
-    if (::ioctl(fd, STORAGE_MPIO_SET_WRCONTEXT, &context) == 0) return {};
-
-    // Return only the error code: the caller owns the process-wide "give up"
-    // state and the rate-limited logging; a per-open probe must not log here.
-    const int saved_errno = errno;
-    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
-        saved_errno == EOPNOTSUPP) {
+    // The write-context contract is private know-how: the provider owns the
+    // ioctl number, the flag semantics, and the range-lock layout. The public
+    // adapter only reports success, "not supported", or a hard failure.
+    const int rc =
+        mooncake::ext::DfeProvider::Instance().ConfigureWriteFd(fd,
+                                                                max_write_bytes);
+    if (rc == MOONCAKE_EXT_STATUS_OK) return {};
+    if (rc == MOONCAKE_EXT_STATUS_NOT_SUPPORTED ||
+        rc == MOONCAKE_EXT_STATUS_UNAVAILABLE ||
+        rc == MOONCAKE_EXT_STATUS_DISABLED) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
@@ -304,24 +298,20 @@ tl::expected<void, ErrorCode> PosixFsAdapter::UpdateFileMtime(
     const std::string& path) {
 #if defined(__linux__)
     // A write handle that skips the mtime update cannot refresh it, so the
-    // master does it once when the bucket is sealed. This is best-effort: the
-    // caller logs and does not retry on failure.
+    // master does it once when the bucket is sealed. The provider owns the
+    // refresh command; opening and closing the handle stays generic here.
+    // This is best-effort: the caller logs and does not retry on failure.
     const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT) return {};
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    // The ABI encodes an unsigned-int payload. The value is not interpreted,
-    // but passing valid storage is required for kernels that validate the _IOW
-    // argument (ad_ofs.c passes NULL).
-    unsigned int arg = 0;
-    const int rc = ::ioctl(fd, STORAGE_UPDATE_TIME, &arg);
-    const int saved_errno = errno;
+    const int rc =
+        mooncake::ext::DfeProvider::Instance().RefreshFileMtime(fd);
     ::close(fd);
-    if (rc >= 0) return {};
-    if (saved_errno == ENOENT) return {};
-    if (saved_errno == ENOTTY || saved_errno == EINVAL ||
-        saved_errno == EOPNOTSUPP) {
+    if (rc == MOONCAKE_EXT_STATUS_OK) return {};
+    if (rc == MOONCAKE_EXT_STATUS_UNAVAILABLE ||
+        rc == MOONCAKE_EXT_STATUS_NOT_SUPPORTED) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
     return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);

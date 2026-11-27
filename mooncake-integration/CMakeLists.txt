@@ -135,14 +135,6 @@ set(UBSHMEM_ALLOCATOR_SO_PATH
     "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so"
 )
 
-if(USE_HIP)
-  install(
-    FILES
-      "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co"
-    DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
-    COMPONENT python)
-endif()
-
 set(MOONCAKE_HAS_NVLINK_ALLOCATOR OFF)
 if(USE_CUDA
    OR USE_HIP

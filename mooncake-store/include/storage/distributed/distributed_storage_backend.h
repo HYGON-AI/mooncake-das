@@ -31,7 +31,6 @@ enum class DistributedStorageMode {
     kFileSystem,
     kObjectStorage,
 };
-class ThreadPool;
 
 struct DfsWriteRequest {
     std::string key;
@@ -310,11 +309,11 @@ class DistributedStorageBackend
     GetOrOpenBucketDirect(int64_t bucket_id, const UUID& epoch);
 
     /**
-     * @brief One contiguous read scheduled as a single task.
+     * @brief One request scheduled as a single read task.
      *
-     * `entries` references the requests covered by this task. For direct,
-     * unmerged reads it contains one entry; for merged bucket reads it may
-     * contain several entries that share one contiguous on-disk run.
+     * `entries` always holds exactly one entry. Batching and merging across
+     * tasks is delegated to the optional private data-plane extension; the
+     * baseline path executes tasks one by one.
      */
     struct ReadEntry {
         size_t request_index = 0;
@@ -325,7 +324,6 @@ class DistributedStorageBackend
         ResolvedTarget target;
         uint64_t io_offset = 0;
         uint64_t total_size = 0;
-        bool merged = false;
         bool direct_read = false;
         std::vector<ReadEntry> entries;
     };
@@ -339,10 +337,6 @@ class DistributedStorageBackend
                          std::vector<tl::expected<void, ErrorCode>>& results);
 
     void ExecuteSingleReadTask(
-        const ReadTask& task, const std::vector<DfsReadRequest>& requests,
-        std::vector<tl::expected<void, ErrorCode>>& results);
-
-    void ExecuteMergedReadTask(
         const ReadTask& task, const std::vector<DfsReadRequest>& requests,
         std::vector<tl::expected<void, ErrorCode>>& results);
 
@@ -400,11 +394,20 @@ class DistributedStorageBackend
     // feature is off, where reads keep sharing bucket_id_cache_.
     std::unordered_map<int64_t, std::shared_ptr<OpenFileHandle>>
         bucket_id_read_cache_;
-    // Set once the write-context ioctl fails or reports NOT_SUPPORTED. After
-    // that no further open probes the ioctl, so an unsupported or misbehaving
-    // filesystem cannot turn into an open+ioctl storm on every cold bucket.
+    // Latched once the write-context ioctl fails or reports NOT_SUPPORTED.
+    // Config-off and a master that cannot refresh mtime are not latched here:
+    // they are re-evaluated on every cold open (config is process-lifetime;
+    // the master capability cache is reset on each epoch change), so a Master
+    // restart that flips the capability is observed. After this is set no
+    // further open probes the ioctl, so an unsupported filesystem cannot turn
+    // into an open+ioctl storm on every cold bucket.
     std::atomic<bool> posix_write_context_unavailable_{false};
-    std::unique_ptr<ThreadPool> batch_read_pool_;
+    // Cached master capability answer: -1 unknown, 0 the master cannot refresh
+    // a sealed bucket's mtime (no private extension there), 1 it can. Reset to
+    // -1 on every accepted Master epoch change (AcquireBucketEpoch) so a
+    // restarted master's capability is re-read; the write-context ioctl is
+    // only enabled when the master can compensate.
+    std::atomic<int> master_mtime_refresh_support_{-1};
 
     tl::expected<void, ErrorCode> InitBucketModeLocked();
     tl::expected<void, ErrorCode> InitLocked();

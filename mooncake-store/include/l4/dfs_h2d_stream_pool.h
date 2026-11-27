@@ -2,10 +2,27 @@
 
 #include "real_client.h"
 #include "device/accelerator_registry.h"
+#include "ext/ahe_loader.h"
+#include "ext/mooncake_private_ext_abi.h"
+
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 
 namespace mooncake {
 
+// Public façade over the accelerator host-to-device extension.
+//
+// The persistent streams, their synchronization workers and the batch copy
+// engine live in the private provider. This class only keeps one provider
+// handle per device, serializes submissions through a per-device lease and
+// drains every handle on shutdown. When no provider is loaded the leases stay
+// usable: the caller falls back to the public per-range copy on the implicit
+// stream.
 class RealClient::DfsH2dStreamPool {
    private:
     struct DeviceKey {
@@ -22,137 +39,15 @@ class RealClient::DfsH2dStreamPool {
     };
 
     struct DeviceState {
-        struct SyncWorker {
-            std::mutex mutex;
-            std::condition_variable task_cv;
-            std::condition_variable completion_cv;
-            std::thread thread;
-            bool has_task = false;
-            bool stopping = false;
-            bool ready = false;
-            bool result = false;
-        };
-
         DeviceState(const device::AcceleratorDevice *device, int32_t device_id)
             : device(device), device_id(device_id) {}
-
-        ~DeviceState() { StopSyncWorkers(); }
-
-        bool StartSyncWorkers() {
-            try {
-                sync_workers.reserve(streams.size());
-                for (void *stream : streams) {
-                    auto worker = std::make_unique<SyncWorker>();
-                    SyncWorker *worker_ptr = worker.get();
-                    worker->thread = std::thread([this, worker_ptr, stream] {
-                        device->SetContext(device_id);
-                        {
-                            std::lock_guard<std::mutex> lock(
-                                worker_ptr->mutex);
-                            worker_ptr->ready = true;
-                        }
-                        worker_ptr->completion_cv.notify_one();
-                        while (true) {
-                            std::unique_lock<std::mutex> lock(
-                                worker_ptr->mutex);
-                            worker_ptr->task_cv.wait(lock, [worker_ptr] {
-                                return worker_ptr->has_task ||
-                                       worker_ptr->stopping;
-                            });
-                            if (worker_ptr->stopping &&
-                                !worker_ptr->has_task) {
-                                break;
-                            }
-                            lock.unlock();
-                            bool result = false;
-                            try {
-                                result = device->SynchronizeStream(stream);
-                            } catch (const std::exception &error) {
-                                LOG(ERROR)
-                                    << "Persistent DFS H2D sync worker failed: "
-                                    << error.what();
-                            } catch (...) {
-                                LOG(ERROR) << "Persistent DFS H2D sync worker "
-                                              "failed";
-                            }
-                            lock.lock();
-                            worker_ptr->result = result;
-                            worker_ptr->has_task = false;
-                            lock.unlock();
-                            worker_ptr->completion_cv.notify_one();
-                        }
-                    });
-                    sync_workers.push_back(std::move(worker));
-                    std::unique_lock<std::mutex> lock(worker_ptr->mutex);
-                    worker_ptr->completion_cv.wait(
-                        lock, [worker_ptr] { return worker_ptr->ready; });
-                }
-            } catch (const std::exception &error) {
-                LOG(ERROR) << "Failed to create persistent DFS H2D sync "
-                              "worker: "
-                           << error.what();
-                StopSyncWorkers();
-                return false;
-            } catch (...) {
-                LOG(ERROR) << "Failed to create persistent DFS H2D sync "
-                              "worker";
-                StopSyncWorkers();
-                return false;
-            }
-            return true;
-        }
-
-        bool SynchronizeStreams(const std::vector<uint8_t> &used_streams,
-                                std::vector<uint8_t> *results) {
-            if (!results || used_streams.size() != sync_workers.size()) {
-                return false;
-            }
-            results->assign(sync_workers.size(), 1);
-            for (size_t i = 0; i < sync_workers.size(); ++i) {
-                if (!used_streams[i]) continue;
-                auto &worker = *sync_workers[i];
-                std::lock_guard<std::mutex> lock(worker.mutex);
-                if (worker.stopping || worker.has_task) return false;
-            }
-            for (size_t i = 0; i < sync_workers.size(); ++i) {
-                if (!used_streams[i]) continue;
-                auto &worker = *sync_workers[i];
-                std::lock_guard<std::mutex> lock(worker.mutex);
-                worker.has_task = true;
-            }
-            for (size_t i = 0; i < sync_workers.size(); ++i) {
-                if (used_streams[i]) sync_workers[i]->task_cv.notify_one();
-            }
-            for (size_t i = 0; i < sync_workers.size(); ++i) {
-                if (!used_streams[i]) continue;
-                auto &worker = *sync_workers[i];
-                std::unique_lock<std::mutex> lock(worker.mutex);
-                worker.completion_cv.wait(
-                    lock, [&worker] { return !worker.has_task; });
-                (*results)[i] = worker.result;
-            }
-            return true;
-        }
-
-        void StopSyncWorkers() {
-            for (auto &worker : sync_workers) {
-                {
-                    std::lock_guard<std::mutex> lock(worker->mutex);
-                    worker->stopping = true;
-                }
-                worker->task_cv.notify_one();
-            }
-            for (auto &worker : sync_workers) {
-                if (worker->thread.joinable()) worker->thread.join();
-            }
-            sync_workers.clear();
-        }
 
         const device::AcceleratorDevice *device;
         int32_t device_id;
         std::mutex mutex;
-        std::vector<void *> streams;
-        std::vector<std::unique_ptr<SyncWorker>> sync_workers;
+        // Opaque provider handle; nullptr when the extension is unavailable.
+        void *handle = nullptr;
+        uint32_t stream_count = 0;
         bool initialized = false;
     };
 
@@ -167,10 +62,29 @@ class RealClient::DfsH2dStreamPool {
             return state_->device;
         }
         int32_t device_id() const { return state_->device_id; }
-        const std::vector<void *> &streams() const { return state_->streams; }
-        bool SynchronizeStreams(const std::vector<uint8_t> &used_streams,
-                                std::vector<uint8_t> *results) {
-            return state_->SynchronizeStreams(used_streams, results);
+        bool accelerated() const { return state_->handle != nullptr; }
+        uint32_t stream_count() const {
+            return state_->handle != nullptr ? state_->stream_count : 0;
+        }
+
+        bool Submit(const mooncake_ahe_copy_range *ranges, size_t range_count,
+                    uint32_t stream_key) {
+            if (state_->handle == nullptr) return false;
+            return ext::AheProvider::Instance().Submit(
+                state_->handle, ranges, range_count, stream_key);
+        }
+
+        // With a provider this waits for every stream of the device handle;
+        // without one it drains the implicit stream used by the fallback.
+        bool Synchronize() {
+            if (state_->handle == nullptr) {
+                // The implicit stream belongs to the current device; switch
+                // back before draining so a batch that spans several devices
+                // waits on the right one instead of whatever was last set.
+                state_->device->SetContext(state_->device_id);
+                return state_->device->SynchronizeStream(nullptr);
+            }
+            return ext::AheProvider::Instance().Sync(state_->handle);
         }
 
        private:
@@ -196,8 +110,7 @@ class RealClient::DfsH2dStreamPool {
         DeviceKey key{accelerator, device_id};
         auto [it, inserted] = states_.try_emplace(key);
         if (inserted) {
-            it->second =
-                std::make_shared<DeviceState>(accelerator, device_id);
+            it->second = std::make_shared<DeviceState>(accelerator, device_id);
         }
         state = it->second;
 
@@ -207,19 +120,7 @@ class RealClient::DfsH2dStreamPool {
         lock.unlock();
         state->device->SetContext(state->device_id);
         if (!state->initialized) {
-            state->streams.reserve(streams_per_device_);
-            for (size_t i = 0; i < streams_per_device_; ++i) {
-                void *stream = nullptr;
-                if (!state->device->CreateStream(&stream)) break;
-                state->streams.push_back(stream);
-            }
-            if (!state->StartSyncWorkers()) {
-                for (void *stream : state->streams) {
-                    state->device->DestroyStream(stream);
-                }
-                state->streams.clear();
-                return nullptr;
-            }
+            InitializeDevice(*state);
             state->initialized = true;
         }
         return std::make_unique<Lease>(state, std::move(state_lock));
@@ -241,19 +142,15 @@ class RealClient::DfsH2dStreamPool {
         bool succeeded = true;
         for (auto &[_, state] : states) {
             std::lock_guard<std::mutex> state_lock(state->mutex);
-            std::vector<uint8_t> results;
-            const std::vector<uint8_t> used_streams(state->streams.size(), 1);
-            if (!state->SynchronizeStreams(used_streams, &results)) {
-                succeeded = false;
-            } else {
-                for (uint8_t result : results) succeeded &= result != 0;
-            }
-            state->StopSyncWorkers();
             state->device->SetContext(state->device_id);
-            for (void *stream : state->streams) {
-                state->device->DestroyStream(stream);
+            if (state->handle != nullptr) {
+                if (!ext::AheProvider::Instance().Sync(state->handle)) {
+                    succeeded = false;
+                }
+                ext::AheProvider::Instance().Destroy(state->handle);
+                state->handle = nullptr;
             }
-            state->streams.clear();
+            state->stream_count = 0;
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -265,6 +162,17 @@ class RealClient::DfsH2dStreamPool {
     }
 
    private:
+    void InitializeDevice(DeviceState &state) {
+        ext::AheProvider &provider = ext::AheProvider::Instance();
+        if (!provider.available()) return;
+        const uint32_t count = static_cast<uint32_t>(streams_per_device_);
+        if (count == 0) return;
+        void *handle = provider.Create(state.device_id, count);
+        if (handle == nullptr) return;
+        state.handle = handle;
+        state.stream_count = count;
+    }
+
     const size_t streams_per_device_;
     std::mutex mutex_;
     std::condition_variable shutdown_cv_;

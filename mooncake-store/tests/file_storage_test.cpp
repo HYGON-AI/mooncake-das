@@ -557,9 +557,6 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES");
         UnsetEnv("MC_STORE_DFS_READ_CHUNK_SIZE_BYTES");
         UnsetEnv("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES");
-        UnsetEnv("MC_STORE_DFS_READ_PROTECTION_CHUNKS");
-        UnsetEnv("MC_STORE_DFS_WRITE_PROTECTION_CHUNKS");
-        UnsetEnv("MC_STORE_DFS_PREFETCH_CAPACITY_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
@@ -1322,7 +1319,6 @@ TEST_F(FileStorageTest, WriteChunkMustFitAfterReadProtection) {
 TEST_F(FileStorageTest, UnifiedPrefetchAllocationSharesRestoreArena) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
-    file_storage_config.prefetch_capacity_ratio = 0.5;
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
 
     constexpr size_t kAlignment = 4096;

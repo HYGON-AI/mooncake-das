@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "replica.h"
+#include "ext/dfe_loader.h"
 #include "metadata_store.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
@@ -378,9 +379,8 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir) {
     config.bucket_capacity = kBucketCapacity;
     config.max_bucket_count = 16;
     config.alignment = kAlignment;
-    // Keep the legacy contiguous layout: these tests assert per-object offsets
-    // and merged-read task counts, which a nonzero batch boundary would change.
-    config.bucket_batch_alignment = 0;
+    // Recovery must be on for the restart/recovery cases in this suite.
+    config.bucket_recovery_enabled = true;
     config.single_tenant = true;
     config.eviction_enabled = false;
     config.deferred_free_duration = std::chrono::seconds(0);
@@ -471,7 +471,6 @@ TEST_F(DfsBucketBackendTest, RangeReadPreservesSliceBoundariesWithMergeEnabled) 
     const std::string key = "range_window";
     const std::string value = "0123456789abcdef";
     const auto desc = WriteObject(key, value);
-    config_.batch_read_merge_enabled = true;
     FileStorageConfig file_config;
     auto backend = MakeTestBackend(file_config, config_,
                                    std::make_unique<PosixFsAdapter>());
@@ -1747,9 +1746,8 @@ TEST_F(DfsBucketBackendTest, ContiguousEntriesAreMerged) {
         descriptors.push_back(*desc);
     }
 
-    // Reopen with the optional merged-read path enabled so this test exercises
-    // extraction from a combined [object][padding] window.
-    config_.batch_read_merge_enabled = true;
+    // Reopen so this test exercises extraction from a combined
+    // [object][padding] window.
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = tmp_->path();
@@ -1773,7 +1771,7 @@ TEST_F(DfsBucketBackendTest, ContiguousEntriesAreMerged) {
         reads.push_back({keys[i], descriptors[i], read_slices[i]});
     }
 
-    // Use default parallel read threads
+    // Batch read through the default path.
     auto read_results = backend_->BatchRead(reads);
     ASSERT_EQ(read_results.size(), reads.size());
     for (size_t i = 0; i < read_results.size(); ++i) {
@@ -1782,8 +1780,8 @@ TEST_F(DfsBucketBackendTest, ContiguousEntriesAreMerged) {
     }
 }
 
-TEST_F(DfsBucketBackendTest, BatchReadWithDifferentThreadCounts) {
-    // Test BatchRead behavior with different thread count configurations
+TEST_F(DfsBucketBackendTest, BatchReadAcrossMultipleBuckets) {
+    // Batch read many objects spread across multiple buckets.
     constexpr size_t kNumEntries = 20;
     std::vector<std::string> keys;
     std::vector<std::string> values;
@@ -1808,42 +1806,27 @@ TEST_F(DfsBucketBackendTest, BatchReadWithDifferentThreadCounts) {
         descriptors.push_back(*desc);
     }
 
-    // Test different batch_read_threads configurations
-    std::vector<int> thread_counts{1, 2, 4, 8};
-    for (int threads : thread_counts) {
-        config_.batch_read_threads = threads;
+    // Batch read
+    std::vector<std::string> outputs;
+    std::vector<std::vector<Slice>> read_slices;
+    std::vector<DfsReadRequest> reads;
+    outputs.reserve(keys.size());
+    read_slices.resize(keys.size());
 
-        // Recreate backend to apply new configuration
-        FileStorageConfig file_config;
-        file_config.storage_backend_type = StorageBackendType::kDistributed;
-        file_config.storage_filepath = tmp_->path();
-        backend_ = MakeTestBackend(file_config, config_,
-                                   std::make_unique<FaultyPosixFsAdapter>());
-        ASSERT_TRUE(backend_->Init().has_value());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        outputs.emplace_back(values[i].size(), '\0');
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        read_slices[i] = {{outputs[i].data(), outputs[i].size()}};
+        reads.push_back({keys[i], descriptors[i], read_slices[i]});
+    }
 
-        // Batch read
-        std::vector<std::string> outputs;
-        std::vector<std::vector<Slice>> read_slices;
-        std::vector<DfsReadRequest> reads;
-        outputs.reserve(keys.size());
-        read_slices.resize(keys.size());
-
-        for (size_t i = 0; i < keys.size(); ++i) {
-            outputs.emplace_back(values[i].size(), '\0');
-        }
-        for (size_t i = 0; i < keys.size(); ++i) {
-            read_slices[i] = {{outputs[i].data(), outputs[i].size()}};
-            reads.push_back({keys[i], descriptors[i], read_slices[i]});
-        }
-
-        auto read_results = backend_->BatchRead(reads);
-        ASSERT_EQ(read_results.size(), reads.size());
-        for (size_t i = 0; i < read_results.size(); ++i) {
-            ASSERT_TRUE(read_results[i].has_value())
-                << "Failed with " << threads << " threads, entry " << i;
-            EXPECT_EQ(outputs[i], values[i])
-                << "Mismatch with " << threads << " threads, entry " << i;
-        }
+    auto read_results = backend_->BatchRead(reads);
+    ASSERT_EQ(read_results.size(), reads.size());
+    for (size_t i = 0; i < read_results.size(); ++i) {
+        ASSERT_TRUE(read_results[i].has_value())
+            << "Failed read for entry " << i;
+        EXPECT_EQ(outputs[i], values[i]) << "Mismatch for entry " << i;
     }
 }
 
@@ -1916,8 +1899,6 @@ TEST_F(DfsBucketBackendTest, BatchReadMixedContiguousAndNonContiguous) {
         ++out_idx;
     }
 
-    // Use parallel reads
-    config_.batch_read_threads = 4;
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = tmp_->path();
@@ -1935,7 +1916,12 @@ TEST_F(DfsBucketBackendTest, BatchReadMixedContiguousAndNonContiguous) {
     }
 }
 
-TEST_F(DfsBucketBackendTest, MergedBatchReadUsesIndependentIoTasks) {
+TEST_F(DfsBucketBackendTest, BatchReadIssuesOneReadPerObjectWithoutProvider) {
+    // The provider is a process-wide singleton, so this baseline-only test
+    // cannot run once a provider is loaded; the no-provider run covers it.
+    if (mooncake::ext::DfeProvider::Instance().available()) {
+        GTEST_SKIP() << "DFE provider loaded; run without MOONCAKE_EXT_DIR";
+    }
     const std::string key1 = "merged_task_key_1";
     const std::string key2 = "merged_task_key_2";
     const std::string key3 = "merged_task_key_3";
@@ -1945,8 +1931,7 @@ TEST_F(DfsBucketBackendTest, MergedBatchReadUsesIndependentIoTasks) {
 
     auto desc1 = WriteObject(key1, value1);
     auto desc2 = WriteObject(key2, value2);
-    // Force a gap before key3 so the merged-read path must produce more than
-    // one task for a single bucket.
+    // Force a gap before key3 so a read plan cannot assume one contiguous run.
     ASSERT_TRUE(allocator_->Allocate("merged_task_spacer", 4096).has_value());
     auto desc3 = WriteObject(key3, value3);
 
@@ -1954,9 +1939,7 @@ TEST_F(DfsBucketBackendTest, MergedBatchReadUsesIndependentIoTasks) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = tmp_->path();
-    config_.batch_read_merge_enabled = true;
     config_.direct_read_enabled = false;
-    config_.batch_read_threads = 2;
     auto adapter = std::make_unique<FaultyPosixFsAdapter>();
     adapter_ = adapter.get();
     backend_ = MakeTestBackend(file_config, config_, std::move(adapter));
@@ -1977,9 +1960,10 @@ TEST_F(DfsBucketBackendTest, MergedBatchReadUsesIndependentIoTasks) {
     EXPECT_EQ(output1, value1);
     EXPECT_EQ(output2, value2);
     EXPECT_EQ(output3, value3);
-    // With a single bucket, two contiguous reads merge into one task and the
-    // third read runs as an independent task.
-    EXPECT_EQ(adapter_->ReadCalls(), 2);
+    // Read merging and parallel dispatch live in the private data-plane
+    // extension. Without it loaded, the baseline path issues one read per
+    // object.
+    EXPECT_EQ(adapter_->ReadCalls(), 3);
 }
 
 }  // namespace mooncake::test

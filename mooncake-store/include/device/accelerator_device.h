@@ -68,14 +68,11 @@ class AcceleratorDevice {
         (void)stream;
         return Copy(dst, src, size, CopyDirection::kHostToDevice);
     }
-    // Submit a set of independent host-to-device copies on one stream. The
-    // default implementation deliberately keeps the old semantics; backends
-    // with a native scatter-copy primitive or a suitable batch kernel can
-    // override it to reduce host submission overhead.
+    // Submit a set of independent host-to-device copies on one stream. Backends
+    // with a native scatter-copy primitive can override it to reduce host
+    // submission overhead.
     virtual bool CopyFromHostBatchAsync(std::span<const HostCopyRange> ranges,
-                                        void* stream,
-                                        bool* used_batch_kernel = nullptr) const {
-        if (used_batch_kernel) *used_batch_kernel = false;
+                                        void* stream) const {
         bool success = true;
         for (const auto& range : ranges) {
             // Keep attempting the remaining ranges. A backend failure for one
@@ -99,7 +96,7 @@ class AcceleratorDevice {
 
     // Allocate host memory with a device-visible mapping when supported. This
     // is separate from ordinary pinned memory because mapped host access is
-    // only needed by the DFS scatter-kernel path.
+    // only needed by callers that copy straight from the host buffer.
     virtual PinnedHostBuffer AllocateMappedPinnedHost(size_t size) const {
         return AllocatePinnedHost(size);
     }

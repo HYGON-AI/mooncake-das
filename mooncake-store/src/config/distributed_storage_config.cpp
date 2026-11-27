@@ -16,8 +16,7 @@
 
 namespace mooncake {
 namespace {
-// Bound parallel bucket staging buffers and background preallocation workers.
-constexpr int kMaxBatchReadThreads = 256;
+// Bound background preallocation workers.
 constexpr int kMaxBucketCreateConcurrency = 8;
 
 bool ValidateEvictionSettings(const DistributedStorageConfig& config) {
@@ -180,12 +179,6 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT, config.max_bucket_count);
     config.alignment =
         Environ::ReadOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
-    config.bucket_batch_alignment = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT,
-        config.bucket_batch_alignment);
-    config.posix_write_context_enabled =
-        Environ::ReadOr(Variables::MOONCAKE_DFS_POSIX_WRITE_CONTEXT_ENABLED,
-                        config.posix_write_context_enabled);
     config.single_tenant = Environ::ReadOr(
         Variables::MOONCAKE_DFS_SINGLE_TENANT, config.single_tenant);
     config.eviction_enabled = Environ::ReadOr(
@@ -260,11 +253,6 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.bucket_create_concurrency = Environ::ReadOr(
         Variables::MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY,
         config.bucket_create_concurrency);
-    config.batch_read_threads = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_BATCH_READ_THREADS, config.batch_read_threads);
-    config.batch_read_merge_enabled = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED,
-        config.batch_read_merge_enabled);
     config.direct_read_enabled = Environ::ReadOr(
         Variables::MOONCAKE_DFS_DIRECT_READ_ENABLED, config.direct_read_enabled);
     config.batch_get_timeout_ms = Environ::ReadOr(
@@ -287,7 +275,6 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", enable_health_check=" << enable_health_check
         << ", shard_count=" << shard_count
         << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment
-        << ", bucket_batch_alignment=" << bucket_batch_alignment
         << ", single_tenant=" << single_tenant
         << ", eviction_enabled=" << eviction_enabled
         << ", eviction_high_watermark=" << eviction_high_watermark
@@ -303,12 +290,9 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", allocator_type=" << ToString(allocator_type)
         << ", bucket_capacity=" << bucket_capacity
         << ", bucket_recovery_enabled=" << bucket_recovery_enabled
-        << ", posix_write_context_enabled=" << posix_write_context_enabled
         << ", max_bucket_count=" << max_bucket_count
         << ", ready_bucket_target=" << ready_bucket_target
         << ", bucket_create_concurrency=" << bucket_create_concurrency
-        << ", batch_read_threads=" << batch_read_threads
-        << ", batch_read_merge_enabled=" << batch_read_merge_enabled
         << ", direct_read_enabled=" << direct_read_enabled
         << ", batch_get_timeout_ms=" << batch_get_timeout_ms
         << ", batch_timeout_fixed_ms=" << batch_timeout_fixed_ms
@@ -345,9 +329,6 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                    << alignment;
         return false;
     }
-    // bucket_batch_alignment is a master-side placement hint. It is validated
-    // and normalized by the bucket allocator so that a client sharing the same
-    // environment never fails to start because of it.
     if (bucket_capacity % alignment != 0) {
         LOG(ERROR) << "DistributedStorageConfig: bucket_capacity ("
                    << bucket_capacity << ") must be a multiple of alignment ("
@@ -386,13 +367,6 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
                "in [1, "
             << kMaxBucketCreateConcurrency
             << "], bucket_create_concurrency=" << bucket_create_concurrency;
-        return false;
-    }
-    if (batch_read_threads < 1 || batch_read_threads > kMaxBatchReadThreads) {
-        LOG(ERROR) << "DistributedStorageConfig: batch_read_threads must be in "
-                      "[1, "
-                   << kMaxBatchReadThreads
-                   << "], batch_read_threads=" << batch_read_threads;
         return false;
     }
     return true;

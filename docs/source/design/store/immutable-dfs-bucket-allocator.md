@@ -65,23 +65,10 @@ are consumed only by the master allocator.
 | `MOONCAKE_DFS_ROOT_DIR` | `/mnt/3fs/mooncake` | Shared directory containing bucket files. |
 | `MOONCAKE_DFS_FS_ADAPTER` | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. |
 | `MOONCAKE_DFS_ALIGNMENT` | `4096` | Power-of-two entry alignment; must divide bucket capacity. |
-| `MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT` | `524288` (512 KiB) | Bucket batch boundary, consumed by the master allocator only and applied only with the `posix` adapter. Set to `0` for the legacy per-key layout. Any value the bucket geometry cannot honor (not a power-of-two multiple of the entry alignment, larger than bucket capacity, or not dividing it) is disabled with a warning instead of failing startup; clients and non-POSIX adapters ignore it. |
 | `MOONCAKE_DFS_EVICTION_ENABLED` | `true` | Enable bucket-level eviction. |
 | `MOONCAKE_DFS_EVICTION_HIGH_WATERMARK` | `0.9` | Usage ratio that starts normal eviction. |
 | `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | `0.7` | Usage ratio at which normal eviction stops. |
 | `MOONCAKE_DFS_EVICTION_CHECK_INTERVAL` | `5` | Background eviction check interval in seconds. |
-
-`MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT` is applied by the master allocator at the
-start of each `BatchPutStart` segment in each bucket. A single-key `PutStart`
-uses the same batch allocation path, so it is aligned as well. Keys within a
-segment continue to use `MOONCAKE_DFS_ALIGNMENT`; when a batch enters another
-bucket, the new segment is aligned again. Padding before a batch boundary is
-reserved space and is not reclaimed if the batch later fails, because the
-allocator may allow another request to append while bucket creation is in
-progress. A nonzero batch boundary can therefore reduce usable capacity by up
-to one boundary per bucket segment; choose it together with the bucket capacity
-and expected object sizes.
-
 
 ```bash
 export MOONCAKE_ENABLE_DFS=1
@@ -91,7 +78,6 @@ export MOONCAKE_DFS_FS_ADAPTER=posix
 export MOONCAKE_DFS_BUCKET_CAPACITY=1073741824
 export MOONCAKE_DFS_MAX_BUCKET_COUNT=64
 export MOONCAKE_DFS_ALIGNMENT=4096
-export MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT=524288
 ```
 
 `MOONCAKE_DFS_SHARD_COUNT`, `MOONCAKE_DFS_SHARD_CAPACITY`, and online shard

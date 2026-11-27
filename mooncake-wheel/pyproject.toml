@@ -67,5 +67,6 @@ where = ["."]
 include = ["mooncake*"]
 
 [tool.setuptools.package-data]
-# *.co: Store H2D scatter kernel (packaged only when present; built with -DUSE_HIP=ON)
-mooncake = ["*.so", "*.co", "*.pyi", "py.typed", "mooncake_master", "mooncake_client", "transfer_engine_bench", "_pg_jit/*.cpp", "_pg_jit/*.h"]
+# The private H2D scatter kernel (*.co) ships with the private extension and
+# must never be bundled into the public wheel.
+mooncake = ["*.so", "*.pyi", "py.typed", "mooncake_master", "mooncake_client", "transfer_engine_bench", "_pg_jit/*.cpp", "_pg_jit/*.h"]

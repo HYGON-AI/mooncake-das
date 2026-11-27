@@ -15,6 +15,9 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
+    ext/shared_library.cpp
+    ext/dfe_loader.cpp
+    ext/ahe_loader.cpp
     config/distributed_storage_config.cpp
     config/rpc_protocol_config.cpp
     config/replica_selection_config.cpp
@@ -572,6 +575,7 @@ target_link_libraries(
           yaml-cpp
           mooncake_common
           $<$<PLATFORM_ID:Linux>:numa>
+          ${CMAKE_DL_LIBS}
           asio_shared
           yalantinglibs::yalantinglibs)
 if(MOONCAKE_KVCS_SDK_FOUND)
@@ -713,6 +717,7 @@ target_link_libraries(
           yaml-cpp
           Mooncake::xxhash
           OpenSSL::Crypto
+          ${CMAKE_DL_LIBS}
           $<$<PLATFORM_ID:Linux>:numa>)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store_master PRIVATE Mooncake::libzmq)
@@ -754,7 +759,7 @@ target_link_libraries(
          mooncake_nof_core
          yalantinglibs::yalantinglibs
   PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash
-          OpenSSL::Crypto $<$<PLATFORM_ID:Linux>:numa>)
+          OpenSSL::Crypto ${CMAKE_DL_LIBS} $<$<PLATFORM_ID:Linux>:numa>)
 if(USE_NOF)
   # SPDK/DPDK stay confined to mooncake_nof_spdk (PRIVATE) instead of
   # propagating to every mooncake_store consumer.

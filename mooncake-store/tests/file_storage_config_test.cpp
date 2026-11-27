@@ -51,12 +51,6 @@ struct FileStorageEnvironment {
         "MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES"};
     ScopedEnvVar read_chunk_size{"MC_STORE_DFS_READ_CHUNK_SIZE_BYTES"};
     ScopedEnvVar write_chunk_size{"MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES"};
-    ScopedEnvVar read_protection_chunks{
-        "MC_STORE_DFS_READ_PROTECTION_CHUNKS"};
-    ScopedEnvVar write_protection_chunks{
-        "MC_STORE_DFS_WRITE_PROTECTION_CHUNKS"};
-    ScopedEnvVar prefetch_capacity_ratio{
-        "MC_STORE_DFS_PREFETCH_CAPACITY_RATIO"};
     ScopedEnvVar scanmeta_iterator_keys_limit{
         "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT"};
     ScopedEnvVar legacy_scanmeta_iterator_keys_limit{
@@ -90,9 +84,6 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.unified_buffer_size, 12LL * 1024 * 1024 * 1024);
     EXPECT_EQ(config.read_chunk_size, 1LL * 1024 * 1024 * 1024);
     EXPECT_EQ(config.write_chunk_size, 1LL * 1024 * 1024 * 1024);
-    EXPECT_EQ(config.read_protection_chunks, 4);
-    EXPECT_EQ(config.write_protection_chunks, 1);
-    EXPECT_DOUBLE_EQ(config.prefetch_capacity_ratio, 0.5);
     EXPECT_EQ(config.scanmeta_iterator_keys_limit, 20000);
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
@@ -173,9 +164,6 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     env.unified_buffer_size.Set("67108864");
     env.read_chunk_size.Set("33554432");
     env.write_chunk_size.Set("134217728");
-    env.read_protection_chunks.Set("6");
-    env.write_protection_chunks.Set("3");
-    env.prefetch_capacity_ratio.Set("0.25");
     env.scanmeta_iterator_keys_limit.Set("12345");
     env.total_keys_limit.Set("5000000");
     env.total_size_limit.Set("1099511627776");
@@ -195,9 +183,6 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
     EXPECT_EQ(config.unified_buffer_size, 64 * 1024 * 1024);
     EXPECT_EQ(config.read_chunk_size, 32 * 1024 * 1024);
     EXPECT_EQ(config.write_chunk_size, 128 * 1024 * 1024);
-    EXPECT_EQ(config.read_protection_chunks, 6);
-    EXPECT_EQ(config.write_protection_chunks, 3);
-    EXPECT_DOUBLE_EQ(config.prefetch_capacity_ratio, 0.25);
     EXPECT_EQ(config.scanmeta_iterator_keys_limit, 12345);
     EXPECT_EQ(config.total_keys_limit, 5000000);
     EXPECT_EQ(config.total_size_limit, 1099511627776);
@@ -273,9 +258,6 @@ TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
     env.unified_buffer_size.Set("invalid");
     env.read_chunk_size.Set("invalid");
     env.write_chunk_size.Set("invalid");
-    env.read_protection_chunks.Set("invalid");
-    env.write_protection_chunks.Set("invalid");
-    env.prefetch_capacity_ratio.Set("invalid");
     env.scanmeta_iterator_keys_limit.Set("invalid");
     env.total_keys_limit.Set("invalid");
     env.total_size_limit.Set("invalid");
@@ -297,9 +279,6 @@ TEST_F(FileStorageConfigTest, InvalidValuesUseDefaultsAndPreserveDiagnostics) {
              "MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES",
              "MC_STORE_DFS_READ_CHUNK_SIZE_BYTES",
              "MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES",
-             "MC_STORE_DFS_READ_PROTECTION_CHUNKS",
-             "MC_STORE_DFS_WRITE_PROTECTION_CHUNKS",
-             "MC_STORE_DFS_PREFETCH_CAPACITY_RATIO",
              "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
              "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT",
              "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES",
@@ -420,13 +399,6 @@ TEST_F(FileStorageConfigTest, ValidateFailsOnInvalidLimits) {
     config.unified_buffer_size = 1;
     config.read_chunk_size = 1;
     config.write_chunk_size = 1;
-    config.prefetch_capacity_ratio = -1.0;
-    EXPECT_FALSE(config.Validate());
-
-    config.prefetch_capacity_ratio = 2.0;
-    EXPECT_FALSE(config.Validate());
-
-    config.prefetch_capacity_ratio = 0.5;
     config.heartbeat_interval_seconds = 0;
     EXPECT_FALSE(config.Validate());
 

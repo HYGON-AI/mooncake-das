@@ -41,6 +41,7 @@
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "storage/distributed/dfs_log_limiter.h"
+#include "storage/distributed/dfs_root_identity.h"
 
 namespace mooncake::test {
 
@@ -173,7 +174,9 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
     config.max_bucket_count = max_bucket_count;
     config.ready_bucket_target = 0;
     config.alignment = kAlignment;
-    config.bucket_batch_alignment = 0;
+    // Recovery tests (and the restart-durability tests) expect metadata to be
+    // restored; the production default stays disabled unless configured.
+    config.bucket_recovery_enabled = true;
     config.single_tenant = true;
     config.eviction_enabled = false;
     config.eviction_high_watermark = 0.9;
@@ -1390,6 +1393,14 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDisabledReclaimsFilesAndUsesFreshBudg
     std::ofstream(tmp.file("bucket_000042.data")) << "orphan data";
     std::vector<std::string> old_files;
     for (const auto& entry : std::filesystem::directory_iterator(tmp.path())) {
+        // The root marker and the write-context capability file are directory
+        // infrastructure, not bucket files; the allocator recreates both on
+        // every Init and never reclaims them.
+        const auto name = entry.path().filename();
+        if (name == kDfsRootMarkerFileName ||
+            name == kDfsWriteContextCapabilityFileName) {
+            continue;
+        }
         old_files.push_back(entry.path().string());
     }
 
@@ -2275,10 +2286,48 @@ TEST(ImmutableBucketAllocatorTest, ConcurrentAllocateProducesDisjointRegions) {
     }
 }
 
+TEST(ImmutableBucketAllocatorTest,
+     DefaultAlignmentPacksPastHalfAndCrossesBuckets) {
+    // Regression for the removed "over half" rule: with the default batch
+    // boundary the allocator must keep accepting entries after a bucket passes
+    // half full and roll over only when the entry truly does not fit. The old
+    // provider reported fits=0 once append_offset passed capacity/2, which
+    // turned every later allocation into a forced eviction.
+    TempDir tmp("bucket_over_half");
+    ImmutableBucketAllocator alloc;
+    constexpr uint64_t kCapacity = 4 * 1024 * 1024;
+    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kCapacity, 16)));
+
+    // 256 KiB values: eight aligned slots per bucket, so 96 keys need twelve
+    // buckets. The over-half rule stopped at four per bucket (64 total).
+    constexpr int kKeys = 96;
+    constexpr uint64_t kValueSize = 256 * 1024;
+    std::vector<int64_t> bucket_ids;
+    for (int i = 0; i < kKeys; ++i) {
+        const std::string key = "over_half_" + std::to_string(i);
+        auto desc = alloc.Allocate(key, kValueSize);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i << " failed";
+        ASSERT_TRUE(alloc.MarkCommitted(key, *desc));
+        EXPECT_TRUE(alloc.GetBucketIdForKey(key).has_value()) << "key=" << key;
+        // The reserved region must stay inside its bucket.
+        const uint64_t begin = EntryStartOf(*desc);
+        EXPECT_LE(begin + desc->aligned_size, kCapacity);
+        bucket_ids.push_back(static_cast<int64_t>(desc->shard_idx));
+    }
+    std::sort(bucket_ids.begin(), bucket_ids.end());
+    bucket_ids.erase(std::unique(bucket_ids.begin(), bucket_ids.end()),
+                     bucket_ids.end());
+    EXPECT_GE(bucket_ids.size(), 2u) << "expected to cross bucket boundaries";
+}
+
 TEST(ImmutableBucketAllocatorTest, ConcurrentFreeAndUpdateAccessAreSafe) {
     TempDir tmp("bucket_concurrent_free");
     ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), 1024 * 1024, 16)));
+    // With the default 512 KiB batch boundary a 1 MiB bucket holds only two
+    // entries, so 64 keys would exhaust `max_bucket_count` before the test
+    // reaches the concurrency section. Use a larger bucket; the test is about
+    // Free/UpdateAccess interleaving, not capacity.
+    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), 4 * 1024 * 1024, 16)));
 
     constexpr int kKeys = 64;
     std::vector<std::pair<std::string, DistributedFSDescriptor>> allocations;
@@ -2618,7 +2667,8 @@ TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
     }
 
     // Bucket files have one `.meta` companion, alongside the master-owned DFS
-    // root marker; there are no logs, snapshot slots, or rename temporaries.
+    // root marker and write-context capability file; there are no logs,
+    // snapshot slots, or rename temporaries.
     std::set<std::string> data_ids;
     std::set<std::string> meta_ids;
     bool found_root_marker = false;
@@ -2628,6 +2678,9 @@ TEST(BucketMetadataDurabilityTest, EachBucketOwnsExactlyOneMetadataFile) {
             found_root_marker = true;
             continue;
         }
+        // The capability file is published by every Init; it is not a bucket
+        // file and must not trip the bucket-only assertions below.
+        if (name == kDfsWriteContextCapabilityFileName) continue;
         ASSERT_EQ(name.rfind("bucket_", 0), 0u);
         const std::string id = name.substr(7, 6);
         const std::string suffix = name.substr(13);
@@ -2697,6 +2750,76 @@ TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
     const size_t restored = recovered.TakeRecoveredReplicas().size();
     EXPECT_GE(restored, kTotal - kEntriesPerBucket);
     EXPECT_LE(restored, kTotal);
+}
+
+// The master publishes a tiny sidecar advertising whether it can refresh a
+// sealed bucket's mtime; the client only skips per-write mtime updates when it
+// parses "1". These tests pin the wire format end to end so a malformed,
+// stale, or absent file always falls back to the safe "unsupported" default.
+TEST(DfsWriteContextCapabilityTest, SerializeTrueRoundTripsAsSupported) {
+    const std::string serialized = SerializeDfsWriteContextCapability(true);
+    ASSERT_FALSE(serialized.empty());
+    EXPECT_LE(serialized.size(), kMaxDfsWriteContextCapabilitySize);
+    bool parsed = false;
+    ASSERT_TRUE(ParseDfsWriteContextCapability(serialized, &parsed));
+    EXPECT_TRUE(parsed);
+}
+
+TEST(DfsWriteContextCapabilityTest, SerializeFalseRoundTripsAsUnsupported) {
+    const std::string serialized = SerializeDfsWriteContextCapability(false);
+    bool parsed = true;
+    ASSERT_TRUE(ParseDfsWriteContextCapability(serialized, &parsed));
+    EXPECT_FALSE(parsed);
+}
+
+TEST(DfsWriteContextCapabilityTest, ParseRejectsMalformedPayloads) {
+    const std::string prefix =
+        std::string(kDfsWriteContextCapabilityMagic) + "\n";
+
+    // On any parse failure the out-param must never be flipped to true: the
+    // client initializes it to false before calling, so a malformed or absent
+    // file always resolves to the safe "master cannot refresh" default.
+    const auto expect_unsupported = [](std::string_view payload) {
+        bool parsed = false;
+        EXPECT_FALSE(ParseDfsWriteContextCapability(payload, &parsed))
+            << "payload should not parse: " << std::string(payload);
+        EXPECT_FALSE(parsed);
+    };
+
+    expect_unsupported("");                   // absent / empty file
+    expect_unsupported("not-the-magic\n1\n");  // wrong magic
+    expect_unsupported(prefix + "1");          // missing trailing newline
+    expect_unsupported(prefix + "1\n\n");      // extra trailing byte
+    expect_unsupported(prefix + "2\n");        // digit out of range
+    expect_unsupported(prefix + "x\n");        // non-digit body
+    expect_unsupported(prefix + "1 extra\n");  // body longer than "<d>\n"
+    std::string oversized = prefix + "1\n";
+    oversized.append(kMaxDfsWriteContextCapabilitySize + 8, ' ');
+    expect_unsupported(oversized);             // over the size cap
+
+    // A null out-pointer is rejected without dereferencing it.
+    EXPECT_FALSE(ParseDfsWriteContextCapability(
+        SerializeDfsWriteContextCapability(true), nullptr));
+}
+
+TEST(DfsWriteContextCapabilityTest, AllocatorPublishesCapabilityFileOnInit) {
+    TempDir tmp("dfs_capability_publish");
+    auto config = MakeBucketConfig(tmp.path(), 64 * 1024, 4);
+    config.ready_bucket_target = 0;
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(config));
+
+    const std::string path = tmp.file(kDfsWriteContextCapabilityFileName);
+    std::ifstream in(path, std::ios::binary);
+    ASSERT_TRUE(in.good()) << "capability file missing at " << path;
+    const std::string contents((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    bool parsed = false;
+    ASSERT_TRUE(ParseDfsWriteContextCapability(contents, &parsed))
+        << "capability file is malformed: " << contents;
+    // The published value must match the master's runtime capability, whether
+    // or not the private extension is loaded in this process.
+    EXPECT_EQ(parsed, alloc.MtimeRefreshOnSeal());
 }
 
 }  // namespace mooncake::test

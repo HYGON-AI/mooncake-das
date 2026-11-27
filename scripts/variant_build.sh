@@ -25,7 +25,7 @@ Usage: ./scripts/variant_build.sh [options]
 
 Without feature flags, build for a normal RDMA NIC with HIP and HyLink disabled.
 HyLink depends on HIP, so --hylink also enables USE_HIP.
-HIP also builds and enables the Store H2D scatter kernel.
+HIP also builds and enables the Store host-to-device copy path.
 
 USE_ETCD and STORE_USE_ETCD default to OFF; --etcd enables both.
 HIP or HyLink additionally enables ENABLE_MULTI_PROTOCOL.
