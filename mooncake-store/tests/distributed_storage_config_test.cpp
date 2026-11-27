@@ -54,10 +54,6 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar shard_count{"MOONCAKE_DFS_SHARD_COUNT"};
     ScopedEnvVar shard_capacity{"MOONCAKE_DFS_SHARD_CAPACITY"};
     ScopedEnvVar alignment{"MOONCAKE_DFS_ALIGNMENT"};
-    ScopedEnvVar bucket_batch_alignment{
-        "MOONCAKE_DFS_BUCKET_BATCH_ALIGNMENT"};
-    ScopedEnvVar posix_write_context{
-        "MOONCAKE_DFS_POSIX_WRITE_CONTEXT_ENABLED"};
     ScopedEnvVar single_tenant{"MOONCAKE_DFS_SINGLE_TENANT"};
     ScopedEnvVar eviction_enabled{"MOONCAKE_DFS_EVICTION_ENABLED"};
     ScopedEnvVar eviction_high_watermark{
@@ -80,8 +76,6 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar ready_bucket_count{"MOONCAKE_DFS_READY_BUCKET_COUNT"};
     ScopedEnvVar bucket_create_concurrency{
         "MOONCAKE_DFS_BUCKET_CREATE_CONCURRENCY"};
-    ScopedEnvVar batch_read_threads{"MOONCAKE_DFS_BATCH_READ_THREADS"};
-    ScopedEnvVar batch_read_merge{"MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED"};
     ScopedEnvVar direct_read{"MOONCAKE_DFS_DIRECT_READ_ENABLED"};
     ScopedEnvVar batch_get_timeout{"MOONCAKE_DFS_BATCH_GET_TIMEOUT_MS"};
     ScopedEnvVar batch_timeout_fixed{"MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS"};
@@ -99,8 +93,6 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_EQ(config.shard_count, 64);
     EXPECT_EQ(config.shard_capacity, 4ULL * 1024 * 1024 * 1024);
     EXPECT_EQ(config.alignment, 4096);
-    EXPECT_EQ(config.bucket_batch_alignment, 512 * 1024);
-    EXPECT_TRUE(config.posix_write_context_enabled);
     EXPECT_TRUE(config.single_tenant);
     EXPECT_TRUE(config.eviction_enabled);
     EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.9);
@@ -140,8 +132,6 @@ TEST_F(DistributedStorageConfigTest, ReadsL4SettingsThroughTypedEnvironment) {
     env.bucket_recovery.Set("true");
     env.ready_bucket_count.Set("6");
     env.bucket_create_concurrency.Set("3");
-    env.batch_read_threads.Set("16");
-    env.batch_read_merge.Set("true");
     env.direct_read.Set("false");
     env.batch_get_timeout.Set("20000");
     env.batch_timeout_fixed.Set("700");
@@ -157,8 +147,6 @@ TEST_F(DistributedStorageConfigTest, ReadsL4SettingsThroughTypedEnvironment) {
     EXPECT_TRUE(config.bucket_recovery_enabled);
     EXPECT_EQ(config.ready_bucket_target, 6);
     EXPECT_EQ(config.bucket_create_concurrency, 3);
-    EXPECT_EQ(config.batch_read_threads, 16);
-    EXPECT_TRUE(config.batch_read_merge_enabled);
     EXPECT_FALSE(config.direct_read_enabled);
     EXPECT_EQ(config.batch_get_timeout_ms, 20000U);
     EXPECT_EQ(config.batch_timeout_fixed_ms, 700U);

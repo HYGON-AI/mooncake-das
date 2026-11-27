@@ -273,9 +273,7 @@ class RealClient::DfsAsyncScatterContext {
     ~DfsAsyncScatterContext() {
         if (!submitted_ || synchronized_) return;
         for (auto &active : active_devices_) {
-            std::vector<uint8_t> stream_results;
-            if (!active.lease->SynchronizeStreams(active.used_streams,
-                                                  &stream_results)) {
+            if (!active.lease->Synchronize()) {
                 LOG(ERROR) << "Failed to dispatch DFS H2D stream "
                               "synchronization during cleanup";
             }
@@ -371,21 +369,21 @@ class RealClient::DfsAsyncScatterContext {
                 continue;
             }
 
-            const auto &streams = active.lease->streams();
-            if (streams.empty()) {
+            // The accelerator extension owns the persistent streams and the
+            // batch copy engine. Without it, submit the whole device batch on
+            // the implicit stream through the public per-range fallback.
+            const bool accelerated = active.lease->accelerated();
+            const size_t stream_count =
+                accelerated ? active.lease->stream_count() : 1;
+            if (stream_count == 0) {
                 for (size_t operation_index : operation_indices) {
-                    const auto &operation = operations_[operation_index];
-                    if (!target.device->Copy(
-                            operation.dst, operation.src, operation.size,
-                            device::CopyDirection::kHostToDevice)) {
-                        MarkFailed(operation_index);
-                    }
+                    MarkFailed(operation_index);
                 }
                 continue;
             }
 
-            active.operations_by_stream.resize(streams.size());
-            active.used_streams.resize(streams.size());
+            active.operations_by_stream.resize(stream_count);
+            active.used_streams.assign(stream_count, 0);
             active_devices_.push_back(std::move(active));
             auto &owned_active = active_devices_.back();
             size_t next_stream = 0;
@@ -394,40 +392,53 @@ class RealClient::DfsAsyncScatterContext {
                 const auto &operation = operations_[operation_index];
                 const size_t result_index =
                     range_results_[operation.first_range];
-                auto [stream_it, inserted] =
-                    result_streams.try_emplace(result_index);
-                if (inserted) {
-                    stream_it->second = next_stream++ % streams.size();
+                size_t stream_index = 0;
+                if (accelerated) {
+                    auto [stream_it, inserted] =
+                        result_streams.try_emplace(result_index);
+                    if (inserted) {
+                        stream_it->second = next_stream++ % stream_count;
+                    }
+                    stream_index = stream_it->second;
                 }
-                const size_t stream_index = stream_it->second;
                 owned_active.used_streams[stream_index] = true;
                 owned_active.operations_by_stream[stream_index].push_back(
                     operation_index);
             }
 
-            // Submit one batch per stream. Unsupported backends use the
-            // default implementation, preserving the original DMA behavior.
-            for (size_t stream_index = 0; stream_index < streams.size();
+            for (size_t stream_index = 0; stream_index < stream_count;
                  ++stream_index) {
                 auto &stream_operations =
                     owned_active.operations_by_stream[stream_index];
                 if (stream_operations.empty()) continue;
-                std::vector<device::HostCopyRange> ranges;
-                ranges.reserve(stream_operations.size());
-                for (size_t operation_index : stream_operations) {
-                    const auto &operation = operations_[operation_index];
-                    ranges.push_back(device::HostCopyRange{
-                        operation.dst, operation.src, operation.size,
-                        operation.src_device});
-                }
-                bool used_h2d_kernel = false;
-                if (target.device->CopyFromHostBatchAsync(
-                        ranges, streams[stream_index], &used_h2d_kernel)) {
-                    if (collect_metrics_ && used_h2d_kernel) {
-                        ++h2d_kernel_batches_;
+                bool submitted = false;
+                if (accelerated) {
+                    std::vector<mooncake_ahe_copy_range> ranges;
+                    ranges.reserve(stream_operations.size());
+                    for (size_t operation_index : stream_operations) {
+                        const auto &operation = operations_[operation_index];
+                        ranges.push_back(mooncake_ahe_copy_range{
+                            operation.src, operation.src_device,
+                            reinterpret_cast<uint64_t>(operation.dst),
+                            operation.size});
                     }
-                    continue;
+                    submitted = owned_active.lease->Submit(
+                        ranges.data(), ranges.size(),
+                        static_cast<uint32_t>(stream_index));
+                    if (submitted && collect_metrics_) ++h2d_ext_batches_;
+                } else {
+                    std::vector<device::HostCopyRange> ranges;
+                    ranges.reserve(stream_operations.size());
+                    for (size_t operation_index : stream_operations) {
+                        const auto &operation = operations_[operation_index];
+                        ranges.push_back(device::HostCopyRange{
+                            operation.dst, operation.src, operation.size,
+                            operation.src_device});
+                    }
+                    submitted = target.device->CopyFromHostBatchAsync(
+                        ranges, nullptr);
                 }
+                if (submitted) continue;
                 for (size_t operation_index : stream_operations) {
                     MarkFailed(operation_index);
                 }
@@ -441,20 +452,9 @@ class RealClient::DfsAsyncScatterContext {
         if (!submitted_) Submit();
 
         for (auto &active : active_devices_) {
-            std::vector<uint8_t> stream_results;
-            if (!active.lease->SynchronizeStreams(active.used_streams,
-                                                  &stream_results)) {
-                for (size_t i = 0; i < active.used_streams.size(); ++i) {
-                    if (!active.used_streams[i]) continue;
-                    for (size_t operation_index :
-                         active.operations_by_stream[i]) {
-                        MarkFailed(operation_index);
-                    }
-                }
-                continue;
-            }
-            for (size_t i = 0; i < stream_results.size(); ++i) {
-                if (!active.used_streams[i] || stream_results[i]) continue;
+            if (active.lease->Synchronize()) continue;
+            for (size_t i = 0; i < active.used_streams.size(); ++i) {
+                if (!active.used_streams[i]) continue;
                 for (size_t operation_index :
                      active.operations_by_stream[i]) {
                     MarkFailed(operation_index);
@@ -489,7 +489,7 @@ class RealClient::DfsAsyncScatterContext {
     size_t device_copy_ops() const { return device_copy_ops_; }
     size_t host_copy_ranges() const { return host_copy_ranges_; }
     size_t device_copy_ranges() const { return device_copy_ranges_; }
-    size_t h2d_kernel_batches() const { return h2d_kernel_batches_; }
+    size_t h2d_ext_batches() const { return h2d_ext_batches_; }
 
    private:
     static bool IsUsableRegion(const RealClient::WritableBufferRegion &region) {
@@ -575,7 +575,7 @@ class RealClient::DfsAsyncScatterContext {
     size_t device_copy_ops_ = 0;
     size_t host_copy_ranges_ = 0;
     size_t device_copy_ranges_ = 0;
-    size_t h2d_kernel_batches_ = 0;
+    size_t h2d_ext_batches_ = 0;
 };
 
 
@@ -809,9 +809,6 @@ std::string RealClient::dfs_prefetch_arena_status() const {
     }
     if (!file_storage_->HasPinnedRestoreArena()) {
         return "unavailable: unified DFS buffer is not initialized";
-    }
-    if (file_storage_->PrefetchCapacityRatio() <= 0.0) {
-        return "disabled: prefetch capacity ratio is zero";
     }
     if (file_storage_->UnifiedPrefetchLimitBytes() == 0) {
         return "disabled: prefetch limit is zero after read/write protection";
@@ -1604,7 +1601,7 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
             << ", device_copy_ops=" << async_scatter.device_copy_ops()
             << ", host_copy_ranges=" << async_scatter.host_copy_ranges()
             << ", device_copy_ranges=" << async_scatter.device_copy_ranges()
-            << ", h2d_kernel_batches=" << async_scatter.h2d_kernel_batches()
+            << ", h2d_ext_batches=" << async_scatter.h2d_ext_batches()
             << ", scatter_plan_us=" << scatter_plan_us
             << ", scatter_submit_us=" << scatter_submit_us
             << ", scatter_sync_us=" << scatter_sync_us

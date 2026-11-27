@@ -16,6 +16,8 @@
 #include "device/accelerator_registry.h"
 #include "environment_variables.h"
 #include "environ.h"
+#include "ext/dfe_loader.h"
+#include "ext/mooncake_private_ext_abi.h"
 #ifdef USE_URING
 #include "file_interface.h"
 #endif
@@ -30,6 +32,32 @@ bool UseMappedPinnedRestoreArena() {
 #else
     return false;
 #endif
+}
+
+// Baseline unified-buffer policy used when no extension provider is loaded.
+// These are the pre-change defaults: hold back four read chunks, carve one
+// write chunk out of the prefetch budget, let prefetch fill half the buffer and
+// warn above four fifths. Keeping them here means the no-library path behaves
+// like the accelerated one, only without the merge algorithm.
+mooncake_ext_buffer_policy DefaultDfsBufferPolicy(
+    const mooncake_ext_buffer_policy_query& query) {
+    constexpr uint64_t kReadProtectionChunks = 4;
+    constexpr uint64_t kWriteProtectionChunks = 1;
+    const auto scaled = [](uint64_t bytes, uint64_t count) {
+        return bytes > std::numeric_limits<uint64_t>::max() / count
+                   ? std::numeric_limits<uint64_t>::max()
+                   : bytes * count;
+    };
+    mooncake_ext_buffer_policy policy{};
+    policy.read_min_protection_bytes = std::min(
+        scaled(query.read_chunk_bytes, kReadProtectionChunks),
+        query.capacity_bytes / 2);
+    policy.write_min_protection_bytes =
+        scaled(query.write_chunk_bytes, kWriteProtectionChunks);
+    policy.prefetch_limit_bytes = query.capacity_bytes / 2;
+    policy.high_watermark_numerator = 8;
+    policy.high_watermark_denominator = 10;
+    return policy;
 }
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
@@ -136,78 +164,43 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                     static_cast<size_t>(std::max<int64_t>(
                         config_.write_chunk_size, 0)),
                     dfs_alignment);
-            // Reserve room for several concurrent reads
-            // (MC_STORE_DFS_READ_PROTECTION_CHUNKS, default 4). A single
-            // chunk only protects one read; further concurrent reads then
-            // compete with prefetch and write staging for the shared headroom
-            // and fail whenever that headroom is fragmented or already taken.
-            const auto read_protection_chunks = static_cast<size_t>(
-                std::max<int64_t>(config_.read_protection_chunks, 1));
-            const auto desired_read_protection =
-                read_chunk_allocation_bytes >
-                        std::numeric_limits<size_t>::max() /
-                            read_protection_chunks
-                    ? std::numeric_limits<size_t>::max()
-                    : read_chunk_allocation_bytes * read_protection_chunks;
-            const auto read_min_protection_bytes = std::min(
-                desired_read_protection,
-                pinned_restore_arena_->capacity / 2);
-            if (desired_read_protection > read_min_protection_bytes) {
-                LOG(WARNING)
-                    << "DFS read protection was clamped to half of the "
-                       "unified buffer: requested_read_protection_bytes="
-                    << desired_read_protection
-                    << ", effective_read_protection_bytes="
-                    << read_min_protection_bytes
-                    << ", read_protection_chunks=" << read_protection_chunks
-                    << ", unified_capacity_bytes="
-                    << pinned_restore_arena_->capacity;
+            mooncake_ext_buffer_policy_query policy_query{};
+            policy_query.capacity_bytes = pinned_restore_arena_->capacity;
+            policy_query.read_chunk_bytes = read_chunk_allocation_bytes;
+            policy_query.write_chunk_bytes = write_chunk_allocation_bytes;
+            mooncake_ext_buffer_policy policy{};
+            if (!ext::DfeProvider::Instance().BufferPolicy(policy_query,
+                                                          &policy)) {
+                policy = DefaultDfsBufferPolicy(policy_query);
             }
-            // Carve room for write chunks out of the prefetch budget so
-            // prefetch can never fill the whole non-read region and leave DFS
-            // write staging without space
-            // (MC_STORE_DFS_WRITE_PROTECTION_CHUNKS, default 1). This is a
-            // configuration-time reservation only: writes wait for space
-            // (bounded by MC_STORE_DFS_WRITE_ARENA_WAIT_MS, default 10s)
-            // instead of failing immediately, so once reads release memory the
-            // write proceeds. No per-request write protection is therefore
-            // needed in the admission path.
-            const auto write_protection_chunks = static_cast<size_t>(
-                std::max<int64_t>(config_.write_protection_chunks, 1));
-            const auto desired_write_protection =
-                write_chunk_allocation_bytes >
-                        std::numeric_limits<size_t>::max() /
-                            write_protection_chunks
-                    ? std::numeric_limits<size_t>::max()
-                    : write_chunk_allocation_bytes * write_protection_chunks;
-            const auto write_min_protection_bytes = std::min(
-                desired_write_protection,
-                pinned_restore_arena_->capacity - read_min_protection_bytes);
-            if (desired_write_protection > write_min_protection_bytes) {
+            usage_tracker_->ConfigureHighWatermark(
+                policy.high_watermark_numerator,
+                policy.high_watermark_denominator);
+            const auto admission_limits = usage_tracker_->ConfigureAdmission(
+                policy.read_min_protection_bytes,
+                policy.write_min_protection_bytes,
+                policy.prefetch_limit_bytes);
+            const auto read_min_protection_bytes =
+                admission_limits.read_min_protection_bytes;
+            if (policy.write_min_protection_bytes >
+                admission_limits.write_min_protection_bytes) {
                 LOG(WARNING)
                     << "DFS write protection was clamped to the space left "
                        "after the read protection: "
                        "requested_write_protection_bytes="
-                    << desired_write_protection
+                    << policy.write_min_protection_bytes
                     << ", effective_write_protection_bytes="
-                    << write_min_protection_bytes
-                    << ", write_protection_chunks=" << write_protection_chunks
+                    << admission_limits.write_min_protection_bytes
                     << ", unified_capacity_bytes="
                     << pinned_restore_arena_->capacity;
             }
-            const auto prefetch_limit_bytes = static_cast<uint64_t>(
-                static_cast<double>(pinned_restore_arena_->capacity) *
-                config_.prefetch_capacity_ratio);
-            const auto admission_limits = usage_tracker_->ConfigureAdmission(
-                read_min_protection_bytes, write_min_protection_bytes,
-                prefetch_limit_bytes);
-            if (prefetch_limit_bytes >
+            if (policy.prefetch_limit_bytes >
                 admission_limits.prefetch_limit_bytes) {
                 LOG(WARNING)
                     << "DFS prefetch capacity was truncated to leave room for "
                        "the read and write protections: "
                        "requested_prefetch_limit_bytes="
-                    << prefetch_limit_bytes
+                    << policy.prefetch_limit_bytes
                     << ", effective_prefetch_limit_bytes="
                     << admission_limits.prefetch_limit_bytes
                     << ", read_min_protection_bytes="

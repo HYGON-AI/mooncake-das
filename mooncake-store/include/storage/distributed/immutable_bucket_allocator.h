@@ -172,6 +172,12 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
         return initialized_.load(std::memory_order_acquire);
     }
 
+    // Whether the master can refresh a sealed bucket's mtime. Requires the
+    // POSIX adapter and the private extension with write-context enabled;
+    // published as the .mooncake_dfs_write_context_capability sidecar and read
+    // by clients to decide whether they may skip per-write mtime updates.
+    bool MtimeRefreshOnSeal() const { return mtime_refresh_on_seal_; }
+
     tl::expected<DistributedFSDescriptor, ErrorCode> Allocate(
         const std::string& key, uint64_t size) override;
 
@@ -561,13 +567,20 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
 
     uint64_t UsedBytesLocked() const;
 
+    // The batch boundary is a private-extension placement hint now, so it has to
+    // be validated against the bucket geometry the same way the pre-change
+    // bucket_batch_alignment config was.
+    bool IsBatchBoundaryCompatible(uint64_t boundary, uint64_t capacity) const;
+
     std::string fsdir_;
     std::string fs_adapter_type_;
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
 
     uint64_t bucket_capacity_ = 0;
     uint64_t alignment_ = 4096;
-    uint64_t bucket_batch_alignment_ = 0;
+    // Batch boundary reported by the private extension and validated against the
+    // bucket geometry at Init(). Zero keeps the baseline per-key layout.
+    uint64_t dfe_batch_alignment_ = 0;
     int64_t max_bucket_count_ = 0;
     size_t ready_bucket_target_ = 4;
     size_t bucket_create_concurrency_ = 2;
@@ -576,8 +589,8 @@ class ImmutableBucketAllocator final : public DfsAllocatorInterface {
     double eviction_high_watermark_ = 0.9;
     double eviction_low_watermark_ = 0.7;
     std::chrono::seconds eviction_check_interval_{5};
-    // With the POSIX write context enabled, client write handles stop updating
-    // mtime, so the master refreshes it once when a bucket is sealed.
+    // With the POSIX adapter the client write handles may stop updating mtime,
+    // so the master refreshes it once when a bucket is sealed.
     bool mtime_refresh_on_seal_ = false;
     mutable std::mutex mutex_;
     // Serializes `.meta` writes and eviction deletion. Flush and eviction both

@@ -746,6 +746,37 @@ void MasterService::ReconcileDfsRootFiles() {
     reconcile(root, kDfsRootMarkerFileName,
               std::string(kDfsRootMarkerPayload,
                           sizeof(kDfsRootMarkerPayload) - 1));
+    // Heal the write-context capability sidecar if it was removed (e.g. by an
+    // operator). Its value is process-deterministic; clients treat an absent
+    // or unparseable file as the safe default, so this only restores the
+    // optimization. A present file (valid or corrupt) is left in place to
+    // avoid clobbering on a transient read error; it is republished on the
+    // next master restart.
+    {
+        const bool expected_value =
+            bucket_allocator_ ? bucket_allocator_->MtimeRefreshOnSeal()
+                              : false;
+        const std::string expected =
+            SerializeDfsWriteContextCapability(expected_value);
+        const std::string cap_path =
+            root + "/" + kDfsWriteContextCapabilityFileName;
+        if (ReadExpectedDfsRootFile(cap_path, expected) ==
+            DfsRootFileStatus::kMissing) {
+            if (PublishExpectedDfsRootFile(root, cap_path, expected)) {
+                LOG(WARNING) << "Recreated missing DFS write-context "
+                                "capability "
+                             << cap_path;
+            } else {
+                static DfsLogLimiter cap_log_limiter;
+                if (auto suppressed = cap_log_limiter.ShouldLog()) {
+                    LOG(ERROR)
+                        << "Failed to recreate missing DFS write-context "
+                           "capability "
+                        << cap_path << ", suppressed=" << *suppressed;
+                }
+            }
+        }
+    }
     for (size_t probe_index = 0;
          probe_index < kDfsReadProbeDirectoryNames.size(); ++probe_index) {
         const auto directory_name =

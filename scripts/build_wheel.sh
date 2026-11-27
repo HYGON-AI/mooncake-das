@@ -27,9 +27,7 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:${BUILD
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
-rm -f mooncake-wheel/mooncake/*.so
-# Store H2D scatter kernel artifact (built with -DUSE_HIP=ON).
-rm -f mooncake-wheel/mooncake/*.co
+rm -f mooncake-wheel/mooncake/*.so mooncake-wheel/mooncake/*.co
 
 if [ -d "${BUILD_DIR_ABS}/ep_pg_staging/_pg_jit" ]; then
     rm -rf mooncake-wheel/mooncake/_pg_jit
@@ -61,12 +59,6 @@ fi
 
 # Copy the shared segment wrapper, which builds on engine.so
 cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment.py
-
-# Copy the Store H2D scatter kernel when built with USE_HIP.
-if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co" ]; then
-    echo "Copying mc_copy_kernel (USE_HIP)..."
-    cp "${BUILD_DIR}/mooncake-transfer-engine/src/transport/hip_transport/mc_copy_kernel.co" mooncake-wheel/mooncake/mc_copy_kernel.co
-fi
 
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so

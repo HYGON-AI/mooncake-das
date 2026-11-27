@@ -20,6 +20,7 @@
 #include <unordered_set>
 
 #include "environ.h"
+#include "ext/dfe_loader.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
@@ -185,7 +186,6 @@ DistributedStorageBackend::~DistributedStorageBackend() {
         bucket_id_direct_cache_.clear();
         bucket_id_read_cache_.clear();
     }
-    batch_read_pool_.reset();
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
 
@@ -302,12 +302,11 @@ DistributedStorageBackend::ResolveTarget(
         }
     }
     if (!handle) {
-        // Only the POSIX adapter implements the write context, so only there
-        // must a read avoid the write fd. Other adapters keep sharing one fd
-        // even if the flag is set by mistake.
+        // Buffered reads get their own handle: the write handle may carry the
+        // write-context ioctl whose per-fd effects must not leak into reads.
+        // Direct reads already opened their own fd above.
         const bool separate_read =
-            for_read && distributed_config_.posix_write_context_enabled &&
-            distributed_config_.fs_adapter_type == "posix";
+            for_read && distributed_config_.fs_adapter_type == "posix";
         handle = separate_read
                      ? GetOrOpenBucketForRead(descriptor.shard_idx, epoch)
                      : GetOrOpenBucket(descriptor.shard_idx, epoch);

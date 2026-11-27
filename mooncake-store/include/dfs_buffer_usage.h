@@ -12,9 +12,6 @@
 
 namespace mooncake {
 
-inline constexpr uint64_t kHighWatermarkNumerator = 8;
-inline constexpr uint64_t kHighWatermarkDenominator = 10;
-
 enum class DfsBufferUsageKind : uint8_t { kRead, kPrefetch, kWrite };
 
 enum class DfsBufferAdmissionFailure : uint8_t {
@@ -71,6 +68,17 @@ class DfsBufferUsageTracker {
         return DfsBufferAdmissionLimits{read_min_protection_bytes_,
                                         write_min_protection_bytes_,
                                         prefetch_limit_bytes_};
+    }
+
+    // Fraction of the capacity whose crossing raises one high-usage warning.
+    // The baseline is four fifths; an extension provider may replace it.
+    void ConfigureHighWatermark(uint32_t numerator, uint32_t denominator) {
+        if (denominator == 0 || numerator == 0 || numerator > denominator) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        high_watermark_numerator_ = numerator;
+        high_watermark_denominator_ = denominator;
     }
 
     DfsBufferAdmissionFailure TryReserve(DfsBufferUsageKind kind,
@@ -172,9 +180,9 @@ class DfsBufferUsageTracker {
             if (capacity_bytes_ > 0) {
                 const bool above_threshold =
                     static_cast<unsigned __int128>(total_bytes_) *
-                        kHighWatermarkDenominator >=
+                        high_watermark_denominator_ >=
                     static_cast<unsigned __int128>(capacity_bytes_) *
-                        kHighWatermarkNumerator;
+                        high_watermark_numerator_;
                 warn = above_threshold && !high_watermark_warned_;
                 high_watermark_warned_ = above_threshold;
                 total = total_bytes_;
@@ -213,9 +221,9 @@ class DfsBufferUsageTracker {
             if (capacity_bytes_ > 0) {
                 const bool above_threshold =
                     static_cast<unsigned __int128>(total_bytes_) *
-                        kHighWatermarkDenominator >=
+                        high_watermark_denominator_ >=
                     static_cast<unsigned __int128>(capacity_bytes_) *
-                        kHighWatermarkNumerator;
+                        high_watermark_numerator_;
                 warn = above_threshold && !high_watermark_warned_;
                 high_watermark_warned_ = above_threshold;
                 total = total_bytes_;
@@ -245,9 +253,9 @@ class DfsBufferUsageTracker {
         total_bytes_ = total_bytes_ >= bytes ? total_bytes_ - bytes : 0;
         if (capacity_bytes_ > 0 &&
             static_cast<unsigned __int128>(total_bytes_) *
-                    kHighWatermarkDenominator <
+                    high_watermark_denominator_ <
                 static_cast<unsigned __int128>(capacity_bytes_) *
-                    kHighWatermarkNumerator) {
+                    high_watermark_numerator_) {
             high_watermark_warned_ = false;
         }
     }
@@ -287,6 +295,8 @@ class DfsBufferUsageTracker {
     uint64_t total_bytes_ = 0;
     uint64_t peak_total_bytes_ = 0;
     uint64_t capacity_bytes_ = 0;
+    uint32_t high_watermark_numerator_ = 4;
+    uint32_t high_watermark_denominator_ = 5;
     bool admission_configured_ = false;
     bool high_watermark_warned_ = false;
 };

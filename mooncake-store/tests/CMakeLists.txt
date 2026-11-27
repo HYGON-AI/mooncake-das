@@ -40,6 +40,26 @@ function(add_ha_test name)
 endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
+
+# Contract test for the public extension loader. A fake provider is built under
+# the name the loader looks for, inside its own directory, and that directory is
+# baked into the test so the loader resolves it from MOONCAKE_EXT_DIR.
+if(NOT WIN32)
+  add_library(fake_dfe_provider SHARED ext/fake_dfe_provider.cpp)
+  target_include_directories(fake_dfe_provider
+                             PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
+  set_target_properties(
+    fake_dfe_provider
+    PROPERTIES OUTPUT_NAME mooncake_dfe
+               SUFFIX ".so.1"
+               LIBRARY_OUTPUT_DIRECTORY
+               "${CMAKE_CURRENT_BINARY_DIR}/fake_provider")
+  add_store_test(extension_loader_test ext/extension_loader_test.cpp)
+  target_compile_definitions(
+    extension_loader_test
+    PRIVATE FAKE_DFE_PROVIDER_DIR="$<TARGET_FILE_DIR:fake_dfe_provider>")
+  add_dependencies(extension_loader_test fake_dfe_provider)
+endif()
 add_store_test(weight_management_contract_test
                weight_management_contract_test.cpp)
 add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)

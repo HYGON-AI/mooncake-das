@@ -14,6 +14,45 @@ inline constexpr std::string_view kDfsRootIdentityMagic =
     "mooncake-dfs-root-identity-v1";
 inline constexpr size_t kMaxDfsRootIdentitySize = 256;
 
+// Written by the master next to the root identity to advertise whether it can
+// refresh a sealed bucket's mtime. The client only skips the per-write mtime
+// update (via the write-context ioctl) when the master confirmed it can
+// compensate on seal; otherwise a split deployment (master without the private
+// extension, client with it) would freeze the mtime at the last real update.
+inline constexpr char kDfsWriteContextCapabilityFileName[] =
+    ".mooncake_dfs_write_context_capability";
+inline constexpr std::string_view kDfsWriteContextCapabilityMagic =
+    "mooncake-dfs-write-context-v1";
+inline constexpr size_t kMaxDfsWriteContextCapabilitySize = 64;
+
+inline std::string SerializeDfsWriteContextCapability(
+    bool master_refreshes_mtime) {
+    return std::string(kDfsWriteContextCapabilityMagic) + "\n" +
+           (master_refreshes_mtime ? "1" : "0") + "\n";
+}
+
+inline bool ParseDfsWriteContextCapability(std::string_view contents,
+                                           bool* master_refreshes_mtime) {
+    if (master_refreshes_mtime == nullptr) return false;
+    if (contents.empty() ||
+        contents.size() > kMaxDfsWriteContextCapabilitySize) {
+        return false;
+    }
+    const std::string prefix = std::string(kDfsWriteContextCapabilityMagic) + "\n";
+    if (!contents.starts_with(prefix)) return false;
+    contents.remove_prefix(prefix.size());
+    if (contents.size() != 2 || contents[1] != '\n') return false;
+    if (contents[0] == '1') {
+        *master_refreshes_mtime = true;
+        return true;
+    }
+    if (contents[0] == '0') {
+        *master_refreshes_mtime = false;
+        return true;
+    }
+    return false;
+}
+
 inline std::string SerializeDfsRootIdentity(const std::string& cluster_id,
                                             const UUID& token) {
     if (!IsValidClusterIdComponent(cluster_id) || token == UUID{}) {

@@ -3,10 +3,13 @@
 #include "storage/distributed/dfs_log_limiter.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <iterator>
 #include <limits>
@@ -18,6 +21,8 @@
 #include <unordered_set>
 
 #include "environ.h"
+#include "bool_parser.h"
+#include "ext/dfe_loader.h"
 #include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/dfs_io_timeout.h"
 #include "storage/distributed/immutable_bucket_allocator.h"
@@ -32,6 +37,23 @@ namespace mooncake {
 
 namespace {
 
+// Owns a raw fd for the duration of a cold open so an exception or early
+// return before the fd is handed to its cached OpenFileHandle cannot leak it.
+struct FdGuard {
+    FileSystemAdapter* adapter = nullptr;
+    int fd = -1;
+    ~FdGuard() {
+        if (fd >= 0 && adapter != nullptr) {
+            (void)adapter->CloseFile(fd);
+        }
+    }
+    int release() {
+        const int handed_off = fd;
+        fd = -1;
+        return handed_off;
+    }
+};
+
 std::string CanonicalizePath(const std::string& path) {
     std::error_code ec;
     auto canonical = std::filesystem::weakly_canonical(path, ec);
@@ -39,20 +61,138 @@ std::string CanonicalizePath(const std::string& path) {
     return canonical.lexically_normal().string();
 }
 
-// Bound temporary memory and I/O latency while still collapsing the common
-// BatchAllocate output to one read. Larger batches become a few contiguous
-// reads rather than one read per object.
-constexpr uint64_t kMaxMergedIo = 4ULL * 1024 * 1024;
 constexpr char kDfsHealthProbePayload[] = "mooncake-dfs-health-v1\n";
 
-struct MergedReadScratch {
-    std::vector<char> sink;
-    std::vector<iovec> iovs;
-    std::vector<iovec> pending;
-};
+// The private data-plane extension owns the read merge algorithm. This helper
+// only decides whether the current configuration may use it: the provider
+// issues raw positional I/O, so it is valid only for the POSIX adapter.
+bool DfeDataPlaneAvailable(const DistributedStorageConfig& config) {
+    return config.fs_adapter_type == "posix" &&
+           mooncake::ext::DfeProvider::Instance().available();
+}
 
-thread_local MergedReadScratch merged_read_scratch;
+// Only shape/availability rejections are worth redoing on the baseline path.
+// A real I/O error is final: retrying it would repeat the same failed syscall
+// for every object in the batch.
+bool ExtStatusNeedsBaselineFallback(int32_t status) {
+    return status == MOONCAKE_EXT_STATUS_INVALID_ARGUMENT ||
+           status == MOONCAKE_EXT_STATUS_UNAVAILABLE;
+}
 
+ErrorCode MapExtReadFailure(int32_t status, int32_t error_code) {
+    switch (status) {
+        case MOONCAKE_EXT_STATUS_NO_SPACE:
+            return ErrorCode::NO_AVAILABLE_HANDLE;
+        case MOONCAKE_EXT_STATUS_NOT_SUPPORTED:
+            return ErrorCode::NOT_SUPPORTED;
+        case MOONCAKE_EXT_STATUS_IO_ERROR:
+            // The provider reports the errno of the failing syscall, so the
+            // baseline mapping for a missing file still applies.
+            return error_code == ENOENT ? ErrorCode::FILE_NOT_FOUND
+                                        : ErrorCode::FILE_READ_FAIL;
+        case MOONCAKE_EXT_STATUS_DISABLED:
+            return ErrorCode::NOT_SUPPORTED;
+        default:
+            return ErrorCode::FILE_READ_FAIL;
+    }
+}
+
+ErrorCode MapExtWriteFailure(int32_t status, int32_t error_code) {
+    (void)error_code;
+    switch (status) {
+        case MOONCAKE_EXT_STATUS_NO_SPACE:
+            return ErrorCode::NO_AVAILABLE_HANDLE;
+        case MOONCAKE_EXT_STATUS_NOT_SUPPORTED:
+            return ErrorCode::NOT_SUPPORTED;
+        case MOONCAKE_EXT_STATUS_IO_ERROR:
+            // The baseline write path (PosixFsAdapter::WriteAt) maps every
+            // pwritev failure, including ENOENT, to FILE_WRITE_FAIL. Match it
+            // here so a missing bucket file reports the same error class with
+            // or without the extension, restoring the pre-change behaviour.
+            return ErrorCode::FILE_WRITE_FAIL;
+        case MOONCAKE_EXT_STATUS_DISABLED:
+            return ErrorCode::NOT_SUPPORTED;
+        default:
+            return ErrorCode::FILE_WRITE_FAIL;
+    }
+}
+
+// Runs `count` independent items across up to `max_threads` workers. Both the
+// baseline batch reader and the extension fallback used to be strictly serial,
+// which turned a large batch into a per-object latency pile-up.
+constexpr size_t kBaselineReadThreads = 128;
+constexpr size_t kFallbackThreads = 32;
+
+template <typename F>
+void RunParallel(size_t count, size_t max_threads, F&& fn) {
+    if (count == 0) return;
+    const size_t workers = std::min(max_threads == 0 ? size_t{1} : max_threads,
+                                    count);
+    if (workers <= 1) {
+        for (size_t i = 0; i < count; ++i) fn(i);
+        return;
+    }
+    std::atomic<size_t> next{0};
+    // An exception escaping a pool worker would call std::terminate, which in
+    // this backend runs inside the inference process. Capture the first one
+    // and rethrow it on the caller's thread only after every worker has been
+    // joined; the caller (or the detached timed-read worker) already maps a
+    // thrown batch to a whole-batch failure.
+    std::exception_ptr eptr;
+    std::mutex eptr_mutex;
+    const auto worker = [&] {
+        try {
+            for (size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                 i < count;
+                 i = next.fetch_add(1, std::memory_order_relaxed)) {
+                fn(i);
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(eptr_mutex);
+            if (!eptr) eptr = std::current_exception();
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    for (size_t i = 0; i < workers; ++i) {
+        try {
+            pool.emplace_back(worker);
+        } catch (...) {
+            // Thread creation can fail under resource pressure. Stop spawning;
+            // the caller's thread below picks up whatever is left.
+            break;
+        }
+    }
+    // Run the caller's share under the same barrier so an exception here does
+    // not leave the pool threads unjoined (which would terminate on their
+    // destruction during stack unwinding).
+    try {
+        worker();
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(eptr_mutex);
+        if (!eptr) eptr = std::current_exception();
+    }
+    for (auto& thread : pool) thread.join();
+    if (eptr) std::rethrow_exception(eptr);
+}
+
+void LogDfeBaselineFallback(const char* direction, size_t count) {
+    static std::atomic<uint64_t> batches{0};
+    static std::atomic<uint64_t> requests{0};
+    const uint64_t total_batches =
+        batches.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t total_requests =
+        requests.fetch_add(count, std::memory_order_relaxed) + count;
+    static DfsLogLimiter limiter;
+    if (auto suppressed = limiter.ShouldLog()) {
+        LOG(WARNING) << "DFS " << direction
+                     << " batch rejected by the extension; redoing only the "
+                        "rejected items on the baseline path: requests="
+                     << count << ", fallback_batches=" << total_batches
+                     << ", fallback_requests=" << total_requests
+                     << ", suppressed=" << *suppressed;
+    }
+}
 
 }  // namespace
 
@@ -123,7 +263,6 @@ void DistributedStorageBackend::ResetFailedInitializationLocked() {
         bucket_id_direct_cache_.clear();
         bucket_id_read_cache_.clear();
     }
-    batch_read_pool_.reset();
     canonical_root_dir_.clear();
     if (fs_adapter_) (void)fs_adapter_->Shutdown();
     initialized_.store(false, std::memory_order_release);
@@ -279,51 +418,110 @@ DistributedStorageBackend::GetOrOpenBucket(int64_t bucket_id,
         return tl::make_unexpected(fd_result.error());
     }
     int fd = *fd_result;
+    // Own the fd immediately: the capability read and the write-context probe
+    // below can throw (e.g. bad_alloc) and used to leak it.
+    FdGuard fd_guard{fs_adapter_.get(), fd};
 
     // Write-context ioctl is a pure optimization. If the filesystem does not
     // implement it, or rejects it for any other reason, fall back to the plain
     // locked write path instead of failing the write. Once it fails the process
     // stops probing it, so an unsupported filesystem never induces an
     // open+ioctl+close storm for every cold bucket.
-    if (distributed_config_.posix_write_context_enabled &&
-        distributed_config_.fs_adapter_type == "posix" &&
-        !posix_write_context_unavailable_.load(std::memory_order_relaxed)) {
-        auto context = fs_adapter_->SetBucketWriteContext(
-            fd, distributed_config_.bucket_capacity);
-        if (context) {
-            // One INFO per process; the ioctl is otherwise silent.
+    //
+    // The switch is also a safety escape hatch: when the operator turns it off
+    // both the client and the master must keep the filesystem mtime update.
+    // Parse it with the shared rules so FALSE/Off/disable behave like 0.
+    static const bool write_context_configured = [] {
+        const char* raw =
+            std::getenv("MOONCAKE_DFS_POSIX_WRITE_CONTEXT_ENABLED");
+        if (raw == nullptr) return true;
+        return TryParseBool(raw).value_or(true);
+    }();
+    // Split deployments can run the master without the private extension.
+    // Skipping the per-write mtime update is only safe when the master
+    // advertised that it refreshes the mtime on seal; otherwise the value
+    // would freeze at the last real update. Cache the answer, but drop it on
+    // every Master epoch change (see AcquireBucketEpoch): a restarted master
+    // may run a different private-extension build and flip the capability, so
+    // a stale cache could keep skipping per-write mtime updates against a
+    // master that no longer compensates on seal.
+    const auto master_refreshes_mtime = [&]() {
+        const int cached =
+            master_mtime_refresh_support_.load(std::memory_order_relaxed);
+        if (cached >= 0) return cached != 0;
+        bool supported = false;
+        const std::string capability_path =
+            root_dir_ + "/" + kDfsWriteContextCapabilityFileName;
+        std::vector<char> contents(kMaxDfsWriteContextCapabilitySize);
+        auto read = fs_adapter_->ReadFile(capability_path, contents.data(),
+                                          contents.size());
+        if (read && *read <= kMaxDfsWriteContextCapabilitySize) {
+            (void)ParseDfsWriteContextCapability(
+                std::string_view(contents.data(), *read), &supported);
+        }
+        master_mtime_refresh_support_.store(supported ? 1 : 0,
+                                            std::memory_order_relaxed);
+        return supported;
+    };
+    if (distributed_config_.fs_adapter_type == "posix" &&
+        mooncake::ext::DfeProvider::Instance().available()) {
+        // Config-off and a master that cannot refresh mtime are re-evaluated
+        // on every cold open from cheap sources (a process-lifetime constant
+        // and the epoch-fresh capability cache above), so they are not latched
+        // here. Only a filesystem ioctl failure is permanent for this client
+        // and survives a Master generation change.
+        if (!write_context_configured) {
             LOG_FIRST_N(INFO, 1)
-                << "DFS bucket write context enabled: client skips per-write "
-                   "mtime updates (range locks retained)";
-        } else {
-            posix_write_context_unavailable_.store(true,
-                                                   std::memory_order_relaxed);
-            static DfsLogLimiter log_limiter;
-            if (auto suppressed = log_limiter.ShouldLog()) {
-                LOG(WARNING)
-                    << "DFS bucket write-context ioctl failed for " << path
-                    << " (error=" << context.error()
-                    << "); disabling it for this process and falling back to "
-                       "the legacy write path from now on, suppressed="
-                    << *suppressed;
-            }
-            if (context.error() != ErrorCode::NOT_SUPPORTED) {
-                // A hard error may have left the fd in an unknown state.
-                // Replace it with a clean handle before writing through it.
-                (void)fs_adapter_->CloseFile(fd);
-                auto reopened = fs_adapter_->OpenFileReadWriteExisting(path);
-                if (!reopened) {
-                    return tl::make_unexpected(reopened.error());
+                << "DFS bucket write context disabled by configuration "
+                   "(MOONCAKE_DFS_POSIX_WRITE_CONTEXT_ENABLED); keeping the "
+                   "per-write mtime update";
+        } else if (!master_refreshes_mtime()) {
+            LOG_FIRST_N(INFO, 1)
+                << "DFS bucket write context disabled: the master does not "
+                   "advertise sealed-bucket mtime refresh (private extension "
+                   "missing on the master?); keeping the per-write mtime "
+                   "update";
+        } else if (!posix_write_context_unavailable_.load(
+                       std::memory_order_relaxed)) {
+            auto context = fs_adapter_->SetBucketWriteContext(
+                fd_guard.fd, distributed_config_.bucket_capacity);
+            if (context) {
+                // One INFO per process; the ioctl is otherwise silent.
+                LOG_FIRST_N(INFO, 1)
+                    << "DFS bucket write context enabled: client skips "
+                       "per-write mtime updates (range locks retained)";
+            } else {
+                posix_write_context_unavailable_.store(
+                    true, std::memory_order_relaxed);
+                static DfsLogLimiter log_limiter;
+                if (auto suppressed = log_limiter.ShouldLog()) {
+                    LOG(WARNING)
+                        << "DFS bucket write-context ioctl failed for " << path
+                        << " (error=" << context.error()
+                        << "); disabling it for this process and falling back "
+                           "to the legacy write path from now on, suppressed="
+                        << *suppressed;
                 }
-                fd = *reopened;
+                if (context.error() != ErrorCode::NOT_SUPPORTED) {
+                    // A hard error may have left the fd in an unknown state.
+                    // Replace it with a clean handle before writing through it.
+                    (void)fs_adapter_->CloseFile(fd_guard.fd);
+                    fd_guard.fd = -1;  // avoid a double-close if reopen fails
+                    auto reopened =
+                        fs_adapter_->OpenFileReadWriteExisting(path);
+                    if (!reopened) {
+                        return tl::make_unexpected(reopened.error());
+                    }
+                    fd_guard.fd = *reopened;
+                }
             }
         }
     }
 
     auto handle = std::make_shared<OpenFileHandle>();
-    handle->path = path;
-    handle->fd = fd;
     handle->adapter = fs_adapter_.get();
+    handle->fd = fd_guard.release();
+    handle->path = path;
 
     // A queued operation may still carry the old epoch before this client has
     // observed a restart. Confirm AFTER opening: an old location must never
@@ -370,11 +568,13 @@ DistributedStorageBackend::GetOrOpenBucketForRead(int64_t bucket_id,
         }
         return tl::make_unexpected(fd_result.error());
     }
+    int read_fd = *fd_result;
+    FdGuard fd_guard{fs_adapter_.get(), read_fd};
 
     auto handle = std::make_shared<OpenFileHandle>();
-    handle->path = path;
-    handle->fd = *fd_result;
     handle->adapter = fs_adapter_.get();
+    handle->fd = fd_guard.release();
+    handle->path = path;
 
     // A queued operation may still carry the old epoch before this client has
     // observed a restart. Confirm AFTER opening: an old location must never
@@ -500,6 +700,12 @@ DistributedStorageBackend::AcquireBucketEpoch(const UUID& epoch) {
         if (bucket_epoch_ != UUID{})
             retired_bucket_epochs_.insert(bucket_epoch_);
         bucket_epoch_ = epoch;
+        // A restarted Master may run a different private-extension build, so
+        // its sealed-bucket mtime-refresh capability can flip. Drop the cached
+        // answer so the next cold write re-reads the capability file. The
+        // ioctl latch (posix_write_context_unavailable_) is a filesystem
+        // property and survives the generation change.
+        master_mtime_refresh_support_.store(-1, std::memory_order_relaxed);
         LOG(INFO) << "Invalidated " << *invalidated
                   << " DFS bucket handles before using a changed Master epoch";
     }
@@ -686,93 +892,91 @@ DistributedStorageBackend::BatchWriteBucket(
                             std::move(payload)});
     }
 
-    auto write_run = [&](size_t begin, size_t end) {
-        size_t pos = begin;
-        while (pos < end) {
-            size_t stop = pos;
-            uint64_t total_size = 0;
-            constexpr size_t kMaxIov = 1024;
-            while (stop < end && stop - pos < kMaxIov &&
-                   (stop == pos || total_size + prepared[stop].payload.size() <=
-                                       kMaxMergedIo)) {
-                total_size += prepared[stop].payload.size();
-                ++stop;
+    // Baseline write for one prepared object. Shared by the all-baseline path
+    // and by the fallback that only redoes objects the provider rejected.
+    const auto write_one = [&](size_t prepared_index) {
+        const auto& item = prepared[prepared_index];
+        const auto& payload = item.payload;
+        uint64_t written = 0;
+        ErrorCode error = ErrorCode::OK;
+        while (written < payload.size()) {
+            iovec iov{const_cast<char*>(payload.data()) + written,
+                      static_cast<size_t>(payload.size() - written)};
+            auto result = fs_adapter_->WriteAt(
+                item.target.fd, &iov, 1,
+                static_cast<int64_t>(item.offset + written));
+            if (!result) {
+                error = result.error();
+                break;
             }
-
-            std::vector<iovec> iovs;
-            iovs.reserve(stop - pos);
-            for (size_t j = pos; j < stop; ++j) {
-                iovs.push_back(
-                    {prepared[j].payload.data(), prepared[j].payload.size()});
+            if (*result == 0) {
+                error = ErrorCode::FILE_WRITE_FAIL;
+                break;
             }
-
-            uint64_t written = 0;
-            size_t iov_index = 0;
-            uint64_t iov_consumed = 0;
-            ErrorCode error = ErrorCode::OK;
-            while (written < total_size) {
-                std::vector<iovec> pending;
-                pending.reserve(iovs.size() - iov_index);
-                pending.push_back(
-                    {static_cast<char*>(iovs[iov_index].iov_base) +
-                         iov_consumed,
-                     iovs[iov_index].iov_len - iov_consumed});
-                for (size_t j = iov_index + 1; j < iovs.size(); ++j) {
-                    pending.push_back(iovs[j]);
-                }
-                auto result = fs_adapter_->WriteAt(
-                    prepared[pos].target.fd, pending.data(),
-                    static_cast<int>(pending.size()),
-                    static_cast<int64_t>(prepared[pos].offset + written));
-                if (!result) {
-                    error = result.error();
-                    break;
-                }
-                if (*result == 0) {
-                    error = ErrorCode::FILE_WRITE_FAIL;
-                    break;
-                }
-                uint64_t advanced = *result;
-                written += advanced;
-                while (advanced != 0 && iov_index < iovs.size()) {
-                    const uint64_t available =
-                        iovs[iov_index].iov_len - iov_consumed;
-                    const uint64_t step =
-                        std::min<uint64_t>(advanced, available);
-                    iov_consumed += step;
-                    advanced -= step;
-                    if (iov_consumed == iovs[iov_index].iov_len) {
-                        ++iov_index;
-                        iov_consumed = 0;
-                    }
-                }
-            }
-            if (error == ErrorCode::OK && written == total_size) {
-                for (size_t j = pos; j < stop; ++j) {
-                    results[prepared[j].index] = {};
-                }
-            } else {
-                if (error == ErrorCode::OK) error = ErrorCode::FILE_WRITE_FAIL;
-                for (size_t j = pos; j < stop; ++j) {
-                    results[prepared[j].index] = tl::make_unexpected(error);
-                }
-            }
-            pos = stop;
+            written += *result;
+        }
+        if (error == ErrorCode::OK) {
+            results[item.index] = {};
+        } else {
+            results[item.index] = tl::make_unexpected(error);
         }
     };
-    size_t run = 0;
-    for (size_t i = 1; i <= prepared.size(); ++i) {
-        bool contiguous =
-            i < prepared.size() &&
-            prepared[i - 1].target.fd == prepared[i].target.fd &&
-            prepared[i - 1].target.mutex == prepared[i].target.mutex &&
-            prepared[i].offset ==
-                prepared[i - 1].offset + prepared[i - 1].payload.size();
-        if (!contiguous) {
-            if (run < i) write_run(run, i);
-            run = i;
+
+    // The private data-plane extension owns the write-side run merge and
+    // parallelism. Every payload stays owned here; only the positional write
+    // is delegated. A shape the provider cannot take falls back below.
+    if (!prepared.empty() && DfeDataPlaneAvailable(distributed_config_)) {
+        std::vector<mooncake_ext_iovec> iovecs(prepared.size());
+        std::vector<mooncake_ext_io_request> io_requests(prepared.size());
+        for (size_t i = 0; i < prepared.size(); ++i) {
+            iovecs[i].base = prepared[i].payload.data();
+            iovecs[i].length = prepared[i].payload.size();
+            auto& request = io_requests[i];
+            request.fd = prepared[i].target.fd;
+            request.offset = prepared[i].offset;
+            request.total_size = prepared[i].payload.size();
+            request.op = MOONCAKE_EXT_IO_WRITE;
+            request.mergeable = 1;
+            request.iovecs = &iovecs[i];
+            request.iovec_count = 1;
+        }
+        std::vector<mooncake_ext_io_result> io_results(prepared.size());
+        if (mooncake::ext::DfeProvider::Instance().IoBatch(
+                io_requests.data(), io_results.data(), io_requests.size())) {
+            std::vector<size_t> fallback;
+            for (size_t i = 0; i < io_results.size(); ++i) {
+                const auto& item = prepared[i];
+                const bool ok =
+                    io_results[i].status == MOONCAKE_EXT_STATUS_OK &&
+                    io_results[i].bytes_done == item.payload.size();
+                if (ok) {
+                    results[item.index] = tl::expected<void, ErrorCode>{};
+                    continue;
+                }
+                if (ExtStatusNeedsBaselineFallback(io_results[i].status)) {
+                    // Shape/availability rejection: redo only this object on
+                    // the baseline path, never the objects already served.
+                    fallback.push_back(i);
+                    continue;
+                }
+                // A real I/O error is final. Retrying it would repeat the
+                // same failing write, so map it through the provider's errno.
+                results[item.index] = tl::make_unexpected(
+                    MapExtWriteFailure(io_results[i].status,
+                                       io_results[i].error_code));
+            }
+            if (!fallback.empty()) {
+                LogDfeBaselineFallback("write", fallback.size());
+                RunParallel(fallback.size(), kFallbackThreads,
+                            [&](size_t k) { write_one(fallback[k]); });
+            }
+            return results;
         }
     }
+
+    // Baseline write path: one positional write per object. Run merging and
+    // parallel dispatch belong to the private extension above.
+    for (size_t i = 0; i < prepared.size(); ++i) write_one(i);
     return results;
 }
 
@@ -781,9 +985,7 @@ DistributedStorageBackend::PrepareReadTasks(
     const std::vector<DfsReadRequest>& requests,
     std::vector<tl::expected<void, ErrorCode>>& results) {
     std::vector<ReadTask> tasks;
-    std::vector<ReadTask> oversized_tasks;
     tasks.reserve(requests.size());
-    oversized_tasks.reserve(requests.size());
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
         auto target = ResolveTarget(
@@ -834,65 +1036,18 @@ DistributedStorageBackend::PrepareReadTasks(
         task.direct_read = distributed_config_.direct_read_enabled &&
                            task.target.direct_read;
         task.entries.push_back({i, task.io_offset});
-        const bool merge_candidate =
-            !request.range_read && IsBucketMode() &&
-            distributed_config_.batch_read_merge_enabled &&
-            task.total_size <= kMaxMergedIo;
-        if (merge_candidate) {
-            tasks.push_back(std::move(task));
-        } else {
-            oversized_tasks.push_back(std::move(task));
-        }
+        tasks.push_back(std::move(task));
     }
-
-    if (!IsBucketMode() || !distributed_config_.batch_read_merge_enabled) {
-        tasks.insert(tasks.end(), std::make_move_iterator(oversized_tasks.begin()),
-                     std::make_move_iterator(oversized_tasks.end()));
-        return tasks;
-    }
-    std::sort(tasks.begin(), tasks.end(), [](const ReadTask& a,
-                                             const ReadTask& b) {
-        if (a.target.fd != b.target.fd) {
-            return a.target.fd < b.target.fd;
-        }
-        return a.io_offset < b.io_offset;
-    });
-
-    std::vector<ReadTask> merged;
-    merged.reserve(tasks.size());
-    for (auto& task : tasks) {
-        const uint64_t task_end = task.io_offset + task.total_size;
-        if (!merged.empty() &&
-            merged.back().target.fd == task.target.fd &&
-            merged.back().target.mutex == task.target.mutex &&
-            merged.back().io_offset + merged.back().total_size ==
-                task.io_offset &&
-            task_end - merged.back().io_offset <= kMaxMergedIo) {
-            merged.back().total_size = task_end - merged.back().io_offset;
-            merged.back().merged = true;
-            merged.back().entries.insert(merged.back().entries.end(),
-                                         task.entries.begin(),
-                                         task.entries.end());
-            continue;
-        }
-        merged.push_back(std::move(task));
-    }
-    merged.insert(merged.end(),
-                  std::make_move_iterator(oversized_tasks.begin()),
-                  std::make_move_iterator(oversized_tasks.end()));
-    return merged;
+    return tasks;
 }
 
-// Dispatches merged bucket tasks to the staging-buffer path; all other tasks
-// contain one request and use direct scatter reads into the caller's slices.
+// Each task now carries exactly one request. Reads scatter straight into the
+// caller's slices; the optional private extension may merge and parallelize
+// them across equally-shaped tasks.
 void DistributedStorageBackend::ExecuteReadTask(
     const ReadTask& task, const std::vector<DfsReadRequest>& requests,
     std::vector<tl::expected<void, ErrorCode>>& results) {
-    if (task.merged || task.entries.size() > 1) {
-        ExecuteMergedReadTask(task, requests, results);
-    } else {
-        ExecuteSingleReadTask(task, requests, results);
-    }
+    ExecuteSingleReadTask(task, requests, results);
 }
 
 void DistributedStorageBackend::ExecuteSingleReadTask(
@@ -984,174 +1139,130 @@ void DistributedStorageBackend::ExecuteSingleReadTask(
                                : tl::make_unexpected(error);
 }
 
-void DistributedStorageBackend::ExecuteMergedReadTask(
-    const ReadTask& task, const std::vector<DfsReadRequest>& requests,
-    std::vector<tl::expected<void, ErrorCode>>& results) {
-    if (task.entries.empty()) return;
-    // Reuse worker-local storage. Determine the full padding size before adding
-    // pointers into sink so later growth cannot invalidate existing iovecs.
-    auto& scratch = merged_read_scratch;
-    uint64_t total_padding = 0;
-    for (const auto& entry : task.entries) {
-        const auto& request = requests[entry.request_index];
-        const uint64_t reserved = IsBucketMode()
-                                      ? request.descriptor.aligned_size
-                                      : request.descriptor.object_size;
-        uint64_t covered = 0;
-        for (const auto& slice : request.slices) {
-            if (covered >= reserved) break;
-            covered += std::min<uint64_t>(slice.size, reserved - covered);
-        }
-        if (covered < reserved) total_padding += reserved - covered;
-    }
-
-    scratch.sink.resize(static_cast<size_t>(total_padding));
-    scratch.iovs.clear();
-    scratch.iovs.reserve(task.entries.size() * 2);
-    size_t sink_offset = 0;
-    for (const auto& entry : task.entries) {
-        const auto& request = requests[entry.request_index];
-        const uint64_t reserved = IsBucketMode()
-                                      ? request.descriptor.aligned_size
-                                      : request.descriptor.object_size;
-        uint64_t collected = 0;
-        for (const auto& slice : request.slices) {
-            if (collected >= reserved) break;
-            const uint64_t size =
-                std::min<uint64_t>(slice.size, reserved - collected);
-            if (size != 0) {
-                scratch.iovs.push_back({slice.ptr, static_cast<size_t>(size)});
-                collected += size;
-            }
-        }
-        if (collected < reserved) {
-            const size_t padding = static_cast<size_t>(reserved - collected);
-            scratch.iovs.push_back({scratch.sink.data() + sink_offset, padding});
-            sink_offset += padding;
-        }
-    }
-
-    constexpr size_t kMaxIovChunk = 1024;
-    scratch.pending.clear();
-    scratch.pending.reserve(kMaxIovChunk);
-    ErrorCode error = ErrorCode::OK;
-    uint64_t done = 0;
-    size_t index = 0;
-    uint64_t iov_consumed = 0;
-    while (done < task.total_size && index < scratch.iovs.size()) {
-        scratch.pending.clear();
-        scratch.pending.push_back(
-            {static_cast<char*>(scratch.iovs[index].iov_base) + iov_consumed,
-             scratch.iovs[index].iov_len - iov_consumed});
-        for (size_t j = index + 1;
-             j < scratch.iovs.size() && scratch.pending.size() < kMaxIovChunk;
-             ++j) {
-            scratch.pending.push_back(scratch.iovs[j]);
-        }
-        auto read_result = task.direct_read
-                               ? fs_adapter_->DirectReadAt(
-                                     task.target.fd, scratch.pending.data(),
-                                     static_cast<int>(scratch.pending.size()),
-                                     static_cast<int64_t>(task.io_offset + done))
-                               : fs_adapter_->ReadAt(
-                                     task.target.fd, scratch.pending.data(),
-                                     static_cast<int>(scratch.pending.size()),
-                                     static_cast<int64_t>(task.io_offset + done));
-        if (!read_result) {
-            error = read_result.error();
-            break;
-        }
-        if (*read_result == 0) {
-            error = ErrorCode::FILE_READ_FAIL;
-            break;
-        }
-        uint64_t advanced = *read_result;
-        done += advanced;
-        while (advanced != 0 && index < scratch.iovs.size()) {
-            const uint64_t available =
-                scratch.iovs[index].iov_len - iov_consumed;
-            const uint64_t step = std::min<uint64_t>(advanced, available);
-            iov_consumed += step;
-            advanced -= step;
-            if (iov_consumed == scratch.iovs[index].iov_len) {
-                ++index;
-                iov_consumed = 0;
-            }
-        }
-    }
-    if (error == ErrorCode::OK && done != task.total_size) {
-        error = ErrorCode::FILE_READ_FAIL;
-    }
-    for (const auto& entry : task.entries) {
-        results[entry.request_index] =
-            error == ErrorCode::OK ? tl::expected<void, ErrorCode>{}
-                                   : tl::make_unexpected(error);
-    }
-}
-
 void DistributedStorageBackend::ExecuteReadTasks(
     const std::vector<ReadTask>& tasks,
     const std::vector<DfsReadRequest>& requests,
     std::vector<tl::expected<void, ErrorCode>>& results) {
-    if (batch_read_pool_ == nullptr || tasks.size() <= 1) {
-        for (const auto& task : tasks) {
-            ExecuteReadTask(task, requests, results);
+    const auto run_serial = [&]() {
+        for (const auto& task : tasks) ExecuteReadTask(task, requests, results);
+    };
+    if (tasks.empty()) return;
+
+    // A single request has nothing to merge. Keep it on the baseline path so
+    // the common small-GET case never pays the provider handshake.
+    if (tasks.size() <= 1 || !IsBucketMode() ||
+        !DfeDataPlaneAvailable(distributed_config_)) {
+        // Without the extension there is no merge to do, but the reads are
+        // still independent: run them concurrently instead of serially, which
+        // matches the pre-change batch reader's concurrency.
+        if (tasks.size() <= 1) {
+            run_serial();
+        } else {
+            RunParallel(tasks.size(), kBaselineReadThreads, [&](size_t k) {
+                ExecuteReadTask(tasks[k], requests, results);
+            });
         }
         return;
     }
 
-    const size_t worker_count = std::min<size_t>(
-        static_cast<size_t>(distributed_config_.batch_read_threads), tasks.size());
-    std::atomic<size_t> next_task{0};
-    std::mutex completion_mutex;
-    std::condition_variable completion_cv;
-    size_t pending_workers = 0;
-    auto mark_done = [&completion_mutex, &completion_cv, &pending_workers]() {
-        std::lock_guard<std::mutex> lock(completion_mutex);
-        --pending_workers;
-        completion_cv.notify_one();
-    };
+    // One provider request per task. The provider merges adjacent requests
+    // that share an fd and parallelizes the resulting runs. Buffers and sinks
+    // stay owned here and outlive the synchronous call.
+    std::vector<std::vector<char>> sinks(tasks.size());
+    std::vector<std::vector<mooncake_ext_iovec>> iov_storage(tasks.size());
+    std::vector<mooncake_ext_io_request> io_requests;
+    std::vector<size_t> task_indices;
+    io_requests.reserve(tasks.size());
+    task_indices.reserve(tasks.size());
 
-    auto worker_fn = [this, &tasks, &requests, &results, &mark_done,
-                      &next_task]() {
-        while (true) {
-            const size_t task_index =
-                next_task.fetch_add(1, std::memory_order_relaxed);
-            if (task_index >= tasks.size()) break;
-            try {
-                ExecuteReadTask(tasks[task_index], requests, results);
-            } catch (const std::exception& e) {
-                LOG(ERROR) << "Batch read task failed: " << e.what();
-                for (const auto& entry : tasks[task_index].entries) {
-                    results[entry.request_index] =
-                        tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                }
-            } catch (...) {
-                LOG(ERROR) << "Batch read task failed";
-                for (const auto& entry : tasks[task_index].entries) {
-                    results[entry.request_index] =
-                        tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                }
+    for (size_t task_index = 0; task_index < tasks.size(); ++task_index) {
+        const auto& task = tasks[task_index];
+        if (task.entries.empty()) continue;
+        const auto& request = requests[task.entries.front().request_index];
+        auto& iovs = iov_storage[task_index];
+        uint64_t collected = 0;
+        iovs.reserve(request.slices.size() + 1);
+        for (const auto& slice : request.slices) {
+            if (collected >= task.total_size) break;
+            const uint64_t size =
+                std::min<uint64_t>(slice.size, task.total_size - collected);
+            if (size != 0) {
+                iovs.push_back({slice.ptr, size});
+                collected += size;
             }
         }
-        mark_done();
-    };
+        auto& sink = sinks[task_index];
+        if (collected < task.total_size) {
+            sink.resize(static_cast<size_t>(task.total_size - collected));
+            iovs.push_back({sink.data(), sink.size()});
+        }
+        if (iovs.empty()) {
+            if (task.total_size == 0) {
+                results[task.entries.front().request_index] =
+                    tl::expected<void, ErrorCode>{};
+            }
+            continue;
+        }
 
-    for (size_t worker = 0; worker < worker_count; ++worker) {
-        {
-            std::lock_guard<std::mutex> lock(completion_mutex);
-            ++pending_workers;
-        }
-        try {
-            batch_read_pool_->enqueue(worker_fn);
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Failed to enqueue batch read worker: " << e.what();
-            worker_fn();
-        }
+        mooncake_ext_io_request io_request{};
+        io_request.fd = task.target.fd;
+        io_request.offset = task.io_offset;
+        io_request.total_size = task.total_size;
+        io_request.op = MOONCAKE_EXT_IO_READ;
+        io_request.direct_io = task.direct_read ? 1u : 0u;
+        io_request.mergeable = 1;
+        io_request.worker_count = 0;
+        io_request.iovecs = iovs.data();
+        io_request.iovec_count = iovs.size();
+        io_requests.push_back(io_request);
+        task_indices.push_back(task_index);
     }
 
-    std::unique_lock<std::mutex> lock(completion_mutex);
-    completion_cv.wait(lock, [&pending_workers] { return pending_workers == 0; });
+    if (io_requests.empty()) return;
+    std::vector<mooncake_ext_io_result> io_results(io_requests.size());
+    // Pre-seed as failure: the enum value of OK is 0, so a value-initialised
+    // slot would otherwise look like a successful zero-length read.
+    for (auto& result : io_results) {
+        result.status = MOONCAKE_EXT_STATUS_IO_ERROR;
+        result.bytes_done = 0;
+    }
+    if (!mooncake::ext::DfeProvider::Instance().IoBatch(
+            io_requests.data(), io_results.data(), io_requests.size())) {
+        // The provider failed before returning per-request results. Redo the
+        // batch on the baseline path in parallel: a serial redo would multiply
+        // the batch latency by the number of objects.
+        LogDfeBaselineFallback("read", task_indices.size());
+        RunParallel(task_indices.size(), kFallbackThreads, [&](size_t k) {
+            ExecuteReadTask(tasks[task_indices[k]], requests, results);
+        });
+        return;
+    }
+    // Only a shape/availability rejection is rerun on the baseline path; an
+    // I/O error is final and is mapped through the provider's errno.
+    std::vector<size_t> fallback;
+    for (size_t i = 0; i < io_results.size(); ++i) {
+        const auto& task = tasks[task_indices[i]];
+        const bool ok =
+            io_results[i].status == MOONCAKE_EXT_STATUS_OK &&
+            io_results[i].bytes_done == task.total_size;
+        if (ok) {
+            results[task.entries.front().request_index] =
+                tl::expected<void, ErrorCode>{};
+            continue;
+        }
+        if (ExtStatusNeedsBaselineFallback(io_results[i].status)) {
+            fallback.push_back(i);
+            continue;
+        }
+        results[task.entries.front().request_index] = tl::make_unexpected(
+            MapExtReadFailure(io_results[i].status, io_results[i].error_code));
+    }
+    if (!fallback.empty()) {
+        LogDfeBaselineFallback("read", fallback.size());
+        RunParallel(fallback.size(), kFallbackThreads, [&](size_t k) {
+            ExecuteReadTask(tasks[task_indices[fallback[k]]], requests, results);
+        });
+    }
 }
 
 ErrorCode DistributedStorageBackend::AcquireInflightReadUntil(
@@ -1228,10 +1339,9 @@ DistributedStorageBackend::InitBucketModeLocked() {
         ResetFailedInitializationLocked();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (distributed_config_.batch_read_threads > 1) {
-        batch_read_pool_ = std::make_unique<ThreadPool>(
-            static_cast<size_t>(distributed_config_.batch_read_threads));
-    }
+    const auto& dfe = mooncake::ext::DfeProvider::Instance();
+    LOG(INFO) << "DFS private data-plane extension: state=" << dfe.state()
+              << " detail=" << dfe.detail();
     initialized_.store(true, std::memory_order_release);
     LOG(INFO) << "DistributedStorageBackend initialized in bucket mode, "
                  "fsdir="

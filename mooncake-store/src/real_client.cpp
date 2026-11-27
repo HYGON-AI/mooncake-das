@@ -1739,7 +1739,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         prefetch_arena_available_.store(
             enable_dfs_prefetch && file_storage_->HasPinnedRestoreArena() &&
-                file_storage_config.prefetch_capacity_ratio > 0.0 &&
                 file_storage_->UnifiedPrefetchLimitBytes() > 0,
             std::memory_order_release);
     }

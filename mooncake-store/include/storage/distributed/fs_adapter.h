@@ -5,6 +5,7 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -481,6 +482,48 @@ inline uint64_t TotalIovBytes(const iovec* iov, int iovcnt) {
 // probe files under .health1 and .health2 instead.
 inline constexpr char kDfsRootMarkerFileName[] = ".mooncake_dfs_root_marker";
 inline constexpr char kDfsRootMarkerPayload[] = "mooncake-dfs-root-v1\n";
+
+// Atomically replace a stable sidecar file so a concurrent reader never
+// observes a half-written payload: write a unique temp file in the same
+// directory, fsync it, rename it over the target, then fsync the parent
+// directory. Readers must treat a missing or unparseable target as the safe
+// default; a failed publish leaves the previous contents (or nothing) in place
+// and removes the temp file. Uses only the adapter's generic primitives so it
+// works for every adapter that implements WriteFile/RenameFile/SyncFile.
+inline tl::expected<void, ErrorCode> PublishDfsFileAtomic(
+    FileSystemAdapter& adapter, const std::string& path,
+    std::span<const char> data) {
+    static std::atomic<uint64_t> temp_counter{0};
+    const std::string temp_path =
+        path + ".tmp." + std::to_string(::getpid()) + "." +
+        std::to_string(temp_counter.fetch_add(1, std::memory_order_relaxed));
+    const auto cleanup = [&] { (void)adapter.DeleteFile(temp_path); };
+
+    auto written = adapter.WriteFile(temp_path, data);
+    if (!written) {
+        cleanup();
+        return tl::make_unexpected(written.error());
+    }
+    if (*written != data.size()) {
+        cleanup();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (auto synced = adapter.SyncFile(temp_path); !synced) {
+        cleanup();
+        return tl::make_unexpected(synced.error());
+    }
+    if (auto renamed = adapter.RenameFile(temp_path, path); !renamed) {
+        cleanup();
+        return tl::make_unexpected(renamed.error());
+    }
+    // Best-effort: losing the directory sync only costs rename durability, not
+    // the atomicity a reader observes on the target name.
+    const size_t slash = path.find_last_of('/');
+    if (slash != std::string::npos) {
+        (void)adapter.SyncDirectory(path.substr(0, slash));
+    }
+    return {};
+}
 
 inline tl::expected<void, ErrorCode> EnsureDfsRootMarker(
     FileSystemAdapter& adapter, const std::string& path) {

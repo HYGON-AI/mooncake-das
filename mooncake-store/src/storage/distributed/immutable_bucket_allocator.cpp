@@ -1,4 +1,7 @@
 #include "storage/distributed/immutable_bucket_allocator.h"
+
+#include "ext/dfe_loader.h"
+#include "storage/distributed/bucket_entry_layout.h"
 #include "storage/distributed/dfs_log_limiter.h"
 
 #include <glog/logging.h>
@@ -19,7 +22,9 @@
 #include <ylt/struct_pb.hpp>
 
 #include "crc32c.h"
+#include "bool_parser.h"
 #include "master_metric_manager.h"
+#include "storage/distributed/dfs_root_identity.h"
 #include "config/distributed_storage_config.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #ifdef USE_3FS
@@ -179,6 +184,13 @@ std::string ImmutableBucketAllocator::BucketMetaPath(int64_t bucket_id) const {
            kBucketMetaSuffix;
 }
 
+bool ImmutableBucketAllocator::IsBatchBoundaryCompatible(uint64_t boundary,
+                                                         uint64_t capacity) const {
+    return boundary != 0 && IsValidBucketAlignment(boundary) &&
+           boundary >= alignment_ && boundary % alignment_ == 0 &&
+           boundary <= capacity && capacity % boundary == 0;
+}
+
 tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     const DistributedStorageConfig& config) {
     if (initialized_.load(std::memory_order_acquire)) return {};
@@ -196,27 +208,33 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     fs_adapter_type_ = config.fs_adapter_type;
     bucket_capacity_ = config.bucket_capacity;
     alignment_ = config.alignment;
-    bucket_batch_alignment_ = config.bucket_batch_alignment;
-    // The batch boundary exists to keep each client write inside one 512 KiB
-    // filesystem range-lock unit, which only the POSIX write context relies on.
-    // Other adapters gain nothing from it and would only pay the padding cost.
-    if (fs_adapter_type_ != "posix") {
-        bucket_batch_alignment_ = 0;
-    } else if (bucket_batch_alignment_ != 0 &&
-               (!IsValidBucketAlignment(bucket_batch_alignment_) ||
-                bucket_batch_alignment_ < alignment_ ||
-                bucket_batch_alignment_ % alignment_ != 0 ||
-                bucket_batch_alignment_ > bucket_capacity_ ||
-                bucket_capacity_ % bucket_batch_alignment_ != 0)) {
-        // The batch boundary is a master-side placement hint only. A value that
-        // the current bucket geometry cannot honor must not stop the master, so
-        // fall back to the legacy per-key allocation instead of failing Init().
-        LOG(WARNING) << "DFS bucket batch alignment is incompatible with the "
-                        "bucket geometry; disabling batch alignment, "
-                     << "batch_alignment=" << bucket_batch_alignment_
-                     << ", alignment=" << alignment_
-                     << ", bucket_capacity=" << bucket_capacity_;
-        bucket_batch_alignment_ = 0;
+    // The batch boundary used to come from bucket_batch_alignment and was
+    // validated once here. It is now a private-extension placement hint, so the
+    // same validation must still run against this bucket geometry: a boundary
+    // the geometry cannot honor would make every allocation roll to a fresh
+    // bucket. Incompatible boundaries are disabled with a warning instead of
+    // failing Init(), matching the pre-change behaviour.
+    dfe_batch_alignment_ = 0;
+    if (fs_adapter_type_ == "posix") {
+        const auto& dfe = mooncake::ext::DfeProvider::Instance();
+        uint64_t probe_start = 0;
+        uint64_t probe_boundary = 0;
+        bool probe_fits = false;
+        if (dfe.available() &&
+            dfe.AlignBatchOffset(0, bucket_capacity_, 1, &probe_start,
+                                 &probe_boundary, &probe_fits) &&
+            probe_boundary != 0) {
+            if (IsBatchBoundaryCompatible(probe_boundary, bucket_capacity_)) {
+                dfe_batch_alignment_ = probe_boundary;
+            } else {
+                LOG(WARNING)
+                    << "DFS bucket batch alignment is incompatible with the "
+                       "bucket geometry; disabling batch alignment, "
+                    << "batch_alignment=" << probe_boundary
+                    << ", alignment=" << alignment_
+                    << ", bucket_capacity=" << bucket_capacity_;
+            }
+        }
     }
     max_bucket_count_ = config.max_bucket_count;
     ready_bucket_target_ = static_cast<size_t>(config.ready_bucket_target);
@@ -226,11 +244,30 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     eviction_high_watermark_ = config.eviction_high_watermark;
     eviction_low_watermark_ = config.eviction_low_watermark;
     eviction_check_interval_ = config.eviction_check_interval;
-    // The mtime refresh ioctl exists only on the POSIX adapter. Other adapters
-    // never receive a write context from the client, so they still update it
-    // themselves and the master must not touch it.
-    mtime_refresh_on_seal_ = config.posix_write_context_enabled &&
-                             config.fs_adapter_type == "posix";
+    // The mtime refresh ioctl exists only on the POSIX adapter and only when
+    // the private extension is loaded. It is still gated by the pre-change
+    // write-context switch: when disabled the client keeps mtime updates in
+    // the filesystem, so the master must not refresh on seal.
+    const char* write_context_env =
+        std::getenv("MOONCAKE_DFS_POSIX_WRITE_CONTEXT_ENABLED");
+    // Same boolean rules as the client (TryParseBool): case-insensitive,
+    // trimmed, and 0/false/no/off/disable all switch it off. This keeps the
+    // two ends consistent, which matters because the ioctl suppresses the
+    // per-write mtime update the master has to compensate for on seal.
+    bool write_context_enabled = true;
+    if (write_context_env != nullptr && write_context_env[0] != '\0') {
+        const auto parsed = TryParseBool(write_context_env);
+        if (parsed.has_value()) {
+            write_context_enabled = *parsed;
+        } else {
+            LOG(WARNING) << "Invalid MOONCAKE_DFS_POSIX_WRITE_CONTEXT_ENABLED="
+                         << write_context_env
+                         << "; treating it as enabled";
+        }
+    }
+    mtime_refresh_on_seal_ =
+        config.fs_adapter_type == "posix" && write_context_enabled &&
+        mooncake::ext::DfeProvider::Instance().available();
 
     std::error_code ec;
     if (!std::filesystem::is_directory(fsdir_, ec) || ec) {
@@ -376,6 +413,32 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
         return tl::make_unexpected(initial_creation_error);
     }
 
+    // Advertise whether this master can refresh a sealed bucket's mtime, now
+    // that init has fully succeeded. Publishing only on success avoids leaving
+    // a stale capability behind when a later init step fails. The client only
+    // enables its write-context optimization when it parses "1"; a master
+    // without the private extension writes "0", so a split deployment keeps
+    // the per-write mtime update on the client and the mtime never freezes at
+    // the last real write. Atomic publish keeps a concurrent reader from
+    // seeing a half-written file; on failure the client treats the capability
+    // as absent (unsupported), the safe default.
+    {
+        const std::string capability_path =
+            fsdir_ + "/" + kDfsWriteContextCapabilityFileName;
+        const std::string capability =
+            SerializeDfsWriteContextCapability(mtime_refresh_on_seal_);
+        auto capability_published = PublishDfsFileAtomic(
+            *fs_adapter_, capability_path,
+            std::span<const char>(capability.data(), capability.size()));
+        if (!capability_published) {
+            LOG(WARNING)
+                << "Failed to publish DFS write-context capability to "
+                << capability_path
+                << ", error=" << capability_published.error()
+                << "; clients will keep per-write mtime updates";
+        }
+    }
+
     initialized_.store(true, std::memory_order_release);
 
     // Recovery may have rewritten in-memory state (legacy format upgrade,
@@ -393,7 +456,7 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::Init(
     LOG(INFO) << "DFS bucket allocator initialized, fsdir=" << fsdir_
               << ", bucket_capacity=" << bucket_capacity_
               << ", alignment=" << alignment_
-              << ", bucket_batch_alignment=" << bucket_batch_alignment_
+              << ", bucket_batch_alignment=" << dfe_batch_alignment_
               << ", max_bucket_count=" << max_bucket_count_
               << ", ready_bucket_target=" << ready_bucket_target_
               << ", bucket_create_concurrency=" << bucket_create_concurrency_
@@ -1428,10 +1491,11 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
         }
     };
 
-    // Append-pack in request order. The first actual reservation in this batch
-    // starts at bucket_batch_alignment_ when configured; keys inside the batch
-    // keep the normal per-key alignment. If a later key rolls to a new bucket,
-    // offset zero naturally starts the continuation on the same boundary.
+    // Append-pack in request order. Keys inside one batch keep the normal
+    // per-key alignment; a batch that enters a new bucket first re-aligns its
+    // start to the batch boundary validated in Init(). If a later key rolls to
+    // a new bucket, offset zero naturally starts the continuation on the same
+    // boundary.
     for (size_t index = 0; index < requests.size(); ++index) {
         const auto& request = requests[index];
         // Dedup right before the reserve, under the same lock hold. A key can
@@ -1479,15 +1543,19 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
             break;
         }
         auto bucket = bucket_result.value();
-        if (bucket_batch_alignment_ != 0 &&
+        if (dfe_batch_alignment_ != 0 &&
             bucket->bucket_id != aligned_bucket_id) {
             // Entering a new bucket for this batch: re-align its start to the
-            // configured batch boundary. This also covers a bucket that another
-            // batch packed into while this batch was rolling over. Applying the
-            // padding per bucket instead of once per batch is what allows the
-            // whole-batch mutex to be dropped.
+            // batch boundary validated in Init(). Placement correctness belongs
+            // to the allocator, not the provider: the extension only supplies
+            // the boundary value, never the decision of whether the object
+            // fits. If the aligned start does not fit in this bucket, roll to
+            // a fresh one and re-align there, matching the pre-change
+            // bucket_batch_alignment policy. Applying this per bucket instead
+            // of once per batch is what allows the whole-batch mutex to be
+            // dropped.
             auto aligned_start =
-                CheckedAlignUp(bucket->append_offset, bucket_batch_alignment_);
+                CheckedAlignUp(bucket->append_offset, dfe_batch_alignment_);
             if (!aligned_start || *aligned_start > bucket->capacity ||
                 object_layout->aligned_size >
                     bucket->capacity - *aligned_start) {
@@ -1496,7 +1564,7 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
                 // sealing the old active bucket, so a failed creation leaves
                 // the old bucket available for smaller allocations.
                 bucket_result = EnsureActiveBucket(
-                    lock, object_layout->aligned_size, bucket_batch_alignment_);
+                    lock, object_layout->aligned_size, dfe_batch_alignment_);
                 if (!bucket_result) {
                     results[index].success = false;
                     results[index].descriptor = DistributedFSDescriptor{};
@@ -1506,7 +1574,7 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
                 }
                 bucket = bucket_result.value();
                 aligned_start = CheckedAlignUp(bucket->append_offset,
-                                               bucket_batch_alignment_);
+                                               dfe_batch_alignment_);
             }
             if (!aligned_start || *aligned_start > bucket->capacity ||
                 object_layout->aligned_size >

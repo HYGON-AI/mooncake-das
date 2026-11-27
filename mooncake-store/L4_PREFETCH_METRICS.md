@@ -118,20 +118,17 @@ rate(mooncake_dfs_posix_read_bytes_total{path="direct",result="success"}[5m])
   / rate(mooncake_dfs_posix_read_ops_total{path="direct",result="success"}[5m])
 ```
 
-第二个查询只能作为**辅助线索**，不能单独用来判断合并窗口是否生效。原因：
+第二个查询只能作为**辅助线索**，不能单独用来判断读取是否被批量下发。原因：
 
-- `batch_read_merge_enabled` **默认关闭**，关闭时或非 bucket 模式下根本不合并，每个
-  对象一次调用。而对象本身接近 4 MiB 时，平均值同样接近 4194304。
-- 大于 4 MiB 的对象进 `oversized_tasks`，走单对象路径一次读完，会把平均值拉到
-  4 MiB **以上**。
+- 每次调用的实际字节数由对象大小分布决定；对象本身较大时，平均值同样会偏高。
+- 大于单次下发上限的对象走单对象路径一次读完，会把平均值拉高。
 - 健康探针 `ProbeRead` 每轮对 `.health1` / `.health2` 各读一次 1 MiB，缓冲区 4 KiB
-  对齐，走同一个 adapter 的对齐分支，因此计入 `direct/success`。例如一次合并的 4 MiB
-  业务读加一轮探针，`bytes/ops` = 6 MiB / 3 = 2 MiB，会被误判为"合并没生效"。业务读
-  少的时候探针几乎是唯一样本。
+  对齐，走同一个 adapter 的对齐分支，因此计入 `direct/success`。业务读少的时候探针
+  几乎是唯一样本。
 
-判断合并是否生效，应结合 `MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED`、对象大小分布，并
-按 `path` 和时段区分探针流量。`staged` 上存在非零计数说明有 slice 未对齐，属于可优化
-的性能损失（对齐告警只在首次打印一次，容易漏看）。
+判断批量读取是否生效，应结合对象大小分布，并按 `path` 和时段区分探针流量。`staged`
+上存在非零计数说明有 slice 未对齐，属于可优化的性能损失（对齐告警只在首次打印一次，
+容易漏看）。
 
 ## `result` 标签的真实含义
 
