@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Modified by Hygon Information Technology Co., Ltd., 2026.
 
+#include <pybind11/chrono.h>
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
 #include <numa.h>
@@ -2264,6 +2265,117 @@ PYBIND11_MODULE(_store, m) {
         .value("ENABLE", SoftPinAction::ENABLE)
         .value("DISABLE", SoftPinAction::DISABLE);
 
+    py::enum_<StorageBackendType>(m, "StorageBackendType")
+        .value("FILE_PER_KEY", StorageBackendType::kFilePerKey)
+        .value("BUCKET", StorageBackendType::kBucket)
+        .value("OFFSET_ALLOCATOR", StorageBackendType::kOffsetAllocator)
+        .value("DISTRIBUTED", StorageBackendType::kDistributed)
+        .value("NVME_KV", StorageBackendType::kNvmeKv);
+
+    py::enum_<DfsAllocatorType>(m, "DfsAllocatorType")
+        .value("SHARD", DfsAllocatorType::SHARD)
+        .value("BUCKET", DfsAllocatorType::BUCKET);
+    py::class_<DistributedStorageConfig>(m, "DistributedStorageConfig")
+        .def(py::init<>())
+        .def_readwrite("fsdir", &DistributedStorageConfig::fsdir)
+        .def_readwrite("fs_adapter_type",
+                       &DistributedStorageConfig::fs_adapter_type)
+        .def_readwrite("enable_health_check",
+                       &DistributedStorageConfig::enable_health_check)
+        .def_readwrite("shard_count", &DistributedStorageConfig::shard_count)
+        .def_readwrite("shard_capacity",
+                       &DistributedStorageConfig::shard_capacity)
+        .def_readwrite("alignment", &DistributedStorageConfig::alignment)
+        .def_readwrite("bucket_batch_alignment",
+                       &DistributedStorageConfig::bucket_batch_alignment)
+        .def_readwrite("single_tenant",
+                       &DistributedStorageConfig::single_tenant)
+        .def_readwrite("eviction_enabled",
+                       &DistributedStorageConfig::eviction_enabled)
+        .def_readwrite("eviction_high_watermark",
+                       &DistributedStorageConfig::eviction_high_watermark)
+        .def_readwrite("eviction_low_watermark",
+                       &DistributedStorageConfig::eviction_low_watermark)
+        .def_readwrite("low_utilization_threshold",
+                       &DistributedStorageConfig::low_utilization_threshold)
+        .def_readwrite(
+            "low_utilization_evictions_per_tick",
+            &DistributedStorageConfig::low_utilization_evictions_per_tick)
+        .def_readwrite("low_utilization_eviction_attempts_per_tick",
+                       &DistributedStorageConfig::
+                           low_utilization_eviction_attempts_per_tick)
+        .def_readwrite("deferred_free_duration",
+                       &DistributedStorageConfig::deferred_free_duration)
+        .def_readwrite("eviction_check_interval",
+                       &DistributedStorageConfig::eviction_check_interval)
+        .def_readwrite("allocator_type",
+                       &DistributedStorageConfig::allocator_type)
+        .def_readwrite("bucket_capacity",
+                       &DistributedStorageConfig::bucket_capacity)
+        .def_readwrite("bucket_recovery_enabled",
+                       &DistributedStorageConfig::bucket_recovery_enabled)
+        .def_readwrite("max_bucket_count",
+                       &DistributedStorageConfig::max_bucket_count)
+        .def_readwrite("ready_bucket_target",
+                       &DistributedStorageConfig::ready_bucket_target)
+        .def_readwrite("bucket_create_concurrency",
+                       &DistributedStorageConfig::bucket_create_concurrency)
+        .def_readwrite("batch_read_threads",
+                       &DistributedStorageConfig::batch_read_threads)
+        .def_readwrite("batch_read_merge_enabled",
+                       &DistributedStorageConfig::batch_read_merge_enabled)
+        .def_readwrite("direct_read_enabled",
+                       &DistributedStorageConfig::direct_read_enabled)
+        .def_readwrite("batch_get_timeout_ms",
+                       &DistributedStorageConfig::batch_get_timeout_ms)
+        .def_readwrite("batch_timeout_fixed_ms",
+                       &DistributedStorageConfig::batch_timeout_fixed_ms)
+        .def_readwrite(
+            "batch_get_max_inflight_batches",
+            &DistributedStorageConfig::batch_get_max_inflight_batches)
+        .def_readwrite("batch_get_max_inflight_bytes",
+                       &DistributedStorageConfig::batch_get_max_inflight_bytes)
+        .def_readwrite("object_storage_config_path",
+                       &DistributedStorageConfig::object_storage_config_path)
+        .def_readwrite("posix_write_context_enabled",
+                       &DistributedStorageConfig::posix_write_context_enabled);
+
+    py::class_<DfsOptions>(m, "DfsOptions")
+        .def(py::init<>())
+        .def_static("from_environment",
+                    [] { return DfsOptions::FromEnvironment(); })
+        .def_readwrite("use_master_dfs_root_dir",
+                       &DfsOptions::use_master_dfs_root_dir)
+        .def_readwrite("force_dfs_one_replica",
+                       &DfsOptions::force_dfs_one_replica)
+        .def_readwrite("dfs_batch_put_timeout_ms",
+                       &DfsOptions::dfs_batch_put_timeout_ms)
+        .def_readwrite("dfs_batch_timeout_fixed_ms",
+                       &DfsOptions::dfs_batch_timeout_fixed_ms)
+        .def_readwrite("dfs_write_arena_wait_ms",
+                       &DfsOptions::dfs_write_arena_wait_ms)
+        .def_readwrite("dfs_pinned_pool_bytes",
+                       &DfsOptions::dfs_pinned_pool_bytes)
+        .def_readwrite("dfs_write_threads", &DfsOptions::dfs_write_threads)
+        .def_readwrite("dfs_h2d_streams", &DfsOptions::dfs_h2d_streams)
+        .def_readwrite("local_buffer_size", &DfsOptions::local_buffer_size)
+        .def_readwrite("unified_buffer_size", &DfsOptions::unified_buffer_size)
+        .def_readwrite("prefetch_capacity_ratio",
+                       &DfsOptions::prefetch_capacity_ratio)
+        .def_readwrite("dfs_read_arena_wait_ms",
+                       &DfsOptions::dfs_read_arena_wait_ms)
+        .def_readwrite("read_chunk_size", &DfsOptions::read_chunk_size)
+        .def_readwrite("write_chunk_size", &DfsOptions::write_chunk_size)
+        .def_readwrite("read_protection_chunks",
+                       &DfsOptions::read_protection_chunks)
+        .def_readwrite("write_protection_chunks",
+                       &DfsOptions::write_protection_chunks)
+        .def_readwrite("storage_backend_type",
+                       &DfsOptions::storage_backend_type)
+        .def_readwrite("storage", &DfsOptions::storage)
+        .def_readwrite("root_identity", &DfsOptions::root_identity)
+        .def_readwrite("descriptor_root_dir", &DfsOptions::descriptor_root_dir);
+
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
@@ -2553,7 +2665,7 @@ PYBIND11_MODULE(_store, m) {
                     "master_server_addr", "engine", "enable_ssd_offload",
                     "ssd_offload_path", "tenant_id", "enable_client_http_server",
                     "client_http_port", "enable_dfs_prefetch",
-                    "enable_embedded_master", "metadata_cluster_id"};
+                    "enable_embedded_master", "metadata_cluster_id", "dfs_options"};
                 return result;
             },
             "Describe optional local APIs and setup parameters without an RPC. "
@@ -2594,7 +2706,8 @@ PYBIND11_MODULE(_store, m) {
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
                bool enable_dfs_prefetch = true,
                bool enable_embedded_master = false,
-               const std::string &metadata_cluster_id = "") {
+               const std::string &metadata_cluster_id = "",
+               const std::optional<DfsOptions> &dfs_options = std::nullopt) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2611,7 +2724,8 @@ PYBIND11_MODULE(_store, m) {
                         master_server_addr, transfer_engine, "", 50052,
                         enable_ssd_offload, true, ssd_offload_path, tenant_id,
                         enable_client_http_server, client_http_port,
-                        enable_dfs_prefetch, enable_embedded_master, metadata_cluster_id);
+                        enable_dfs_prefetch, enable_embedded_master,
+                        metadata_cluster_id, dfs_options);
                     ret = result.has_value() ? 0
                                              : static_cast<int>(result.error());
                 }
@@ -2627,10 +2741,12 @@ PYBIND11_MODULE(_store, m) {
             py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT,
             py::arg("enable_dfs_prefetch") = true, py::kw_only(),
             py::arg("enable_embedded_master") = false,
-            py::arg("metadata_cluster_id") = "")
+            py::arg("metadata_cluster_id") = "",
+            py::arg("dfs_options") = py::none())
         .def(
             "setup",
-            [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
+            [](MooncakeStorePyWrapper &self, const py::dict &config_dict,
+               const std::optional<DfsOptions> &dfs_options) {
                 auto real_client = self.init_real_client();
 
                 // Convert py::dict to ConfigDict (all values as strings)
@@ -2644,14 +2760,18 @@ PYBIND11_MODULE(_store, m) {
                 int ret;
                 {
                     py::gil_scoped_release release;
-                    auto result = real_client->setup_internal(config);
+                    auto result =
+                        real_client->setup_internal(config, dfs_options);
                     ret = result.has_value() ? 0
                                              : static_cast<int>(result.error());
                 }
                 return ret;
             },
-            py::arg("config"),
+            py::arg("config"), py::kw_only(),
+            py::arg("dfs_options") = py::none(),
             "Setup the store with a configuration dictionary.\n"
+            "dfs_options: Explicit DfsOptions (DFS ignores process env); "
+            "None keeps legacy environment defaults.\n"
             "Supported keys:\n"
             "  local_hostname (required): Local hostname.\n"
             "  metadata_server (required): Metadata server address.\n"
@@ -2670,8 +2790,8 @@ PYBIND11_MODULE(_store, m) {
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
             "  ssd_offload_path: SSD storage directory path (overrides env "
             "var).\n"
-            "  enable_dfs_prefetch: Honor the DFS prefetch arena size from "
-            "environment (default true).\n"
+            "  enable_dfs_prefetch: Enable the configured DFS prefetch arena "
+            "(default true).\n"
             "  tenant_id: Tenant identifier (default 'default').\n"
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
