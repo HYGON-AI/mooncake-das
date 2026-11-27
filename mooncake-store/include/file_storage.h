@@ -155,6 +155,7 @@ class FileStorage {
     [[nodiscard]] std::chrono::milliseconds ReadArenaWait() const {
         return read_arena_wait_;
     }
+    [[nodiscard]] size_t DfsAlignment() const { return dfs_alignment_; }
 
     // Allocate from the unified restore arena for prefetch and enforce the
     // caller's active-capacity limit before publishing the handle.
@@ -374,6 +375,7 @@ class FileStorage {
     std::shared_ptr<PinnedBufferPool::Buffer> pinned_restore_arena_;
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     // Resolved once at construction; the read hot path reads the member.
+    const size_t dfs_alignment_;
     const std::chrono::milliseconds read_arena_wait_;
     mutable std::mutex unified_prefetch_mutex_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;

@@ -16,6 +16,7 @@
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
+#include <stdexcept>
 #include <cstring>
 #include <algorithm>
 #include <cerrno>
@@ -659,27 +660,6 @@ inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
     return false;
 }
 
-size_t DfsH2dStreamCount() {
-    constexpr size_t kDefaultStreams = 4;
-    const char *value = std::getenv("MC_STORE_DFS_H2D_STREAMS");
-    if (!value || value[0] == '\0') return kDefaultStreams;
-
-    errno = 0;
-    char *end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    const bool digits_only =
-        std::all_of(value, value + std::strlen(value), [](unsigned char c) {
-            return std::isdigit(c) != 0;
-        });
-    if (!digits_only || errno != 0 || end == value || *end != '\0' ||
-        (parsed != 1 && parsed != 2 && parsed != 4)) {
-        LOG(WARNING) << "Invalid MC_STORE_DFS_H2D_STREAMS='" << value
-                     << "', using " << kDefaultStreams;
-        return kDefaultStreams;
-    }
-    return static_cast<size_t>(parsed);
-}
-
 }  // namespace
 
 class RealClient::OffloadRestoreLease {
@@ -1017,11 +997,9 @@ RealClient::RealClient() : prefetcher_(std::make_unique<SsdPrefetcher>()) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
-    const size_t h2d_streams_per_device = DfsH2dStreamCount();
-    dfs_h2d_stream_pool_ =
-        std::make_unique<DfsH2dStreamPool>(h2d_streams_per_device);
-    LOG(INFO) << "DFS staging config: h2d_streams_per_device="
-              << h2d_streams_per_device;
+    // setup installs the caller's resolved stream count. No DFS env is read
+    // while merely creating the wrapper.
+    dfs_h2d_stream_pool_ = std::make_unique<DfsH2dStreamPool>(4);
 }
 
 RealClient::~RealClient() {
@@ -1105,13 +1083,57 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
     bool enable_dfs_prefetch, bool enable_embedded_master) {
+    return setup_internal(local_hostname, metadata_server, global_segment_size,
+                          local_buffer_size, protocol, rdma_devices,
+                          master_server_addr, transfer_engine, ipc_socket_path,
+                          local_rpc_port, enable_ssd_offload,
+                          start_offload_rpc_server, ssd_offload_path, tenant_id,
+                          enable_client_http_server, client_http_port,
+                          enable_dfs_prefetch, enable_embedded_master, "");
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    bool enable_dfs_prefetch, bool enable_embedded_master,
+    const std::string &metadata_cluster_id) {
+    return setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, local_rpc_port, enable_ssd_offload,
+        start_offload_rpc_server, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, enable_dfs_prefetch,
+        enable_embedded_master, metadata_cluster_id, std::nullopt);
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    bool enable_dfs_prefetch, bool enable_embedded_master,
+    const std::string &metadata_cluster_id,
+    const std::optional<DfsOptions> &options) {
     return setup_internal(EgmStorePoolConfig{}, local_hostname, metadata_server,
                           global_segment_size, local_buffer_size, protocol,
                           rdma_devices, master_server_addr, transfer_engine,
                           ipc_socket_path, local_rpc_port, enable_ssd_offload,
                           start_offload_rpc_server, ssd_offload_path, tenant_id,
                           enable_client_http_server, client_http_port,
-                          enable_dfs_prefetch, enable_embedded_master);
+                          enable_dfs_prefetch, enable_embedded_master,
+                          metadata_cluster_id, options);
 }
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
@@ -1124,7 +1146,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port,
-    bool enable_dfs_prefetch, bool enable_embedded_master) {
+    bool enable_dfs_prefetch, bool enable_embedded_master,
+    const std::string &metadata_cluster_id,
+    const std::optional<DfsOptions> &dfs_options) {
+    // Preserve the full legacy config and resolve DFS fields from that
+    // snapshot.
+    auto legacy_config =
+        dfs_options ? std::nullopt
+                    : std::make_optional(FileStorageConfig::FromEnvironment());
+    const auto options = dfs_options
+                             ? *dfs_options
+                             : DfsOptions::FromEnvironment(*legacy_config);
+    if (!options.Validate(!legacy_config.has_value())) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     // Re-entry guard (mirrors initAll_internal): a second setup would
     // overwrite client_ and skip the first instance's ordered cleanup.
     if (client_) {
@@ -1163,9 +1198,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     {
         std::unique_lock<std::shared_mutex> lock(dfs_read_lifecycle_mutex_);
         dfs_read_shutting_down_ = false;
-        if (!dfs_h2d_stream_pool_) {
-            dfs_h2d_stream_pool_ = std::make_unique<DfsH2dStreamPool>(DfsH2dStreamCount());
-        }
+        dfs_h2d_stream_pool_ =
+            std::make_unique<DfsH2dStreamPool>(options.dfs_h2d_streams);
     }
     // Reset the teardown latch so this instance can be torn down again.
     closed_.store(false, std::memory_order_release);
@@ -1237,7 +1271,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, resolved_metadata_server, protocol,
             device_name, resolved_master_server_addr, transfer_engine,
-            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
+            {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator,
+            metadata_cluster_id, options);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1268,7 +1303,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, resolved_metadata_server, protocol,
                 device_name, resolved_master_server_addr, transfer_engine,
-                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator);
+                {{"client_mode", "real"}}, tenant_id, nof_runtime_.initiator,
+                metadata_cluster_id, options);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1699,20 +1735,36 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
-    const auto distributed_config = DistributedStorageConfig::FromEnvironment();
-    const bool enable_kvcs = distributed_config.UsesKvcs();
+    auto file_storage_config =
+        legacy_config ? *legacy_config : options.ToFileStorageConfig();
+    if (legacy_config) {
+        file_storage_config.storage_backend_type = options.storage_backend_type;
+        file_storage_config.dfs_options =
+            options.ToFileStorageConfig().dfs_options;
+    }
+    const bool enable_kvcs =
+        file_storage_config.dfs_options &&
+        file_storage_config.dfs_options->storage.UsesKvcs();
     if (enable_ssd_offload || enable_kvcs) {
-        auto file_storage_config = FileStorageConfig::FromEnvironment();
-        if (enable_kvcs) {
-            file_storage_config.storage_backend_type =
-                StorageBackendType::kDistributed;
-        }
         if (!ssd_offload_path.empty()) {
             file_storage_config.storage_filepath = ssd_offload_path;
         }
         // setup_internal reports failures through tl::expected; do not let a
         // constructor throw escape into the caller (pybind would abort).
         try {
+            if (file_storage_config.storage_backend_type ==
+                StorageBackendType::kDistributed) {
+                auto &dfs_options = *file_storage_config.dfs_options;
+                if (dfs_options.root_identity.empty()) {
+                    dfs_options.root_identity = client_->GetDfsRootIdentity();
+                }
+                const auto root = client_->GetDfsRootDirOverride();
+                if (!root.empty() &&
+                    (dfs_options.storage.fs_adapter_type == "posix" ||
+                     dfs_options.storage.fs_adapter_type == "hf3fs")) {
+                    dfs_options.storage.fsdir = root;
+                }
+            }
             file_storage_ = std::make_shared<FileStorage>(
                 file_storage_config, client_, this->local_rpc_addr,
                 client_->GetSsdMetricPtr());
@@ -1727,8 +1779,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                                      file_storage_->UnifiedBufferCapacity());
         client_->SetDfsWriteChunkSize(
             static_cast<size_t>(file_storage_config.write_chunk_size));
-        client_->SetDfsWriteAlignment(
-            GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096));
+        client_->SetDfsWriteAlignment(file_storage_->DfsAlignment());
         SetDfsReadChunkSize(
             static_cast<size_t>(file_storage_config.read_chunk_size));
         auto init_result = file_storage_->Init();
@@ -1886,6 +1937,11 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
 
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const ConfigDict &config) {
+    return setup_internal(config, std::nullopt);
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal(
+    const ConfigDict &config, const std::optional<DfsOptions> &options) {
     // Extract required parameters (no defaults)
     std::string local_hostname = get_config(config, CONFIG_KEY_LOCAL_HOSTNAME);
     std::string metadata_server =
@@ -1929,6 +1985,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string protocol =
         get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
+    std::string metadata_cluster_id =
+        get_config(config, CONFIG_KEY_METADATA_CLUSTER_ID);
     std::string master_server_addr = get_config(
         config, CONFIG_KEY_MASTER_SERVER_ADDR,
         enable_embedded_master ? std::string() : DEFAULT_MASTER_SERVER_ADDR);
@@ -2006,7 +2064,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             local_buffer_size, protocol, rdma_devices, master_server_addr,
             nullptr, ipc_socket_path, 50052, enable_ssd_offload, true,
             ssd_offload_path, tenant_id, enable_client_http_server,
-            client_http_port, enable_dfs_prefetch, enable_embedded_master);
+            client_http_port, enable_dfs_prefetch, enable_embedded_master,
+            metadata_cluster_id, options);
         if (!result && egm_config->enabled) {
             (void)tearDownAll_internal();
         }

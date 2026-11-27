@@ -113,6 +113,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                              const std::string& local_server_name,
                              const std::string& ip_or_host_name,
                              uint64_t rpc_port) {
+    return init(metadata_conn_string, local_server_name, ip_or_host_name,
+                rpc_port, "");
+}
+
+int TransferEngineImpl::init(const std::string& metadata_conn_string,
+                             const std::string& local_server_name,
+                             const std::string& ip_or_host_name,
+                             uint64_t rpc_port,
+                             const std::string& metadata_cluster_id) {
     TransferMetadata::RpcMetaDesc desc;
     std::string rpc_binding_method;
 
@@ -224,7 +233,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
               << "";
 
-    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
+    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string,
+                                                   metadata_cluster_id);
 #ifdef USE_ASCEND
     std::string mutable_server_name =
         local_server_name_ + ":npu_" + std::to_string(devicePhyId);

@@ -236,6 +236,9 @@ class TransferMetadata {
    public:
     TransferMetadata(const std::string &conn_string);
 
+    TransferMetadata(const std::string &conn_string,
+                     const std::string &metadata_cluster_id);
+
     ~TransferMetadata();
 
    protected:

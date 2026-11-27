@@ -139,9 +139,21 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
-    impl_->applyProtocolHint(protocol);
     return init(metadata_conn_string, local_server_name, ip_or_host_name,
-                rpc_port);
+                rpc_port, protocol, "");
+}
+
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name, uint64_t rpc_port,
+                         const std::string& protocol,
+                         const std::string& metadata_cluster_id) {
+    impl_->applyProtocolHint(protocol);
+    const int result =
+        impl_->init(metadata_conn_string, local_server_name, ip_or_host_name,
+                    rpc_port, metadata_cluster_id);
+    if (result == 0) metadata_conn_string_ = metadata_conn_string;
+    return result;
 }
 
 int TransferEngine::freeEngine() {
@@ -671,13 +683,28 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name, uint64_t rpc_port,
                          const std::string& protocol) {
+    return init(metadata_conn_string, local_server_name, ip_or_host_name,
+                rpc_port, protocol, "");
+}
+
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name, uint64_t rpc_port,
+                         const std::string& protocol,
+                         const std::string& metadata_cluster_id) {
     if (!use_tent_) {
         impl_->applyProtocolHint(protocol);
-        const int result = impl_->init(metadata_conn_string, local_server_name,
-                                       ip_or_host_name, rpc_port);
+        const int result =
+            impl_->init(metadata_conn_string, local_server_name,
+                        ip_or_host_name, rpc_port, metadata_cluster_id);
         if (result == 0) metadata_conn_string_ = metadata_conn_string;
         return result;
     } else {
+        if (!metadata_cluster_id.empty()) {
+            LOG(ERROR)
+                << "Per-engine metadata namespace is unsupported by TENT";
+            return -1;
+        }
         auto config = buildTentConfig(metadata_conn_string, local_server_name);
         if (protocol == "tcp") {
             mooncake::tent::ConfigHelper::forceTcp(*config);

@@ -73,7 +73,16 @@ FileStorage::FileStorage(const FileStorageConfig& config,
               : 0)),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
-      read_arena_wait_(ResolveReadArenaWait()),
+      dfs_alignment_(config.dfs_options
+                         ? config.dfs_options->storage.alignment
+                         : (config.dfs_resources_explicit
+                                ? kDefaultDfsAlignment
+                                : GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT",
+                                                   kDefaultDfsAlignment))),
+      read_arena_wait_(
+          config.dfs_options || config.dfs_resources_explicit
+              ? std::chrono::milliseconds(config.dfs_read_arena_wait_ms)
+              : ResolveReadArenaWait()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
     if (!config_.Validate()) {
@@ -83,7 +92,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     // Resolve the backend mode before allocating DFS staging: filesystem and
     // KVCS need the unified buffer, while other object stores use offloading.
     auto create_storage_backend_result = CreateStorageBackend(
-        config_, client_ ? client_->GetDfsRootIdentity() : std::string{});
+        config_, client_ ? client_->GetDfsRootIdentity() : std::string{},
+        client_ ? client_->GetDfsRootDirOverride() : std::string{});
     if (!create_storage_backend_result) {
         LOG(ERROR) << "Failed to create storage backend";
         throw std::runtime_error("Failed to create storage backend");
@@ -124,8 +134,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                 client ? client->GetProtocol() : "",
                 pinned_restore_arena_->device_data, pinned_restore_arena_,
                 usage_tracker_, DfsBufferUsageKind::kRead);
-            const auto dfs_alignment =
-                GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
+            const auto dfs_alignment = dfs_alignment_;
             const auto read_chunk_allocation_bytes =
                 pinned_restore_arena_allocator_->allocation_size_for_aligned_request(
                     static_cast<size_t>(std::max<int64_t>(
@@ -296,7 +305,16 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                     return client->FetchDfsRootIdentity();
                 });
             if (config_.enable_dfs) {
-                client_->SetDfsStorageBackend(distributed_backend);
+                if (config_.dfs_options) {
+                    client_->SetDfsWriteAlignment(dfs_alignment_);
+                    client_->SetDfsBatchTimeoutFixedMs(
+                        config_.dfs_options->storage.batch_timeout_fixed_ms);
+                }
+                client_->SetDfsStorageBackend(
+                    distributed_backend,
+                    config_.dfs_options
+                        ? config_.dfs_options->descriptor_root_dir
+                        : std::string{});
             }
         }
     }

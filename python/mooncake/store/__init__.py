@@ -8,6 +8,10 @@ from types import ModuleType
 
 _CPP_EXPORTS = frozenset(
     {
+        "DfsOptions",
+        "DistributedStorageConfig",
+        "DfsAllocatorType",
+        "StorageBackendType",
         "RangedReadSnapshot",
         "ReadKeyMapping",
         "ReadComponent",

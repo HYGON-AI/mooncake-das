@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -31,6 +32,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <sched.h>
 #include <thread>
@@ -134,34 +136,6 @@ std::vector<tl::expected<void, ErrorCode>> FinalizeSessionsByEpoch(
 }
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteChunkSize = 1ULL * 1024 * 1024 * 1024;
-constexpr size_t kDefaultDfsWriteThreads = 8;
-
-size_t ReadDfsWriteChunkSize() {
-    const auto configured = Environ::Read(
-        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES);
-    if (!configured.has_value() || *configured <= 0) {
-        return kDefaultDfsWriteChunkSize;
-    }
-    return static_cast<size_t>(*configured);
-}
-
-size_t ReadDfsWriteThreads() {
-    const auto configured = Environ::Read(
-        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_THREADS);
-    if (!configured.has_value() || *configured <= 0) {
-        return kDefaultDfsWriteThreads;
-    }
-    return static_cast<size_t>(*configured);
-}
-
-std::chrono::milliseconds ReadDfsWriteArenaWait() {
-    constexpr int64_t kDefaultWaitMs = 10000;
-    const auto configured = Environ::Read(
-        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_WAIT_MS);
-    return std::chrono::milliseconds(std::max<int64_t>(
-        configured.value_or(kDefaultWaitMs), 0));
-}
 constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
 class ScopedObjectChecksumBuffer {
@@ -650,11 +624,138 @@ FinalizeDecision DetermineFinalizeDecision(
     return slice_size;
 }
 
+DfsOptions::DfsOptions() {
+    const FileStorageConfig defaults;
+    storage_backend_type = defaults.storage_backend_type;
+    local_buffer_size = defaults.local_buffer_size;
+    unified_buffer_size = defaults.unified_buffer_size;
+    prefetch_capacity_ratio = defaults.prefetch_capacity_ratio;
+    dfs_read_arena_wait_ms = defaults.dfs_read_arena_wait_ms;
+    read_chunk_size = defaults.read_chunk_size;
+    write_chunk_size = defaults.write_chunk_size;
+    read_protection_chunks = defaults.read_protection_chunks;
+    write_protection_chunks = defaults.write_protection_chunks;
+}
+
+void DfsOptions::ApplyTo(FileStorageConfig& config) const {
+    config.dfs_resources_explicit = true;
+    config.local_buffer_size = local_buffer_size;
+    config.unified_buffer_size = unified_buffer_size;
+    config.prefetch_capacity_ratio = prefetch_capacity_ratio;
+    config.dfs_read_arena_wait_ms = dfs_read_arena_wait_ms;
+    config.read_chunk_size = read_chunk_size;
+    config.write_chunk_size = write_chunk_size;
+    config.read_protection_chunks = read_protection_chunks;
+    config.write_protection_chunks = write_protection_chunks;
+    config.storage_backend_type = storage_backend_type;
+    config.dfs_options.reset();
+    if (storage_backend_type == StorageBackendType::kDistributed) {
+        config.dfs_options =
+            DfsBackendOptions{storage, root_identity, descriptor_root_dir};
+    }
+}
+
+FileStorageConfig DfsOptions::ToFileStorageConfig() const {
+    FileStorageConfig config;
+    ApplyTo(config);
+    return config;
+}
+
+DfsOptions DfsOptions::FromEnvironment(const FileStorageConfig& config) {
+    DfsOptions options;
+    constexpr EnvironmentVariable<bool> root_option{
+        "MOONCAKE_DFS_USE_MASTER_ROOT_DIR"};
+    options.use_master_dfs_root_dir = Environ::ReadOr(root_option, false);
+    options.force_dfs_one_replica =
+        DistributedStorageConfig::IsReplicaEnabledFromEnvironment();
+    options.dfs_batch_put_timeout_ms =
+        Environ::ReadOr(DistributedStorageEnvironmentVariables::
+                            MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS,
+                        options.dfs_batch_put_timeout_ms);
+    options.dfs_write_arena_wait_ms = std::max<int64_t>(
+        Environ::ReadOr(
+            FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_ARENA_WAIT_MS,
+            options.dfs_write_arena_wait_ms),
+        0);
+    options.dfs_pinned_pool_bytes = Environ::ReadOr(
+        DistributedStorageEnvironmentVariables::MC_STORE_DFS_PINNED_POOL_BYTES,
+        options.dfs_pinned_pool_bytes);
+    const auto threads = Environ::Read(
+        FileStorageEnvironmentVariables::MC_STORE_DFS_WRITE_THREADS);
+    if (threads && *threads > 0) options.dfs_write_threads = *threads;
+
+    constexpr EnvironmentVariable<size_t> streams_option{
+        "MC_STORE_DFS_H2D_STREAMS"};
+    const auto streams = Environ::Read(streams_option);
+    if (streams && (*streams == 1 || *streams == 2 || *streams == 4)) {
+        options.dfs_h2d_streams = *streams;
+    }
+    options.storage_backend_type = config.storage_backend_type;
+    options.local_buffer_size = config.local_buffer_size;
+    options.unified_buffer_size = config.unified_buffer_size;
+    options.prefetch_capacity_ratio = config.prefetch_capacity_ratio;
+    options.dfs_read_arena_wait_ms = config.dfs_read_arena_wait_ms;
+    options.read_chunk_size = config.read_chunk_size;
+    options.write_chunk_size = config.write_chunk_size;
+    options.read_protection_chunks = config.read_protection_chunks;
+    options.write_protection_chunks = config.write_protection_chunks;
+    options.storage = DistributedStorageConfig::FromEnvironment();
+    options.dfs_batch_timeout_fixed_ms = options.storage.batch_timeout_fixed_ms;
+    // Preserve the legacy KVCS shortcut without overriding explicit choices.
+    if (options.storage.UsesKvcs()) {
+        options.storage_backend_type = StorageBackendType::kDistributed;
+    }
+    return options;
+}
+
+bool DfsOptions::Validate(bool validate_storage_resources) const {
+    switch (storage_backend_type) {
+        case StorageBackendType::kFilePerKey:
+        case StorageBackendType::kBucket:
+        case StorageBackendType::kOffsetAllocator:
+        case StorageBackendType::kDistributed:
+        case StorageBackendType::kNvmeKv:
+            break;
+        default:
+            LOG(ERROR)
+                << "Invalid storage_backend_type for Client initialization";
+            return false;
+    }
+    if (dfs_write_arena_wait_ms < 0 || dfs_write_threads == 0 ||
+        (dfs_h2d_streams != 1 && dfs_h2d_streams != 2 &&
+         dfs_h2d_streams != 4)) {
+        LOG(ERROR) << "Invalid Client DFS execution options: "
+                      "dfs_write_arena_wait_ms must be >= 0, "
+                      "dfs_write_threads must be > 0, "
+                      "dfs_h2d_streams must be 1, 2 or 4";
+        return false;
+    }
+    if (write_chunk_size <= 0) return false;
+    if (!validate_storage_resources) return true;
+    if (local_buffer_size <= 0 || read_chunk_size <= 0 ||
+        read_protection_chunks < 0 || write_protection_chunks < 0 ||
+        dfs_read_arena_wait_ms < 0 || unified_buffer_size < 0 ||
+        !std::isfinite(prefetch_capacity_ratio) ||
+        prefetch_capacity_ratio < 0.0 || prefetch_capacity_ratio > 1.0) {
+        LOG(ERROR) << "Invalid Client DFS buffer or chunk options";
+        return false;
+    }
+    return true;
+}
+
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
                const std::string& protocol,
                const std::map<std::string, std::string>& labels,
                const std::string& tenant_id)
+    : Client(local_hostname, metadata_connstring, protocol, labels, tenant_id,
+             DfsOptions::FromEnvironment()) {}
+
+Client::Client(const std::string& local_hostname,
+               const std::string& metadata_connstring,
+               const std::string& protocol,
+               const std::map<std::string, std::string>& labels,
+               const std::string& tenant_id, const DfsOptions& options)
     : client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels(labels))),
       master_client_(client_id_,
@@ -667,22 +768,22 @@ Client::Client(const std::string& local_hostname,
       protocol_(protocol),
       object_checksum_enabled_(
           ClientObjectChecksumConfig::IsEnabledAtFirstUse()),
-      dfs_batch_put_timeout_ms_(
-          Environ::ReadOr(DistributedStorageEnvironmentVariables::
-                              MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS,
-                          uint64_t{10000})),
-      dfs_batch_timeout_fixed_ms_(
-          Environ::ReadOr(DistributedStorageEnvironmentVariables::
-                              MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS,
-                          kDefaultDfsBatchTimeoutFixedMs)),
-      dfs_write_arena_wait_(ReadDfsWriteArenaWait()),
-      dfs_write_chunk_size_(ReadDfsWriteChunkSize()),
-      pinned_buffer_pool_(std::make_shared<PinnedBufferPool>(
-          Environ::ReadOr(DistributedStorageEnvironmentVariables::
-                              MC_STORE_DFS_PINNED_POOL_BYTES,
-                          PinnedBufferPool::kDefaultMaxCachedBytes))),
-      write_thread_pool_(ReadDfsWriteThreads()),
+      dfs_batch_put_timeout_ms_(options.dfs_batch_put_timeout_ms),
+      dfs_batch_timeout_fixed_ms_(options.dfs_batch_timeout_fixed_ms),
+      dfs_write_arena_wait_(options.dfs_write_arena_wait_ms),
+      dfs_write_chunk_size_(options.write_chunk_size),
+      dfs_write_alignment_(options.storage_backend_type ==
+                                   StorageBackendType::kDistributed
+                               ? options.storage.alignment
+                               : kDefaultDfsAlignment),
+      pinned_buffer_pool_(
+          std::make_shared<PinnedBufferPool>(options.dfs_pinned_pool_bytes)),
+      write_thread_pool_(options.dfs_write_threads),
+      dfs_options_(options),
       task_thread_pool_(4) {
+    if (!options.Validate(false)) {
+        throw std::invalid_argument("Invalid Client DFS execution options");
+    }
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
@@ -820,7 +921,7 @@ ReplicateConfig Client::AttachConfig(const ReplicateConfig& config) const {
     }
     if (!DfsWriteAllowed()) {
         client_cfg.dfs_replica_num = 0;
-    } else if (DistributedStorageConfig::IsReplicaEnabledFromEnvironment()) {
+    } else if (dfs_options_.force_dfs_one_replica) {
         client_cfg.dfs_replica_num = 1;
     }
     // Declare that this client can consume a DFS-only topology. The bit
@@ -842,12 +943,17 @@ static std::string NormalizeDfsPath(const std::string& path) {
     return normalized.lexically_normal().string();
 }
 
-static void WarnOnClientDfsPathMismatch(const std::string& master_fsdir) {
-    const auto storage_config = FileStorageConfig::FromEnvironment();
-    if (storage_config.storage_backend_type != StorageBackendType::kDistributed) {
+std::string Client::GetDfsRootDirOverride() const {
+    return dfs_options_.use_master_dfs_root_dir ? master_dfs_root_dir_
+                                                : std::string{};
+}
+
+static void WarnOnClientDfsPathMismatch(const std::string& master_fsdir,
+                                        const DfsOptions& options) {
+    if (options.use_master_dfs_root_dir) return;
+    if (options.storage_backend_type != StorageBackendType::kDistributed)
         return;
-    }
-    const auto client_fsdir = DistributedStorageConfig::FromEnvironment().fsdir;
+    const auto& client_fsdir = options.storage.fsdir;
     if (client_fsdir.empty() || master_fsdir.empty()) return;
 
     const auto normalized_client = NormalizeDfsPath(client_fsdir);
@@ -858,7 +964,6 @@ static void WarnOnClientDfsPathMismatch(const std::string& master_fsdir) {
                  << normalized_client << "', master='" << normalized_master
                  << ". Verify that both paths refer to the same DFS storage.";
 }
-
 
 std::optional<SegmentLocality> Client::DiscoverSegmentLocality(
     const Topology& topology, const std::string& location) {
@@ -1205,6 +1310,14 @@ ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
+    return InitTransferEngine(local_hostname, metadata_connstring, protocol,
+                              device_names, "");
+}
+
+ErrorCode Client::InitTransferEngine(
+    const std::string& local_hostname, const std::string& metadata_connstring,
+    const std::string& protocol, const std::optional<std::string>& device_names,
+    const std::string& metadata_cluster_id) {
     // TEs created through the Store entry (Client::Create ->
     // InitTransferEngine) are tagged so ascend_direct can resolve a per-role
     // link config (e.g. Store=RoCE/D2H, P2P=HCCS/D2D). The flag only needs to
@@ -1261,8 +1374,13 @@ ErrorCode Client::InitTransferEngine(
         }
     }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    int rc = transfer_engine_->init(metadata_connstring, local_hostname,
-                                    hostname, port);
+    // Preserve the original transport selection when no namespace is set.
+    int rc = metadata_cluster_id.empty()
+                 ? transfer_engine_->init(metadata_connstring, local_hostname,
+                                          hostname, port)
+                 : transfer_engine_->init(metadata_connstring, local_hostname,
+                                          hostname, port, protocol,
+                                          metadata_cluster_id);
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
         return ErrorCode::INTERNAL_ERROR;
@@ -1454,14 +1572,47 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels, const std::string& tenant_id,
     std::shared_ptr<NVMeoFInitiator> nof_initiator) {
+    return Create(local_hostname, metadata_connstring, protocol, device_names,
+                  master_server_entry, transfer_engine, std::move(labels),
+                  tenant_id, std::move(nof_initiator), "");
+}
+
+std::optional<std::shared_ptr<Client>> Client::Create(
+    const std::string& local_hostname, const std::string& metadata_connstring,
+    const std::string& protocol, const std::optional<std::string>& device_names,
+    const std::string& master_server_entry,
+    const std::shared_ptr<TransferEngine>& transfer_engine,
+    std::map<std::string, std::string> labels, const std::string& tenant_id,
+    std::shared_ptr<NVMeoFInitiator> nof_initiator,
+    const std::string& metadata_cluster_id) {
+    return Create(local_hostname, metadata_connstring, protocol, device_names,
+                  master_server_entry, transfer_engine, std::move(labels),
+                  tenant_id, std::move(nof_initiator), metadata_cluster_id,
+                  DfsOptions::FromEnvironment());
+}
+
+std::optional<std::shared_ptr<Client>> Client::Create(
+    const std::string& local_hostname, const std::string& metadata_connstring,
+    const std::string& protocol, const std::optional<std::string>& device_names,
+    const std::string& master_server_entry,
+    const std::shared_ptr<TransferEngine>& transfer_engine,
+    std::map<std::string, std::string> labels, const std::string& tenant_id,
+    std::shared_ptr<NVMeoFInitiator> nof_initiator,
+    const std::string& metadata_cluster_id, const DfsOptions& options) {
+    if (transfer_engine && !metadata_cluster_id.empty()) {
+        LOG(ERROR) << "Explicit metadata namespace requires a dedicated engine";
+        return std::nullopt;
+    }
+    if (!options.Validate(false)) return std::nullopt;
     // Reused engines retain their metadata mode. In particular, P2PHANDSHAKE
     // must publish the engine's actual endpoint rather than the Store hostname.
     const auto& resolved_metadata =
         transfer_engine && metadata_connstring.empty()
             ? transfer_engine->getMetadataConnectionString()
             : metadata_connstring;
-    auto client = std::shared_ptr<Client>(new Client(
-        local_hostname, resolved_metadata, protocol, labels, tenant_id));
+    auto client = std::shared_ptr<Client>(
+        new Client(local_hostname, resolved_metadata, protocol, labels,
+                   tenant_id, options));
     if (!nof_initiator) {
         // nullptr means "use the process default", not "disable NoF" —
         // existing callers keep the pre-parameter behavior. Explicit disable
@@ -1515,7 +1666,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         auto config = config_response.value();
         client->dfs_root_identity_ = config.dfs_root_identity;
         client->master_dfs_root_dir_ = config.dfs_fsdir;
-        WarnOnClientDfsPathMismatch(config.dfs_fsdir);
+        WarnOnClientDfsPathMismatch(config.dfs_fsdir, options);
         if (config.fsdir.empty()) {
             LOG(INFO)
                 << "Storage root directory is not set. persisting data is "
@@ -1560,7 +1711,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
-                                         protocol, device_names);
+                                         protocol, device_names,
+                                         metadata_cluster_id);
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to initialize transfer engine";
             return std::nullopt;
@@ -5618,8 +5770,16 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
 
 void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
-    if (backend && !master_dfs_root_dir_.empty()) {
-        backend->SetDescriptorRootDir(master_dfs_root_dir_);
+    SetDfsStorageBackend(std::move(backend), {});
+}
+
+void Client::SetDfsStorageBackend(
+    std::shared_ptr<DistributedStorageBackend> backend,
+    const std::string& descriptor_root_dir) {
+    const auto& root = descriptor_root_dir.empty() ? master_dfs_root_dir_
+                                                   : descriptor_root_dir;
+    if (backend && !root.empty()) {
+        backend->SetDescriptorRootDir(root);
     }
     if (backend) {
         backend->SetBatchTimeoutFixedMs(GetDfsBatchTimeoutFixedMs());

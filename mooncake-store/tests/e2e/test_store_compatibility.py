@@ -10,7 +10,13 @@ import threading
 import unittest
 from uuid import uuid4
 
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import (
+    DfsAllocatorType,
+    DfsOptions,
+    MooncakeDistributedStore,
+    ReplicateConfig,
+    StorageBackendType,
+)
 
 
 class StoreCapabilitiesTest(unittest.TestCase):
@@ -39,11 +45,91 @@ class StoreCapabilitiesTest(unittest.TestCase):
             ),
         )
         self.assertIn("enable_dfs_prefetch", capabilities["setup_parameters"])
+        self.assertIn("dfs_options", capabilities["setup_parameters"])
+        self.assertNotIn("client_options", capabilities["setup_parameters"])
         self.assertIn("tenant_id", capabilities["setup_parameters"])
         capabilities["features"]["read_plan"] = False
         capabilities["setup_parameters"].clear()
         self.assertTrue(store.get_capabilities()["features"]["read_plan"])
         self.assertIn("tenant_id", store.get_capabilities()["setup_parameters"])
+
+    def test_dfs_options_expose_scoped_values(self):
+        options = DfsOptions()
+        for name in (
+            "local_buffer_size",
+            "unified_buffer_size",
+            "prefetch_capacity_ratio",
+            "dfs_read_arena_wait_ms",
+            "read_chunk_size",
+            "write_chunk_size",
+            "read_protection_chunks",
+            "write_protection_chunks",
+            "dfs_batch_timeout_fixed_ms",
+        ):
+            with self.subTest(field=name):
+                self.assertTrue(hasattr(options, name))
+        self.assertFalse(hasattr(options, "file_storage_config"))
+        options.force_dfs_one_replica = False
+        options.dfs_pinned_pool_bytes = 0
+        options.dfs_batch_timeout_fixed_ms = 0
+        self.assertFalse(options.force_dfs_one_replica)
+        self.assertEqual(options.dfs_pinned_pool_bytes, 0)
+        self.assertEqual(options.dfs_batch_timeout_fixed_ms, 0)
+        self.assertFalse(hasattr(options, "backend_options"))
+        self.assertEqual(options.storage_backend_type, StorageBackendType.BUCKET)
+        for backend_type in (
+            StorageBackendType.FILE_PER_KEY,
+            StorageBackendType.BUCKET,
+            StorageBackendType.OFFSET_ALLOCATOR,
+            StorageBackendType.DISTRIBUTED,
+            StorageBackendType.NVME_KV,
+        ):
+            with self.subTest(backend_type=backend_type):
+                options.storage_backend_type = backend_type
+                self.assertEqual(options.storage_backend_type, backend_type)
+        options.storage_backend_type = StorageBackendType.DISTRIBUTED
+        self.assertEqual(options.storage.allocator_type, DfsAllocatorType.BUCKET)
+        options.storage.fsdir = "/explicit-root"
+        options.root_identity = "test-root"
+        options.descriptor_root_dir = "/descriptor-root"
+        self.assertEqual(options.storage.fsdir, "/explicit-root")
+        self.assertEqual(options.root_identity, "test-root")
+        self.assertEqual(options.descriptor_root_dir, "/descriptor-root")
+
+    def test_setup_accepts_none_and_rejects_invalid_dfs_options(self):
+        # Required config is valid, but invalid DFS values are rejected before
+        # attempting to connect to a master.
+        options = DfsOptions()
+        options.dfs_write_arena_wait_ms = -1
+        self.assertEqual(
+            MooncakeDistributedStore().setup(
+                "127.0.0.1",
+                "P2PHANDSHAKE",
+                0,
+                0,
+                "tcp",
+                "",
+                "127.0.0.1:1",
+                dfs_options=options,
+            ),
+            -600,
+        )
+        self.assertEqual(
+            MooncakeDistributedStore().setup(
+                {
+                    "local_hostname": "127.0.0.1",
+                    "metadata_server": "P2PHANDSHAKE",
+                    "global_segment_size": "0",
+                    "local_buffer_size": "0",
+                },
+                dfs_options=options,
+            ),
+            -600,
+        )
+        # Missing mandatory configuration fails without network access for both
+        # the omitted argument and an explicitly supplied None.
+        self.assertEqual(MooncakeDistributedStore().setup({}), -600)
+        self.assertEqual(MooncakeDistributedStore().setup({}, dfs_options=None), -600)
 
     def test_community_and_l3_entry_points_are_retained(self):
         store = MooncakeDistributedStore()

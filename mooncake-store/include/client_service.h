@@ -78,6 +78,47 @@ class QueryResult {
     }
 };
 
+// Explicit construction uses only these values and type defaults. Legacy
+// entry points opt into process environment defaults through FromEnvironment().
+struct DfsOptions {
+    bool use_master_dfs_root_dir = false;
+    bool force_dfs_one_replica = false;
+    uint64_t dfs_batch_put_timeout_ms = 10000;
+    // Used before a backend is bound; backend and Master snapshots take over.
+    uint64_t dfs_batch_timeout_fixed_ms = kDefaultDfsBatchTimeoutFixedMs;
+    int64_t dfs_write_arena_wait_ms = 10000;
+    size_t dfs_pinned_pool_bytes = PinnedBufferPool::kDefaultMaxCachedBytes;
+    size_t dfs_write_threads = 8;
+    size_t dfs_h2d_streams = 4;
+
+    // Backend selection is independent of DFS allocator_type.
+    StorageBackendType storage_backend_type;
+
+    // DFS resources use the same defaults as FileStorageConfig.
+    int64_t local_buffer_size;
+    int64_t unified_buffer_size;
+    double prefetch_capacity_ratio;
+    int64_t dfs_read_arena_wait_ms;
+    int64_t read_chunk_size;
+    int64_t write_chunk_size;
+    int64_t read_protection_chunks;
+    int64_t write_protection_chunks;
+    // Consumed only by the distributed backend; defaults never read env.
+    DistributedStorageConfig storage{.allocator_type =
+                                         DfsAllocatorType::BUCKET};
+    std::string root_identity;
+    std::string descriptor_root_dir;
+
+    DfsOptions();
+    void ApplyTo(FileStorageConfig& config) const;
+    FileStorageConfig ToFileStorageConfig() const;
+    // Client-only callers do not consume FileStorage resource settings.
+    bool Validate(bool validate_storage_resources = true) const;
+    // Capture legacy DFS defaults once; explicit construction never calls this.
+    static DfsOptions FromEnvironment(
+        const FileStorageConfig& config = FileStorageConfig::FromEnvironment());
+};
+
 /**
  * @brief Client for interacting with the mooncake distributed object store
  */
@@ -128,6 +169,7 @@ class Client {
         return dfs_root_identity_;
     }
     tl::expected<std::string, ErrorCode> FetchDfsRootIdentity();
+    std::string GetDfsRootDirOverride() const;
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -152,6 +194,29 @@ class Client {
         std::map<std::string, std::string> labels = {},
         const std::string& tenant_id = "default",
         std::shared_ptr<NVMeoFInitiator> nof_initiator = nullptr);
+
+    static std::optional<std::shared_ptr<Client>> Create(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names,
+        const std::string& master_server_entry,
+        const std::shared_ptr<TransferEngine>& transfer_engine,
+        std::map<std::string, std::string> labels, const std::string& tenant_id,
+        std::shared_ptr<NVMeoFInitiator> nof_initiator,
+        const std::string& metadata_cluster_id);
+
+    // Explicit DFS instance options; metadata namespace remains a separate
+    // parameter aligned with the community interface. Legacy overloads capture
+    // environment defaults once at creation and delegate here.
+    static std::optional<std::shared_ptr<Client>> Create(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names,
+        const std::string& master_server_entry,
+        const std::shared_ptr<TransferEngine>& transfer_engine,
+        std::map<std::string, std::string> labels, const std::string& tenant_id,
+        std::shared_ptr<NVMeoFInitiator> nof_initiator,
+        const std::string& metadata_cluster_id, const DfsOptions& options);
 
     // Test-only seam: when set, Client::Create builds the default NoF
     // initiator from this factory instead of CreateNofRuntime() whenever the
@@ -803,6 +868,9 @@ class Client {
         const std::vector<StorageObjectMetadata>& metadatas);
     void SetDfsStorageBackend(
         std::shared_ptr<DistributedStorageBackend> backend);
+    void SetDfsStorageBackend(
+        std::shared_ptr<DistributedStorageBackend> backend,
+        const std::string& descriptor_root_dir);
 
     void SetDfsAccessPolicy(bool allow_read, bool allow_write) {
         dfs_read_allowed_.store(allow_read, std::memory_order_release);
@@ -944,6 +1012,9 @@ class Client {
         std::shared_ptr<ClientBufferAllocator> allocator, size_t capacity);
     void SetDfsWriteChunkSize(size_t chunk_size);
     void SetDfsWriteAlignment(size_t alignment);
+    [[nodiscard]] size_t GetDfsWriteAlignment() const {
+        return dfs_write_alignment_;
+    }
     [[nodiscard]] bool HasClassicTransport(const std::string& protocol) const {
         return transfer_engine_ && !transfer_engine_->isUsingTent() &&
                transfer_engine_->getTransport(protocol) != nullptr;
@@ -1100,6 +1171,10 @@ class Client {
            const std::string& metadata_connstring, const std::string& protocol,
            const std::map<std::string, std::string>& labels = {},
            const std::string& tenant_id = "default");
+    Client(const std::string& local_hostname,
+           const std::string& metadata_connstring, const std::string& protocol,
+           const std::map<std::string, std::string>& labels,
+           const std::string& tenant_id, const DfsOptions& options);
 
     /**
      * @brief Prepare and use the storage backend for persisting data.
@@ -1149,6 +1224,12 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
+
+    ErrorCode InitTransferEngine(const std::string& local_hostname,
+                                 const std::string& metadata_connstring,
+                                 const std::string& protocol,
+                                 const std::optional<std::string>& device_names,
+                                 const std::string& metadata_cluster_id);
     void InitTransferSubmitter();
     ErrorCode TransferData(
         const Replica::Descriptor& replica_descriptor,
@@ -1462,6 +1543,7 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::string master_dfs_root_dir_;
+    const DfsOptions dfs_options_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
     // Preserve existing behavior for non-SGLang callers. SGLang explicitly
     // installs memory-only immediately after setup and before warmup.

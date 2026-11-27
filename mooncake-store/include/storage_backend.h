@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "config/bucket_backend_config.h"
+#include "config/distributed_storage_config.h"
 #include "config/file_per_key_config.h"
 #include "config/offset_allocator_backend_config.h"
 #include "file_interface.h"
@@ -203,9 +204,23 @@ YLT_REFL(OffsetAllocatorPersistedMetadata, version, allocator_state, insert_seq,
 // records cannot be parsed with the current record layout.
 inline constexpr uint32_t kOffsetAllocatorPersistVersion = 3;
 
+struct DfsBackendOptions {
+    DistributedStorageConfig storage{.allocator_type =
+                                         DfsAllocatorType::BUCKET};
+    std::string root_identity;
+    std::string descriptor_root_dir;
+};
+
 struct FileStorageConfig {
     // type of the storage backend
     StorageBackendType storage_backend_type = StorageBackendType::kBucket;
+
+    // Explicit DFS instance settings; absent preserves legacy env defaults.
+    std::optional<DfsBackendOptions> dfs_options;
+
+    // Internal compatibility marker: explicit DFS resources bypass legacy env
+    // reads.
+    bool dfs_resources_explicit = false;
 
     // Path where data files are stored on disk
     std::string storage_filepath = "/data/file_storage";
@@ -216,6 +231,9 @@ struct FileStorageConfig {
     // Unified pinned+mapped backing shared by DFS read, prefetch and write.
     int64_t unified_buffer_size = 12LL * 1024 * 1024 * 1024;
     double prefetch_capacity_ratio = 0.5;
+
+    // Explicit FileStorage construction uses this captured local wait budget.
+    int64_t dfs_read_arena_wait_ms = 10000;
 
     // Read/write request chunk sizes; these are not backing capacities.
     int64_t read_chunk_size = 1LL * 1024 * 1024 * 1024;
@@ -1691,8 +1709,13 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
    private:
 };
 
+// Uses config.dfs_options when present; strings below are legacy defaults.
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config,
                      const std::string& dfs_root_identity = {});
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const FileStorageConfig& config,
+                     const std::string& dfs_root_identity,
+                     const std::string& local_dfs_root);
 
 }  // namespace mooncake

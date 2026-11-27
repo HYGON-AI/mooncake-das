@@ -5781,6 +5781,17 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config,
                      const std::string& dfs_root_identity) {
+    return CreateStorageBackend(config, dfs_root_identity, {});
+}
+
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const FileStorageConfig& config,
+                     const std::string& dfs_root_identity,
+                     const std::string& local_dfs_root) {
+    if (config.dfs_options &&
+        config.storage_backend_type != StorageBackendType::kDistributed) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
@@ -5815,8 +5826,34 @@ CreateStorageBackend(const FileStorageConfig& config,
             return std::make_shared<NvmeKvStorageBackend>(config);
 
         case StorageBackendType::kDistributed: {
-            auto distributed_config =
-                DistributedStorageConfig::FromEnvironment();
+            auto resolved_config = config;
+            if (!resolved_config.dfs_options) {
+                auto distributed_config =
+                    DistributedStorageConfig::FromEnvironment();
+                if (!local_dfs_root.empty() &&
+                    (distributed_config.fs_adapter_type == "posix" ||
+                     distributed_config.fs_adapter_type == "hf3fs")) {
+                    distributed_config.fsdir = local_dfs_root;
+                }
+                resolved_config.dfs_options = DfsBackendOptions{
+                    std::move(distributed_config), dfs_root_identity, {}};
+            }
+            const auto& options = *resolved_config.dfs_options;
+            const auto& distributed_config = options.storage;
+            if (!distributed_config.UsesObjectStorage() &&
+                (!distributed_config.allocator_type_valid ||
+                 distributed_config.allocator_type !=
+                     DfsAllocatorType::BUCKET)) {
+                throw std::invalid_argument(
+                    "Invalid allocator_type for Client DFS backend "
+                    "initialization: "
+                    "only 'bucket' is supported");
+            }
+            if (!options.descriptor_root_dir.empty() &&
+                !std::filesystem::path(options.descriptor_root_dir)
+                     .is_absolute()) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
             if (!distributed_config.Validate()) {
                 throw std::invalid_argument(
                     "Invalid DistributedStorage configuration");
@@ -5856,9 +5893,13 @@ CreateStorageBackend(const FileStorageConfig& config,
             } else {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            return std::make_shared<DistributedStorageBackend>(
-                config, distributed_config, std::move(fs_adapter),
-                std::move(object_storage_adapter), dfs_root_identity);
+            auto backend = std::make_shared<DistributedStorageBackend>(
+                resolved_config, distributed_config, std::move(fs_adapter),
+                std::move(object_storage_adapter), options.root_identity);
+            if (!options.descriptor_root_dir.empty()) {
+                backend->SetDescriptorRootDir(options.descriptor_root_dir);
+            }
+            return backend;
         }
         default: {
             LOG(ERROR) << "Unsupported backend type: "
