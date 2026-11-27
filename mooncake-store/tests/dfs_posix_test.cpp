@@ -3075,6 +3075,7 @@ TEST_F(DfsBackendTest, FailurePaths) {
 TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     EnvGuard env;
     ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
     TempDir tmp("dfs_factory");
     ASSERT_TRUE(WriteTestDfsRootIdentity(tmp.path()));
     env.Set("MOONCAKE_DFS_ROOT_DIR", tmp.path().c_str());

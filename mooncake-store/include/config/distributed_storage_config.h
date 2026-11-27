@@ -9,13 +9,15 @@
 
 namespace mooncake {
 
+inline constexpr uint64_t kDefaultDfsAlignment = 4096;
+
 struct DistributedStorageConfig {
     std::string fsdir = "/mnt/3fs/mooncake";
     std::string fs_adapter_type = "hf3fs";
     bool enable_health_check = false;
     int shard_count = 64;
     uint64_t shard_capacity = 4ULL * 1024 * 1024 * 1024;
-    uint64_t alignment = 4096;
+    uint64_t alignment = kDefaultDfsAlignment;
     // BUCKET mode only: align the first allocation of each BatchPutStart
     // segment to this boundary. The same rule also applies to single-key
     // PutStart allocations because they use BatchAllocate internally. Zero

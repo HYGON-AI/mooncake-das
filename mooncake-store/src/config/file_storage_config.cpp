@@ -1,5 +1,6 @@
 #include "storage_backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <limits>
@@ -98,6 +99,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.unified_buffer_size = Environ::ReadOr(
         Variables::MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES,
         config.unified_buffer_size);
+    config.dfs_read_arena_wait_ms = std::max<int64_t>(
+        Environ::ReadOr(Variables::MC_STORE_DFS_READ_ARENA_WAIT_MS,
+                        config.dfs_read_arena_wait_ms),
+        0);
     config.read_chunk_size = Environ::ReadOr(
         Variables::MC_STORE_DFS_READ_CHUNK_SIZE_BYTES, config.read_chunk_size);
     config.write_chunk_size = Environ::ReadOr(
@@ -276,11 +281,22 @@ bool FileStorageConfig::ValidatePath(std::string path,
 }
 
 bool FileStorageConfig::Validate() const {
+    if (dfs_options &&
+        storage_backend_type != StorageBackendType::kDistributed) {
+        LOG(ERROR)
+            << "FileStorageConfig: dfs_options require a distributed backend";
+        return false;
+    }
+    if (dfs_read_arena_wait_ms < 0) {
+        LOG(ERROR) << "FileStorageConfig: dfs_read_arena_wait_ms must be >= 0";
+        return false;
+    }
     const bool require_storage_path_available =
         storage_backend_type != StorageBackendType::kDistributed;
     const bool uses_kvcs =
         storage_backend_type == StorageBackendType::kDistributed &&
-        DistributedStorageConfig::FromEnvironment().UsesKvcs();
+        (dfs_options ? dfs_options->storage.UsesKvcs()
+                     : DistributedStorageConfig::FromEnvironment().UsesKvcs());
     if (!uses_kvcs &&
         !ValidatePath(storage_filepath, require_storage_path_available)) {
         return false;

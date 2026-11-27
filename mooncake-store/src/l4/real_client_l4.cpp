@@ -1266,8 +1266,7 @@ ErrorCode RealClient::execute_session_dfs_range_reads_batch(
         size_t size;
     };
 
-    const size_t dfs_alignment =
-        GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
+    const size_t dfs_alignment = client_->GetDfsWriteAlignment();
     std::vector<ArenaView> arena_views;
     arena_views.reserve(entries.size());
     size_t arena_size = 0;
@@ -1670,8 +1669,7 @@ RealClient::PlanDfsReadChunks(
     size_t chunk_limit_bytes, size_t &request_planned_bytes) {
     // Match the full-object layout used below: DFS objects read aligned_size
     // (including padding), with an alignment gap between staging slots.
-    const size_t dfs_alignment =
-        GetEnvOr<size_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
+    const size_t dfs_alignment = client_->GetDfsWriteAlignment();
     auto get_staging_size = [&](SessionRangeReadRequest *entry,
                                 size_t *staging_size) {
         const uint64_t total_size = calculate_total_size(entry->replica);

@@ -7,7 +7,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <fstream>
 #include <memory>
+#include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -17,6 +20,9 @@
 #include "common/network.h"
 #include "file_storage.h"
 #include "storage_backend.h"
+#include "storage/distributed/dfs_root_identity.h"
+#include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/immutable_bucket_allocator.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
 #include "common/client_buffer_allocation.h"
@@ -29,6 +35,29 @@ void SetEnv(const std::string& key, const std::string& value) {
 }
 
 void UnsetEnv(const std::string& key) { unsetenv(key.c_str()); }
+
+class DfsOptionsEnvGuard {
+   public:
+    void Set(const std::string& key, const std::string& value) {
+        if (!saved_.contains(key)) {
+            const auto* old = std::getenv(key.c_str());
+            saved_[key] =
+                old ? std::make_optional(std::string(old)) : std::nullopt;
+        }
+        SetEnv(key, value);
+    }
+    ~DfsOptionsEnvGuard() {
+        for (const auto& [key, value] : saved_) {
+            if (value)
+                SetEnv(key, *value);
+            else
+                UnsetEnv(key);
+        }
+    }
+
+   private:
+    std::unordered_map<std::string, std::optional<std::string>> saved_;
+};
 
 // Commit another offload after grouping but before this batch reaches the
 // backend. This deterministically exercises the duplicate race from #4097
@@ -74,6 +103,56 @@ class ConcurrentOffloadBackend : public BucketStorageBackend {
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
+
+    static tl::expected<void, ErrorCode> InitBackend(FileStorage& storage) {
+        return storage.storage_backend_->Init();
+    }
+
+    static void VerifyExplicitDfsIo(FileStorage& storage,
+                                    const std::string& root, size_t alignment,
+                                    size_t capacity, const std::string& value,
+                                    const std::string& descriptor_root = {}) {
+        const auto filename =
+            "bucket_" + ImmutableBucketAllocator::FormatBucketId(0) + ".data";
+        const auto path = root + "/" + filename;
+        if (!fs::exists(path)) std::ofstream(path, std::ios::binary);
+        fs::resize_file(path, capacity);
+        DistributedFSDescriptor descriptor;
+        descriptor.file_path =
+            (descriptor_root.empty() ? root : descriptor_root) + "/" + filename;
+        descriptor.offset = alignment;
+        descriptor.object_size = value.size();
+        descriptor.aligned_size = alignment;
+        descriptor.shard_idx = 0;
+        auto backend = storage.distributed_backend_;
+        ASSERT_NE(backend, nullptr);
+        auto writes = backend->BatchWrite(
+            {{"same-key",
+              descriptor,
+              {{const_cast<char*>(value.data()), value.size()}}}});
+        ASSERT_EQ(writes.size(), 1u);
+        ASSERT_TRUE(writes[0]) << toString(writes[0].error());
+        std::string read(value.size(), '\0');
+        auto reads = backend->BatchRead(
+            {{"same-key", descriptor, {{read.data(), read.size()}}}});
+        ASSERT_EQ(reads.size(), 1u);
+        ASSERT_TRUE(reads[0]) << toString(reads[0].error());
+        EXPECT_EQ(read, value);
+        std::string range(97, '\0');
+        auto ranges = backend->BatchRead({{"same-key",
+                                           descriptor,
+                                           {{range.data(), range.size()}},
+                                           nullptr,
+                                           13,
+                                           true}});
+        ASSERT_EQ(ranges.size(), 1u);
+        ASSERT_TRUE(ranges[0]) << toString(ranges[0].error());
+        EXPECT_EQ(range, value.substr(13, range.size()));
+    }
+
+    static uint64_t BackendFixedTimeout(FileStorage& storage) {
+        return storage.distributed_backend_->GetBatchTimeoutFixedMs();
+    }
 
     static uintmax_t StoredFileBytes(const std::string& path) {
         uintmax_t bytes = 0;
@@ -1143,7 +1222,563 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
                 !enable_offloading_result3.value());
 }
 
+TEST_F(FileStorageTest,
+       ExplicitDfsOptionsKeepInstancesIndependentOfEnvironment) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "invalid-adapter");
+    env.Set("MOONCAKE_DFS_ROOT_DIR", data_path + "/wrong-root");
+    env.Set("MOONCAKE_DFS_ALIGNMENT", "3");
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "invalid-allocator");
+    env.Set("MC_STORE_DFS_READ_ARENA_WAIT_MS", "777");
+
+    DfsBackendOptions first;
+    first.storage.fsdir = data_path + "/explicit-first";
+    first.storage.fs_adapter_type = "posix";
+    first.storage.alignment = 8192;
+    first.storage.allocator_type = DfsAllocatorType::BUCKET;
+    first.storage.bucket_capacity = 1024 * 1024;
+    first.storage.batch_read_threads = 1;
+    first.root_identity =
+        SerializeDfsRootIdentity("instance_options", UUID{1, 2});
+    fs::create_directories(first.storage.fsdir);
+    std::ofstream(first.storage.fsdir + "/" + kDfsRootIdentityFileName)
+        << first.root_identity;
+
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = first.storage.fsdir;
+    config.local_buffer_size = 1024 * 1024;
+    config.unified_buffer_size = 0;
+    config.dfs_read_arena_wait_ms = 17;
+    config.dfs_options = first;
+    auto a = std::make_unique<FileStorage>(config, nullptr, "localhost:9003");
+    ASSERT_TRUE(InitBackend(*a));
+    EXPECT_EQ(a->DfsAlignment(), 8192u);
+    EXPECT_EQ(a->ReadArenaWait(), std::chrono::milliseconds(17));
+
+    auto second = first;
+    second.storage.fsdir = data_path + "/explicit-second";
+    second.storage.alignment = 16384;
+    second.root_identity =
+        SerializeDfsRootIdentity("instance_options", UUID{3, 4});
+    fs::create_directories(second.storage.fsdir);
+    std::ofstream(second.storage.fsdir + "/" + kDfsRootIdentityFileName)
+        << second.root_identity;
+    config.storage_filepath = second.storage.fsdir;
+    config.dfs_read_arena_wait_ms = 29;
+    config.dfs_options = second;
+    auto b = std::make_unique<FileStorage>(config, nullptr, "localhost:9004");
+    ASSERT_TRUE(InitBackend(*b));
+    const auto first_root = first.storage.fsdir;
+    config.dfs_options->storage.alignment = 3;
+    config.dfs_options->storage.fsdir = data_path + "/wrong-root";
+    env.Set("MOONCAKE_DFS_ALIGNMENT", "65536");
+    env.Set("MC_STORE_DFS_READ_ARENA_WAIT_MS", "999");
+    EXPECT_EQ(a->DfsAlignment(), 8192u);
+    EXPECT_EQ(b->DfsAlignment(), 16384u);
+    VerifyExplicitDfsIo(*a, first_root, 8192, first.storage.bucket_capacity,
+                        std::string(1103, 'a'));
+    VerifyExplicitDfsIo(*b, second.storage.fsdir, 16384,
+                        second.storage.bucket_capacity, std::string(1103, 'b'));
+    auto invalid = second;
+    invalid.storage.alignment = 3;
+    config.dfs_options = invalid;
+    EXPECT_THROW(FileStorage(config, nullptr, "localhost:9005"),
+                 std::invalid_argument);
+    b.reset();
+    EXPECT_EQ(a->ReadArenaWait(), std::chrono::milliseconds(17));
+    VerifyExplicitDfsIo(*a, first_root, 8192, first.storage.bucket_capacity,
+                        std::string(1103, 'c'));
+    EXPECT_FALSE(fs::exists(data_path + "/wrong-root"));
+}
+
+TEST_F(FileStorageTest, ExplicitDfsOptionsSynchronizeEachBoundClient) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_ENABLE_DFS", "0");
+    env.Set("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "777");
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_root_fs_dir("")
+                                 .build()));
+    const auto endpoint_a = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto created_a = Client::Create(endpoint_a, master.metadata_url(), "tcp",
+                                    std::nullopt, master.master_address());
+    ASSERT_TRUE(created_a);
+    const auto endpoint_b = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto created_b = Client::Create(endpoint_b, master.metadata_url(), "tcp",
+                                    std::nullopt, master.master_address());
+    ASSERT_TRUE(created_b);
+    auto client_a = *created_a;
+    auto client_b = *created_b;
+    EXPECT_EQ(client_a->GetDfsBatchTimeoutFixedMs(), 777u);
+    DfsBackendOptions options;
+    options.storage.fsdir = data_path + "/bound-first";
+    options.storage.fs_adapter_type = "posix";
+    options.storage.allocator_type = DfsAllocatorType::BUCKET;
+    options.storage.alignment = 8192;
+    options.storage.batch_timeout_fixed_ms = 31;
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    config.unified_buffer_size = 0;
+    config.dfs_options = options;
+    auto a = std::make_unique<FileStorage>(config, client_a, endpoint_a);
+    options.storage.fsdir = data_path + "/bound-second";
+    options.storage.alignment = 16384;
+    options.storage.batch_timeout_fixed_ms = 43;
+    config.dfs_options = options;
+    auto b = std::make_unique<FileStorage>(config, client_b, endpoint_b);
+    env.Set("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "999");
+    env.Set("MOONCAKE_DFS_ALIGNMENT", "65536");
+    EXPECT_EQ(client_a->GetDfsWriteAlignment(), 8192u);
+    EXPECT_EQ(client_b->GetDfsWriteAlignment(), 16384u);
+    EXPECT_EQ(client_a->GetDfsBatchTimeoutFixedMs(), 31u);
+    EXPECT_EQ(client_b->GetDfsBatchTimeoutFixedMs(), 43u);
+    EXPECT_EQ(BackendFixedTimeout(*a), 31u);
+    EXPECT_EQ(BackendFixedTimeout(*b), 43u);
+    b.reset();
+    EXPECT_EQ(client_a->GetDfsWriteAlignment(), a->DfsAlignment());
+    EXPECT_EQ(client_a->GetDfsBatchTimeoutFixedMs(), BackendFixedTimeout(*a));
+}
+
+TEST_F(FileStorageTest,
+       ExplicitDfsOptionsRejectInvalidSettingsInsteadOfEnvFallback) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_ALIGNMENT", "4096");
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = data_path;
+    config.dfs_options.emplace();
+    auto& options = *config.dfs_options;
+    options.storage.fsdir = data_path;
+    options.storage.fs_adapter_type = "posix";
+    options.storage.allocator_type = DfsAllocatorType::BUCKET;
+    options.storage.alignment = 3;
+    EXPECT_THROW(CreateStorageBackend(config), std::invalid_argument);
+    options.storage.alignment = 4096;
+    options.storage.fsdir = "relative-root";
+    EXPECT_THROW(CreateStorageBackend(config), std::invalid_argument);
+    EXPECT_THROW(FileStorage(config, nullptr, "localhost:9003"),
+                 std::invalid_argument);
+    options.storage.fsdir = data_path;
+    options.descriptor_root_dir = "relative-root";
+    const auto relative = CreateStorageBackend(config);
+    ASSERT_FALSE(relative);
+    EXPECT_EQ(relative.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST_F(FileStorageTest, DfsOptionsProjectOnlyDfsFieldsAndIgnoreEnvironment) {
+    DfsOptionsEnvGuard env;
+    env.Set("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "8192");
+    env.Set("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", "123");
+    DfsOptions options;
+    const FileStorageConfig defaults;
+    EXPECT_EQ(options.write_chunk_size, defaults.write_chunk_size);
+    EXPECT_EQ(options.local_buffer_size, defaults.local_buffer_size);
+    options.write_chunk_size = 16384;
+    options.unified_buffer_size = 32768;
+    options.storage_backend_type = StorageBackendType::kDistributed;
+    options.root_identity = "explicit-root";
+    options.descriptor_root_dir = "/descriptor";
+    options.storage.fsdir = "/explicit";
+    auto config = FileStorageConfig::FromEnvironment();
+    ASSERT_EQ(config.total_keys_limit, 123);
+    options.ApplyTo(config);
+    EXPECT_EQ(config.total_keys_limit, 123);
+    EXPECT_TRUE(config.dfs_resources_explicit);
+    EXPECT_EQ(config.write_chunk_size, 16384);
+    EXPECT_EQ(config.unified_buffer_size, 32768);
+    EXPECT_EQ(config.storage_backend_type, StorageBackendType::kDistributed);
+    ASSERT_TRUE(config.dfs_options);
+    EXPECT_EQ(config.dfs_options->root_identity, options.root_identity);
+    EXPECT_EQ(config.dfs_options->descriptor_root_dir,
+              options.descriptor_root_dir);
+    EXPECT_EQ(config.dfs_options->storage.fsdir, options.storage.fsdir);
+    EXPECT_EQ(options.ToFileStorageConfig().total_keys_limit,
+              defaults.total_keys_limit);
+    EXPECT_EQ(DfsOptions::FromEnvironment().write_chunk_size, 8192);
+}
+
+TEST_F(FileStorageTest, DfsOptionsPreserveEveryEnvironmentBackendSelection) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    const std::pair<const char*, StorageBackendType> cases[] = {
+        {"bucket_storage_backend", StorageBackendType::kBucket},
+        {"file_per_key_storage_backend", StorageBackendType::kFilePerKey},
+        {"offset_allocator_storage_backend",
+         StorageBackendType::kOffsetAllocator},
+        {"distributed_storage_backend", StorageBackendType::kDistributed},
+        {"nvme_kv_storage_backend", StorageBackendType::kNvmeKv},
+    };
+    for (const auto& [descriptor, type] : cases) {
+        SCOPED_TRACE(descriptor);
+        env.Set("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", descriptor);
+        const auto options = DfsOptions::FromEnvironment();
+        EXPECT_EQ(options.storage_backend_type, type);
+        EXPECT_EQ(options.ToFileStorageConfig().storage_backend_type, type);
+        EXPECT_EQ(options.ToFileStorageConfig().dfs_options.has_value(),
+                  type == StorageBackendType::kDistributed);
+    }
+    env.Set("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+            "file_per_key_storage_backend");
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+    const auto kvcs = DfsOptions::FromEnvironment();
+    EXPECT_EQ(kvcs.storage_backend_type, StorageBackendType::kDistributed);
+    EXPECT_TRUE(kvcs.storage.UsesKvcs());
+    ASSERT_TRUE(kvcs.ToFileStorageConfig().dfs_options);
+}
+
+TEST_F(FileStorageTest, ExplicitBackendTypeOverridesEnvironmentAndClearsDfs) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+            "distributed_storage_backend");
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "kvcs-lowlevel");
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "shard");
+    DfsOptions options;
+    EXPECT_EQ(options.storage_backend_type,
+              FileStorageConfig{}.storage_backend_type);
+    for (const auto type :
+         {StorageBackendType::kFilePerKey, StorageBackendType::kBucket,
+          StorageBackendType::kOffsetAllocator,
+          StorageBackendType::kDistributed, StorageBackendType::kNvmeKv}) {
+        options.storage_backend_type = type;
+        const auto config = options.ToFileStorageConfig();
+        EXPECT_EQ(config.storage_backend_type, type);
+        EXPECT_EQ(config.dfs_options.has_value(),
+                  type == StorageBackendType::kDistributed);
+        if (config.dfs_options) {
+            EXPECT_EQ(config.dfs_options->storage.allocator_type,
+                      DfsAllocatorType::BUCKET);
+            EXPECT_FALSE(config.dfs_options->storage.UsesKvcs());
+        }
+        EXPECT_TRUE(options.Validate());
+    }
+    options.storage_backend_type = StorageBackendType::kDistributed;
+    auto config = options.ToFileStorageConfig();
+    ASSERT_TRUE(config.dfs_options);
+    options.storage_backend_type = StorageBackendType::kFilePerKey;
+    options.ApplyTo(config);
+    EXPECT_EQ(config.storage_backend_type, StorageBackendType::kFilePerKey);
+    EXPECT_FALSE(config.dfs_options);
+
+    options.storage.fs_adapter_type = "kvcs-lowlevel";
+    options.root_identity = "unused";
+    EXPECT_TRUE(options.Validate());
+    EXPECT_TRUE(options.Validate(false));
+    EXPECT_FALSE(options.ToFileStorageConfig().dfs_options);
+    options.storage_backend_type = static_cast<StorageBackendType>(99);
+    EXPECT_FALSE(options.Validate());
+}
+
+TEST_F(FileStorageTest, DfsOptionsCaptureLegacyEnvironmentInOneSnapshot) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+            "distributed_storage_backend");
+    env.Set("MOONCAKE_DFS_USE_MASTER_ROOT_DIR", "true");
+    env.Set("MOONCAKE_DFS_FORCE_ONE_REPLICA", "true");
+    env.Set("MOONCAKE_DFS_BATCH_PUT_TIMEOUT_MS", "123");
+    env.Set("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "456");
+    env.Set("MC_STORE_DFS_WRITE_ARENA_WAIT_MS", "17");
+    env.Set("MC_STORE_DFS_PINNED_POOL_BYTES", "4096");
+    env.Set("MC_STORE_DFS_WRITE_THREADS", "3");
+    env.Set("MC_STORE_DFS_H2D_STREAMS", "2");
+    env.Set("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "8192");
+    env.Set("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "16384");
+    env.Set("MC_STORE_DFS_PREFETCH_CAPACITY_RATIO", "0.25");
+    env.Set("MC_STORE_DFS_READ_ARENA_WAIT_MS", "19");
+    env.Set("MC_STORE_DFS_READ_CHUNK_SIZE_BYTES", "2048");
+    env.Set("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "4096");
+    env.Set("MC_STORE_DFS_READ_PROTECTION_CHUNKS", "2");
+    env.Set("MC_STORE_DFS_WRITE_PROTECTION_CHUNKS", "3");
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_ROOT_DIR", data_path);
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    env.Set("MOONCAKE_DFS_ALIGNMENT", "8192");
+
+    const auto expected_local_buffer_size =
+        FileStorageConfig::FromEnvironment().local_buffer_size;
+    const auto options = DfsOptions::FromEnvironment();
+    EXPECT_TRUE(options.use_master_dfs_root_dir);
+    EXPECT_TRUE(options.force_dfs_one_replica);
+    EXPECT_EQ(options.dfs_batch_put_timeout_ms, 123);
+    EXPECT_EQ(options.dfs_batch_timeout_fixed_ms, 456);
+    EXPECT_EQ(options.dfs_write_arena_wait_ms, 17);
+    EXPECT_EQ(options.dfs_pinned_pool_bytes, 4096);
+    EXPECT_EQ(options.dfs_write_threads, 3);
+    EXPECT_EQ(options.dfs_h2d_streams, 2);
+    EXPECT_EQ(options.local_buffer_size, expected_local_buffer_size);
+    EXPECT_EQ(options.unified_buffer_size, 16384);
+    EXPECT_DOUBLE_EQ(options.prefetch_capacity_ratio, 0.25);
+    EXPECT_EQ(options.dfs_read_arena_wait_ms, 19);
+    EXPECT_EQ(options.read_chunk_size, 2048);
+    EXPECT_EQ(options.write_chunk_size, 4096);
+    EXPECT_EQ(options.read_protection_chunks, 2);
+    EXPECT_EQ(options.write_protection_chunks, 3);
+    EXPECT_EQ(options.storage.fsdir, data_path);
+    EXPECT_EQ(options.storage.alignment, 8192);
+    EXPECT_EQ(options.storage.batch_timeout_fixed_ms, 456);
+
+    env.Set("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "789");
+    env.Set("MC_STORE_DFS_WRITE_THREADS", "5");
+    EXPECT_EQ(options.dfs_batch_timeout_fixed_ms, 456);
+    EXPECT_EQ(options.dfs_write_threads, 3);
+    EXPECT_EQ(DfsOptions::FromEnvironment().dfs_batch_timeout_fixed_ms, 789);
+}
+
+TEST_F(FileStorageTest, DfsOptionsCaptureFixedTimeoutWithoutEnablingBackend) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+            "bucket_storage_backend");
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_BATCH_TIMEOUT_FIXED_MS", "777");
+    const auto options = DfsOptions::FromEnvironment();
+    EXPECT_FALSE(options.ToFileStorageConfig().dfs_options);
+    EXPECT_EQ(options.dfs_batch_timeout_fixed_ms, 777);
+    EXPECT_EQ(DfsOptions{}.dfs_batch_timeout_fixed_ms,
+              kDefaultDfsBatchTimeoutFixedMs);
+}
+
+TEST_F(FileStorageTest, DfsOptionsUseLocalFixedTimeoutBeforeBackendBinding) {
+    class UnboundClient : public Client {
+       public:
+        explicit UnboundClient(const DfsOptions& options)
+            : Client("localhost:9003", "P2PHANDSHAKE", "tcp", {}, "default",
+                     options) {}
+    };
+    DfsOptions options;
+    options.storage_backend_type = StorageBackendType::kDistributed;
+    options.dfs_batch_timeout_fixed_ms = 0;
+    options.storage.batch_timeout_fixed_ms = 123;
+    UnboundClient client(options);
+    EXPECT_EQ(client.GetDfsBatchTimeoutFixedMs(), 0u);
+}
+
+TEST_F(FileStorageTest, DfsOptionsReuseCapturedFileStorageConfig) {
+    DfsOptionsEnvGuard env;
+    env.Set("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "8192");
+    const auto captured = FileStorageConfig::FromEnvironment();
+    env.Set("MC_STORE_DFS_WRITE_CHUNK_SIZE_BYTES", "16384");
+    EXPECT_EQ(DfsOptions::FromEnvironment(captured).write_chunk_size, 8192);
+    EXPECT_EQ(DfsOptions::FromEnvironment().write_chunk_size, 16384);
+}
+
+TEST_F(FileStorageTest, DfsOptionsRejectUnsafeBufferAndChunkSizes) {
+    DfsOptions options;
+    EXPECT_TRUE(options.Validate());
+    options.local_buffer_size = 0;
+    EXPECT_FALSE(options.Validate());
+    options = DfsOptions{};
+    options.read_chunk_size = -1;
+    EXPECT_FALSE(options.Validate());
+    options.read_chunk_size = 0;
+    EXPECT_FALSE(options.Validate());
+    options = DfsOptions{};
+    options.unified_buffer_size = 0;
+    options.dfs_pinned_pool_bytes = 0;
+    options.dfs_write_arena_wait_ms = 0;
+    options.dfs_read_arena_wait_ms = 0;
+    EXPECT_TRUE(options.Validate());
+}
+
+TEST_F(FileStorageTest, LegacyClientValidationPreservesUnusedStorageSettings) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "0");
+    env.Set("MC_STORE_DFS_UNIFIED_BUFFER_SIZE_BYTES", "-1");
+    const auto options = DfsOptions::FromEnvironment();
+    EXPECT_EQ(options.local_buffer_size, 0);
+    EXPECT_EQ(options.unified_buffer_size, -1);
+    EXPECT_TRUE(options.Validate(false));
+    EXPECT_FALSE(options.Validate());
+}
+
+TEST_F(FileStorageTest, ExplicitBucketDfsResourcesDoNotReadDfsEnvironment) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_DFS_ALIGNMENT", "8192");
+    env.Set("MC_STORE_DFS_READ_ARENA_WAIT_MS", "23");
+    DfsOptions options;
+    options.local_buffer_size = 1024 * 1024;
+    options.dfs_read_arena_wait_ms = 31;
+    auto config = options.ToFileStorageConfig();
+    config.storage_filepath = data_path;
+    FileStorage explicit_storage(config, nullptr, "localhost:9003");
+    EXPECT_EQ(explicit_storage.DfsAlignment(), 4096u);
+    EXPECT_EQ(explicit_storage.ReadArenaWait(), std::chrono::milliseconds(31));
+
+    FileStorageConfig legacy;
+    legacy.storage_filepath = data_path;
+    legacy.local_buffer_size = 1024 * 1024;
+    FileStorage legacy_storage(legacy, nullptr, "localhost:9004");
+    EXPECT_EQ(legacy_storage.DfsAlignment(), 8192u);
+    EXPECT_EQ(legacy_storage.ReadArenaWait(), std::chrono::milliseconds(23));
+}
+
+TEST_F(FileStorageTest, MasterDfsRootSelectionIsExplicitAndInstanceScoped) {
+    DfsOptionsEnvGuard env;
+    const auto root = data_path + "/master-root";
+    fs::create_directories(root);
+    env.Set("MOONCAKE_ENABLE_DFS", "1");
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_ROOT_DIR", root);
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    env.Set("MOONCAKE_DFS_BUCKET_CAPACITY", "1048576");
+    env.Set("MOONCAKE_DFS_MAX_BUCKET_COUNT", "16");
+    env.Set("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_root_fs_dir("")
+                                 .build()));
+    const auto create = [&](bool use_master_root) {
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        DfsOptions options;
+        options.use_master_dfs_root_dir = use_master_root;
+        return Client::Create(endpoint, master.metadata_url(), "tcp",
+                              std::nullopt, master.master_address(), nullptr,
+                              {}, "default", nullptr, "", options);
+    };
+    env.Set("MOONCAKE_DFS_USE_MASTER_ROOT_DIR", "false");
+    auto enabled = create(true);
+    ASSERT_TRUE(enabled);
+    env.Set("MOONCAKE_DFS_USE_MASTER_ROOT_DIR", "true");
+    auto disabled = create(false);
+    ASSERT_TRUE(disabled);
+    const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto legacy = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(legacy);
+    env.Set("MOONCAKE_DFS_USE_MASTER_ROOT_DIR", "false");
+    EXPECT_EQ((*enabled)->GetDfsRootDirOverride(), root);
+    EXPECT_TRUE((*disabled)->GetDfsRootDirOverride().empty());
+    EXPECT_EQ((*legacy)->GetDfsRootDirOverride(), root);
+}
+
+TEST_F(FileStorageTest, ExplicitDescriptorRootSurvivesClientBinding) {
+    DfsOptionsEnvGuard env;
+    const auto master_root = data_path + "/master-descriptor-root";
+    const auto local_root = data_path + "/local-mount";
+    const auto descriptor_root = data_path + "/explicit-descriptor-root";
+    fs::create_directories(master_root);
+    fs::create_directories(local_root);
+    env.Set("MOONCAKE_ENABLE_DFS", "1");
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_ROOT_DIR", master_root);
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    env.Set("MOONCAKE_DFS_BUCKET_CAPACITY", "1048576");
+    env.Set("MOONCAKE_DFS_MAX_BUCKET_COUNT", "16");
+    env.Set("MOONCAKE_DFS_READY_BUCKET_COUNT", "0");
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_root_fs_dir("")
+                                 .build()));
+    const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                  std::nullopt, master.master_address());
+    ASSERT_TRUE(created);
+    auto client = *created;
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = local_root;
+    config.local_buffer_size = 1024 * 1024;
+    config.unified_buffer_size = 0;
+    DfsBackendOptions options;
+    options.storage.fsdir = local_root;
+    options.storage.fs_adapter_type = "posix";
+    options.storage.bucket_capacity = 1024 * 1024;
+    options.storage.batch_read_threads = 1;
+    options.root_identity = client->GetDfsRootIdentity();
+    options.descriptor_root_dir = descriptor_root;
+    std::ofstream(local_root + "/" + kDfsRootIdentityFileName)
+        << options.root_identity;
+    config.dfs_options = options;
+    FileStorage storage(config, client, endpoint);
+    ASSERT_TRUE(InitBackend(storage));
+    VerifyExplicitDfsIo(storage, local_root, options.storage.alignment,
+                        options.storage.bucket_capacity, std::string(1103, 'd'),
+                        descriptor_root);
+    EXPECT_FALSE(fs::exists(descriptor_root));
+}
+
+TEST_F(FileStorageTest, DfsOptionsRejectNonBucketAllocators) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    config.unified_buffer_size = 0;
+    config.dfs_options.emplace();
+    auto& options = *config.dfs_options;
+    options.storage.fsdir = data_path + "/unsupported-allocator";
+    options.storage.fs_adapter_type = "posix";
+    for (const auto type :
+         {DfsAllocatorType::SHARD, static_cast<DfsAllocatorType>(99)}) {
+        options.storage.allocator_type = type;
+        try {
+            (void)CreateStorageBackend(config);
+            FAIL() << "Non-bucket allocator was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_STREQ(
+                error.what(),
+                "Invalid allocator_type for Client DFS backend initialization: "
+                "only 'bucket' is supported");
+        }
+        EXPECT_THROW(FileStorage(config, nullptr, "localhost:9003"),
+                     std::invalid_argument);
+    }
+    options.storage.allocator_type = DfsAllocatorType::BUCKET;
+    options.storage.allocator_type_valid = false;
+    EXPECT_THROW(CreateStorageBackend(config), std::invalid_argument);
+    EXPECT_FALSE(fs::exists(options.storage.fsdir));
+}
+
+TEST_F(FileStorageTest, LegacyDfsOptionsRejectUnsupportedAllocatorNames) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    config.unified_buffer_size = 0;
+    for (const auto* type : {"shard", "shared", "unknown"}) {
+        env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", type);
+        EXPECT_THROW(CreateStorageBackend(config), std::invalid_argument);
+        EXPECT_THROW(FileStorage(config, nullptr, "localhost:9003"),
+                     std::invalid_argument);
+    }
+}
+
+TEST_F(FileStorageTest,
+       LegacyDfsConstructorKeepsEnvironmentDefaultsAndRootOverride) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_ROOT_DIR", data_path + "/legacy-root");
+    env.Set("MOONCAKE_DFS_ALIGNMENT", "8192");
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+    env.Set("MC_STORE_DFS_READ_ARENA_WAIT_MS", "23");
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributed;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    config.unified_buffer_size = 0;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    EXPECT_EQ(storage.DfsAlignment(), 8192u);
+    EXPECT_EQ(storage.ReadArenaWait(), std::chrono::milliseconds(23));
+    EXPECT_THROW(CreateStorageBackend(config, std::string{}, "relative-root"),
+                 std::invalid_argument);
+    const auto overridden =
+        CreateStorageBackend(config, std::string{}, data_path);
+    EXPECT_TRUE(overridden);
+}
+
 TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
     SetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
            "distributed_storage_backend");
     SetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR", data_path + "/distributed");
@@ -1205,6 +1840,8 @@ TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
 }
 
 TEST_F(FileStorageTest, DistributedBackendHonorsDisabledUnifiedBuffer) {
+    DfsOptionsEnvGuard env;
+    env.Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
     SetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
            "distributed_storage_backend");
     SetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE", "posix");
